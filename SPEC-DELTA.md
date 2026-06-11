@@ -204,3 +204,46 @@ Resize, snapshots, drift correction, GCP/DO providers.
   dead); the `dblab` CLI calls in env scripts remain plan hooks until
   `env preflight` reports READY.
 - GitHub Actions runner registration — blocked on a repo-admin token; exact handoff + execution sequence documented in `docs/runner-admin-handoff.md`.
+
+## Provision/destroy delta (v0.1 lifecycle, Hetzner-only — feat/provision)
+
+### AWS deferred to post-v0.2
+SPEC v0.1 §2 promised "Hetzner OR AWS" for provision. The shipped `provision`
+is **Hetzner only**: the `Provider` port (src/providers/types.ts) is in place
+and the orchestrator is provider-agnostic, but no AWS adapter exists yet and
+`provision --provider aws` is rejected at parse time with a "deferred"
+message. `preview --provider aws` still renders offline. Rationale: tonight's
+from-scratch lifecycle test runs on Hetzner; the AWS SDK adapter is pure
+add-on work behind the port.
+
+### Provision-time host-key pinning is TOFU (trust on first BOOT)
+`adopt` demands an out-of-band-verified fingerprint because the host predates
+samohost. A freshly **provisioned** box has no out-of-band channel — samohost
+created it seconds ago via the authenticated provider API — so the
+booting→ready gate pins trust-on-first-boot: once `ssh-keyscan` answers on
+the hardened port, ALL scanned key lines are fingerprinted (multi-key lesson
+from #5), the **ed25519** key is preferred, its fingerprint is persisted in
+`VmRecord.hostKeyFingerprint` and its line planted via `recordHostKey()`; all
+subsequent SSH (including the cloud-init sentinel probes that gate `ready`)
+runs `StrictHostKeyChecking=yes` against that pin. **Caveat:** the trust
+window is the seconds between sshd answering and the first scan; an active
+MITM inside that window could supply the pinned key. Acceptable for v0.1
+cattle (same model as `gh`/cloud-init ecosystems); operators can compare
+`samohost status` fingerprints against the provider console out-of-band.
+
+### SSH keys are cloud-init-only (no Hetzner key resource)
+`POST /v1/servers` is sent **without** `ssh_keys`: the hardening baseline
+already plants the operator's public key for the non-root admin user, and
+root login + password auth are disabled, so a provider-side key resource
+would only add a second lifecycle (create/dedupe/cleanup) for zero security
+gain. The `root_password` Hetzner returns in that case is ignored and never
+surfaced. Delete protection is never enabled.
+
+### Destroy surfaces volumes — never deletes them
+`destroy` lists volumes attached to the server (server.volumes → volume
+details) and prints `attached volume NOT deleted: id/name/size` before the
+server DELETE. Data outlives cattle by default; volume deletion stays a
+manual, deliberate act. On provider API failure the record stays
+`destroying` (truthful + retryable); `notFound` counts as already-gone.
+Crash reclaim: destroy is legal from `creating`/`booting` so a provision
+that died mid-flight is never orphaned.
