@@ -130,9 +130,9 @@ describe("runAdopt", () => {
     hostKeyFingerprint: FP,
   };
 
-  test("happy path: writes an adopted record, prints a line", () => {
+  test("happy path: writes an adopted record, prints a line", async () => {
     const c = capture();
-    const code = runAdopt(validInput, { json: false }, store, c.out, c.err);
+    const code = await runAdopt(validInput, { json: false }, store, c.out, c.err);
     expect(code).toBe(0);
     const recs = store.list();
     expect(recs.length).toBe(1);
@@ -150,26 +150,26 @@ describe("runAdopt", () => {
     expect(c.o).toContain("samo-field");
   });
 
-  test("--json prints the raw record", () => {
+  test("--json prints the raw record", async () => {
     const c = capture();
-    const code = runAdopt(validInput, { json: true }, store, c.out, c.err);
+    const code = await runAdopt(validInput, { json: true }, store, c.out, c.err);
     expect(code).toBe(0);
     const parsed = JSON.parse(c.o);
     expect(parsed.lifecycleState).toBe("adopted");
     expect(parsed.ip).toBe("178.105.246.151");
   });
 
-  test("warns (not fails) when the ssh key file is missing", () => {
+  test("warns (not fails) when the ssh key file is missing", async () => {
     const c = capture();
-    const code = runAdopt(validInput, { json: false }, store, c.out, c.err);
+    const code = await runAdopt(validInput, { json: false }, store, c.out, c.err);
     expect(code).toBe(0);
     expect(c.e.toLowerCase()).toContain("warning");
     expect(c.e).toContain("/nonexistent/key");
   });
 
-  test("expands ~ in the ssh key path", () => {
+  test("expands ~ in the ssh key path", async () => {
     const c = capture();
-    runAdopt(
+    await runAdopt(
       { ...validInput, sshKey: "~/.ssh/id_ed25519" },
       { json: false },
       store,
@@ -181,9 +181,9 @@ describe("runAdopt", () => {
     expect(r.sshKeyPath).toContain(".ssh/id_ed25519");
   });
 
-  test("rejects an invalid IP", () => {
+  test("rejects an invalid IP", async () => {
     const c = capture();
-    const code = runAdopt(
+    const code = await runAdopt(
       { ...validInput, ip: "999.1.1.1" },
       { json: false },
       store,
@@ -195,9 +195,9 @@ describe("runAdopt", () => {
     expect(store.list().length).toBe(0);
   });
 
-  test("accepts a valid IPv6 address", () => {
+  test("accepts a valid IPv6 address", async () => {
     const c = capture();
-    const code = runAdopt(
+    const code = await runAdopt(
       { ...validInput, ip: "2001:db8::1" },
       { json: false },
       store,
@@ -208,10 +208,10 @@ describe("runAdopt", () => {
     expect(store.list()[0]!.ip).toBe("2001:db8::1");
   });
 
-  test("rejects an out-of-range port", () => {
+  test("rejects an out-of-range port", async () => {
     const c = capture();
     expect(
-      runAdopt(
+      await runAdopt(
         { ...validInput, sshPort: 70000 },
         { json: false },
         store,
@@ -220,7 +220,7 @@ describe("runAdopt", () => {
       ),
     ).toBe(1);
     expect(
-      runAdopt(
+      await runAdopt(
         { ...validInput, sshPort: 0 },
         { json: false },
         store,
@@ -231,9 +231,9 @@ describe("runAdopt", () => {
     expect(store.list().length).toBe(0);
   });
 
-  test("rejects a malformed fingerprint", () => {
+  test("rejects a malformed fingerprint", async () => {
     const c = capture();
-    const code = runAdopt(
+    const code = await runAdopt(
       { ...validInput, hostKeyFingerprint: "SHA256:short" },
       { json: false },
       store,
@@ -245,9 +245,9 @@ describe("runAdopt", () => {
     expect(store.list().length).toBe(0);
   });
 
-  test("rejects an MD5 (non-SHA256) fingerprint", () => {
+  test("rejects an MD5 (non-SHA256) fingerprint", async () => {
     const c = capture();
-    const code = runAdopt(
+    const code = await runAdopt(
       {
         ...validInput,
         hostKeyFingerprint: "MD5:aa:bb:cc:dd:ee:ff:00:11:22:33:44:55:66:77:88:99",
