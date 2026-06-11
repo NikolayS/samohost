@@ -126,6 +126,8 @@ app register options (write an AppRecord; offline, no network):
   --env-file <path>          remote env file; sourced (read-only) by the deploy
                              script before install — NEVER written by samohost
   --assert-rls               require app to connect as a non-superuser (RLS gate)
+  --rls-url-var <NAME>       env var holding the NON-superuser URL the RLS probe
+                             uses (default: RLS_DATABASE_URL || DATABASE_URL)
   --json                     print the raw record as JSON
 
 app deploy options:
@@ -605,6 +607,7 @@ function parseAppRegister(args: string[]): ParsedAppRegister {
   let seedCmd: string | undefined;
   let envFile: string | undefined;
   let rlsNonSuperuser = false;
+  let rlsUrlVar: string | undefined;
   let json = false;
 
   for (let i = 0; i < args.length; i++) {
@@ -621,6 +624,7 @@ function parseAppRegister(args: string[]): ParsedAppRegister {
       case "--seed-cmd": seedCmd = takeValue(args, i, a); i++; break;
       case "--env-file": envFile = takeValue(args, i, a); i++; break;
       case "--assert-rls": rlsNonSuperuser = true; break;
+      case "--rls-url-var": rlsUrlVar = takeValue(args, i, a); i++; break;
       case "--json": json = true; break;
       default:
         if (a.startsWith("-")) throw new UsageError(`unknown flag: ${a}`);
@@ -637,6 +641,12 @@ function parseAppRegister(args: string[]): ParsedAppRegister {
   }
   if (serviceUnit === undefined) throw new UsageError("--service-unit is required");
   if (healthUrl === undefined) throw new UsageError("--health-url is required");
+  if (rlsUrlVar !== undefined && !/^[A-Za-z_][A-Za-z0-9_]*$/.test(rlsUrlVar)) {
+    throw new UsageError(
+      `invalid --rls-url-var: ${rlsUrlVar} (must be a valid env var name, ` +
+        `e.g. APP_DATABASE_URL)`,
+    );
+  }
   const resolvedAppDir = appDir ?? `/opt/${name}/app`;
 
   const input: AppRegisterInput = {
@@ -652,6 +662,7 @@ function parseAppRegister(args: string[]): ParsedAppRegister {
     ...(migrateCmd !== undefined ? { migrateCmd } : {}),
     ...(seedCmd !== undefined ? { seedCmd } : {}),
     ...(envFile !== undefined ? { envFile } : {}),
+    ...(rlsUrlVar !== undefined ? { rlsUrlVar } : {}),
   };
   return { kind: "app-register", input, json };
 }

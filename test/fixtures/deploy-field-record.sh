@@ -127,7 +127,7 @@ echo "<<<SAMOHOST_PHASE:assert-rls:start>>>"
 RLS_URL="${RLS_DATABASE_URL:-${DATABASE_URL:-}}"
 if [[ -z "$RLS_URL" ]]; then
   echo "<<<SAMOHOST_PHASE:assert-rls:fail>>>"
-  echo "assert-rls: neither RLS_DATABASE_URL nor DATABASE_URL is set in the service environment" >&2
+  echo "assert-rls: neither RLS_DATABASE_URL nor DATABASE_URL is set in the deploy environment" >&2
   rollback
 fi
 rls_result=$(psql "$RLS_URL" -tAc "SELECT rolsuper FROM pg_roles WHERE rolname = current_user" 2>&1 || echo CONNECTION_FAILED)

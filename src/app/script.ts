@@ -92,6 +92,16 @@ function marker(phase: PhaseName, status: "start" | "ok" | "fail"): string {
  * intended for `bash -s` over a single SSH connection.
  */
 export function buildDeployScript(app: AppRecord, target: DeployTarget): string {
+  // rlsUrlVar is interpolated into bash as `${<name>:-}` — it must be a valid
+  // identifier (the CLI validates too; this guards hand-edited state files).
+  if (
+    app.rlsUrlVar !== undefined &&
+    !/^[A-Za-z_][A-Za-z0-9_]*$/.test(app.rlsUrlVar)
+  ) {
+    throw new Error(
+      `invalid rlsUrlVar (must be a valid env var name): ${app.rlsUrlVar}`,
+    );
+  }
   const lines: string[] = [];
   const push = (...l: string[]): void => {
     for (const x of l) lines.push(x);
@@ -296,20 +306,38 @@ export function buildDeployScript(app: AppRecord, target: DeployTarget): string 
 
   // ----- assert-rls (optional) ---------------------------------------------
   // Probe that the app connects as a NON-superuser. Expects 'f'. On failure ->
-  // rollback. We read connection params from the app's runtime environment
-  // (RLS_DATABASE_URL / DATABASE_URL exported by the service env) WITHOUT this
-  // script ever writing or echoing the secret value.
+  // rollback. Connection params come from the deploy environment (the env file
+  // sourced above) WITHOUT this script ever writing or echoing the secret
+  // value. The var name is configurable per app (issue #2 bug 2): the app's
+  // non-superuser URL may live under a different name (field-record:
+  // APP_DATABASE_URL) while DATABASE_URL is the SUPERUSER url — consulting the
+  // wrong var makes the probe see rolsuper=t and roll back a healthy deploy.
+  // A configured var is consulted EXCLUSIVELY (no silent fallback: falling
+  // back to DATABASE_URL is exactly the bug); the default keeps the
+  // back-compat RLS_DATABASE_URL || DATABASE_URL chain.
   if (app.assertions?.rlsNonSuperuser) {
+    const rlsLookup =
+      app.rlsUrlVar !== undefined
+        ? [
+            `RLS_URL="\${${app.rlsUrlVar}:-}"`,
+            'if [[ -z "$RLS_URL" ]]; then',
+            `  ${marker("assert-rls", "fail")}`,
+            `  echo "assert-rls: ${app.rlsUrlVar} (configured via --rls-url-var) is not set in the deploy environment" >&2`,
+            "  rollback",
+            "fi",
+          ]
+        : [
+            'RLS_URL="${RLS_DATABASE_URL:-${DATABASE_URL:-}}"',
+            'if [[ -z "$RLS_URL" ]]; then',
+            `  ${marker("assert-rls", "fail")}`,
+            '  echo "assert-rls: neither RLS_DATABASE_URL nor DATABASE_URL is set in the deploy environment" >&2',
+            "  rollback",
+            "fi",
+          ];
     push(
       "# --- assert-rls: app must connect as a non-superuser (RLS not bypassed) ---",
       marker("assert-rls", "start"),
-      // Prefer an explicit RLS URL, else fall back to DATABASE_URL from the env.
-      'RLS_URL="${RLS_DATABASE_URL:-${DATABASE_URL:-}}"',
-      'if [[ -z "$RLS_URL" ]]; then',
-      `  ${marker("assert-rls", "fail")}`,
-      '  echo "assert-rls: neither RLS_DATABASE_URL nor DATABASE_URL is set in the service environment" >&2',
-      "  rollback",
-      "fi",
+      ...rlsLookup,
       // psql reads the URL as its connection string; the secret stays in the
       // variable and is never echoed. Probe returns 'f' for non-superuser.
       'rls_result=$(psql "$RLS_URL" -tAc "SELECT rolsuper FROM pg_roles WHERE rolname = current_user" 2>&1 || echo CONNECTION_FAILED)',

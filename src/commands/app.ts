@@ -43,6 +43,8 @@ export interface AppRegisterInput {
   seedCmd?: string;
   envFile?: string;
   rlsNonSuperuser: boolean;
+  /** Env var holding the NON-superuser URL for the RLS probe (issue #2). */
+  rlsUrlVar?: string;
 }
 
 export interface AppPlanInput {
@@ -103,6 +105,7 @@ export function runAppRegister(
     ...(input.migrateCmd !== undefined ? { migrateCmd: input.migrateCmd } : {}),
     ...(input.seedCmd !== undefined ? { seedCmd: input.seedCmd } : {}),
     ...(input.envFile !== undefined ? { envFile: input.envFile } : {}),
+    ...(input.rlsUrlVar !== undefined ? { rlsUrlVar: input.rlsUrlVar } : {}),
     ...(input.rlsNonSuperuser
       ? { assertions: { rlsNonSuperuser: true } }
       : {}),

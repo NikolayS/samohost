@@ -163,6 +163,14 @@ export interface AppSpec {
   /** Remote env file path. Sourced read-only by the deploy script before
    * install; NEVER written by samohost (see interface note). */
   envFile?: string;
+  /**
+   * Env-var name holding the NON-superuser connection URL for the RLS probe
+   * (issue #2: field-record's is APP_DATABASE_URL, while DATABASE_URL is the
+   * superuser URL — probing via the wrong var falsely rolls back healthy
+   * deploys). When set, the probe consults ONLY this var; when absent, the
+   * back-compat fallback chain RLS_DATABASE_URL || DATABASE_URL applies.
+   */
+  rlsUrlVar?: string;
   /** Optional pluggable post-deploy assertions. */
   assertions?: AppAssertions;
 }
