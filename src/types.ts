@@ -108,6 +108,73 @@ export interface BuildParams {
 }
 
 /**
+ * Optional post-deploy assertions for an app (SPEC-DELTA §3 "post-deploy
+ * assertions as pluggable checks"). Generalized from field-record's RLS probe.
+ */
+export interface AppAssertions {
+  /**
+   * Verify the app connects to Postgres as a NON-superuser. Superusers bypass
+   * RLS unconditionally, so a superuser connection silently voids the security
+   * guarantee. When true, the deploy script emits a psql probe
+   * `SELECT rolsuper FROM pg_roles WHERE rolname = current_user` and expects
+   * `f` (false); anything else triggers rollback. (deploy.sh RLS-active gate.)
+   */
+  rlsNonSuperuser?: boolean;
+}
+
+/**
+ * Declarative spec for a deployable app (SPEC-DELTA §3 "app module"). This is
+ * the generalization of field-record's deploy.sh inputs into typed config.
+ *
+ * NOTE on secrets: `envFile` is a path to a remote env file. samohost NEVER
+ * reads or writes it (divergence from deploy.sh, which rotated APP_DATABASE_URL
+ * into staging.env). Deployed-SHA bookkeeping lives in samohost state
+ * ({@link AppRecord}), not in any remote env file.
+ */
+export interface AppSpec {
+  /** App name, unique per VM (e.g. "field-record"). */
+  name: string;
+  /** GitHub repo in `owner/name` form (e.g. "Tanya301/field-record-1"). */
+  repo: string;
+  /** Git branch to track. Default "main". */
+  branch: string;
+  /** Absolute app checkout dir on the remote (e.g. /opt/field-record/app). */
+  appDir: string;
+  /** Build command (e.g. "npm run build"). */
+  buildCmd: string;
+  /** Optional migration command, run after build, before restart. */
+  migrateCmd?: string;
+  /** Optional idempotent seed command, run after a healthy deploy. */
+  seedCmd?: string;
+  /** Health URL polled after restart (e.g. http://localhost:3000/api/version). */
+  healthUrl: string;
+  /** systemd unit name (e.g. "field-record"). Restarted via full-path sudo. */
+  serviceUnit: string;
+  /** Remote env file path. NEVER read/written by samohost (see interface note). */
+  envFile?: string;
+  /** Optional pluggable post-deploy assertions. */
+  assertions?: AppAssertions;
+}
+
+/**
+ * A persisted app record: an {@link AppSpec} bound to a VM, plus deploy
+ * bookkeeping. Stored separately from VMs in `~/.samohost/apps.json`.
+ *
+ *   - `deployedSha`  : last SHA that deployed AND passed health/assertions.
+ *   - `failedSha`    : last SHA that failed and was rolled back (known-bad
+ *                      guard equivalent of deploy.sh's DEPLOY_FAILED_SHA, but
+ *                      kept in samohost state, NOT in the remote env file).
+ */
+export interface AppRecord extends AppSpec {
+  id: string;
+  /** Id of the {@link VmRecord} this app is deployed on. */
+  vmId: string;
+  deployedSha?: string;
+  failedSha?: string;
+  lastDeployAt?: string;
+}
+
+/**
  * A persisted VM record in the local state store (SPEC §4/§5).
  */
 export interface VmRecord {

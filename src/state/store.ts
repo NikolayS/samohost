@@ -7,12 +7,10 @@
  * over the real file, keeping the previous version as `.bak`.
  */
 
-import { existsSync, mkdirSync, readFileSync, renameSync } from "node:fs";
-import { closeSync, fsyncSync, openSync, writeSync } from "node:fs";
-import { copyFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { dirname, join } from "node:path";
+import { join } from "node:path";
 import type { VmRecord } from "../types.ts";
+import { docPaths, readDoc, writeDoc, type DocPaths } from "./atomic.ts";
 
 interface StateFile {
   version: 1;
@@ -30,13 +28,11 @@ export function defaultStatePath(): string {
 
 export class StateStore {
   readonly path: string;
-  private readonly tmpPath: string;
-  private readonly bakPath: string;
+  private readonly paths: DocPaths;
 
   constructor(path?: string) {
     this.path = path ?? defaultStatePath();
-    this.tmpPath = `${this.path}.tmp`;
-    this.bakPath = `${this.path}.bak`;
+    this.paths = docPaths(this.path);
   }
 
   /** All records (empty array if no state file yet). */
@@ -75,61 +71,23 @@ export class StateStore {
 
   /** Read current state, recovering from `.bak` if the primary is corrupt. */
   private read(): StateFile {
-    if (existsSync(this.path)) {
-      const parsed = tryParse(readFileSync(this.path, "utf8"));
-      if (parsed) return parsed;
-      // Primary corrupt — attempt backup recovery.
-      if (existsSync(this.bakPath)) {
-        const bak = tryParse(readFileSync(this.bakPath, "utf8"));
-        if (bak) return bak;
-      }
-      throw new Error(`state file is corrupt and unrecoverable: ${this.path}`);
-    }
-    // No primary file — try backup (recovery after a crash mid-rename).
-    if (existsSync(this.bakPath)) {
-      const bak = tryParse(readFileSync(this.bakPath, "utf8"));
-      if (bak) return bak;
-    }
-    return structuredClone(EMPTY);
+    return readDoc(this.paths, validateStateFile, () => structuredClone(EMPTY));
   }
 
-  /**
-   * Atomic write: ensure dir → back up current → write tmp (fsync) → rename.
-   * The current file is copied to `.bak` *before* we touch the primary, so an
-   * interrupted write leaves either the old primary or a recoverable `.bak`.
-   */
+  /** Crash-safe write via the shared atomic helper (tmp + fsync + rename). */
   private write(state: StateFile): void {
-    mkdirSync(dirname(this.path), { recursive: true });
-
-    if (existsSync(this.path)) {
-      copyFileSync(this.path, this.bakPath);
-    }
-
-    const data = JSON.stringify(state, null, 2) + "\n";
-    const fd = openSync(this.tmpPath, "w");
-    try {
-      writeSync(fd, data);
-      fsyncSync(fd);
-    } finally {
-      closeSync(fd);
-    }
-    renameSync(this.tmpPath, this.path);
+    writeDoc(this.paths, state);
   }
 }
 
-function tryParse(text: string): StateFile | undefined {
-  try {
-    const obj = JSON.parse(text) as unknown;
-    if (
-      obj !== null &&
-      typeof obj === "object" &&
-      "records" in obj &&
-      Array.isArray((obj as { records: unknown }).records)
-    ) {
-      return obj as StateFile;
-    }
-    return undefined;
-  } catch {
-    return undefined;
+function validateStateFile(obj: unknown): StateFile | undefined {
+  if (
+    obj !== null &&
+    typeof obj === "object" &&
+    "records" in obj &&
+    Array.isArray((obj as { records: unknown }).records)
+  ) {
+    return obj as StateFile;
   }
+  return undefined;
 }
