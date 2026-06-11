@@ -56,6 +56,12 @@ import {
   DEFAULT_CLOUDFLARE_ZONES,
   type DnsStatusInput,
 } from "./commands/dns.ts";
+import {
+  runProvision,
+  defaultProvisionDeps,
+} from "./commands/provision.ts";
+import { runDestroy, defaultConfirm, type DestroyInput } from "./commands/destroy.ts";
+import { HetznerProvider } from "./providers/hetzner.ts";
 import { StateStore } from "./state/store.ts";
 import type { EnvDbBackend } from "./types.ts";
 
@@ -64,6 +70,9 @@ export const VERSION = "0.1.0";
 const HELP = `samohost ${VERSION} — provision security-hardened Linux VMs
 
 Usage:
+  samohost provision --provider hetzner --region <r> --type <t> \\
+      --name <n> --ssh-key <path> [options]
+  samohost destroy <vm-name-or-id> [--yes] [--json]
   samohost preview --provider <hetzner|aws> --region <r> --type <t> \\
       --ssh-pubkey <key|@file> [options]
   samohost adopt --name <n> --ip <ip> --ssh-user <u> --ssh-key <path> \\
@@ -85,6 +94,27 @@ Usage:
   samohost dns status <domain> [--expect-ip <ip>] [--cf-zone <z>] [--json]
   samohost --help
   samohost --version
+
+provision options (Hetzner only in v0.1 — AWS deferred; needs HCLOUD_TOKEN in env):
+  --provider hetzner         cloud provider (required; aws is deferred)
+  --region <region>          provider location, e.g. nbg1/fsn1/hel1 (required)
+  --type <type>              server type, e.g. cx22 (required)
+  --ssh-key <path>           keypair path — either half; the .pub text goes
+                             into cloud-init, the private path is recorded
+                             for \`samohost ssh\` (required)
+  --name <name>              VM name (default: samohost-<provider>)
+  --module <name>            optional module (repeatable)
+  --ssh-port <port>          hardened SSH port (default: 2223)
+  --admin-user <user>        non-root sudo user (default: samo)
+  --trusted-ip <ip>          never-banned IP for fail2ban (repeatable)
+  --timeout <seconds>        booting→ready gate bound (default: 600;
+                             timeout leaves the VM recorded as 'degraded')
+  --json                     print the final VmRecord as JSON
+
+destroy options (typed VM-name confirmation unless --yes):
+  --yes                      skip the confirmation prompt
+  --json                     print the destroyed record as JSON
+  attached volumes are reported but NEVER deleted
 
 preview options:
   --provider <hetzner|aws>   cloud provider (required)
@@ -183,6 +213,20 @@ export interface ParsedPreview {
   json: boolean;
 }
 
+export interface ParsedProvision {
+  kind: "provision";
+  spec: ProvisionSpec;
+  /** Raw --ssh-key path (pub or priv); resolved by the provision command. */
+  sshKey: string;
+  json: boolean;
+}
+
+export interface ParsedDestroy {
+  kind: "destroy";
+  input: DestroyInput;
+  json: boolean;
+}
+
 export interface ParsedAdopt {
   kind: "adopt";
   input: AdoptInput;
@@ -268,6 +312,8 @@ export interface ParsedDnsStatus {
 
 export type ParsedCommand =
   | ParsedPreview
+  | ParsedProvision
+  | ParsedDestroy
   | ParsedAdopt
   | ParsedList
   | ParsedStatus
@@ -311,6 +357,12 @@ export function parseArgs(
 
   if (first === "preview") {
     return parsePreview(argv.slice(1), resolvePubkeyFile);
+  }
+  if (first === "provision") {
+    return parseProvision(argv.slice(1));
+  }
+  if (first === "destroy") {
+    return parseDestroy(argv.slice(1));
   }
   if (first === "adopt") {
     return parseAdopt(argv.slice(1));
@@ -439,6 +491,86 @@ function parsePreview(
   };
 
   return { kind: "preview", spec, sshPubkey, json };
+}
+
+function parseProvision(args: string[]): ParsedProvision {
+  let provider: string | undefined;
+  let region: string | undefined;
+  let type: string | undefined;
+  let name: string | undefined;
+  let sshKey: string | undefined;
+  let sshPort = 2223;
+  let adminUser = "samo";
+  let timeoutSec = 600;
+  let json = false;
+  const modules: string[] = [];
+  const trustedIps: string[] = [];
+
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i]!;
+    switch (a) {
+      case "--provider": provider = takeValue(args, i, a); i++; break;
+      case "--region": region = takeValue(args, i, a); i++; break;
+      case "--type": type = takeValue(args, i, a); i++; break;
+      case "--name": name = takeValue(args, i, a); i++; break;
+      case "--ssh-key": sshKey = takeValue(args, i, a); i++; break;
+      case "--module": modules.push(takeValue(args, i, a)); i++; break;
+      case "--trusted-ip": trustedIps.push(takeValue(args, i, a)); i++; break;
+      case "--ssh-port": sshPort = parseIntFlag(takeValue(args, i, a), a); i++; break;
+      case "--admin-user": adminUser = takeValue(args, i, a); i++; break;
+      case "--timeout": timeoutSec = parseIntFlag(takeValue(args, i, a), a); i++; break;
+      case "--json": json = true; break;
+      default:
+        throw new UsageError(`unknown flag: ${a}`);
+    }
+  }
+
+  if (provider === undefined) throw new UsageError("--provider is required");
+  if (provider === "aws") {
+    throw new UsageError(
+      "provision --provider aws is deferred (v0.1 provisions Hetzner only; " +
+        "`samohost preview --provider aws` still renders offline)",
+    );
+  }
+  if (provider !== "hetzner") {
+    throw new UsageError(`invalid --provider: ${provider} (hetzner)`);
+  }
+  if (region === undefined) throw new UsageError("--region is required");
+  if (type === undefined) throw new UsageError("--type is required");
+  if (sshKey === undefined) throw new UsageError("--ssh-key is required");
+
+  const spec: ProvisionSpec = {
+    provider,
+    region,
+    type,
+    name: name ?? `samohost-${provider}`,
+    // Resolved (to the .pub path) by the provision command's key pairing.
+    sshKeyPath: "",
+    sshPort,
+    adminUser,
+    modules,
+    trustedIps,
+    timeoutSec,
+  };
+  return { kind: "provision", spec, sshKey, json };
+}
+
+function parseDestroy(args: string[]): ParsedDestroy {
+  let target: string | undefined;
+  let yes = false;
+  let json = false;
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i]!;
+    if (a === "--yes") { yes = true; continue; }
+    if (a === "--json") { json = true; continue; }
+    if (a.startsWith("-")) throw new UsageError(`unknown flag: ${a}`);
+    if (target !== undefined) throw new UsageError(`unexpected extra argument: ${a}`);
+    target = a;
+  }
+  if (target === undefined) {
+    throw new UsageError("destroy requires a VM name or id");
+  }
+  return { kind: "destroy", input: { target, yes }, json };
 }
 
 function parseAdopt(args: string[]): ParsedAdopt {
@@ -1032,6 +1164,28 @@ export async function main(
       return 0;
     case "preview":
       return runPreview(cmd.spec, cmd.sshPubkey, { json: cmd.json }, out, err);
+    case "provision": {
+      const store = new StateStore();
+      const provider = new HetznerProvider({ fetch: globalThis.fetch });
+      return runProvision(
+        { spec: cmd.spec, sshKey: cmd.sshKey },
+        { json: cmd.json },
+        defaultProvisionDeps(provider, store),
+        out,
+        err,
+      );
+    }
+    case "destroy": {
+      const store = new StateStore();
+      const provider = new HetznerProvider({ fetch: globalThis.fetch });
+      return runDestroy(
+        cmd.input,
+        { json: cmd.json },
+        { provider, store, confirm: defaultConfirm },
+        out,
+        err,
+      );
+    }
     case "adopt":
       return runAdopt(
         cmd.input,

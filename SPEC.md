@@ -71,6 +71,7 @@ planned ─create→ creating ─api ok→ booting ─cloud-init ok→ ready
     └─ (preview: never persisted)
 booting ─cloud-init timeout/err→ degraded   (resource exists, reclaimable)
 ready/degraded/failed ─destroy→ destroying → destroyed
+creating/booting ─destroy (crash reclaim)→ destroying → destroyed
 ```
 
 - Transition past `creating` (API accepted) **always** writes a record with provider tags `managed-by=samohost`, `samohost-id=<uuid>` so nothing is orphaned even if the process dies.

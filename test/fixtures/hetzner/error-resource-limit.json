@@ -1,0 +1,7 @@
+{
+  "error": {
+    "code": "resource_limit_exceeded",
+    "message": "server limit exceeded",
+    "details": { "limits": [{ "name": "server_limit" }] }
+  }
+}

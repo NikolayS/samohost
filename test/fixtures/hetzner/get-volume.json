@@ -1,0 +1,12 @@
+{
+  "volume": {
+    "id": 70101,
+    "name": "samo-test-data",
+    "size": 50,
+    "server": 4711,
+    "location": { "id": 2, "name": "nbg1" },
+    "labels": {},
+    "status": "available",
+    "protection": { "delete": false }
+  }
+}
