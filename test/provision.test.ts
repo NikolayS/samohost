@@ -478,7 +478,7 @@ describe("integration: HetznerProvider end-to-end — secrets never leak", () =>
       const next = queue.shift();
       if (!next) throw new Error("unexpected fetch");
       return new Response(JSON.stringify(next.body), { status: next.status });
-    }) as typeof fetch;
+    }) as unknown as typeof fetch;
     const provider = new HetznerProvider({ fetch: fetchMock });
 
     const spec = provisionSpec({ name: "samo-test-vm" });
@@ -513,7 +513,7 @@ describe("integration: HetznerProvider end-to-end — secrets never leak", () =>
           },
         }),
         { status: 401 },
-      )) as typeof fetch;
+      )) as unknown as typeof fetch;
     const provider = new HetznerProvider({ fetch: fetchMock });
 
     const code = await runProvision(
