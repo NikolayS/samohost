@@ -1,0 +1,21 @@
+# Dependencies
+node_modules/
+
+# Secrets / environment
+.env
+.env.*
+*.local
+
+# samohost local state
+.samohost/
+state.json
+state.json.tmp
+state.json.bak
+
+# Coverage / test output
+coverage/
+*.lcov
+
+# Editor / OS
+.DS_Store
+*.swp

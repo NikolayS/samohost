@@ -1,0 +1,18 @@
+{
+  "name": "samohost",
+  "version": "0.1.0",
+  "description": "TypeScript/Bun CLI that provisions and manages security-hardened Linux VMs on AWS and Hetzner Cloud.",
+  "type": "module",
+  "bin": {
+    "samohost": "./src/cli.ts"
+  },
+  "scripts": {
+    "test": "bun test",
+    "typecheck": "bunx tsc --noEmit",
+    "samohost": "bun run src/cli.ts"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.3.14",
+    "typescript": "^6.0.3"
+  }
+}
