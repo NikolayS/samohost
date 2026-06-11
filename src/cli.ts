@@ -16,6 +16,7 @@ import type { Provider, ProvisionSpec } from "./types.ts";
 import { runPreview } from "./commands/preview.ts";
 import { runAdopt, type AdoptInput } from "./commands/adopt.ts";
 import { runList } from "./commands/list.ts";
+import { runStatus, type StatusInput } from "./commands/status.ts";
 import { StateStore } from "./state/store.ts";
 
 export const VERSION = "0.1.0";
@@ -28,6 +29,7 @@ Usage:
   samohost adopt --name <n> --ip <ip> --ssh-user <u> --ssh-key <path> \\
       --host-key-fingerprint 'SHA256:...' [options]
   samohost list [--json]
+  samohost status <vm-name-or-id> [--audit] [--json]
   samohost --help
   samohost --version
 
@@ -59,6 +61,10 @@ adopt options (register an existing hardened VM, no network call):
 
 list options:
   --json                     emit the raw records array instead of a table
+
+status options:
+  --audit                    run live hardening probes over pinned SSH
+  --json                     emit a JSON status/audit result
 `;
 
 export interface ParsedPreview {
@@ -79,10 +85,17 @@ export interface ParsedList {
   json: boolean;
 }
 
+export interface ParsedStatus {
+  kind: "status";
+  input: StatusInput;
+  json: boolean;
+}
+
 export type ParsedCommand =
   | ParsedPreview
   | ParsedAdopt
   | ParsedList
+  | ParsedStatus
   | { kind: "help" }
   | { kind: "version" };
 
@@ -118,6 +131,9 @@ export function parseArgs(
   }
   if (first === "list") {
     return parseList(argv.slice(1));
+  }
+  if (first === "status") {
+    return parseStatus(argv.slice(1));
   }
 
   // A bare --help/--version may also appear after an (absent) command.
@@ -348,6 +364,35 @@ function parseList(args: string[]): ParsedList {
   return { kind: "list", json };
 }
 
+function parseStatus(args: string[]): ParsedStatus {
+  let target: string | undefined;
+  let audit = false;
+  let json = false;
+
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i]!;
+    switch (a) {
+      case "--audit":
+        audit = true;
+        break;
+      case "--json":
+        json = true;
+        break;
+      default:
+        if (a.startsWith("-")) throw new UsageError(`unknown flag: ${a}`);
+        if (target !== undefined) {
+          throw new UsageError(`unexpected extra argument: ${a}`);
+        }
+        target = a;
+    }
+  }
+
+  if (target === undefined) {
+    throw new UsageError("status requires a VM name or id");
+  }
+  return { kind: "status", input: { target, audit }, json };
+}
+
 function parseIntFlag(v: string, flag: string): number {
   const n = Number(v);
   if (!Number.isInteger(n)) {
@@ -365,11 +410,11 @@ function readPubkeyFile(path: string): string {
 }
 
 /** Entry point. Returns the process exit code. */
-export function main(
+export async function main(
   argv: string[],
   out: (s: string) => void = (s) => process.stdout.write(s + "\n"),
   err: (s: string) => void = (s) => process.stderr.write(s + "\n"),
-): number {
+): Promise<number> {
   let cmd: ParsedCommand;
   try {
     cmd = parseArgs(argv);
@@ -395,10 +440,12 @@ export function main(
       return runAdopt(cmd.input, { json: cmd.json }, new StateStore(), out, err);
     case "list":
       return runList({ json: cmd.json }, new StateStore(), out, err);
+    case "status":
+      return runStatus(cmd.input, { json: cmd.json }, new StateStore(), out, err);
   }
 }
 
 // Execute when run directly (not when imported by tests).
 if (import.meta.main) {
-  process.exit(main(process.argv.slice(2)));
+  process.exit(await main(process.argv.slice(2)));
 }

@@ -175,14 +175,14 @@ describe("parseArgs", () => {
 });
 
 describe("main (exit codes & output)", () => {
-  function capture(argv: string[]): {
+  async function capture(argv: string[]): Promise<{
     code: number;
     out: string;
     err: string;
-  } {
+  }> {
     let out = "";
     let err = "";
-    const code = main(
+    const code = await main(
       argv,
       (s) => (out += s + "\n"),
       (s) => (err += s + "\n"),
@@ -190,28 +190,28 @@ describe("main (exit codes & output)", () => {
     return { code, out, err };
   }
 
-  test("--version prints version, exit 0", () => {
-    const { code, out } = capture(["--version"]);
+  test("--version prints version, exit 0", async () => {
+    const { code, out } = await capture(["--version"]);
     expect(code).toBe(0);
     expect(out.trim()).toBe("0.1.0");
   });
 
-  test("--help prints usage, exit 0", () => {
-    const { code, out } = capture(["--help"]);
+  test("--help prints usage, exit 0", async () => {
+    const { code, out } = await capture(["--help"]);
     expect(code).toBe(0);
     expect(out).toContain("Usage:");
   });
 
-  test("unknown command → exit 2 with help on stderr", () => {
-    const { code, out, err } = capture(["frobnicate"]);
+  test("unknown command → exit 2 with help on stderr", async () => {
+    const { code, out, err } = await capture(["frobnicate"]);
     expect(code).toBe(2);
     expect(out).toBe("");
     expect(err).toContain("unknown command");
     expect(err).toContain("Usage:");
   });
 
-  test("preview (yaml) → exit 0, renders cloud-init to stdout, no JSON", () => {
-    const { code, out, err } = capture([
+  test("preview (yaml) → exit 0, renders cloud-init to stdout, no JSON", async () => {
+    const { code, out, err } = await capture([
       "preview",
       "--provider",
       "hetzner",
@@ -229,8 +229,8 @@ describe("main (exit codes & output)", () => {
     expect(out).toContain(FAKE_KEY);
   });
 
-  test("preview --json → exit 0, parseable JSON envelope", () => {
-    const { code, out } = capture([
+  test("preview --json → exit 0, parseable JSON envelope", async () => {
+    const { code, out } = await capture([
       "preview",
       "--provider",
       "aws",
@@ -253,11 +253,11 @@ describe("main (exit codes & output)", () => {
     expect(parsed.cloudInit).toContain("#cloud-config");
   });
 
-  test("preview with an unimplemented module → validation error, exit 1", () => {
+  test("preview with an unimplemented module → validation error, exit 1", async () => {
     // v0.1 scaffolds the postgres module interface but defers its
     // implementation; preview reports it as an unknown module rather than
     // silently emitting nothing.
-    const { code, err } = capture([
+    const { code, err } = await capture([
       "preview",
       "--provider",
       "aws",
@@ -274,8 +274,8 @@ describe("main (exit codes & output)", () => {
     expect(err).toContain("unknown module: postgres");
   });
 
-  test("preview with invalid port (22) → validation error, exit 1", () => {
-    const { code, err } = capture([
+  test("preview with invalid port (22) → validation error, exit 1", async () => {
+    const { code, err } = await capture([
       "preview",
       "--provider",
       "hetzner",
