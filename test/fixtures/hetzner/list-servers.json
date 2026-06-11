@@ -1,0 +1,21 @@
+{
+  "servers": [
+    {
+      "id": 4711,
+      "name": "samo-test-vm",
+      "status": "running",
+      "public_net": { "ipv4": { "id": 90, "ip": "192.0.2.10" }, "ipv6": null },
+      "labels": { "managed-by": "samohost", "samohost-id": "00000000-0000-4000-8000-000000000001" },
+      "volumes": []
+    },
+    {
+      "id": 4712,
+      "name": "samo-test-vm-2",
+      "status": "off",
+      "public_net": { "ipv4": null, "ipv6": null },
+      "labels": { "managed-by": "samohost", "samohost-id": "00000000-0000-4000-8000-000000000002" },
+      "volumes": [70103]
+    }
+  ],
+  "meta": { "pagination": { "page": 1, "per_page": 25, "previous_page": null, "next_page": null, "last_page": 1, "total_entries": 2 } }
+}
