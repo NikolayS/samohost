@@ -178,6 +178,32 @@ describe("buildDeployScript hard-won behaviors", () => {
     expect(script).toContain(`set -a; . '/opt/my app/it'\\''s.env'; set +a`);
   });
 
+  // Issue #2 bug 2: the probe's env-var name was hardcoded to
+  // RLS_DATABASE_URL || DATABASE_URL. field-record's NON-superuser URL is
+  // APP_DATABASE_URL, and DATABASE_URL is the SUPERUSER URL — so the probe
+  // connected as superuser, saw rolsuper=t, and rolled back a HEALTHY deploy
+  // (runtime-confirmed, issue #2 attempt 3). The var name must be
+  // configurable per app.
+  test("assert-rls probe uses the configured rlsUrlVar, not the hardcoded chain", () => {
+    const app = { ...fieldRecord(), rlsUrlVar: "APP_DATABASE_URL" };
+    const script = buildDeployScript(app, TARGET);
+    expect(script).toContain('RLS_URL="${APP_DATABASE_URL:-}"');
+    // No silent fallback to a possibly-superuser DATABASE_URL: that fallback
+    // IS bug 2. If the configured var is unset, the probe must fail loudly.
+    expect(script).not.toContain("${RLS_DATABASE_URL:-${DATABASE_URL:-}}");
+    // The error message must name the actual var consulted.
+    expect(script).toContain(
+      "assert-rls: APP_DATABASE_URL (configured via --rls-url-var) is not set",
+    );
+  });
+
+  test("assert-rls default (no rlsUrlVar) preserves the back-compat fallback chain", () => {
+    const script = buildDeployScript(fieldRecord(), TARGET);
+    expect(script).toContain('RLS_URL="${RLS_DATABASE_URL:-${DATABASE_URL:-}}"');
+    // The error message names the actual vars consulted.
+    expect(script).toContain("neither RLS_DATABASE_URL nor DATABASE_URL is set");
+  });
+
   test("embeds the exact target sha and app dir", () => {
     const script = buildDeployScript(fieldRecord(), TARGET);
     expect(script).toContain(TARGET.sha);
