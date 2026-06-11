@@ -11,6 +11,7 @@ import {
   runEnvDestroy,
   type EnvExecDeps,
 } from "../src/commands/env.ts";
+import { DEFAULT_POOL } from "../src/env/ports.ts";
 import { AppStore } from "../src/state/apps.ts";
 import { EnvStore } from "../src/state/envs.ts";
 import { StateStore } from "../src/state/store.ts";
@@ -131,6 +132,22 @@ describe("parseArgs env", () => {
     expect(() => parseArgs(["env", "wat"])).toThrow(/unknown env subcommand/);
     expect(() => parseArgs(["env"])).toThrow(/requires a subcommand/);
   });
+
+  test("create and plan parse --template-db (#11 finding 6)", () => {
+    const c = parseArgs([
+      "env", "create", "vm", "app", "--branch", "b",
+      "--db", "template", "--template-db", "my_tpl",
+    ]);
+    if (c.kind !== "env-create") throw new Error("expected env-create");
+    expect(c.input.templateDb).toBe("my_tpl");
+
+    const p = parseArgs([
+      "env", "plan", "vm", "app", "--branch", "b",
+      "--db", "template", "--template-db", "my_tpl",
+    ]);
+    if (p.kind !== "env-plan") throw new Error("expected env-plan");
+    expect(p.input.templateDb).toBe("my_tpl");
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -160,6 +177,18 @@ describe("deriveTarget", () => {
     const t = deriveTarget(appRec(), "feat/y", "none", "samo.cat", existing);
     if ("error" in t) throw new Error(t.error);
     expect(t.port).toBe(3102);
+  });
+
+  test("--template-db flows into the target (#11 finding 6)", () => {
+    const t = deriveTarget(
+      appRec(), "feat/x", "template", "samo.cat", [], DEFAULT_POOL, "my_tpl",
+    );
+    if ("error" in t) throw new Error(t.error);
+    expect(t.templateDb).toBe("my_tpl");
+    // Absent flag keeps the convention default (templateDb unset → script derives).
+    const d = deriveTarget(appRec(), "feat/x", "template", "samo.cat", []);
+    if ("error" in d) throw new Error(d.error);
+    expect(d.templateDb).toBeUndefined();
   });
 });
 
@@ -266,6 +295,30 @@ describe("env commands", () => {
     expect(second?.id).toBe(first!.id);
     expect(second?.port).toBe(first!.port);
     expect(second?.name).toBe(first!.name);
+  });
+
+  test("create with --template-db persists it and pins it into the script (#11)", async () => {
+    const scripts: string[] = [];
+    const c = capture();
+    const code = await runEnvCreate(
+      { vm: "samo-we-field-record", app: "field-record-1", branch: "feat/x",
+        db: "template", previewDomain: "samo.cat", templateDb: "my_tpl" },
+      { json: false }, vmStore, appStore, envStore,
+      fakeDeps(CREATE_OK, scripts), c.out, c.err,
+    );
+    expect(code).toBe(0);
+    expect(scripts[0]).toContain("SAMOHOST_TEMPLATE_DB='my_tpl'");
+    const rec = envStore.get("vm-1111", "field-record-1", "feat/x");
+    expect(rec?.templateDb).toBe("my_tpl");
+    // Re-create (and destroy) reuse the PERSISTED template db, not the flag.
+    const scripts2: string[] = [];
+    await runEnvCreate(
+      { vm: "samo-we-field-record", app: "field-record-1", branch: "feat/x",
+        db: "template", previewDomain: "samo.cat" },
+      { json: false }, vmStore, appStore, envStore,
+      fakeDeps(CREATE_OK, scripts2), capture().out, capture().err,
+    );
+    expect(scripts2[0]).toContain("SAMOHOST_TEMPLATE_DB='my_tpl'");
   });
 
   test("second branch gets the next port; list shows both", async () => {

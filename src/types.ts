@@ -164,6 +164,14 @@ export interface AppSpec {
    * install; NEVER written by samohost (see interface note). */
   envFile?: string;
   /**
+   * Env vars whose values are database URLs that MUST point at the per-env
+   * database in preview envs (issue #11: a faithful operator template
+   * otherwise wires previews to the PRODUCTION db). The env-create script
+   * rewrites ONLY the db-name path component of each listed var ON THE HOST;
+   * samohost never sees the values. Default when absent: ["DATABASE_URL"].
+   */
+  envDbVars?: string[];
+  /**
    * Env-var name holding the NON-superuser connection URL for the RLS probe
    * (issue #2: field-record's is APP_DATABASE_URL, while DATABASE_URL is the
    * superuser URL — probing via the wrong var falsely rolls back healthy
@@ -228,6 +236,9 @@ export interface EnvRecord {
   dbBackend: EnvDbBackend;
   /** dblab clone id or template-backend database name (absent for `none`). */
   dbName?: string;
+  /** Template database override for the `template` backend (`--template-db`);
+   * absent → the script derives `<app dashes→underscores>_template`. */
+  templateDb?: string;
   createdAt: string;
   /** Last SHA deployed into this env (set by env-aware deploys; optional). */
   lastDeployedSha?: string;

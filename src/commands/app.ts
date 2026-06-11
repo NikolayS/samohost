@@ -42,6 +42,9 @@ export interface AppRegisterInput {
   migrateCmd?: string;
   seedCmd?: string;
   envFile?: string;
+  /** Repeatable --env-db-var (issue #11): env vars whose DB URLs are rewired
+   * per preview env. Absent → the env script defaults to ["DATABASE_URL"]. */
+  envDbVars?: string[];
   rlsNonSuperuser: boolean;
   /** Env var holding the NON-superuser URL for the RLS probe (issue #2). */
   rlsUrlVar?: string;
@@ -113,6 +116,9 @@ export function runAppRegister(
     ...(input.migrateCmd !== undefined ? { migrateCmd: input.migrateCmd } : {}),
     ...(input.seedCmd !== undefined ? { seedCmd: input.seedCmd } : {}),
     ...(input.envFile !== undefined ? { envFile: input.envFile } : {}),
+    ...(input.envDbVars !== undefined && input.envDbVars.length > 0
+      ? { envDbVars: input.envDbVars }
+      : {}),
     ...(input.rlsUrlVar !== undefined ? { rlsUrlVar: input.rlsUrlVar } : {}),
     ...(input.rlsNonSuperuser
       ? { assertions: { rlsNonSuperuser: true } }
