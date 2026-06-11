@@ -17,6 +17,18 @@ import { runPreview } from "./commands/preview.ts";
 import { runAdopt, type AdoptInput } from "./commands/adopt.ts";
 import { runList } from "./commands/list.ts";
 import { runStatus, type StatusInput } from "./commands/status.ts";
+import {
+  runAppRegister,
+  runAppPlan,
+  runAppDeploy,
+  runAppStatus,
+  defaultAppDeployDeps,
+  defaultAppStore,
+  type AppRegisterInput,
+  type AppPlanInput,
+  type AppDeployInput,
+  type AppStatusInput,
+} from "./commands/app.ts";
 import { StateStore } from "./state/store.ts";
 
 export const VERSION = "0.1.0";
@@ -30,6 +42,12 @@ Usage:
       --host-key-fingerprint 'SHA256:...' [options]
   samohost list [--json]
   samohost status <vm-name-or-id> [--audit] [--json]
+  samohost app register <vm> --name <n> --repo <owner/name> \\
+      --service-unit <u> --health-url <url> [options]
+  samohost app plan <vm> <app> --sha <sha>
+  samohost app deploy <vm> <app> [--sha <sha> | --ref <ref>] \\
+      [--skip-ci-gate] [--json]
+  samohost app status <vm> <app> [--json]
   samohost --help
   samohost --version
 
@@ -65,6 +83,27 @@ list options:
 status options:
   --audit                    run live hardening probes over pinned SSH
   --json                     emit a JSON status/audit result
+
+app register options (write an AppRecord; offline, no network):
+  <vm>                       VM name or id the app deploys on (required)
+  --name <name>              app name, unique per VM (required)
+  --repo <owner/name>        GitHub repo (required)
+  --service-unit <unit>      systemd unit restarted on deploy (required)
+  --health-url <url>         post-deploy health URL (required)
+  --branch <branch>          tracked branch (default: main)
+  --app-dir <path>           remote checkout dir (default: /opt/<name>/app)
+  --build-cmd <cmd>          build command (default: npm run build)
+  --migrate-cmd <cmd>        optional migration command
+  --seed-cmd <cmd>           optional idempotent seed command
+  --env-file <path>          remote env file path (NEVER read/written by samohost)
+  --assert-rls               require app to connect as a non-superuser (RLS gate)
+  --json                     print the raw record as JSON
+
+app deploy options:
+  --sha <sha>                explicit SHA to deploy (mutually exclusive w/ --ref)
+  --ref <ref>                git ref resolved to a SHA via gh api (default: branch)
+  --skip-ci-gate             bypass the GitHub Actions CI-green gate (risky)
+  --json                     emit a JSON deploy report
 `;
 
 export interface ParsedPreview {
@@ -91,11 +130,39 @@ export interface ParsedStatus {
   json: boolean;
 }
 
+export interface ParsedAppRegister {
+  kind: "app-register";
+  input: AppRegisterInput;
+  json: boolean;
+}
+
+export interface ParsedAppPlan {
+  kind: "app-plan";
+  input: AppPlanInput;
+  json: boolean;
+}
+
+export interface ParsedAppDeploy {
+  kind: "app-deploy";
+  input: AppDeployInput;
+  json: boolean;
+}
+
+export interface ParsedAppStatus {
+  kind: "app-status";
+  input: AppStatusInput;
+  json: boolean;
+}
+
 export type ParsedCommand =
   | ParsedPreview
   | ParsedAdopt
   | ParsedList
   | ParsedStatus
+  | ParsedAppRegister
+  | ParsedAppPlan
+  | ParsedAppDeploy
+  | ParsedAppStatus
   | { kind: "help" }
   | { kind: "version" };
 
@@ -134,6 +201,9 @@ export function parseArgs(
   }
   if (first === "status") {
     return parseStatus(argv.slice(1));
+  }
+  if (first === "app") {
+    return parseApp(argv.slice(1));
   }
 
   // A bare --help/--version may also appear after an (absent) command.
@@ -393,6 +463,175 @@ function parseStatus(args: string[]): ParsedStatus {
   return { kind: "status", input: { target, audit }, json };
 }
 
+type AppSub = "register" | "plan" | "deploy" | "status";
+
+function parseApp(args: string[]): ParsedCommand {
+  const sub = args[0];
+  if (sub === undefined) {
+    throw new UsageError(
+      "app requires a subcommand: register | plan | deploy | status",
+    );
+  }
+  if (sub !== "register" && sub !== "plan" && sub !== "deploy" && sub !== "status") {
+    throw new UsageError(`unknown app subcommand: ${sub}`);
+  }
+  const rest = args.slice(1);
+  switch (sub as AppSub) {
+    case "register":
+      return parseAppRegister(rest);
+    case "plan":
+      return parseAppPlan(rest);
+    case "deploy":
+      return parseAppDeploy(rest);
+    case "status":
+      return parseAppStatus(rest);
+  }
+}
+
+/** Shared: collect leading positional args (until the first flag). */
+function takeValue(args: string[], i: number, flag: string): string {
+  const v = args[i + 1];
+  if (v === undefined) throw new UsageError(`missing value for ${flag}`);
+  return v;
+}
+
+function parseAppRegister(args: string[]): ParsedAppRegister {
+  let vm: string | undefined;
+  let name: string | undefined;
+  let repo: string | undefined;
+  let branch = "main";
+  let appDir: string | undefined;
+  let buildCmd = "npm run build";
+  let serviceUnit: string | undefined;
+  let healthUrl: string | undefined;
+  let migrateCmd: string | undefined;
+  let seedCmd: string | undefined;
+  let envFile: string | undefined;
+  let rlsNonSuperuser = false;
+  let json = false;
+
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i]!;
+    switch (a) {
+      case "--name": name = takeValue(args, i, a); i++; break;
+      case "--repo": repo = takeValue(args, i, a); i++; break;
+      case "--branch": branch = takeValue(args, i, a); i++; break;
+      case "--app-dir": appDir = takeValue(args, i, a); i++; break;
+      case "--build-cmd": buildCmd = takeValue(args, i, a); i++; break;
+      case "--service-unit": serviceUnit = takeValue(args, i, a); i++; break;
+      case "--health-url": healthUrl = takeValue(args, i, a); i++; break;
+      case "--migrate-cmd": migrateCmd = takeValue(args, i, a); i++; break;
+      case "--seed-cmd": seedCmd = takeValue(args, i, a); i++; break;
+      case "--env-file": envFile = takeValue(args, i, a); i++; break;
+      case "--assert-rls": rlsNonSuperuser = true; break;
+      case "--json": json = true; break;
+      default:
+        if (a.startsWith("-")) throw new UsageError(`unknown flag: ${a}`);
+        if (vm !== undefined) throw new UsageError(`unexpected extra argument: ${a}`);
+        vm = a;
+    }
+  }
+
+  if (vm === undefined) throw new UsageError("app register requires a <vm> argument");
+  if (name === undefined) throw new UsageError("--name is required");
+  if (repo === undefined) throw new UsageError("--repo is required");
+  if (!/^[^/\s]+\/[^/\s]+$/.test(repo)) {
+    throw new UsageError(`invalid --repo: ${repo} (expected owner/name)`);
+  }
+  if (serviceUnit === undefined) throw new UsageError("--service-unit is required");
+  if (healthUrl === undefined) throw new UsageError("--health-url is required");
+  const resolvedAppDir = appDir ?? `/opt/${name}/app`;
+
+  const input: AppRegisterInput = {
+    vm,
+    name,
+    repo,
+    branch,
+    appDir: resolvedAppDir,
+    buildCmd,
+    serviceUnit,
+    healthUrl,
+    rlsNonSuperuser,
+    ...(migrateCmd !== undefined ? { migrateCmd } : {}),
+    ...(seedCmd !== undefined ? { seedCmd } : {}),
+    ...(envFile !== undefined ? { envFile } : {}),
+  };
+  return { kind: "app-register", input, json };
+}
+
+/** Collect up to two positionals (<vm> <app>) plus flags. */
+function takeVmApp(
+  args: string[],
+  onFlag: (a: string, i: number) => number | undefined,
+): { vm?: string; app?: string } {
+  const out: { vm?: string; app?: string } = {};
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i]!;
+    const consumed = onFlag(a, i);
+    if (consumed !== undefined) {
+      i = consumed;
+      continue;
+    }
+    if (a.startsWith("-")) throw new UsageError(`unknown flag: ${a}`);
+    if (out.vm === undefined) out.vm = a;
+    else if (out.app === undefined) out.app = a;
+    else throw new UsageError(`unexpected extra argument: ${a}`);
+  }
+  return out;
+}
+
+function parseAppPlan(args: string[]): ParsedAppPlan {
+  let sha: string | undefined;
+  let json = false;
+  const { vm, app } = takeVmApp(args, (a, i) => {
+    if (a === "--sha") { sha = takeValue(args, i, a); return i + 1; }
+    if (a === "--json") { json = true; return i; }
+    return undefined;
+  });
+  if (vm === undefined) throw new UsageError("app plan requires <vm> <app>");
+  if (app === undefined) throw new UsageError("app plan requires <vm> <app>");
+  if (sha === undefined) throw new UsageError("--sha is required for app plan");
+  return { kind: "app-plan", input: { vm, app, sha }, json };
+}
+
+function parseAppDeploy(args: string[]): ParsedAppDeploy {
+  let sha: string | undefined;
+  let ref: string | undefined;
+  let skipCiGate = false;
+  let json = false;
+  const { vm, app } = takeVmApp(args, (a, i) => {
+    if (a === "--sha") { sha = takeValue(args, i, a); return i + 1; }
+    if (a === "--ref") { ref = takeValue(args, i, a); return i + 1; }
+    if (a === "--skip-ci-gate") { skipCiGate = true; return i; }
+    if (a === "--json") { json = true; return i; }
+    return undefined;
+  });
+  if (vm === undefined) throw new UsageError("app deploy requires <vm> <app>");
+  if (app === undefined) throw new UsageError("app deploy requires <vm> <app>");
+  if (sha !== undefined && ref !== undefined) {
+    throw new UsageError("--sha and --ref are mutually exclusive");
+  }
+  const input: AppDeployInput = {
+    vm,
+    app,
+    skipCiGate,
+    ...(sha !== undefined ? { sha } : {}),
+    ...(ref !== undefined ? { ref } : {}),
+  };
+  return { kind: "app-deploy", input, json };
+}
+
+function parseAppStatus(args: string[]): ParsedAppStatus {
+  let json = false;
+  const { vm, app } = takeVmApp(args, (a, i) => {
+    if (a === "--json") { json = true; return i; }
+    return undefined;
+  });
+  if (vm === undefined) throw new UsageError("app status requires <vm> <app>");
+  if (app === undefined) throw new UsageError("app status requires <vm> <app>");
+  return { kind: "app-status", input: { vm, app }, json };
+}
+
 function parseIntFlag(v: string, flag: string): number {
   const n = Number(v);
   if (!Number.isInteger(n)) {
@@ -442,6 +681,43 @@ export async function main(
       return runList({ json: cmd.json }, new StateStore(), out, err);
     case "status":
       return runStatus(cmd.input, { json: cmd.json }, new StateStore(), out, err);
+    case "app-register":
+      return runAppRegister(
+        cmd.input,
+        { json: cmd.json },
+        new StateStore(),
+        defaultAppStore(),
+        out,
+        err,
+      );
+    case "app-plan":
+      return runAppPlan(
+        cmd.input,
+        { json: cmd.json },
+        new StateStore(),
+        defaultAppStore(),
+        out,
+        err,
+      );
+    case "app-deploy":
+      return runAppDeploy(
+        cmd.input,
+        { json: cmd.json },
+        new StateStore(),
+        defaultAppStore(),
+        defaultAppDeployDeps(),
+        out,
+        err,
+      );
+    case "app-status":
+      return runAppStatus(
+        cmd.input,
+        { json: cmd.json },
+        new StateStore(),
+        defaultAppStore(),
+        out,
+        err,
+      );
   }
 }
 
