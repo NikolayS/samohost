@@ -532,3 +532,23 @@ describe("integration: HetznerProvider end-to-end — secrets never leak", () =>
     ).not.toContain(TOKEN);
   });
 });
+
+describe("runProvision — samorev PR #14 finding 2 (no-IPv4 guard)", () => {
+  test("never reaches ssh gates while the provider reports no IPv4; degrades at deadline", async () => {
+    const env = makeEnv();
+    env.fake.forceIpv4 = null;
+    env.fake.statusSequence = ["running"];
+    const spec = provisionSpec();
+    const code = await runProvision(
+      { spec, sshKey: env.privKeyPath },
+      { json: false },
+      env.deps,
+      env.outFn,
+      env.errFn,
+    );
+    expect(code).not.toBe(0);
+    expect(env.store.stateSequence.at(-1)).toBe("degraded");
+    expect(env.spawnLog.filter((s) => s.file === "ssh-keyscan").length).toBe(0);
+    expect(env.spawnLog.filter((s) => s.file === "ssh").length).toBe(0);
+  });
+});

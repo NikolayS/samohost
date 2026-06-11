@@ -236,7 +236,8 @@ export async function runProvision(
         if (info.ipv4 !== null && info.ipv4 !== record.ip) {
           persist({ ip: info.ipv4 });
         }
-        if (info.status === "running") {
+        if (info.status === "running" && (record.ip !== "" || info.ipv4 !== null)) {
+          // never advance to ssh probes without a target address (samorev #2)
           gate = "ssh-up";
         }
       } catch {

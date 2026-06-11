@@ -30,6 +30,8 @@ export class FakeProviderError extends Error {
 export class FakeProvider implements ProviderPort {
   /** Captured create specs (golden user_data assertions read these). */
   readonly createCalls: CreateServerSpec[] = [];
+  /** When set (incl. null), create() and get() report this ipv4 (samorev #2). */
+  forceIpv4: string | null | undefined = undefined;
   readonly destroyCalls: string[] = [];
   servers = new Map<string, ServerInfo>();
   volumesByServer = new Map<string, VolumeInfo[]>();
@@ -56,7 +58,7 @@ export class FakeProvider implements ProviderPort {
       providerId: id,
       name: spec.name,
       status: "initializing",
-      ipv4: "192.0.2.55",
+      ipv4: this.forceIpv4 !== undefined ? this.forceIpv4 : "192.0.2.55",
       labels: { ...spec.labels },
       volumeIds: (this.volumesByServer.get(id) ?? []).map((v) => v.id),
     };
@@ -69,7 +71,8 @@ export class FakeProvider implements ProviderPort {
     if (!info) throw new FakeProviderError("notFound", `server ${id} not found`);
     const idx = Math.min(this.getCount, this.statusSequence.length - 1);
     this.getCount += 1;
-    return { ...info, status: this.statusSequence[idx]! };
+    const ipv4 = this.forceIpv4 !== undefined ? this.forceIpv4 : info.ipv4;
+    return { ...info, ipv4, status: this.statusSequence[idx]! };
   }
 
   async list(): Promise<ServerInfo[]> {
