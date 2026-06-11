@@ -134,8 +134,10 @@ export interface AppAssertions {
  * Declarative spec for a deployable app (SPEC-DELTA §3 "app module"). This is
  * the generalization of field-record's deploy.sh inputs into typed config.
  *
- * NOTE on secrets: `envFile` is a path to a remote env file. samohost NEVER
- * reads or writes it (divergence from deploy.sh, which rotated APP_DATABASE_URL
+ * NOTE on secrets: `envFile` is a path to a remote env file. The deploy script
+ * SOURCES it read-only before install (issue #2: pushed scripts inherit nothing
+ * from the service environment, so migrate/seed/probes need it), but samohost
+ * NEVER writes it (divergence from deploy.sh, which rotated APP_DATABASE_URL
  * into staging.env). Deployed-SHA bookkeeping lives in samohost state
  * ({@link AppRecord}), not in any remote env file.
  */
@@ -158,8 +160,25 @@ export interface AppSpec {
   healthUrl: string;
   /** systemd unit name (e.g. "field-record"). Restarted via full-path sudo. */
   serviceUnit: string;
-  /** Remote env file path. NEVER read/written by samohost (see interface note). */
+  /** Remote env file path. Sourced read-only by the deploy script before
+   * install; NEVER written by samohost (see interface note). */
   envFile?: string;
+  /**
+   * Env vars whose values are database URLs that MUST point at the per-env
+   * database in preview envs (issue #11: a faithful operator template
+   * otherwise wires previews to the PRODUCTION db). The env-create script
+   * rewrites ONLY the db-name path component of each listed var ON THE HOST;
+   * samohost never sees the values. Default when absent: ["DATABASE_URL"].
+   */
+  envDbVars?: string[];
+  /**
+   * Env-var name holding the NON-superuser connection URL for the RLS probe
+   * (issue #2: field-record's is APP_DATABASE_URL, while DATABASE_URL is the
+   * superuser URL — probing via the wrong var falsely rolls back healthy
+   * deploys). When set, the probe consults ONLY this var; when absent, the
+   * back-compat fallback chain RLS_DATABASE_URL || DATABASE_URL applies.
+   */
+  rlsUrlVar?: string;
   /** Optional pluggable post-deploy assertions. */
   assertions?: AppAssertions;
 }
@@ -217,6 +236,9 @@ export interface EnvRecord {
   dbBackend: EnvDbBackend;
   /** dblab clone id or template-backend database name (absent for `none`). */
   dbName?: string;
+  /** Template database override for the `template` backend (`--template-db`);
+   * absent → the script derives `<app dashes→underscores>_template`. */
+  templateDb?: string;
   createdAt: string;
   /** Last SHA deployed into this env (set by env-aware deploys; optional). */
   lastDeployedSha?: string;

@@ -61,6 +61,36 @@ Encoded lessons (each becomes a unit-tested behavior):
   (`SELECT rolsuper FROM pg_roles WHERE rolname = current_user` must be `f`).
 - Idempotent seed hook; deployed-SHA recorded on success only.
 
+Contract amendments from the first real deploy cycle (2026-06-11; each
+runtime-proven in an executed sandbox before the first production deploy
+completed through samohost the same night — issue #2 / PR #8, issue #4 / PR #5):
+
+- **The deploy script SOURCES the registered `--env-file` (read-only) before
+  install.** v0.1's "samohost never reads or writes the app's env file" is
+  narrowed to never-WRITES: migrate/seed/probes need the app environment, and
+  values still never transit samohost (sourcing happens on-host inside the
+  pushed script). Without this, migrate dies with no `DATABASE_URL`.
+- **Install is `npm ci --include=dev`** — once the env file is sourced,
+  `NODE_ENV=production` reaches the shell and plain `npm ci` drops the build
+  toolchain (`tsc: not found`). Couples with the sourcing change by design.
+- **The RLS probe's env var is declared at register time**
+  (`app register --rls-url-var APP_DATABASE_URL`). A configured var is
+  EXCLUSIVE — no silent fallback to `DATABASE_URL`, because that fallback IS
+  the failure mode: probing the superuser URL falsely rolls back a healthy
+  deploy and brands the good SHA known-bad.
+- **failedSha escape hatches:** `app clear-failed <vm> <app>` and
+  `app deploy --force` (loud). A probe-defect rollback must not wedge the
+  pipeline behind a hand-edit of local state.
+- **`adopt` plants the verified host key** (issue #4): after the out-of-band
+  fingerprint check, ssh-keyscan output is fingerprinted across ALL key lines
+  (keyscan ordering is racy — first-line-only matching refuses genuine hosts
+  intermittently) and the matching line is recorded into the per-VM
+  known_hosts. First real connection works under `StrictHostKeyChecking=yes`
+  with no manual plant.
+- **CI gate auth:** the gate reads `GH_TOKEN`/`GITHUB_TOKEN`; on a private
+  repo with no token, "no CI run" and "no access" are indistinguishable today
+  (issue #10) — operator remedy: `GH_TOKEN="$(gh auth token)"`.
+
 ### 4. `env` command family — per-branch preview environments — **IMPLEMENTED**
 (Name chosen to avoid colliding with v0.1 `preview` = offline cloud-init render.)
 
@@ -96,12 +126,68 @@ DB provisioning:
   `dblab` CLI calls are PLAN HOOKS — flags to be confirmed once DBLab Engine is
   live on the VM (datasets already reserved on the platform VM).
 - **template backend** (fallback until DBLab Engine confirmed):
-  `createdb --template=<app>_template <db>` + per-env role.
+  `dropdb --if-exists <db>` + `createdb --template=<tpl> <db>` — NO per-env
+  role (see the issue #11 redesign below). Template db defaults to
+  `<app dashes→underscores>_template`; override per env with `--template-db`
+  (persisted on the EnvRecord, so re-create/destroy reuse it).
 
 Secret handling: the env file is composed ON THE HOST from an operator-managed
-template (`<app-parent>/envs.template.env`) with PORT/DATABASE_URL appended
-there; clone/db passwords are generated on-host (`openssl rand`). samohost
-never reads, writes, or parses a secret value.
+template (`<app-parent>/envs.template.env`) with PORT appended and the mapped
+DB vars rewired there (below); dblab clone passwords are generated on-host
+(`openssl rand`). samohost never reads, writes, or parses a secret value.
+
+**Per-env DB var mapping — `envDbVars` (issue #11, the production
+cross-wiring lesson).** The executed sandbox proof showed the original design
+silently writing PREVIEW data into the PRODUCTION database: the envfile phase
+appended only PORT + DATABASE_URL, while the app under test reads
+APP_DATABASE_URL for its RLS write path — that var could only come from the
+operator template, i.e. it pointed at prod. A preview POST returned 201 into
+prod and the preview's own GET showed [] — dishonest both ways. The template
+shape the host-prep comment told operators to produce was the dangerous one;
+omitting the var instead hard-failed boot. Lesson: *any* env var an app reads
+as a DB URL is part of the env-isolation contract, and the control plane must
+be told which vars those are.
+
+Design now:
+- `app register --env-db-var <NAME>` (repeatable, validated against
+  `[A-Za-z_][A-Za-z0-9_]*`; default `DATABASE_URL`) persists
+  `AppRecord.envDbVars` — the set of env vars that MUST point at the per-env
+  database.
+- The create script's envfile phase (template backend) rewires each mapped
+  var ON THE HOST: read its value from the copied template, rewrite ONLY the
+  db-name path component of the URL (scheme/user/password/host/port/query
+  preserved; port and `?params` optional; double-quoted values accepted),
+  STRIP the original line (dotenv loaders are app-dependent; systemd
+  EnvironmentFile is last-wins, but append-only composition is unsafe), and
+  hard-fail the phase if a mapped var is missing or not a URL — an env that
+  could inherit production is never composed. samohost never sees the values;
+  the script never echoes them.
+- **Per-env roles were DROPPED** (issue #11 findings 2+3): the env keeps the
+  SAME roles as production, so the grants copied with the template database
+  and the app's RLS policies apply unchanged — the prod URL contract
+  (e.g. "DATABASE_URL bypasses RLS, APP_DATABASE_URL is the policy-fitted app
+  role") survives into the preview. Trade-off, accepted for the SOLO plan:
+  inter-env isolation is weaker (all envs share prod's roles); an env can
+  technically reach a sibling env's db. Previews are same-trust-domain here.
+- **Re-run semantics**: the db phase is drop-if-exists + recreate, so create
+  re-runs are genuinely idempotent — and a re-run RESETS per-env db data
+  (previews are disposable; the CLI failure guidance says so).
+- dblab backend: envDbVars mapping is a TODO entangled with the clone-status
+  port-field fix (issue #7) — clones need host:port rewired per
+  `dblab clone status`, with template creds kept (they exist in the physical
+  clone). Until then dblab keeps its original append-DATABASE_URL shape.
+
+**Deterministic template-DB creation (operator runbook).** `createdb -T <src>`
+requires ZERO other connections on `<src>`, and lazy connection pools make the
+naive check RACY-GREEN (an idle app holds no connections; the copy succeeds
+until the first pooled request). Procedure:
+1. `systemctl stop <app-unit>`
+2. `sudo -u postgres psql -c "SELECT pg_terminate_backend(pid) FROM
+   pg_stat_activity WHERE datname='<src>' AND pid<>pg_backend_pid();"`
+3. `sudo -u postgres createdb -T <src> <app_name_underscored>_template`
+4. `systemctl start <app-unit>` and verify health.
+(Alternative without downtime: `pg_dump <src> | psql <template>`.) With the
+same-roles design no extra grants are needed inside the template.
 
 One-time root setup is NOT auto-applied: `env plan --host-prep` renders the
 reviewable script (systemd template unit, Caddy sites.d include, exact-path
