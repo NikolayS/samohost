@@ -63,15 +63,18 @@ describe("buildDeployScript hard-won behaviors", () => {
     }
   });
 
-  test("never embeds secrets: no env-file values or DATABASE_URL= assignment", () => {
+  test("never embeds secrets and never WRITES the env file", () => {
     const script = buildDeployScript(fieldRecord(), TARGET);
     // The script must never assign a literal secret value.
     expect(script).not.toContain("DATABASE_URL=");
     expect(script).not.toContain("PGPASSWORD=");
-    // It may *reference* the env var (read-only) but never write the env file.
-    expect(script).not.toContain("staging.env");
+    // Issue #2 (bug 1): the env file IS now sourced (read-only) so migrate/
+    // seed/probes get the app environment — but it must never be WRITTEN:
+    // no append-redirect, no in-place edit, no DEPLOYED_SHA bookkeeping in it.
     expect(script).not.toContain(">> ");
     expect(script).not.toContain("sed -i");
+    expect(script).not.toContain("DEPLOYED_SHA");
+    expect(script).not.toContain("DEPLOY_FAILED_SHA");
   });
 
   test("documents that pushed scripts are immune to the splice bug (no re-exec)", () => {
@@ -131,6 +134,74 @@ describe("buildDeployScript hard-won behaviors", () => {
       TARGET,
     );
     expect(without).not.toContain("SAMOHOST_PHASE:assert-rls");
+  });
+
+  // Issue #2 bug 3 (coupled to bug 1): once the env file is sourced,
+  // NODE_ENV=production reaches the deploy shell and a plain `npm ci` drops
+  // devDependencies — the build toolchain (tsc, tsx) lives there, so build
+  // died with "sh: 1: tsc: not found" at runtime. The install phase must
+  // explicitly include dev deps (field-record's own deploy.sh uses
+  // `npm ci --prefer-offline --include=dev --quiet` deliberately).
+  test("install uses `npm ci --include=dev` so NODE_ENV=production cannot drop the build toolchain", () => {
+    const script = buildDeployScript(fieldRecord(), TARGET);
+    expect(script).toContain("if npm ci --include=dev; then");
+    expect(script).not.toContain("if npm ci; then");
+  });
+
+  // Issue #2 bug 1: the registered --env-file was stored but never sourced, so
+  // migrate/seed/RLS ran with no app env. On the real VM, migrate died with
+  // "DATABASE_URL environment variable is required". The env file must be
+  // sourced (read-only) BEFORE install so NODE_ENV etc. apply consistently to
+  // install/build/migrate/seed/probes.
+  test("sources the registered envFile (read-only, exported) before install", () => {
+    const script = buildDeployScript(fieldRecord(), TARGET);
+    const sourceLine = `set -a; . '/opt/field-record/staging.env'; set +a`;
+    expect(script).toContain(sourceLine);
+    const sourceIdx = script.indexOf(sourceLine);
+    const installIdx = script.indexOf("<<<SAMOHOST_PHASE:install:start>>>");
+    expect(installIdx).toBeGreaterThan(-1);
+    expect(sourceIdx).toBeGreaterThan(-1);
+    expect(sourceIdx).toBeLessThan(installIdx);
+  });
+
+  test("omits env-file sourcing when no envFile is registered", () => {
+    const script = buildDeployScript(fieldRecord({ envFile: undefined }), TARGET);
+    expect(script).not.toContain("set -a");
+    expect(script).not.toContain("set +a");
+  });
+
+  test("quotes the envFile path safely (spaces, single quotes)", () => {
+    const script = buildDeployScript(
+      fieldRecord({ envFile: "/opt/my app/it's.env" }),
+      TARGET,
+    );
+    expect(script).toContain(`set -a; . '/opt/my app/it'\\''s.env'; set +a`);
+  });
+
+  // Issue #2 bug 2: the probe's env-var name was hardcoded to
+  // RLS_DATABASE_URL || DATABASE_URL. field-record's NON-superuser URL is
+  // APP_DATABASE_URL, and DATABASE_URL is the SUPERUSER URL — so the probe
+  // connected as superuser, saw rolsuper=t, and rolled back a HEALTHY deploy
+  // (runtime-confirmed, issue #2 attempt 3). The var name must be
+  // configurable per app.
+  test("assert-rls probe uses the configured rlsUrlVar, not the hardcoded chain", () => {
+    const app = { ...fieldRecord(), rlsUrlVar: "APP_DATABASE_URL" };
+    const script = buildDeployScript(app, TARGET);
+    expect(script).toContain('RLS_URL="${APP_DATABASE_URL:-}"');
+    // No silent fallback to a possibly-superuser DATABASE_URL: that fallback
+    // IS bug 2. If the configured var is unset, the probe must fail loudly.
+    expect(script).not.toContain("${RLS_DATABASE_URL:-${DATABASE_URL:-}}");
+    // The error message must name the actual var consulted.
+    expect(script).toContain(
+      "assert-rls: APP_DATABASE_URL (configured via --rls-url-var) is not set",
+    );
+  });
+
+  test("assert-rls default (no rlsUrlVar) preserves the back-compat fallback chain", () => {
+    const script = buildDeployScript(fieldRecord(), TARGET);
+    expect(script).toContain('RLS_URL="${RLS_DATABASE_URL:-${DATABASE_URL:-}}"');
+    // The error message names the actual vars consulted.
+    expect(script).toContain("neither RLS_DATABASE_URL nor DATABASE_URL is set");
   });
 
   test("embeds the exact target sha and app dir", () => {
