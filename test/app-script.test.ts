@@ -63,15 +63,18 @@ describe("buildDeployScript hard-won behaviors", () => {
     }
   });
 
-  test("never embeds secrets: no env-file values or DATABASE_URL= assignment", () => {
+  test("never embeds secrets and never WRITES the env file", () => {
     const script = buildDeployScript(fieldRecord(), TARGET);
     // The script must never assign a literal secret value.
     expect(script).not.toContain("DATABASE_URL=");
     expect(script).not.toContain("PGPASSWORD=");
-    // It may *reference* the env var (read-only) but never write the env file.
-    expect(script).not.toContain("staging.env");
+    // Issue #2 (bug 1): the env file IS now sourced (read-only) so migrate/
+    // seed/probes get the app environment — but it must never be WRITTEN:
+    // no append-redirect, no in-place edit, no DEPLOYED_SHA bookkeeping in it.
     expect(script).not.toContain(">> ");
     expect(script).not.toContain("sed -i");
+    expect(script).not.toContain("DEPLOYED_SHA");
+    expect(script).not.toContain("DEPLOY_FAILED_SHA");
   });
 
   test("documents that pushed scripts are immune to the splice bug (no re-exec)", () => {
@@ -131,6 +134,36 @@ describe("buildDeployScript hard-won behaviors", () => {
       TARGET,
     );
     expect(without).not.toContain("SAMOHOST_PHASE:assert-rls");
+  });
+
+  // Issue #2 bug 1: the registered --env-file was stored but never sourced, so
+  // migrate/seed/RLS ran with no app env. On the real VM, migrate died with
+  // "DATABASE_URL environment variable is required". The env file must be
+  // sourced (read-only) BEFORE install so NODE_ENV etc. apply consistently to
+  // install/build/migrate/seed/probes.
+  test("sources the registered envFile (read-only, exported) before install", () => {
+    const script = buildDeployScript(fieldRecord(), TARGET);
+    const sourceLine = `set -a; . '/opt/field-record/staging.env'; set +a`;
+    expect(script).toContain(sourceLine);
+    const sourceIdx = script.indexOf(sourceLine);
+    const installIdx = script.indexOf("<<<SAMOHOST_PHASE:install:start>>>");
+    expect(installIdx).toBeGreaterThan(-1);
+    expect(sourceIdx).toBeGreaterThan(-1);
+    expect(sourceIdx).toBeLessThan(installIdx);
+  });
+
+  test("omits env-file sourcing when no envFile is registered", () => {
+    const script = buildDeployScript(fieldRecord({ envFile: undefined }), TARGET);
+    expect(script).not.toContain("set -a");
+    expect(script).not.toContain("set +a");
+  });
+
+  test("quotes the envFile path safely (spaces, single quotes)", () => {
+    const script = buildDeployScript(
+      fieldRecord({ envFile: "/opt/my app/it's.env" }),
+      TARGET,
+    );
+    expect(script).toContain(`set -a; . '/opt/my app/it'\\''s.env'; set +a`);
   });
 
   test("embeds the exact target sha and app dir", () => {
