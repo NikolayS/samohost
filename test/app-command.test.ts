@@ -74,6 +74,31 @@ describe("parseArgs app", () => {
     expect(cmd.input.rlsNonSuperuser).toBe(true);
   });
 
+  // Issue #2 bug 2: the RLS probe's env-var name must be configurable —
+  // field-record's non-superuser URL is APP_DATABASE_URL.
+  test("register parses --rls-url-var", () => {
+    const cmd = parseArgs([
+      "app", "register", "vm",
+      "--name", "field-record",
+      "--repo", "Tanya301/field-record-1",
+      "--service-unit", "field-record",
+      "--health-url", "http://localhost:3000/api/version",
+      "--rls-url-var", "APP_DATABASE_URL",
+    ]);
+    if (cmd.kind !== "app-register") throw new Error("expected app-register");
+    expect(cmd.input.rlsUrlVar).toBe("APP_DATABASE_URL");
+  });
+
+  test("register rejects an invalid --rls-url-var name", () => {
+    expect(() =>
+      parseArgs([
+        "app", "register", "vm", "--name", "x", "--repo", "o/r",
+        "--service-unit", "x", "--health-url", "http://h",
+        "--rls-url-var", "not-a-valid$name",
+      ]),
+    ).toThrow(/invalid --rls-url-var/);
+  });
+
   test("register rejects a non owner/name repo", () => {
     expect(() =>
       parseArgs([
@@ -162,6 +187,32 @@ describe("app commands", () => {
     expect(rec?.vmId).toBe("vm-1111");
     expect(rec?.assertions?.rlsNonSuperuser).toBe(true);
     expect(rec?.deployedSha).toBeUndefined();
+  });
+
+  test("register persists rlsUrlVar on the app record (issue #2 bug 2)", () => {
+    const c = capture();
+    const code = runAppRegister(
+      {
+        vm: "samo-we-field-record",
+        name: "field-record",
+        repo: "Tanya301/field-record-1",
+        branch: "main",
+        appDir: "/opt/field-record/app",
+        buildCmd: "npm run build",
+        serviceUnit: "field-record",
+        healthUrl: "http://localhost:3000/api/version",
+        rlsNonSuperuser: true,
+        rlsUrlVar: "APP_DATABASE_URL",
+      },
+      { json: false },
+      vmStore,
+      appStore,
+      c.out,
+      c.err,
+    );
+    expect(code).toBe(0);
+    const rec = appStore.get("vm-1111", "field-record");
+    expect(rec?.rlsUrlVar).toBe("APP_DATABASE_URL");
   });
 
   test("register fails for an unknown VM", () => {
