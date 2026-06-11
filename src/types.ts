@@ -183,6 +183,46 @@ export interface AppRecord extends AppSpec {
 }
 
 /**
+ * Database backend for a preview environment (SPEC-DELTA §4):
+ *  - `dblab`    : DBLab Engine thin clone — instant, storage-cheap, the primary
+ *                 backend for the SOLO plan (destroy = clone delete).
+ *  - `template` : `createdb --template=<tpl>` fallback until DBLab Engine is
+ *                 confirmed on the host (destroy = dropdb).
+ *  - `none`     : app runs against whatever its env file already points at
+ *                 (no per-env database).
+ */
+export type EnvDbBackend = "dblab" | "template" | "none";
+
+/**
+ * A persisted preview environment (SPEC-DELTA §4 "env command family"): one
+ * git branch of one app, running as a systemd template instance on the VM,
+ * served on its own vhost. Stored in `~/.samohost/envs.json`; the natural
+ * identity is (vmId, appName, branch).
+ */
+export interface EnvRecord {
+  id: string;
+  /** Id of the {@link VmRecord} this env runs on. */
+  vmId: string;
+  /** Name of the {@link AppRecord} this env is an instance of. */
+  appName: string;
+  /** The git branch this env tracks (raw, unsanitized). */
+  branch: string;
+  /** Sanitized DNS-label name, `<app>-<branch-label>` (env/name.ts). Doubles
+   * as the systemd instance name and the env dir name. */
+  name: string;
+  /** App port allocated from the per-VM pool (env/ports.ts). */
+  port: number;
+  /** Full vhost, `<name>.<previewDomain>` (e.g. x.samo.cat). */
+  vhost: string;
+  dbBackend: EnvDbBackend;
+  /** dblab clone id or template-backend database name (absent for `none`). */
+  dbName?: string;
+  createdAt: string;
+  /** Last SHA deployed into this env (set by env-aware deploys; optional). */
+  lastDeployedSha?: string;
+}
+
+/**
  * A persisted VM record in the local state store (SPEC §4/§5).
  */
 export interface VmRecord {

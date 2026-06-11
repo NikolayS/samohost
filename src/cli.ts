@@ -29,7 +29,21 @@ import {
   type AppDeployInput,
   type AppStatusInput,
 } from "./commands/app.ts";
+import {
+  runEnvPlan,
+  runEnvCreate,
+  runEnvList,
+  runEnvDestroy,
+  defaultEnvExecDeps,
+  defaultEnvStore,
+  DEFAULT_PREVIEW_DOMAIN,
+  type EnvPlanInput,
+  type EnvCreateInput,
+  type EnvListInput,
+  type EnvDestroyInput,
+} from "./commands/env.ts";
 import { StateStore } from "./state/store.ts";
+import type { EnvDbBackend } from "./types.ts";
 
 export const VERSION = "0.1.0";
 
@@ -48,6 +62,10 @@ Usage:
   samohost app deploy <vm> <app> [--sha <sha> | --ref <ref>] \\
       [--skip-ci-gate] [--json]
   samohost app status <vm> <app> [--json]
+  samohost env plan <vm> <app> (--branch <b> [--destroy] | --host-prep) [options]
+  samohost env create <vm> <app> --branch <b> [--db dblab|template|none] [--json]
+  samohost env list <vm> [--app <name>] [--json]
+  samohost env destroy <vm> <app> --branch <b> [--json]
   samohost --help
   samohost --version
 
@@ -104,6 +122,16 @@ app deploy options:
   --ref <ref>                git ref resolved to a SHA via gh api (default: branch)
   --skip-ci-gate             bypass the GitHub Actions CI-green gate (risky)
   --json                     emit a JSON deploy report
+
+env options (per-branch preview environments — SOLO plan, one shared VM):
+  --branch <branch>          git branch the env tracks (required except --host-prep)
+  --db <dblab|template|none> per-env database backend (default: dblab)
+  --preview-domain <domain>  vhost domain (default: ${DEFAULT_PREVIEW_DOMAIN};
+                             vhost = <app>-<branch-label>.<domain>)
+  --destroy                  (plan) print the destroy script instead of create
+  --host-prep                (plan) print the ONE-TIME root host-prep script
+  --app <name>               (list) narrow to one app
+  --json                     emit JSON instead of text
 `;
 
 export interface ParsedPreview {
@@ -154,6 +182,30 @@ export interface ParsedAppStatus {
   json: boolean;
 }
 
+export interface ParsedEnvPlan {
+  kind: "env-plan";
+  input: EnvPlanInput;
+  json: boolean;
+}
+
+export interface ParsedEnvCreate {
+  kind: "env-create";
+  input: EnvCreateInput;
+  json: boolean;
+}
+
+export interface ParsedEnvList {
+  kind: "env-list";
+  input: EnvListInput;
+  json: boolean;
+}
+
+export interface ParsedEnvDestroy {
+  kind: "env-destroy";
+  input: EnvDestroyInput;
+  json: boolean;
+}
+
 export type ParsedCommand =
   | ParsedPreview
   | ParsedAdopt
@@ -163,6 +215,10 @@ export type ParsedCommand =
   | ParsedAppPlan
   | ParsedAppDeploy
   | ParsedAppStatus
+  | ParsedEnvPlan
+  | ParsedEnvCreate
+  | ParsedEnvList
+  | ParsedEnvDestroy
   | { kind: "help" }
   | { kind: "version" };
 
@@ -204,6 +260,9 @@ export function parseArgs(
   }
   if (first === "app") {
     return parseApp(argv.slice(1));
+  }
+  if (first === "env") {
+    return parseEnv(argv.slice(1));
   }
 
   // A bare --help/--version may also appear after an (absent) command.
@@ -632,6 +691,135 @@ function parseAppStatus(args: string[]): ParsedAppStatus {
   return { kind: "app-status", input: { vm, app }, json };
 }
 
+// ---------------------------------------------------------------------------
+// env subcommands
+// ---------------------------------------------------------------------------
+
+const DB_BACKENDS: readonly EnvDbBackend[] = ["dblab", "template", "none"];
+
+function parseDbBackend(v: string): EnvDbBackend {
+  if ((DB_BACKENDS as readonly string[]).includes(v)) return v as EnvDbBackend;
+  throw new UsageError(`invalid --db: ${v} (dblab|template|none)`);
+}
+
+function parseEnv(args: string[]): ParsedCommand {
+  const sub = args[0];
+  if (sub === undefined) {
+    throw new UsageError(
+      "env requires a subcommand: plan | create | list | destroy",
+    );
+  }
+  const rest = args.slice(1);
+  switch (sub) {
+    case "plan":
+      return parseEnvPlan(rest);
+    case "create":
+      return parseEnvCreate(rest);
+    case "list":
+      return parseEnvList(rest);
+    case "destroy":
+      return parseEnvDestroy(rest);
+    default:
+      throw new UsageError(`unknown env subcommand: ${sub}`);
+  }
+}
+
+function parseEnvPlan(args: string[]): ParsedEnvPlan {
+  let branch: string | undefined;
+  let db: EnvDbBackend = "dblab";
+  let previewDomain = DEFAULT_PREVIEW_DOMAIN;
+  let destroy = false;
+  let hostPrep = false;
+  let json = false;
+  const { vm, app } = takeVmApp(args, (a, i) => {
+    if (a === "--branch") { branch = takeValue(args, i, a); return i + 1; }
+    if (a === "--db") { db = parseDbBackend(takeValue(args, i, a)); return i + 1; }
+    if (a === "--preview-domain") { previewDomain = takeValue(args, i, a); return i + 1; }
+    if (a === "--destroy") { destroy = true; return i; }
+    if (a === "--host-prep") { hostPrep = true; return i; }
+    if (a === "--json") { json = true; return i; }
+    return undefined;
+  });
+  if (vm === undefined || app === undefined) {
+    throw new UsageError("env plan requires <vm> <app>");
+  }
+  if (branch === undefined && !hostPrep) {
+    throw new UsageError("env plan requires --branch (or --host-prep)");
+  }
+  const input: EnvPlanInput = {
+    vm,
+    app,
+    db,
+    previewDomain,
+    destroy,
+    hostPrep,
+    ...(branch !== undefined ? { branch } : {}),
+  };
+  return { kind: "env-plan", input, json };
+}
+
+function parseEnvCreate(args: string[]): ParsedEnvCreate {
+  let branch: string | undefined;
+  let db: EnvDbBackend = "dblab";
+  let previewDomain = DEFAULT_PREVIEW_DOMAIN;
+  let json = false;
+  const { vm, app } = takeVmApp(args, (a, i) => {
+    if (a === "--branch") { branch = takeValue(args, i, a); return i + 1; }
+    if (a === "--db") { db = parseDbBackend(takeValue(args, i, a)); return i + 1; }
+    if (a === "--preview-domain") { previewDomain = takeValue(args, i, a); return i + 1; }
+    if (a === "--json") { json = true; return i; }
+    return undefined;
+  });
+  if (vm === undefined || app === undefined) {
+    throw new UsageError("env create requires <vm> <app>");
+  }
+  if (branch === undefined) {
+    throw new UsageError("--branch is required for env create");
+  }
+  return {
+    kind: "env-create",
+    input: { vm, app, branch, db, previewDomain },
+    json,
+  };
+}
+
+function parseEnvList(args: string[]): ParsedEnvList {
+  let app: string | undefined;
+  let json = false;
+  let vm: string | undefined;
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i]!;
+    if (a === "--app") { app = takeValue(args, i, a); i++; continue; }
+    if (a === "--json") { json = true; continue; }
+    if (a.startsWith("-")) throw new UsageError(`unknown flag: ${a}`);
+    if (vm !== undefined) throw new UsageError(`unexpected extra argument: ${a}`);
+    vm = a;
+  }
+  if (vm === undefined) throw new UsageError("env list requires <vm>");
+  return {
+    kind: "env-list",
+    input: { vm, ...(app !== undefined ? { app } : {}) },
+    json,
+  };
+}
+
+function parseEnvDestroy(args: string[]): ParsedEnvDestroy {
+  let branch: string | undefined;
+  let json = false;
+  const { vm, app } = takeVmApp(args, (a, i) => {
+    if (a === "--branch") { branch = takeValue(args, i, a); return i + 1; }
+    if (a === "--json") { json = true; return i; }
+    return undefined;
+  });
+  if (vm === undefined || app === undefined) {
+    throw new UsageError("env destroy requires <vm> <app>");
+  }
+  if (branch === undefined) {
+    throw new UsageError("--branch is required for env destroy");
+  }
+  return { kind: "env-destroy", input: { vm, app, branch }, json };
+}
+
 function parseIntFlag(v: string, flag: string): number {
   const n = Number(v);
   if (!Number.isInteger(n)) {
@@ -715,6 +903,47 @@ export async function main(
         { json: cmd.json },
         new StateStore(),
         defaultAppStore(),
+        out,
+        err,
+      );
+    case "env-plan":
+      return runEnvPlan(
+        cmd.input,
+        { json: cmd.json },
+        new StateStore(),
+        defaultAppStore(),
+        defaultEnvStore(),
+        out,
+        err,
+      );
+    case "env-create":
+      return runEnvCreate(
+        cmd.input,
+        { json: cmd.json },
+        new StateStore(),
+        defaultAppStore(),
+        defaultEnvStore(),
+        defaultEnvExecDeps(),
+        out,
+        err,
+      );
+    case "env-list":
+      return runEnvList(
+        cmd.input,
+        { json: cmd.json },
+        new StateStore(),
+        defaultEnvStore(),
+        out,
+        err,
+      );
+    case "env-destroy":
+      return runEnvDestroy(
+        cmd.input,
+        { json: cmd.json },
+        new StateStore(),
+        defaultAppStore(),
+        defaultEnvStore(),
+        defaultEnvExecDeps(),
         out,
         err,
       );
