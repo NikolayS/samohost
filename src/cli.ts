@@ -124,6 +124,8 @@ app register options (write an AppRecord; offline, no network):
   --migrate-cmd <cmd>        optional migration command
   --seed-cmd <cmd>           optional idempotent seed command
   --env-file <path>          remote env file path (NEVER read/written by samohost)
+  --env-db-var <NAME>        env var whose DB URL must point at the per-env db in
+                             preview envs (repeatable; default: DATABASE_URL)
   --assert-rls               require app to connect as a non-superuser (RLS gate)
   --json                     print the raw record as JSON
 
@@ -136,6 +138,8 @@ app deploy options:
 env options (per-branch preview environments — SOLO plan, one shared VM):
   --branch <branch>          git branch the env tracks (required except --host-prep)
   --db <dblab|template|none> per-env database backend (default: dblab)
+  --template-db <name>       (plan/create, --db template) template database to
+                             copy (default: <app dashes→underscores>_template)
   --preview-domain <domain>  vhost domain (default: ${DEFAULT_PREVIEW_DOMAIN};
                              vhost = <app>-<branch-label>.<domain>)
   --destroy                  (plan) print the destroy script instead of create
@@ -603,6 +607,7 @@ function parseAppRegister(args: string[]): ParsedAppRegister {
   let migrateCmd: string | undefined;
   let seedCmd: string | undefined;
   let envFile: string | undefined;
+  const envDbVars: string[] = [];
   let rlsNonSuperuser = false;
   let json = false;
 
@@ -619,6 +624,18 @@ function parseAppRegister(args: string[]): ParsedAppRegister {
       case "--migrate-cmd": migrateCmd = takeValue(args, i, a); i++; break;
       case "--seed-cmd": seedCmd = takeValue(args, i, a); i++; break;
       case "--env-file": envFile = takeValue(args, i, a); i++; break;
+      case "--env-db-var": {
+        // Embedded in on-host grep/sed patterns — validate strictly (#11).
+        const v = takeValue(args, i, a);
+        if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(v)) {
+          throw new UsageError(
+            `invalid --env-db-var: ${v} (expected an env var name like APP_DATABASE_URL)`,
+          );
+        }
+        envDbVars.push(v);
+        i++;
+        break;
+      }
       case "--assert-rls": rlsNonSuperuser = true; break;
       case "--json": json = true; break;
       default:
@@ -651,6 +668,7 @@ function parseAppRegister(args: string[]): ParsedAppRegister {
     ...(migrateCmd !== undefined ? { migrateCmd } : {}),
     ...(seedCmd !== undefined ? { seedCmd } : {}),
     ...(envFile !== undefined ? { envFile } : {}),
+    ...(envDbVars.length > 0 ? { envDbVars } : {}),
   };
   return { kind: "app-register", input, json };
 }
@@ -812,6 +830,7 @@ function parseEnvPlan(args: string[]): ParsedEnvPlan {
   let branch: string | undefined;
   let db: EnvDbBackend = "dblab";
   let previewDomain = DEFAULT_PREVIEW_DOMAIN;
+  let templateDb: string | undefined;
   let destroy = false;
   let hostPrep = false;
   let json = false;
@@ -819,6 +838,7 @@ function parseEnvPlan(args: string[]): ParsedEnvPlan {
     if (a === "--branch") { branch = takeValue(args, i, a); return i + 1; }
     if (a === "--db") { db = parseDbBackend(takeValue(args, i, a)); return i + 1; }
     if (a === "--preview-domain") { previewDomain = takeValue(args, i, a); return i + 1; }
+    if (a === "--template-db") { templateDb = takeValue(args, i, a); return i + 1; }
     if (a === "--destroy") { destroy = true; return i; }
     if (a === "--host-prep") { hostPrep = true; return i; }
     if (a === "--json") { json = true; return i; }
@@ -838,6 +858,7 @@ function parseEnvPlan(args: string[]): ParsedEnvPlan {
     destroy,
     hostPrep,
     ...(branch !== undefined ? { branch } : {}),
+    ...(templateDb !== undefined ? { templateDb } : {}),
   };
   return { kind: "env-plan", input, json };
 }
@@ -846,11 +867,13 @@ function parseEnvCreate(args: string[]): ParsedEnvCreate {
   let branch: string | undefined;
   let db: EnvDbBackend = "dblab";
   let previewDomain = DEFAULT_PREVIEW_DOMAIN;
+  let templateDb: string | undefined;
   let json = false;
   const { vm, app } = takeVmApp(args, (a, i) => {
     if (a === "--branch") { branch = takeValue(args, i, a); return i + 1; }
     if (a === "--db") { db = parseDbBackend(takeValue(args, i, a)); return i + 1; }
     if (a === "--preview-domain") { previewDomain = takeValue(args, i, a); return i + 1; }
+    if (a === "--template-db") { templateDb = takeValue(args, i, a); return i + 1; }
     if (a === "--json") { json = true; return i; }
     return undefined;
   });
@@ -862,7 +885,10 @@ function parseEnvCreate(args: string[]): ParsedEnvCreate {
   }
   return {
     kind: "env-create",
-    input: { vm, app, branch, db, previewDomain },
+    input: {
+      vm, app, branch, db, previewDomain,
+      ...(templateDb !== undefined ? { templateDb } : {}),
+    },
     json,
   };
 }
