@@ -93,7 +93,7 @@ function formatAudit(results: AuditResult[]): string {
 
 /** Output that signals "the probe ran but was not allowed", not "control off". */
 const PERMISSION_RE =
-  /permission denied|you need to be root|must be root|not permitted|operation not permitted/i;
+  /permission denied|you need to be root|must be root|not permitted|operation not permitted|enough privilege/i;
 
 function evaluate(
   check: AuditCheck,
