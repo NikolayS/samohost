@@ -24,7 +24,11 @@
  *  2. NO env-file bookkeeping. deploy.sh writes DEPLOYED_SHA / DEPLOY_FAILED_SHA
  *     (and rotated APP_DATABASE_URL) INTO the remote staging.env. samohost keeps
  *     all that in its own state (AppRecord.deployedSha / .failedSha); this
- *     script NEVER reads or writes the app's env file, and NEVER echoes secrets.
+ *     script NEVER writes the app's env file, and NEVER echoes secrets. It DOES
+ *     source the registered envFile (read-only) before install — issue #2: a
+ *     pushed script runs over `ssh ... bash -s` and inherits NOTHING from the
+ *     systemd unit's environment, so without sourcing, migrate/seed/RLS probes
+ *     ran with no app env at all (migrate died on "DATABASE_URL ... required").
  *     The known-bad-SHA guard is enforced caller-side (samohost state), not in
  *     this script.
  *
@@ -88,6 +92,16 @@ function marker(phase: PhaseName, status: "start" | "ok" | "fail"): string {
  * intended for `bash -s` over a single SSH connection.
  */
 export function buildDeployScript(app: AppRecord, target: DeployTarget): string {
+  // rlsUrlVar is interpolated into bash as `${<name>:-}` — it must be a valid
+  // identifier (the CLI validates too; this guards hand-edited state files).
+  if (
+    app.rlsUrlVar !== undefined &&
+    !/^[A-Za-z_][A-Za-z0-9_]*$/.test(app.rlsUrlVar)
+  ) {
+    throw new Error(
+      `invalid rlsUrlVar (must be a valid env var name): ${app.rlsUrlVar}`,
+    );
+  }
   const lines: string[] = [];
   const push = (...l: string[]): void => {
     for (const x of l) lines.push(x);
@@ -119,6 +133,21 @@ export function buildDeployScript(app: AppRecord, target: DeployTarget): string 
     'cd "$SAMOHOST_APP_DIR"',
     "",
   );
+
+  // ----- env (optional) ------------------------------------------------------
+  // Source the registered env file READ-ONLY, exported, BEFORE install: a
+  // pushed script inherits nothing from the service environment, and install/
+  // build/migrate/seed/probes must all see the same app env (NODE_ENV,
+  // DATABASE_URL, ...). Issue #2 bug 1: without this, migrate died with
+  // "DATABASE_URL environment variable is required". The file is never
+  // written and its values are never echoed.
+  if (app.envFile !== undefined) {
+    push(
+      "# --- env: source the app env file (READ-ONLY; never written, never echoed) ---",
+      `set -a; . ${sq(app.envFile)}; set +a`,
+      "",
+    );
+  }
 
   // ----- fetch -------------------------------------------------------------
   // git fetch, then verify the exact target SHA exists in the object store.
@@ -195,10 +224,14 @@ export function buildDeployScript(app: AppRecord, target: DeployTarget): string 
   );
 
   // ----- install -----------------------------------------------------------
+  // --include=dev is mandatory: the env file sourced above exports
+  // NODE_ENV=production into this shell, and a plain `npm ci` would then drop
+  // devDependencies — where the build/migrate toolchain (tsc, tsx) lives
+  // (issue #2 bug 3: build died with "tsc: not found").
   push(
-    "# --- install: npm ci (clean, reproducible install) ---",
+    "# --- install: npm ci with dev deps (build toolchain lives in devDependencies) ---",
     marker("install", "start"),
-    "if npm ci; then",
+    "if npm ci --include=dev; then",
     `  ${marker("install", "ok")}`,
     "else",
     `  ${marker("install", "fail")}`,
@@ -273,20 +306,38 @@ export function buildDeployScript(app: AppRecord, target: DeployTarget): string 
 
   // ----- assert-rls (optional) ---------------------------------------------
   // Probe that the app connects as a NON-superuser. Expects 'f'. On failure ->
-  // rollback. We read connection params from the app's runtime environment
-  // (RLS_DATABASE_URL / DATABASE_URL exported by the service env) WITHOUT this
-  // script ever writing or echoing the secret value.
+  // rollback. Connection params come from the deploy environment (the env file
+  // sourced above) WITHOUT this script ever writing or echoing the secret
+  // value. The var name is configurable per app (issue #2 bug 2): the app's
+  // non-superuser URL may live under a different name (field-record:
+  // APP_DATABASE_URL) while DATABASE_URL is the SUPERUSER url — consulting the
+  // wrong var makes the probe see rolsuper=t and roll back a healthy deploy.
+  // A configured var is consulted EXCLUSIVELY (no silent fallback: falling
+  // back to DATABASE_URL is exactly the bug); the default keeps the
+  // back-compat RLS_DATABASE_URL || DATABASE_URL chain.
   if (app.assertions?.rlsNonSuperuser) {
+    const rlsLookup =
+      app.rlsUrlVar !== undefined
+        ? [
+            `RLS_URL="\${${app.rlsUrlVar}:-}"`,
+            'if [[ -z "$RLS_URL" ]]; then',
+            `  ${marker("assert-rls", "fail")}`,
+            `  echo "assert-rls: ${app.rlsUrlVar} (configured via --rls-url-var) is not set in the deploy environment" >&2`,
+            "  rollback",
+            "fi",
+          ]
+        : [
+            'RLS_URL="${RLS_DATABASE_URL:-${DATABASE_URL:-}}"',
+            'if [[ -z "$RLS_URL" ]]; then',
+            `  ${marker("assert-rls", "fail")}`,
+            '  echo "assert-rls: neither RLS_DATABASE_URL nor DATABASE_URL is set in the deploy environment" >&2',
+            "  rollback",
+            "fi",
+          ];
     push(
       "# --- assert-rls: app must connect as a non-superuser (RLS not bypassed) ---",
       marker("assert-rls", "start"),
-      // Prefer an explicit RLS URL, else fall back to DATABASE_URL from the env.
-      'RLS_URL="${RLS_DATABASE_URL:-${DATABASE_URL:-}}"',
-      'if [[ -z "$RLS_URL" ]]; then',
-      `  ${marker("assert-rls", "fail")}`,
-      '  echo "assert-rls: neither RLS_DATABASE_URL nor DATABASE_URL is set in the service environment" >&2',
-      "  rollback",
-      "fi",
+      ...rlsLookup,
       // psql reads the URL as its connection string; the secret stays in the
       // variable and is never echoed. Probe returns 'f' for non-superuser.
       'rls_result=$(psql "$RLS_URL" -tAc "SELECT rolsuper FROM pg_roles WHERE rolname = current_user" 2>&1 || echo CONNECTION_FAILED)',

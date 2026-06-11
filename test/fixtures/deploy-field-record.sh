@@ -15,6 +15,9 @@ SAMOHOST_HEALTH_URL='http://localhost:3000/api/version'
 
 cd "$SAMOHOST_APP_DIR"
 
+# --- env: source the app env file (READ-ONLY; never written, never echoed) ---
+set -a; . '/opt/field-record/staging.env'; set +a
+
 # --- fetch: bring the target SHA into the local object store ---
 echo "<<<SAMOHOST_PHASE:fetch:start>>>"
 if git fetch origin --quiet \
@@ -66,9 +69,9 @@ else
   exit 1
 fi
 
-# --- install: npm ci (clean, reproducible install) ---
+# --- install: npm ci with dev deps (build toolchain lives in devDependencies) ---
 echo "<<<SAMOHOST_PHASE:install:start>>>"
-if npm ci; then
+if npm ci --include=dev; then
   echo "<<<SAMOHOST_PHASE:install:ok>>>"
 else
   echo "<<<SAMOHOST_PHASE:install:fail>>>"
@@ -124,7 +127,7 @@ echo "<<<SAMOHOST_PHASE:assert-rls:start>>>"
 RLS_URL="${RLS_DATABASE_URL:-${DATABASE_URL:-}}"
 if [[ -z "$RLS_URL" ]]; then
   echo "<<<SAMOHOST_PHASE:assert-rls:fail>>>"
-  echo "assert-rls: neither RLS_DATABASE_URL nor DATABASE_URL is set in the service environment" >&2
+  echo "assert-rls: neither RLS_DATABASE_URL nor DATABASE_URL is set in the deploy environment" >&2
   rollback
 fi
 rls_result=$(psql "$RLS_URL" -tAc "SELECT rolsuper FROM pg_roles WHERE rolname = current_user" 2>&1 || echo CONNECTION_FAILED)
