@@ -152,6 +152,18 @@ samo.green only. Full analysis and unblock options:
   PRESENCE only, and reports `serving_ready` (wildcard → VM; what previews
   need) separately from `automation_ready` (Cloudflare authority + token +
   zone coverage). Pure evaluation in src/dns/preflight.ts; resolver injected.
+- **Proxied (orange-cloud) semantics** (added 2026-06-11 after the live
+  `*.samo.cat` proxied wildcard was falsely reported `mismatch`): public DNS
+  returns CF EDGE IPs for proxied records, never the origin, so the public
+  probe cannot judge origin targeting. When authority is Cloudflare + token
+  present + zone covered, `dns status` verifies the record's CONTENT/proxied
+  state at the CF API (read-only zone-by-name + record GETs,
+  `lookupWildcardRecord`) and uses it as authoritative; the public probe only
+  answers delegation/propagation. Report carries `wildcardSource`
+  (cloudflare-api | public-dns), `proxied`, `observedIps`. Without API access
+  on a CF zone, non-origin IPs ⇒ `unknown` (never false `mismatch`); non-CF
+  authority keeps direct comparison. CF API errors are token-redacted before
+  any output (tested).
 - `DnsProviderPort` + `CloudflareDns` adapter (src/dns/cloudflare.ts):
   `listRecords` / `ensureRecord` (idempotent: create / update / no-op) /
   `removeRecord`, injected fetch, unit-tested against mocks. **No CLI write

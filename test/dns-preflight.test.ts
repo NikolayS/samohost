@@ -134,7 +134,7 @@ describe("evaluateDnsPreflight", () => {
     expect(r.reasons.join("\n")).toContain("CLOUDFLARE_API_TOKEN is not set");
   });
 
-  test("wildcard mismatch is called out with the expected ip", () => {
+  test("wildcard mismatch is called out with the expected ip and observed ips", () => {
     const r = evaluateDnsPreflight({
       ...base,
       ns: records("dns1.registrar-servers.com"),
@@ -142,7 +142,117 @@ describe("evaluateDnsPreflight", () => {
       cloudflareTokenPresent: false,
     });
     expect(r.wildcard).toBe("mismatch");
+    expect(r.wildcardSource).toBe("public-dns");
     expect(r.servingReady).toBe(false);
     expect(r.reasons.join("\n")).toContain("178.105.246.151");
+    expect(r.reasons.join("\n")).toContain("9.9.9.9");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Cloudflare proxied (orange-cloud) semantics
+// ---------------------------------------------------------------------------
+
+describe("evaluateDnsPreflight — proxied records", () => {
+  const CF_NS = records("derek.ns.cloudflare.com", "jade.ns.cloudflare.com");
+  /** The LIVE samo.cat shape after the fix: proxied A → origin, edge IPs public. */
+  const liveProxied = {
+    domain: "samo.cat",
+    expectedIp: "178.105.246.151",
+    cloudflareZones: ["samo.cat"],
+    ns: CF_NS,
+    wildcardProbe: records("104.21.51.28", "172.67.220.4"), // CF edge IPs
+    cloudflareTokenPresent: true,
+  };
+
+  test("LIVE shape: proxied A -> expected origin => present + fully ready, edge IPs are NOT a mismatch", () => {
+    const r = evaluateDnsPreflight({
+      ...liveProxied,
+      cfWildcardRecord: { found: true, content: "178.105.246.151", proxied: true },
+    });
+    expect(r.wildcard).toBe("present");
+    expect(r.wildcardSource).toBe("cloudflare-api");
+    expect(r.proxied).toBe(true);
+    expect(r.servingReady).toBe(true);
+    expect(r.automationReady).toBe(true);
+    expect(r.observedIps).toEqual(["104.21.51.28", "172.67.220.4"]);
+    expect(r.reasons).toEqual([]);
+  });
+
+  test("CF record targeting the WRONG origin still blocks, even though it's proxied", () => {
+    const r = evaluateDnsPreflight({
+      ...liveProxied,
+      cfWildcardRecord: { found: true, content: "1.2.3.4", proxied: true },
+    });
+    expect(r.wildcard).toBe("mismatch");
+    expect(r.servingReady).toBe(false);
+    expect(r.reasons.join("\n")).toContain("1.2.3.4");
+    expect(r.reasons.join("\n")).toContain("178.105.246.151");
+  });
+
+  test("CF record correct but public DNS not resolving yet => absent (propagation pending)", () => {
+    const r = evaluateDnsPreflight({
+      ...liveProxied,
+      wildcardProbe: NX,
+      cfWildcardRecord: { found: true, content: "178.105.246.151", proxied: true },
+    });
+    expect(r.wildcard).toBe("absent");
+    expect(r.servingReady).toBe(false);
+    expect(r.reasons.join("\n")).toContain("propagation");
+  });
+
+  test("zone has NO wildcard record at the API => absent, regardless of public cache", () => {
+    const r = evaluateDnsPreflight({
+      ...liveProxied,
+      cfWildcardRecord: { found: false },
+    });
+    expect(r.wildcard).toBe("absent");
+    expect(r.reasons.join("\n")).toContain("no A record");
+    expect(r.reasons.join("\n")).toContain("stale cache");
+  });
+
+  test("UNPROXIED CF record -> expected origin: public probe must match directly too", () => {
+    const r = evaluateDnsPreflight({
+      ...liveProxied,
+      wildcardProbe: records("178.105.246.151"),
+      cfWildcardRecord: { found: true, content: "178.105.246.151", proxied: false },
+    });
+    expect(r.wildcard).toBe("present");
+    expect(r.proxied).toBe(false);
+    expect(r.servingReady).toBe(true);
+  });
+
+  test("NO API data on a Cloudflare zone: edge-looking IPs => unknown (never false mismatch)", () => {
+    const r = evaluateDnsPreflight({
+      ...liveProxied,
+      cloudflareTokenPresent: false,
+      // no cfWildcardRecord — token missing
+    });
+    expect(r.wildcard).toBe("unknown");
+    expect(r.wildcardSource).toBe("public-dns");
+    expect(r.servingReady).toBe(false);
+    expect(r.automationReady).toBe(false);
+    const joined = r.reasons.join("\n");
+    expect(joined).toContain("proxied edge IPs");
+    expect(joined).toContain("104.21.51.28");
+    expect(joined).not.toContain("wildcard mismatch");
+  });
+
+  test("non-Cloudflare authority keeps direct mismatch semantics (no proxy excuse)", () => {
+    const r = evaluateDnsPreflight({
+      ...liveProxied,
+      ns: records("dns1.registrar-servers.com"),
+      cloudflareTokenPresent: false,
+    });
+    expect(r.wildcard).toBe("mismatch");
+  });
+
+  test("CF lookup error is surfaced as a reason and judgment falls back to public DNS", () => {
+    const r = evaluateDnsPreflight({
+      ...liveProxied,
+      cfLookupError: "cloudflare api 403: 9109 Invalid access token",
+    });
+    expect(r.wildcard).toBe("unknown"); // public-dns fallback on a CF zone
+    expect(r.reasons.join("\n")).toContain("cloudflare api read failed");
   });
 });

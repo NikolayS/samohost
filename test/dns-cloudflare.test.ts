@@ -1,5 +1,10 @@
 import { describe, expect, test } from "bun:test";
-import { CloudflareDns, CloudflareError, type FetchFn } from "../src/dns/cloudflare.ts";
+import {
+  CloudflareDns,
+  CloudflareError,
+  lookupWildcardRecord,
+  type FetchFn,
+} from "../src/dns/cloudflare.ts";
 
 interface Call {
   url: string;
@@ -87,6 +92,44 @@ describe("CloudflareDns", () => {
     ]);
     expect(await dns(f.fn).removeRecord("*.samo.cat", "A")).toBe(2);
     expect(f.calls.filter((c) => c.method === "DELETE")).toHaveLength(2);
+  });
+
+  test("lookupWildcardRecord: zone-by-name then record fetch, returns content+proxied", async () => {
+    const f = fakeFetch([
+      ok([{ id: "zone-cat" }]),
+      ok([{ content: "178.105.246.151", proxied: true }]),
+    ]);
+    const rec = await lookupWildcardRecord(
+      { token: "test-token", fetchFn: f.fn },
+      "samo.cat",
+      "*.samo.cat",
+    );
+    expect(rec).toEqual({ found: true, content: "178.105.246.151", proxied: true });
+    expect(f.calls[0]!.url).toContain("/zones?name=samo.cat");
+    expect(f.calls[1]!.url).toContain("/zones/zone-cat/dns_records?type=A&name=");
+    expect(f.calls.every((c) => c.method === "GET")).toBe(true); // read-only
+  });
+
+  test("lookupWildcardRecord: no record in the zone => found:false", async () => {
+    const f = fakeFetch([ok([{ id: "zone-cat" }]), ok([])]);
+    const rec = await lookupWildcardRecord(
+      { token: "test-token", fetchFn: f.fn },
+      "samo.cat",
+      "*.samo.cat",
+    );
+    expect(rec).toEqual({ found: false });
+  });
+
+  test("lookupWildcardRecord: zone invisible to token throws a token-free error", async () => {
+    const f = fakeFetch([ok([])]);
+    try {
+      await lookupWildcardRecord({ token: "test-token", fetchFn: f.fn }, "samo.cat", "*.samo.cat");
+      throw new Error("expected CloudflareError");
+    } catch (e) {
+      expect(e).toBeInstanceOf(CloudflareError);
+      expect((e as Error).message).toContain("no zone named samo.cat");
+      expect((e as Error).message).not.toContain("test-token");
+    }
   });
 
   test("API errors surface code+message but never the token", async () => {

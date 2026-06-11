@@ -15,6 +15,8 @@
  * scope, so we never try to discover it.
  */
 
+import type { CfWildcardRecord } from "./preflight.ts";
+
 export interface DnsRecord {
   id: string;
   type: string;
@@ -59,6 +61,63 @@ interface CfEnvelope<T> {
   success: boolean;
   errors: Array<{ code: number; message: string }>;
   result: T;
+}
+
+/**
+ * READ-ONLY: fetch the wildcard A record for a zone by NAME (two GETs: zone
+ * lookup, then record lookup). Used by `dns status` to verify origin targeting
+ * of proxied records — public DNS cannot (it sees edge IPs). Requires a token
+ * with Zone:Read + DNS:Read on the zone. Never writes anything.
+ */
+export async function lookupWildcardRecord(
+  opts: { token: string; fetchFn?: FetchFn },
+  zoneName: string,
+  recordName: string,
+): Promise<CfWildcardRecord> {
+  const fetchFn = opts.fetchFn ?? globalThis.fetch;
+  const get = async <T>(path: string): Promise<T> => {
+    const res = await fetchFn(`${API}${path}`, {
+      method: "GET",
+      headers: {
+        authorization: `Bearer ${opts.token}`,
+        "content-type": "application/json",
+      },
+    });
+    let parsed: CfEnvelope<T>;
+    try {
+      parsed = (await res.json()) as CfEnvelope<T>;
+    } catch {
+      throw new CloudflareError(res.status, "non-JSON response");
+    }
+    if (!res.ok || !parsed.success) {
+      const msg =
+        parsed.errors?.map((e) => `${e.code} ${e.message}`).join("; ") ||
+        "request failed";
+      throw new CloudflareError(res.status, msg);
+    }
+    return parsed.result;
+  };
+
+  const zones = await get<Array<{ id: string }>>(
+    `/zones?name=${encodeURIComponent(zoneName)}`,
+  );
+  if (zones.length === 0) {
+    throw new CloudflareError(
+      404,
+      `no zone named ${zoneName} visible to this token`,
+    );
+  }
+  const records = await get<
+    Array<{ content: string; proxied?: boolean }>
+  >(
+    `/zones/${zones[0]!.id}/dns_records?type=A&name=${encodeURIComponent(recordName)}`,
+  );
+  if (records.length === 0) return { found: false };
+  return {
+    found: true,
+    content: records[0]!.content,
+    proxied: records[0]!.proxied ?? false,
+  };
 }
 
 export class CloudflareDns implements DnsProviderPort {

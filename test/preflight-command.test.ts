@@ -172,13 +172,24 @@ function dnsDeps(o: {
   ns: LookupResult;
   a: LookupResult;
   token?: string;
+  cfRecordLookup?: DnsStatusDeps["cfRecordLookup"];
 }): DnsStatusDeps {
   return {
     resolveNs: () => Promise.resolve(o.ns),
     resolveA: () => Promise.resolve(o.a),
     env: { CLOUDFLARE_API_TOKEN: o.token },
+    ...(o.cfRecordLookup !== undefined ? { cfRecordLookup: o.cfRecordLookup } : {}),
   };
 }
+
+const CF_NS: LookupResult = {
+  kind: "records",
+  values: ["derek.ns.cloudflare.com", "jade.ns.cloudflare.com"],
+};
+const EDGE_IPS: LookupResult = {
+  kind: "records",
+  values: ["104.21.51.28", "172.67.220.4"],
+};
 
 describe("runDnsStatus", () => {
   test("live samo.cat shape: exit 1, namecheap, no wildcard", async () => {
@@ -229,5 +240,124 @@ describe("runDnsStatus", () => {
     );
     expect(JSON.parse(c.o).automationReady).toBe(true);
     expect(c.o).not.toContain("super-secret");
+  });
+
+  test("LIVE proxied shape: CF API confirms origin -> exit 0, present+proxied, edge IPs not a mismatch", async () => {
+    const calls: string[][] = [];
+    const c = capture();
+    const code = await runDnsStatus(
+      { domain: "samo.cat", expectIp: "178.105.246.151", cfZones: ["samo.cat"] },
+      { json: true },
+      dnsDeps({
+        ns: CF_NS,
+        a: EDGE_IPS,
+        token: "tok-value",
+        cfRecordLookup: (token, zone, name) => {
+          calls.push([token, zone, name]);
+          return Promise.resolve({
+            found: true,
+            content: "178.105.246.151",
+            proxied: true,
+          });
+        },
+      }),
+      c.out, c.err,
+    );
+    expect(code).toBe(0);
+    const rep = JSON.parse(c.o);
+    expect(rep.wildcard).toBe("present");
+    expect(rep.wildcardSource).toBe("cloudflare-api");
+    expect(rep.proxied).toBe(true);
+    expect(rep.servingReady).toBe(true);
+    expect(rep.automationReady).toBe(true);
+    expect(calls).toEqual([["tok-value", "samo.cat", "*.samo.cat"]]);
+    expect(c.o).not.toContain("tok-value"); // token never printed
+  });
+
+  test("CF record targeting the wrong origin: exit 1, mismatch via cloudflare-api", async () => {
+    const c = capture();
+    const code = await runDnsStatus(
+      { domain: "samo.cat", expectIp: "178.105.246.151", cfZones: ["samo.cat"] },
+      { json: true },
+      dnsDeps({
+        ns: CF_NS,
+        a: EDGE_IPS,
+        token: "tok-value",
+        cfRecordLookup: () =>
+          Promise.resolve({ found: true, content: "1.2.3.4", proxied: true }),
+      }),
+      c.out, c.err,
+    );
+    expect(code).toBe(1);
+    const rep = JSON.parse(c.o);
+    expect(rep.wildcard).toBe("mismatch");
+    expect(rep.wildcardSource).toBe("cloudflare-api");
+  });
+
+  test("CF lookup errors are REDACTED before reaching output", async () => {
+    const secret = "cf-secret-token-abcdef123456";
+    const c = capture();
+    const code = await runDnsStatus(
+      { domain: "samo.cat", expectIp: "178.105.246.151", cfZones: ["samo.cat"] },
+      { json: true },
+      dnsDeps({
+        ns: CF_NS,
+        a: EDGE_IPS,
+        token: secret,
+        cfRecordLookup: () =>
+          Promise.reject(
+            new Error(`request failed for Bearer ${secret} at /zones`),
+          ),
+      }),
+      c.out, c.err,
+    );
+    expect(code).toBe(1); // falls back to public-dns judgment: unknown on a CF zone
+    expect(c.o + c.e).not.toContain(secret);
+    expect(c.o).toContain("REDACTED");
+    expect(c.o).toContain("cloudflare api read failed");
+    expect(JSON.parse(c.o).wildcard).toBe("unknown");
+  });
+
+  test("missing token: CF lookup never attempted, edge IPs reported unknown not mismatch", async () => {
+    let lookupCalled = false;
+    const c = capture();
+    const code = await runDnsStatus(
+      { domain: "samo.cat", expectIp: "178.105.246.151", cfZones: ["samo.cat"] },
+      { json: true },
+      dnsDeps({
+        ns: CF_NS,
+        a: EDGE_IPS,
+        cfRecordLookup: () => {
+          lookupCalled = true;
+          return Promise.resolve({ found: true, content: "x" });
+        },
+      }),
+      c.out, c.err,
+    );
+    expect(code).toBe(1);
+    expect(lookupCalled).toBe(false);
+    const rep = JSON.parse(c.o);
+    expect(rep.wildcard).toBe("unknown");
+    expect(rep.automationReady).toBe(false);
+  });
+
+  test("zone not in --cf-zone coverage: CF lookup not attempted", async () => {
+    let lookupCalled = false;
+    const c = capture();
+    await runDnsStatus(
+      { domain: "samo.cat", expectIp: "178.105.246.151", cfZones: ["samo.team"] },
+      { json: true },
+      dnsDeps({
+        ns: CF_NS,
+        a: EDGE_IPS,
+        token: "tok",
+        cfRecordLookup: () => {
+          lookupCalled = true;
+          return Promise.resolve({ found: false });
+        },
+      }),
+      c.out, c.err,
+    );
+    expect(lookupCalled).toBe(false);
   });
 });

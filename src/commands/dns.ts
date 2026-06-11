@@ -13,8 +13,11 @@
  */
 
 import { resolve4, resolveNs } from "node:dns/promises";
+import { lookupWildcardRecord } from "../dns/cloudflare.ts";
 import {
+  classifyAuthority,
   evaluateDnsPreflight,
+  type CfWildcardRecord,
   type DnsPreflightReport,
   type LookupResult,
 } from "../dns/preflight.ts";
@@ -42,6 +45,19 @@ export interface DnsStatusDeps {
   resolveA(name: string): Promise<LookupResult>;
   /** Env for token-PRESENCE check (never the value). */
   env: Record<string, string | undefined>;
+  /** READ-ONLY Cloudflare record fetch (zone by name → wildcard A record).
+   * Only invoked when authority is Cloudflare AND the token is present AND
+   * the zone is covered. Optional so offline contexts can omit it. */
+  cfRecordLookup?: (
+    token: string,
+    zoneName: string,
+    recordName: string,
+  ) => Promise<CfWildcardRecord>;
+}
+
+/** Strip the token value from any error text before it can reach output. */
+function redactToken(text: string, token: string): string {
+  return token.length > 0 ? text.split(token).join("REDACTED") : text;
 }
 
 export async function runDnsStatus(
@@ -56,14 +72,40 @@ export async function runDnsStatus(
     `${WILDCARD_PROBE_LABEL}.${input.domain}`,
   );
 
+  // Proxied records resolve to edge IPs publicly, so origin targeting can only
+  // be verified at the CF API (read-only). Attempt it whenever we credibly can.
+  const token = deps.env["CLOUDFLARE_API_TOKEN"] ?? "";
+  let cfWildcardRecord: CfWildcardRecord | undefined;
+  let cfLookupError: string | undefined;
+  if (
+    token.length > 0 &&
+    deps.cfRecordLookup !== undefined &&
+    classifyAuthority(ns) === "cloudflare" &&
+    input.cfZones.includes(input.domain)
+  ) {
+    try {
+      cfWildcardRecord = await deps.cfRecordLookup(
+        token,
+        input.domain,
+        `*.${input.domain}`,
+      );
+    } catch (e) {
+      cfLookupError = redactToken(
+        e instanceof Error ? e.message : String(e),
+        token,
+      );
+    }
+  }
+
   const report: DnsPreflightReport = evaluateDnsPreflight({
     domain: input.domain,
     ns,
     wildcardProbe,
     ...(input.expectIp !== undefined ? { expectedIp: input.expectIp } : {}),
-    cloudflareTokenPresent:
-      (deps.env["CLOUDFLARE_API_TOKEN"] ?? "").length > 0,
+    cloudflareTokenPresent: token.length > 0,
     cloudflareZones: input.cfZones,
+    ...(cfWildcardRecord !== undefined ? { cfWildcardRecord } : {}),
+    ...(cfLookupError !== undefined ? { cfLookupError } : {}),
   });
 
   if (opts.json) {
@@ -71,7 +113,11 @@ export async function runDnsStatus(
   } else {
     out(`domain: ${report.domain}`);
     out(`authority: ${report.authority}`);
-    out(`wildcard: ${report.wildcard}`);
+    out(`wildcard: ${report.wildcard} (via ${report.wildcardSource})`);
+    if (report.proxied !== undefined) out(`proxied: ${report.proxied}`);
+    if (report.observedIps !== undefined) {
+      out(`observed_ips: ${report.observedIps.join(", ")}`);
+    }
     out(`serving_ready: ${report.servingReady}`);
     out(`automation_ready: ${report.automationReady}`);
     for (const r of report.reasons) out(`  - ${r}`);
@@ -102,5 +148,7 @@ export function defaultDnsStatusDeps(): DnsStatusDeps {
     resolveNs: (domain) => asLookup(resolveNs(domain)),
     resolveA: (name) => asLookup(resolve4(name)),
     env: process.env,
+    cfRecordLookup: (token, zoneName, recordName) =>
+      lookupWildcardRecord({ token }, zoneName, recordName),
   };
 }

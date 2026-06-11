@@ -1,8 +1,8 @@
 # Preview DNS: target vs. authority — the samo.cat mismatch
 
-Status: BLOCKING for preview serving (discovered 2026-06-11; verified by
-manager via public DNS). `samohost dns status samo.cat --expect-ip <vm-ip>`
-reproduces this report at any time, read-only.
+Status: **RESOLVED 2026-06-11 evening** (Option-2 path taken — see the update
+at the bottom). The analysis below is kept for the record; the preflight
+command remains the acceptance check, read-only.
 
 ## The mismatch
 
@@ -72,3 +72,35 @@ zone is a decision for the owner, not a default. Listed for completeness.
 Option 1 unless ongoing samo.cat automation is anticipated. After the wildcard
 exists, `samohost dns status samo.cat --expect-ip 178.105.246.151` must report
 `serving_ready: true`; that command is the acceptance check.
+
+## UPDATE 2026-06-11 evening: resolved via Option 2 — and a preflight lesson
+
+What happened: samo.cat NS was delegated to Cloudflare (derek/jade — verified
+publicly propagated), a samo.cat-scoped token was provided out-of-band, and
+`*.samo.cat` was created as a **proxied** (orange-cloud) A record →
+`178.105.246.151`.
+
+The preflight then mis-reported `wildcard: mismatch` — a samohost bug, fixed
+since: **for a proxied record, public DNS returns Cloudflare EDGE IPs by
+design** (e.g. 104.21.x / 172.67.x), never the origin, so comparing public A
+results to the origin IP proves nothing. Semantics now implemented in
+`dns status`:
+
+- When authority is Cloudflare AND a token is present AND the zone is in
+  `--cf-zone` coverage, the wildcard's **origin targeting is verified at the
+  Cloudflare API** (two read-only GETs: zone-by-name, then the record); the
+  public probe only answers "has delegation propagated". Report fields
+  `wildcard_source: cloudflare-api`, `proxied`, `observed_ips` make the basis
+  explicit. A wrong record content still reports `mismatch`.
+- Without API access on a Cloudflare zone, non-origin IPs report `unknown`
+  (verification needs a token), never a false `mismatch`.
+- Non-Cloudflare authority keeps the direct public-DNS comparison.
+- Read-only throughout; CF API errors are token-redacted before output.
+
+Acceptance check (now passes the proxied case):
+`CLOUDFLARE_API_TOKEN=… samohost dns status samo.cat --expect-ip 178.105.246.151 --cf-zone samo.cat`
+→ `wildcard: present (via cloudflare-api)`, `proxied: true`, `serving_ready: true`.
+
+Remaining consequence of proxying: TLS terminates at the CF edge, so the
+origin TLS mode (Full/Full-strict + origin certificate vs. Caddy) must be
+decided before the first preview env is created.
