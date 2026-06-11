@@ -82,6 +82,164 @@ function fakeKeyscanDeps(
   return { deps, calls };
 }
 
+// ---------------------------------------------------------------------------
+// Multi-key regression (NikolayS/samohost#4 follow-up).
+//
+// Real, unrestricted `ssh-keyscan -p <port> <host>` emits MANY key lines — one
+// per host key type — typically with the ssh-rsa line FIRST, then ed25519 /
+// ecdsa. The fixtures below are the EXACT lines + fingerprints emitted by the
+// runtime sandbox host (127.0.0.1:2299), so the mock matches prod shape: the
+// blobs are real and their SHA256 fingerprints (verified against `ssh-keygen
+// -lf -`) are the constants below. The pinned/out-of-band-verified fingerprint
+// is the ED25519 one, which is NOT the first scanned line — the exact case that
+// must NOT be refused as a MITM.
+// ---------------------------------------------------------------------------
+const MK_RSA_LINE =
+  "[127.0.0.1]:2299 ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABgQC3N+kr5AEI0Kla1t1zU3I/uJrnr3QBNa41zxzrUja3UQ9N5J+FHBCI9kbGE2nAc7Gn72HFGMSMyYJfJ6fc5nqXhhXUz3cnYUHu4LbvwC3tPF8b1UNqIott9DvMXvW58YESu+tcHzjfnJVoWgwc4LXKn0G7qRMpdYmGjCgT/H0TkxEFRoQNJ+gaJ+72fiIHH0aPeHblcFvUjFpjSQKvEhfc5F1kPl+Un42SYLsQh4ZN5tUaL1RNjP1YTrmIEOKvVN237JbRX22N/twNYupOz/0Jt9OBMnZetaW4ILKoDk7jYAzfi5Eie3buLx9XckKiN9QsJo6bFuUN/QRM/gdg+FEXmCQPaGcO91pJfNjcb2ZwzjEF6osv6R1Y1Kml2H9EbCXCO/w28TaHJaONLMh6MXFknU2t9LzilkXzmVgc247VJogSmGPay/TqLtDMnCNvDjxwk+i0iexhvx/bmPdFjNny9Yc19dArjEn7pC38pouEYeLc9VWURuZeyAfO6ca7kx8=";
+const MK_RSA_FP = "SHA256:oku3n4zQX/cIQrLrFyPHfPJann3AnwH5OPwgA5C7Z/E";
+const MK_ED_LINE =
+  "[127.0.0.1]:2299 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFCviR20uT18RBaXxXoWBgDMWqbq1hb8OLxPJaQhas9E";
+const MK_ED_FP = "SHA256:s34mRMX6hboFZUeCK07Ml5UTDAZzeP1DCDWH6OmmBKU";
+const MK_ECDSA_LINE =
+  "[127.0.0.1]:2299 ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBKbNPar/V50mSpIxbRZu+Tpgi30gVtFWW6hgleAEwyTLvRUSxuTI0EzjIcz5rDuOm+9wXLp8hwtoxp+esiCuSwg=";
+const MK_ECDSA_FP = "SHA256:8AtLU6ZNwndW8eHdamoif2XSWMsF6xp+f5Y8RwhW7NQ";
+
+/**
+ * Fake ssh-keyscan emitting the FULL multi-key prod shape: per-type banner
+ * comments interleaved with the rsa / ed25519 / ecdsa key lines, RSA first —
+ * exactly what `ssh-keyscan -p 2299 127.0.0.1` prints against the sandbox host.
+ */
+function fakeMultiKeyscanDeps(knownHostsDir: string): {
+  deps: AdoptHostKeyDeps;
+  calls: { file: string; args: string[] }[];
+} {
+  const calls: { file: string; args: string[] }[] = [];
+  const stdout =
+    `# 127.0.0.1:2299 SSH-2.0-OpenSSH_9.6\n` +
+    `${MK_RSA_LINE}\n` +
+    `# 127.0.0.1:2299 SSH-2.0-OpenSSH_9.6\n` +
+    `${MK_ED_LINE}\n` +
+    `# 127.0.0.1:2299 SSH-2.0-OpenSSH_9.6\n` +
+    `${MK_ECDSA_LINE}\n`;
+  const deps: AdoptHostKeyDeps = {
+    knownHostsDir,
+    spawn: (file: string, args: string[]): Promise<SpawnResult> => {
+      calls.push({ file, args });
+      return Promise.resolve({ code: 0, stdout, stderr: "" });
+    },
+  };
+  return { deps, calls };
+}
+
+function mkInput(overrides: Record<string, unknown> = {}) {
+  return {
+    name: "sandbox-local",
+    ip: "127.0.0.1",
+    sshPort: 2299,
+    sshUser: "agent",
+    sshKey: "/nonexistent/key",
+    hostKeyFingerprint: MK_ED_FP,
+    ...overrides,
+  };
+}
+
+describe("adopt matches the pinned fingerprint among ALL scanned keys (#4 multi-key)", () => {
+  let dir: string;
+  let khDir: string;
+  let store: StateStore;
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), "samohost-adopt-mk-"));
+    khDir = join(dir, "known_hosts.d");
+    store = new StateStore(join(dir, "state.json"));
+  });
+  afterEach(() => {
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  function vmFromStore(): VmRecord {
+    const recs = store.list();
+    if (recs.length !== 1) throw new Error(`expected 1 record, got ${recs.length}`);
+    return recs[0]!;
+  }
+
+  test("pinned fingerprint is the ED25519 (NOT the first/rsa) line: adopt succeeds and plants exactly that line", async () => {
+    const c = capture();
+    const { deps } = fakeMultiKeyscanDeps(khDir);
+    const code = await runAdopt(
+      mkInput(),
+      { json: false },
+      store,
+      c.out,
+      c.err,
+      deps,
+    );
+    // Before the fix: code===1, error "fingerprint mismatch (possible MITM)"
+    // because only the FIRST (rsa) line was fingerprinted.
+    expect(c.e).not.toContain("mismatch");
+    expect(code).toBe(0);
+
+    const vm = vmFromStore();
+    const path = knownHostsPathFor(vm, khDir);
+    expect(existsSync(path)).toBe(true);
+    const content = readFileSync(path, "utf8");
+    // exactly the matching ed25519 line is planted...
+    expect(content).toContain(MK_ED_LINE);
+    // ...and NOT the non-matching rsa / ecdsa lines.
+    expect(content).not.toContain(MK_RSA_LINE);
+    expect(content).not.toContain(MK_ECDSA_LINE);
+  });
+
+  test("when NO scanned key matches, adopt fails and the error lists ALL observed typed fingerprints", async () => {
+    const c = capture();
+    const { deps } = fakeMultiKeyscanDeps(khDir);
+    // pin a fingerprint that matches none of the three scanned keys.
+    const bogus = "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+    const code = await runAdopt(
+      mkInput({ hostKeyFingerprint: bogus }),
+      { json: false },
+      store,
+      c.out,
+      c.err,
+      deps,
+    );
+    expect(code).toBe(1);
+    expect(c.e.toLowerCase()).toContain("mismatch");
+    // expected fingerprint surfaced
+    expect(c.e).toContain(bogus);
+    // ALL observed fingerprints surfaced, typed
+    expect(c.e).toContain(MK_RSA_FP);
+    expect(c.e).toContain(MK_ED_FP);
+    expect(c.e).toContain(MK_ECDSA_FP);
+    expect(c.e).toContain("ssh-rsa");
+    expect(c.e).toContain("ssh-ed25519");
+    // nothing recorded
+    expect(store.list().length).toBe(0);
+  });
+
+  test("re-adopt with the multi-key scan is idempotent (no duplicate ed25519 line)", async () => {
+    const c = capture();
+    const { deps } = fakeMultiKeyscanDeps(khDir);
+    const code = await runAdopt(
+      mkInput(),
+      { json: false },
+      store,
+      c.out,
+      c.err,
+      deps,
+    );
+    expect(code).toBe(0);
+    const vm = vmFromStore();
+    const path = knownHostsPathFor(vm, khDir);
+
+    const { deps: deps2 } = fakeMultiKeyscanDeps(khDir);
+    await plantVerifiedHostKey(vm, MK_ED_FP, deps2);
+
+    const content = readFileSync(path, "utf8");
+    const occurrences = content.split(MK_ED_LINE).length - 1;
+    expect(occurrences).toBe(1);
+  });
+});
+
 describe("adopt plants the verified host key (#4)", () => {
   let dir: string;
   let khDir: string;
