@@ -61,6 +61,36 @@ Encoded lessons (each becomes a unit-tested behavior):
   (`SELECT rolsuper FROM pg_roles WHERE rolname = current_user` must be `f`).
 - Idempotent seed hook; deployed-SHA recorded on success only.
 
+Contract amendments from the first real deploy cycle (2026-06-11; each
+runtime-proven in an executed sandbox before the first production deploy
+completed through samohost the same night — issue #2 / PR #8, issue #4 / PR #5):
+
+- **The deploy script SOURCES the registered `--env-file` (read-only) before
+  install.** v0.1's "samohost never reads or writes the app's env file" is
+  narrowed to never-WRITES: migrate/seed/probes need the app environment, and
+  values still never transit samohost (sourcing happens on-host inside the
+  pushed script). Without this, migrate dies with no `DATABASE_URL`.
+- **Install is `npm ci --include=dev`** — once the env file is sourced,
+  `NODE_ENV=production` reaches the shell and plain `npm ci` drops the build
+  toolchain (`tsc: not found`). Couples with the sourcing change by design.
+- **The RLS probe's env var is declared at register time**
+  (`app register --rls-url-var APP_DATABASE_URL`). A configured var is
+  EXCLUSIVE — no silent fallback to `DATABASE_URL`, because that fallback IS
+  the failure mode: probing the superuser URL falsely rolls back a healthy
+  deploy and brands the good SHA known-bad.
+- **failedSha escape hatches:** `app clear-failed <vm> <app>` and
+  `app deploy --force` (loud). A probe-defect rollback must not wedge the
+  pipeline behind a hand-edit of local state.
+- **`adopt` plants the verified host key** (issue #4): after the out-of-band
+  fingerprint check, ssh-keyscan output is fingerprinted across ALL key lines
+  (keyscan ordering is racy — first-line-only matching refuses genuine hosts
+  intermittently) and the matching line is recorded into the per-VM
+  known_hosts. First real connection works under `StrictHostKeyChecking=yes`
+  with no manual plant.
+- **CI gate auth:** the gate reads `GH_TOKEN`/`GITHUB_TOKEN`; on a private
+  repo with no token, "no CI run" and "no access" are indistinguishable today
+  (issue #10) — operator remedy: `GH_TOKEN="$(gh auth token)"`.
+
 ### 4. `env` command family — per-branch preview environments — **IMPLEMENTED**
 (Name chosen to avoid colliding with v0.1 `preview` = offline cloud-init render.)
 
