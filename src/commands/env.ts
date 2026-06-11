@@ -65,6 +65,8 @@ export interface EnvPlanInput {
   branch?: string;
   db: EnvDbBackend;
   previewDomain: string;
+  /** Template database override for the `template` backend (issue #11 f6). */
+  templateDb?: string;
   /** Print the destroy script instead of the create script. */
   destroy: boolean;
   /** Print the one-time root host-prep script instead. */
@@ -77,6 +79,9 @@ export interface EnvCreateInput {
   branch: string;
   db: EnvDbBackend;
   previewDomain: string;
+  /** Template database override for the `template` backend (issue #11 f6).
+   * Persisted on the EnvRecord so re-create/destroy reuse it. */
+  templateDb?: string;
 }
 
 export interface EnvListInput {
@@ -135,6 +140,7 @@ export function deriveTarget(
   previewDomain: string,
   existingOnVm: readonly EnvRecord[],
   pool: PortPool = DEFAULT_POOL,
+  templateDb?: string,
 ): EnvScriptTarget | { error: string } {
   const names = new Map(existingOnVm.map((e) => [e.name, e.branch]));
   const name = envName(app.name, branch, names);
@@ -157,6 +163,7 @@ export function deriveTarget(
     dbBackend: db,
     ...(db === "dblab" ? { dbName: name } : {}),
     ...(db === "template" ? { dbName: name.replace(/-/g, "_") } : {}),
+    ...(db === "template" && templateDb !== undefined ? { templateDb } : {}),
   };
 }
 
@@ -196,6 +203,8 @@ export function runEnvPlan(
         input.db,
         input.previewDomain,
         envStore.listFor(r.vm.id),
+        DEFAULT_POOL,
+        input.templateDb,
       );
   if ("error" in target) {
     err(`error: ${target.error}`);
@@ -301,6 +310,8 @@ export async function runEnvCreate(
         input.db,
         input.previewDomain,
         envStore.listFor(r.vm.id),
+        DEFAULT_POOL,
+        input.templateDb,
       );
   if ("error" in target) {
     err(`error: ${target.error}`);
@@ -333,6 +344,7 @@ export async function runEnvCreate(
     vhost: target.vhost,
     dbBackend: target.dbBackend,
     ...(target.dbName !== undefined ? { dbName: target.dbName } : {}),
+    ...(target.templateDb !== undefined ? { templateDb: target.templateDb } : {}),
     createdAt: existing?.createdAt ?? deps.now().toISOString(),
   };
   envStore.upsert(record);
@@ -359,7 +371,8 @@ export async function runEnvCreate(
     if (outcome !== "ok") {
       err(
         `env create did not succeed (outcome=${outcome}); the partial env is ` +
-          `recorded — re-run create (idempotent) or destroy to clean up`,
+          `recorded — re-run create (idempotent; NOTE: a re-run drops and ` +
+          `recreates the per-env database) or destroy to clean up`,
       );
     }
   }

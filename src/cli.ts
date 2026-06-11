@@ -14,7 +14,11 @@
 import { readFileSync } from "node:fs";
 import type { Provider, ProvisionSpec } from "./types.ts";
 import { runPreview } from "./commands/preview.ts";
-import { runAdopt, type AdoptInput } from "./commands/adopt.ts";
+import {
+  runAdopt,
+  defaultAdoptHostKeyDeps,
+  type AdoptInput,
+} from "./commands/adopt.ts";
 import { runList } from "./commands/list.ts";
 import { runStatus, type StatusInput } from "./commands/status.ts";
 import {
@@ -22,12 +26,14 @@ import {
   runAppPlan,
   runAppDeploy,
   runAppStatus,
+  runAppClearFailed,
   defaultAppDeployDeps,
   defaultAppStore,
   type AppRegisterInput,
   type AppPlanInput,
   type AppDeployInput,
   type AppStatusInput,
+  type AppClearFailedInput,
 } from "./commands/app.ts";
 import {
   runEnvPlan,
@@ -68,8 +74,9 @@ Usage:
       --service-unit <u> --health-url <url> [options]
   samohost app plan <vm> <app> --sha <sha>
   samohost app deploy <vm> <app> [--sha <sha> | --ref <ref>] \\
-      [--skip-ci-gate] [--json]
+      [--skip-ci-gate] [--force] [--json]
   samohost app status <vm> <app> [--json]
+  samohost app clear-failed <vm> <app> [--json]
   samohost env plan <vm> <app> (--branch <b> [--destroy] | --host-prep) [options]
   samohost env create <vm> <app> --branch <b> [--db dblab|template|none] [--json]
   samohost env list <vm> [--app <name>] [--json]
@@ -124,18 +131,33 @@ app register options (write an AppRecord; offline, no network):
   --migrate-cmd <cmd>        optional migration command
   --seed-cmd <cmd>           optional idempotent seed command
   --env-file <path>          remote env file path (NEVER read/written by samohost)
+  --env-db-var <NAME>        env var whose DB URL must point at the per-env db in
+                             preview envs (repeatable; default: DATABASE_URL)
+  --env-file <path>          remote env file; sourced (read-only) by the deploy
+                             script before install — NEVER written by samohost
   --assert-rls               require app to connect as a non-superuser (RLS gate)
+  --rls-url-var <NAME>       env var holding the NON-superuser URL the RLS probe
+                             uses (default: RLS_DATABASE_URL || DATABASE_URL)
   --json                     print the raw record as JSON
 
 app deploy options:
   --sha <sha>                explicit SHA to deploy (mutually exclusive w/ --ref)
   --ref <ref>                git ref resolved to a SHA via gh api (default: branch)
   --skip-ci-gate             bypass the GitHub Actions CI-green gate (risky)
+  --force                    bypass the known-bad-SHA guard (logged loudly; for
+                             recovering from a false rollback)
   --json                     emit a JSON deploy report
+
+app clear-failed (offline; clears the known-bad-SHA guard record):
+  clears the app's recorded failedSha so deploys of that commit are no
+  longer refused — use after a rollback caused by a tooling defect (e.g.
+  a misconfigured RLS probe), when the commit itself was healthy
 
 env options (per-branch preview environments — SOLO plan, one shared VM):
   --branch <branch>          git branch the env tracks (required except --host-prep)
   --db <dblab|template|none> per-env database backend (default: dblab)
+  --template-db <name>       (plan/create, --db template) template database to
+                             copy (default: <app dashes→underscores>_template)
   --preview-domain <domain>  vhost domain (default: ${DEFAULT_PREVIEW_DOMAIN};
                              vhost = <app>-<branch-label>.<domain>)
   --destroy                  (plan) print the destroy script instead of create
@@ -202,6 +224,12 @@ export interface ParsedAppStatus {
   json: boolean;
 }
 
+export interface ParsedAppClearFailed {
+  kind: "app-clear-failed";
+  input: AppClearFailedInput;
+  json: boolean;
+}
+
 export interface ParsedEnvPlan {
   kind: "env-plan";
   input: EnvPlanInput;
@@ -247,6 +275,7 @@ export type ParsedCommand =
   | ParsedAppPlan
   | ParsedAppDeploy
   | ParsedAppStatus
+  | ParsedAppClearFailed
   | ParsedEnvPlan
   | ParsedEnvCreate
   | ParsedEnvList
@@ -559,16 +588,24 @@ function parseStatus(args: string[]): ParsedStatus {
   return { kind: "status", input: { target, audit }, json };
 }
 
-type AppSub = "register" | "plan" | "deploy" | "status";
+type AppSub = "register" | "plan" | "deploy" | "status" | "clear-failed";
+
+const APP_SUBS: readonly AppSub[] = [
+  "register",
+  "plan",
+  "deploy",
+  "status",
+  "clear-failed",
+];
 
 function parseApp(args: string[]): ParsedCommand {
   const sub = args[0];
   if (sub === undefined) {
     throw new UsageError(
-      "app requires a subcommand: register | plan | deploy | status",
+      `app requires a subcommand: ${APP_SUBS.join(" | ")}`,
     );
   }
-  if (sub !== "register" && sub !== "plan" && sub !== "deploy" && sub !== "status") {
+  if (!(APP_SUBS as readonly string[]).includes(sub)) {
     throw new UsageError(`unknown app subcommand: ${sub}`);
   }
   const rest = args.slice(1);
@@ -581,6 +618,8 @@ function parseApp(args: string[]): ParsedCommand {
       return parseAppDeploy(rest);
     case "status":
       return parseAppStatus(rest);
+    case "clear-failed":
+      return parseAppClearFailed(rest);
   }
 }
 
@@ -603,7 +642,9 @@ function parseAppRegister(args: string[]): ParsedAppRegister {
   let migrateCmd: string | undefined;
   let seedCmd: string | undefined;
   let envFile: string | undefined;
+  const envDbVars: string[] = [];
   let rlsNonSuperuser = false;
+  let rlsUrlVar: string | undefined;
   let json = false;
 
   for (let i = 0; i < args.length; i++) {
@@ -619,7 +660,20 @@ function parseAppRegister(args: string[]): ParsedAppRegister {
       case "--migrate-cmd": migrateCmd = takeValue(args, i, a); i++; break;
       case "--seed-cmd": seedCmd = takeValue(args, i, a); i++; break;
       case "--env-file": envFile = takeValue(args, i, a); i++; break;
+      case "--env-db-var": {
+        // Embedded in on-host grep/sed patterns — validate strictly (#11).
+        const v = takeValue(args, i, a);
+        if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(v)) {
+          throw new UsageError(
+            `invalid --env-db-var: ${v} (expected an env var name like APP_DATABASE_URL)`,
+          );
+        }
+        envDbVars.push(v);
+        i++;
+        break;
+      }
       case "--assert-rls": rlsNonSuperuser = true; break;
+      case "--rls-url-var": rlsUrlVar = takeValue(args, i, a); i++; break;
       case "--json": json = true; break;
       default:
         if (a.startsWith("-")) throw new UsageError(`unknown flag: ${a}`);
@@ -636,6 +690,12 @@ function parseAppRegister(args: string[]): ParsedAppRegister {
   }
   if (serviceUnit === undefined) throw new UsageError("--service-unit is required");
   if (healthUrl === undefined) throw new UsageError("--health-url is required");
+  if (rlsUrlVar !== undefined && !/^[A-Za-z_][A-Za-z0-9_]*$/.test(rlsUrlVar)) {
+    throw new UsageError(
+      `invalid --rls-url-var: ${rlsUrlVar} (must be a valid env var name, ` +
+        `e.g. APP_DATABASE_URL)`,
+    );
+  }
   const resolvedAppDir = appDir ?? `/opt/${name}/app`;
 
   const input: AppRegisterInput = {
@@ -651,6 +711,8 @@ function parseAppRegister(args: string[]): ParsedAppRegister {
     ...(migrateCmd !== undefined ? { migrateCmd } : {}),
     ...(seedCmd !== undefined ? { seedCmd } : {}),
     ...(envFile !== undefined ? { envFile } : {}),
+    ...(envDbVars.length > 0 ? { envDbVars } : {}),
+    ...(rlsUrlVar !== undefined ? { rlsUrlVar } : {}),
   };
   return { kind: "app-register", input, json };
 }
@@ -694,11 +756,13 @@ function parseAppDeploy(args: string[]): ParsedAppDeploy {
   let sha: string | undefined;
   let ref: string | undefined;
   let skipCiGate = false;
+  let force = false;
   let json = false;
   const { vm, app } = takeVmApp(args, (a, i) => {
     if (a === "--sha") { sha = takeValue(args, i, a); return i + 1; }
     if (a === "--ref") { ref = takeValue(args, i, a); return i + 1; }
     if (a === "--skip-ci-gate") { skipCiGate = true; return i; }
+    if (a === "--force") { force = true; return i; }
     if (a === "--json") { json = true; return i; }
     return undefined;
   });
@@ -711,10 +775,23 @@ function parseAppDeploy(args: string[]): ParsedAppDeploy {
     vm,
     app,
     skipCiGate,
+    ...(force ? { force } : {}),
     ...(sha !== undefined ? { sha } : {}),
     ...(ref !== undefined ? { ref } : {}),
   };
   return { kind: "app-deploy", input, json };
+}
+
+function parseAppClearFailed(args: string[]): ParsedAppClearFailed {
+  let json = false;
+  const { vm, app } = takeVmApp(args, (a, i) => {
+    if (a === "--json") { json = true; return i; }
+    return undefined;
+  });
+  if (vm === undefined || app === undefined) {
+    throw new UsageError("app clear-failed requires <vm> <app>");
+  }
+  return { kind: "app-clear-failed", input: { vm, app }, json };
 }
 
 function parseAppStatus(args: string[]): ParsedAppStatus {
@@ -812,6 +889,7 @@ function parseEnvPlan(args: string[]): ParsedEnvPlan {
   let branch: string | undefined;
   let db: EnvDbBackend = "dblab";
   let previewDomain = DEFAULT_PREVIEW_DOMAIN;
+  let templateDb: string | undefined;
   let destroy = false;
   let hostPrep = false;
   let json = false;
@@ -819,6 +897,7 @@ function parseEnvPlan(args: string[]): ParsedEnvPlan {
     if (a === "--branch") { branch = takeValue(args, i, a); return i + 1; }
     if (a === "--db") { db = parseDbBackend(takeValue(args, i, a)); return i + 1; }
     if (a === "--preview-domain") { previewDomain = takeValue(args, i, a); return i + 1; }
+    if (a === "--template-db") { templateDb = takeValue(args, i, a); return i + 1; }
     if (a === "--destroy") { destroy = true; return i; }
     if (a === "--host-prep") { hostPrep = true; return i; }
     if (a === "--json") { json = true; return i; }
@@ -838,6 +917,7 @@ function parseEnvPlan(args: string[]): ParsedEnvPlan {
     destroy,
     hostPrep,
     ...(branch !== undefined ? { branch } : {}),
+    ...(templateDb !== undefined ? { templateDb } : {}),
   };
   return { kind: "env-plan", input, json };
 }
@@ -846,11 +926,13 @@ function parseEnvCreate(args: string[]): ParsedEnvCreate {
   let branch: string | undefined;
   let db: EnvDbBackend = "dblab";
   let previewDomain = DEFAULT_PREVIEW_DOMAIN;
+  let templateDb: string | undefined;
   let json = false;
   const { vm, app } = takeVmApp(args, (a, i) => {
     if (a === "--branch") { branch = takeValue(args, i, a); return i + 1; }
     if (a === "--db") { db = parseDbBackend(takeValue(args, i, a)); return i + 1; }
     if (a === "--preview-domain") { previewDomain = takeValue(args, i, a); return i + 1; }
+    if (a === "--template-db") { templateDb = takeValue(args, i, a); return i + 1; }
     if (a === "--json") { json = true; return i; }
     return undefined;
   });
@@ -862,7 +944,10 @@ function parseEnvCreate(args: string[]): ParsedEnvCreate {
   }
   return {
     kind: "env-create",
-    input: { vm, app, branch, db, previewDomain },
+    input: {
+      vm, app, branch, db, previewDomain,
+      ...(templateDb !== undefined ? { templateDb } : {}),
+    },
     json,
   };
 }
@@ -948,7 +1033,14 @@ export async function main(
     case "preview":
       return runPreview(cmd.spec, cmd.sshPubkey, { json: cmd.json }, out, err);
     case "adopt":
-      return runAdopt(cmd.input, { json: cmd.json }, new StateStore(), out, err);
+      return runAdopt(
+        cmd.input,
+        { json: cmd.json },
+        new StateStore(),
+        out,
+        err,
+        defaultAdoptHostKeyDeps(),
+      );
     case "list":
       return runList({ json: cmd.json }, new StateStore(), out, err);
     case "status":
@@ -983,6 +1075,15 @@ export async function main(
       );
     case "app-status":
       return runAppStatus(
+        cmd.input,
+        { json: cmd.json },
+        new StateStore(),
+        defaultAppStore(),
+        out,
+        err,
+      );
+    case "app-clear-failed":
+      return runAppClearFailed(
         cmd.input,
         { json: cmd.json },
         new StateStore(),
