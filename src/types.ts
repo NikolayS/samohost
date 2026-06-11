@@ -14,12 +14,18 @@ export type Provider = "hetzner" | "aws";
  *   creating ─api fail→ failed
  *   booting  ─timeout/err→ degraded
  *   ready/degraded/failed ─destroy→ destroying → destroyed
+ *
+ * SPEC-DELTA §1 adds an `adopted` state for VMs registered from an existing,
+ * already-hardened host (no provider create). It behaves like `ready`:
+ *
+ *   (absent) ─adopt→ adopted ─destroy→ destroying → destroyed
  */
 export type LifecycleState =
   | "planned"
   | "creating"
   | "booting"
   | "ready"
+  | "adopted"
   | "degraded"
   | "failed"
   | "destroying"
@@ -113,6 +119,13 @@ export interface VmRecord {
   ip: string;
   sshKeyPath: string;
   sshPort: number;
+  /** Remote login user for SSH (SPEC-DELTA §1). For provisioned VMs this equals
+   * the spec's adminUser; for adopted VMs it is supplied via --ssh-user. */
+  sshUser: string;
+  /** Pinned host key fingerprint, out-of-band verified at adopt time
+   * (SPEC-DELTA §1). Format: `SHA256:<43 base64 chars>`. All SSH pins this
+   * key (`StrictHostKeyChecking=yes`, per-VM known_hosts). */
+  hostKeyFingerprint: string;
   region: string;
   type: string;
   modules: string[];

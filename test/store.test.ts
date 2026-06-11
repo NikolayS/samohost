@@ -26,6 +26,8 @@ function rec(id: string, overrides: Partial<VmRecord> = {}): VmRecord {
     ip: "203.0.113.10",
     sshKeyPath: "/home/u/.ssh/id_ed25519.pub",
     sshPort: 2223,
+    sshUser: "samo",
+    hostKeyFingerprint: "SHA256:" + "A".repeat(43),
     region: "nbg1",
     type: "cx22",
     modules: [],
