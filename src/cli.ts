@@ -14,7 +14,11 @@
 import { readFileSync } from "node:fs";
 import type { Provider, ProvisionSpec } from "./types.ts";
 import { runPreview } from "./commands/preview.ts";
-import { runAdopt, type AdoptInput } from "./commands/adopt.ts";
+import {
+  runAdopt,
+  defaultAdoptHostKeyDeps,
+  type AdoptInput,
+} from "./commands/adopt.ts";
 import { runList } from "./commands/list.ts";
 import { runStatus, type StatusInput } from "./commands/status.ts";
 import {
@@ -948,7 +952,14 @@ export async function main(
     case "preview":
       return runPreview(cmd.spec, cmd.sshPubkey, { json: cmd.json }, out, err);
     case "adopt":
-      return runAdopt(cmd.input, { json: cmd.json }, new StateStore(), out, err);
+      return runAdopt(
+        cmd.input,
+        { json: cmd.json },
+        new StateStore(),
+        out,
+        err,
+        defaultAdoptHostKeyDeps(),
+      );
     case "list":
       return runList({ json: cmd.json }, new StateStore(), out, err);
     case "status":
