@@ -214,10 +214,14 @@ export function buildDeployScript(app: AppRecord, target: DeployTarget): string 
   );
 
   // ----- install -----------------------------------------------------------
+  // --include=dev is mandatory: the env file sourced above exports
+  // NODE_ENV=production into this shell, and a plain `npm ci` would then drop
+  // devDependencies — where the build/migrate toolchain (tsc, tsx) lives
+  // (issue #2 bug 3: build died with "tsc: not found").
   push(
-    "# --- install: npm ci (clean, reproducible install) ---",
+    "# --- install: npm ci with dev deps (build toolchain lives in devDependencies) ---",
     marker("install", "start"),
-    "if npm ci; then",
+    "if npm ci --include=dev; then",
     `  ${marker("install", "ok")}`,
     "else",
     `  ${marker("install", "fail")}`,

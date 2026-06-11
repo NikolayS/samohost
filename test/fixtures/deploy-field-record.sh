@@ -69,9 +69,9 @@ else
   exit 1
 fi
 
-# --- install: npm ci (clean, reproducible install) ---
+# --- install: npm ci with dev deps (build toolchain lives in devDependencies) ---
 echo "<<<SAMOHOST_PHASE:install:start>>>"
-if npm ci; then
+if npm ci --include=dev; then
   echo "<<<SAMOHOST_PHASE:install:ok>>>"
 else
   echo "<<<SAMOHOST_PHASE:install:fail>>>"
