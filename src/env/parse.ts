@@ -28,6 +28,7 @@ const VALID_PHASES = new Set<EnvPhaseName>([
   "clone",
   "install",
   "build",
+  "db-preflight",
   "db",
   "envfile",
   "unit",

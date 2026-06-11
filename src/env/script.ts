@@ -30,6 +30,7 @@ export type EnvPhaseName =
   | "clone"
   | "install"
   | "build"
+  | "db-preflight"
   | "db"
   | "envfile"
   | "unit"
@@ -162,6 +163,22 @@ export function buildEnvCreateScript(
   if (t.dbBackend === "dblab") {
     const dbName = t.dbName ?? t.name;
     lines.push(
+      // Installed shape (unit file, ZFS datasets) is NOT a running engine.
+      // Gate on the engine actually being active + drivable before any clone
+      // call: fail fast with a pointer at the full diagnosis command.
+      ...phaseBlock(
+        "db-preflight",
+        "DBLab engine must be RUNNING, not merely installed-shape",
+        [
+          "if systemctl is-active --quiet dblab.service \\",
+          "   && command -v dblab >/dev/null; ",
+        ],
+        [
+          '  echo "DBLab engine not confirmed running on this host — refusing to attempt a clone." >&2',
+          '  echo "Diagnose with: samohost env preflight <vm>   (or use --db template|none)" >&2',
+          "  exit 1",
+        ],
+      ),
       `SAMOHOST_CLONE_ID=${sq(dbName)}`,
       "# Per-clone credentials are generated ON THE HOST and never echoed.",
       'SAMOHOST_DB_PASSWORD="$(openssl rand -hex 16)"',

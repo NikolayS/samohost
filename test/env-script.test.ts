@@ -68,6 +68,20 @@ describe("buildEnvCreateScript", () => {
     );
   });
 
+  test("dblab backend is GATED on a running engine (installed shape is not enough)", () => {
+    const s = buildEnvCreateScript(app(), target({ dbBackend: "dblab" }));
+    expect(s).toContain("<<<SAMOHOST_PHASE:db-preflight:start>>>");
+    expect(s).toContain("systemctl is-active --quiet dblab.service");
+    expect(s).toContain("command -v dblab");
+    expect(s).toContain("samohost env preflight"); // pointer to the diagnosis cmd
+    // The gate precedes any clone attempt.
+    expect(s.indexOf("db-preflight:start")).toBeLessThan(s.indexOf("dblab clone create"));
+    // Non-dblab backends have no engine gate.
+    for (const db of ["template", "none"] as const) {
+      expect(buildEnvCreateScript(app(), target({ dbBackend: db }))).not.toContain("db-preflight");
+    }
+  });
+
   test("dblab backend: clone create + on-host password, no samohost-side secrets", () => {
     const s = buildEnvCreateScript(app(), target({ dbBackend: "dblab" }));
     expect(s).toContain("dblab clone create --id");

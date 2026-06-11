@@ -121,12 +121,43 @@ DNS decision (deferred automation): previews assume a ONE-TIME wildcard A record
 `*.samo.cat → VM IP` at the registrar (Namecheap), so no per-env DNS API calls
 are needed and Caddy gets per-vhost certs via HTTP-01. The Cloudflare adapter
 (§5) is only needed if the preview domain moves to a Cloudflare zone.
+**Preflight:** `samohost dns status samo.cat --expect-ip <vm-ip>` (§5) verifies
+the wildcard exists before any env is created; as of 2026-06-11 it does NOT.
 
-### 5. DNS provider port (Cloudflare adapter, read/write per-zone)
-Only needed if the preview domain lands on Cloudflare (decision pending —
-samo.cat currently on Namecheap NS). Interface mirrors the Provider port:
-`ensureRecord(zone, name, type, value, proxied)`, `removeRecord(...)`. Token via
-`CLOUDFLARE_API_TOKEN`; zone ID supplied in config (tokens may lack list scope).
+**DBLab preflight (installed shape ≠ running engine).** The live SOLO VM has
+the dblab.service unit file (ExecStart=/usr/local/bin/dblab-engine) and the
+tank/dblab|postgresql|previews ZFS datasets — but the service is inactive+
+disabled, the engine binary and dblab CLI are absent, and nothing listens on
+the API port. `samohost env preflight <vm>` (read-only probes batched into ONE
+SSH connection via audit/batch.ts; pure evaluation in src/dblab/preflight.ts)
+reports the dblab-engine gate as READY | BLOCKED | UNKNOWN with per-check
+detail and reasons, plus the `--db template` fallback's readiness (local
+Postgres on 127.0.0.1:5432 — currently READY). `env create --db dblab` is
+additionally gated ON-HOST: a `db-preflight` script phase refuses to attempt a
+clone unless dblab.service is active AND the dblab CLI exists, pointing at
+`env preflight` for diagnosis.
+
+### 5. DNS provider port + preflight — **IMPLEMENTED (adapter unwired by design)**
+
+Live facts (verified 2026-06-11): previews target `<app>-<branch>.samo.cat`,
+but samo.cat is on **Namecheap registrar nameservers** and `*.samo.cat` does
+not resolve, while the operator's Cloudflare token/config cover samo.team +
+samo.green only. Full analysis and unblock options:
+`docs/dns-preview-authority.md`.
+
+- `samohost dns status <domain> [--expect-ip <ip>]` (src/commands/dns.ts) —
+  READ-ONLY preflight: classifies authority from NS records
+  (cloudflare | namecheap | other | unresolved), probes a synthetic label to
+  detect the wildcard (present | absent | mismatch | unknown), checks token
+  PRESENCE only, and reports `serving_ready` (wildcard → VM; what previews
+  need) separately from `automation_ready` (Cloudflare authority + token +
+  zone coverage). Pure evaluation in src/dns/preflight.ts; resolver injected.
+- `DnsProviderPort` + `CloudflareDns` adapter (src/dns/cloudflare.ts):
+  `listRecords` / `ensureRecord` (idempotent: create / update / no-op) /
+  `removeRecord`, injected fetch, unit-tested against mocks. **No CLI write
+  path calls it** — live DNS writes stay out of scope until a samo.cat-scoped
+  token exists and the cutover is approved. Token via `CLOUDFLARE_API_TOKEN`;
+  zone ID supplied in config (zone-scoped tokens may lack list scope).
 
 ### 6. Hardening baseline corrections (apply to v0.1 builder NOW)
 - Ubuntu 24.04 socket-activated sshd: port must be set via
@@ -150,7 +181,14 @@ Resize, snapshots, drift correction, GCP/DO providers.
 
 ## Deferred from the env milestone (tracked, not lost)
 - `env gc` (reap envs whose branch is merged/deleted; TTL-based).
-- Cloudflare DNS adapter (§5) — unneeded while previews ride the wildcard A record.
+- Cloudflare DNS adapter WRITES — adapter implemented + tested (§5) but
+  deliberately unwired; needs a samo.cat-scoped token and an approved cutover.
+- Namecheap DNS provider — only if samo.cat stays on Namecheap AND needs
+  ongoing automation (see docs/dns-preview-authority.md; one manual wildcard
+  avoids it entirely).
 - Hetzner `provision`/rebuild path — blocked on HCLOUD_TOKEN availability on the operator machine.
-- Live DBLab Engine verification on the platform VM (the `dblab` CLI calls in env scripts are plan hooks).
+- DBLab Engine INSTALL on the platform VM — preflight now detects/blocks
+  (installed shape only: unit file + ZFS datasets, no engine binary, service
+  dead); the `dblab` CLI calls in env scripts remain plan hooks until
+  `env preflight` reports READY.
 - GitHub Actions runner registration — blocked on a repo-admin token; exact handoff + execution sequence documented in `docs/runner-admin-handoff.md`.

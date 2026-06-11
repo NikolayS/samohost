@@ -19,6 +19,12 @@
  */
 
 import { spawnSync } from "node:child_process";
+import { buildAuditScript, parseAuditOutput } from "../audit/batch.ts";
+import {
+  DBLAB_PROBES,
+  evaluateDblabPreflight,
+  type DblabPreflightReport,
+} from "../dblab/preflight.ts";
 import { parseEnvOutcome, type EnvOutcome } from "../env/parse.ts";
 import { envName } from "../env/name.ts";
 import { allocatePort, DEFAULT_POOL, type PortPool } from "../env/ports.ts";
@@ -408,6 +414,61 @@ export async function runEnvDestroy(
     out(`env ${env.name} destroyed on ${r.vm.name}`);
   }
   return 0;
+}
+
+// ---------------------------------------------------------------------------
+// preflight (remote read-only probes, ONE connection)
+// ---------------------------------------------------------------------------
+
+export interface EnvPreflightInput {
+  vm: string;
+}
+
+/**
+ * Run the DBLab/preview readiness probes (dblab/preflight.ts) over one SSH
+ * connection and print READY/BLOCKED/UNKNOWN with reasons. Exit 0 only when
+ * the dblab engine gate is READY (the template fallback's state is reported
+ * but does not gate the exit code — `--db template` is chosen explicitly).
+ */
+export async function runEnvPreflight(
+  input: EnvPreflightInput,
+  opts: { json: boolean },
+  vmStore: StateStore,
+  deps: EnvExecDeps,
+  out: (s: string) => void,
+  err: (s: string) => void,
+): Promise<number> {
+  const vm = findVm(vmStore, input.vm);
+  if (vm === undefined) {
+    err(`error: VM not found in state: ${input.vm}`);
+    return 1;
+  }
+
+  const script = buildAuditScript(DBLAB_PROBES);
+  let result: SpawnResult;
+  try {
+    result = await deps.remote(vm, script);
+  } catch (e) {
+    err(
+      `error: remote preflight connection failed: ${e instanceof Error ? e.message : String(e)}`,
+    );
+    return 1;
+  }
+
+  const sections = parseAuditOutput(result.stdout, DBLAB_PROBES);
+  const report: DblabPreflightReport = evaluateDblabPreflight(sections);
+
+  if (opts.json) {
+    out(JSON.stringify(report, null, 2));
+  } else {
+    out(`dblab engine: ${report.engine}`);
+    out(`template fallback: ${report.templateFallback}`);
+    for (const c of report.checks) {
+      out(`  [${c.status.padEnd(7)}] ${c.id}: ${c.detail.split("\n")[0]}`);
+    }
+    for (const r of report.reasons) out(`  - ${r}`);
+  }
+  return report.engine === "READY" ? 0 : 1;
 }
 
 // ---------------------------------------------------------------------------

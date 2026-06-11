@@ -34,6 +34,7 @@ import {
   runEnvCreate,
   runEnvList,
   runEnvDestroy,
+  runEnvPreflight,
   defaultEnvExecDeps,
   defaultEnvStore,
   DEFAULT_PREVIEW_DOMAIN,
@@ -41,7 +42,14 @@ import {
   type EnvCreateInput,
   type EnvListInput,
   type EnvDestroyInput,
+  type EnvPreflightInput,
 } from "./commands/env.ts";
+import {
+  runDnsStatus,
+  defaultDnsStatusDeps,
+  DEFAULT_CLOUDFLARE_ZONES,
+  type DnsStatusInput,
+} from "./commands/dns.ts";
 import { StateStore } from "./state/store.ts";
 import type { EnvDbBackend } from "./types.ts";
 
@@ -66,6 +74,8 @@ Usage:
   samohost env create <vm> <app> --branch <b> [--db dblab|template|none] [--json]
   samohost env list <vm> [--app <name>] [--json]
   samohost env destroy <vm> <app> --branch <b> [--json]
+  samohost env preflight <vm> [--json]
+  samohost dns status <domain> [--expect-ip <ip>] [--cf-zone <z>] [--json]
   samohost --help
   samohost --version
 
@@ -132,6 +142,16 @@ env options (per-branch preview environments — SOLO plan, one shared VM):
   --host-prep                (plan) print the ONE-TIME root host-prep script
   --app <name>               (list) narrow to one app
   --json                     emit JSON instead of text
+
+env preflight (READ-ONLY probes over one SSH connection):
+  reports dblab engine READY/BLOCKED/UNKNOWN (gate for --db dblab) and the
+  template-fallback readiness, with per-check detail and reasons
+
+dns status options (READ-ONLY: public NS/A lookups + token PRESENCE check):
+  --expect-ip <ip>           IP the preview wildcard must point at
+  --cf-zone <zone>           zone the local Cloudflare token/config covers
+                             (repeatable; default: ${DEFAULT_CLOUDFLARE_ZONES.join(", ")})
+  --json                     emit the JSON report
 `;
 
 export interface ParsedPreview {
@@ -206,6 +226,18 @@ export interface ParsedEnvDestroy {
   json: boolean;
 }
 
+export interface ParsedEnvPreflight {
+  kind: "env-preflight";
+  input: EnvPreflightInput;
+  json: boolean;
+}
+
+export interface ParsedDnsStatus {
+  kind: "dns-status";
+  input: DnsStatusInput;
+  json: boolean;
+}
+
 export type ParsedCommand =
   | ParsedPreview
   | ParsedAdopt
@@ -219,6 +251,8 @@ export type ParsedCommand =
   | ParsedEnvCreate
   | ParsedEnvList
   | ParsedEnvDestroy
+  | ParsedEnvPreflight
+  | ParsedDnsStatus
   | { kind: "help" }
   | { kind: "version" };
 
@@ -263,6 +297,9 @@ export function parseArgs(
   }
   if (first === "env") {
     return parseEnv(argv.slice(1));
+  }
+  if (first === "dns") {
+    return parseDns(argv.slice(1));
   }
 
   // A bare --help/--version may also appear after an (absent) command.
@@ -719,9 +756,56 @@ function parseEnv(args: string[]): ParsedCommand {
       return parseEnvList(rest);
     case "destroy":
       return parseEnvDestroy(rest);
+    case "preflight":
+      return parseEnvPreflight(rest);
     default:
       throw new UsageError(`unknown env subcommand: ${sub}`);
   }
+}
+
+function parseEnvPreflight(args: string[]): ParsedEnvPreflight {
+  let vm: string | undefined;
+  let json = false;
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i]!;
+    if (a === "--json") { json = true; continue; }
+    if (a.startsWith("-")) throw new UsageError(`unknown flag: ${a}`);
+    if (vm !== undefined) throw new UsageError(`unexpected extra argument: ${a}`);
+    vm = a;
+  }
+  if (vm === undefined) throw new UsageError("env preflight requires <vm>");
+  return { kind: "env-preflight", input: { vm }, json };
+}
+
+function parseDns(args: string[]): ParsedDnsStatus {
+  const sub = args[0];
+  if (sub === undefined) throw new UsageError("dns requires a subcommand: status");
+  if (sub !== "status") throw new UsageError(`unknown dns subcommand: ${sub}`);
+
+  let domain: string | undefined;
+  let expectIp: string | undefined;
+  const cfZones: string[] = [];
+  let json = false;
+  const rest = args.slice(1);
+  for (let i = 0; i < rest.length; i++) {
+    const a = rest[i]!;
+    if (a === "--expect-ip") { expectIp = takeValue(rest, i, a); i++; continue; }
+    if (a === "--cf-zone") { cfZones.push(takeValue(rest, i, a)); i++; continue; }
+    if (a === "--json") { json = true; continue; }
+    if (a.startsWith("-")) throw new UsageError(`unknown flag: ${a}`);
+    if (domain !== undefined) throw new UsageError(`unexpected extra argument: ${a}`);
+    domain = a;
+  }
+  if (domain === undefined) throw new UsageError("dns status requires <domain>");
+  return {
+    kind: "dns-status",
+    input: {
+      domain,
+      cfZones: cfZones.length > 0 ? cfZones : [...DEFAULT_CLOUDFLARE_ZONES],
+      ...(expectIp !== undefined ? { expectIp } : {}),
+    },
+    json,
+  };
 }
 
 function parseEnvPlan(args: string[]): ParsedEnvPlan {
@@ -944,6 +1028,23 @@ export async function main(
         defaultAppStore(),
         defaultEnvStore(),
         defaultEnvExecDeps(),
+        out,
+        err,
+      );
+    case "env-preflight":
+      return runEnvPreflight(
+        cmd.input,
+        { json: cmd.json },
+        new StateStore(),
+        defaultEnvExecDeps(),
+        out,
+        err,
+      );
+    case "dns-status":
+      return runDnsStatus(
+        cmd.input,
+        { json: cmd.json },
+        defaultDnsStatusDeps(),
         out,
         err,
       );
