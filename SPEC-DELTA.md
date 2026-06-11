@@ -153,4 +153,4 @@ Resize, snapshots, drift correction, GCP/DO providers.
 - Cloudflare DNS adapter (§5) — unneeded while previews ride the wildcard A record.
 - Hetzner `provision`/rebuild path — blocked on HCLOUD_TOKEN availability on the operator machine.
 - Live DBLab Engine verification on the platform VM (the `dblab` CLI calls in env scripts are plan hooks).
-- GitHub Actions runner registration — blocked on a repo-admin token; needs an explicit admin-token handoff (or GitHub App) documented separately.
+- GitHub Actions runner registration — blocked on a repo-admin token; exact handoff + execution sequence documented in `docs/runner-admin-handoff.md`.
