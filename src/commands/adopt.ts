@@ -143,7 +143,7 @@ export async function runAdopt(
       if (e instanceof HostKeyMismatchError) {
         err(`error: ${e.message}`);
         err(`  expected (out-of-band verified): ${e.expected}`);
-        err(`  scanned   (ssh-keyscan):         ${e.scanned}`);
+        err(`  observed (ssh-keyscan, all keys): ${e.scanned}`);
         err(
           `Refusing to adopt: the live host key does not match the verified ` +
             `fingerprint. Nothing was recorded. Re-verify the host out of band.`,
@@ -168,14 +168,21 @@ export async function runAdopt(
   return 0;
 }
 
-/** Raised when the scanned host key's fingerprint != the verified one. */
+/**
+ * Raised when NONE of the scanned host keys match the verified fingerprint.
+ *
+ * `scanned` is a human-readable, typed summary of every observed key (e.g.
+ * `ssh-rsa SHA256:..., ssh-ed25519 SHA256:...`) so the operator can see exactly
+ * what the host offered versus what they pinned.
+ */
 export class HostKeyMismatchError extends Error {
   readonly expected: string;
+  /** Typed summary of all observed fingerprints (for operator diagnostics). */
   readonly scanned: string;
   constructor(expected: string, scanned: string) {
     super(
-      `host key fingerprint mismatch (possible MITM): scanned key does not ` +
-        `match the out-of-band-verified fingerprint`,
+      `host key fingerprint mismatch (possible MITM): none of the scanned host ` +
+        `keys match the out-of-band-verified fingerprint`,
     );
     this.name = "HostKeyMismatchError";
     this.expected = expected;
@@ -184,17 +191,41 @@ export class HostKeyMismatchError extends Error {
 }
 
 /**
- * Pick the host-key line out of `ssh-keyscan` stdout. ssh-keyscan emits banner
- * comments (`# host:port SSH-2.0-...`) and blank lines alongside the actual
- * `<host> <keytype> <base64blob>` entries; we take the first real entry.
+ * Extract EVERY host-key line from `ssh-keyscan` stdout. Unrestricted
+ * `ssh-keyscan -p <port> <host>` emits one entry per host key type (ssh-rsa,
+ * ssh-ed25519, ecdsa-...), typically ssh-rsa first, interleaved with banner
+ * comments (`# host:port SSH-2.0-...`) and blank lines. We must consider ALL of
+ * them: the operator may have pinned the fingerprint of ANY one type, so taking
+ * only the first line wrongly refuses a genuine host pinned by, e.g., ed25519.
  */
-export function parseScannedKeyLine(stdout: string): string {
+export function parseScannedKeyLines(stdout: string): string[] {
+  const lines: string[] = [];
   for (const raw of stdout.split("\n")) {
     const line = raw.trim();
     if (line.length === 0 || line.startsWith("#")) continue;
-    return line;
+    lines.push(line);
   }
-  throw new Error("ssh-keyscan returned no host key line");
+  if (lines.length === 0) {
+    throw new Error("ssh-keyscan returned no host key line");
+  }
+  return lines;
+}
+
+/**
+ * Back-compat single-line accessor: the FIRST real host-key entry. Retained for
+ * callers/tests that only need one line; the adopt flow uses
+ * {@link parseScannedKeyLines} and matches the pinned fingerprint among ALL of
+ * them.
+ */
+export function parseScannedKeyLine(stdout: string): string {
+  return parseScannedKeyLines(stdout)[0]!;
+}
+
+/** The key-type field of a known_hosts line (e.g. `ssh-ed25519`), or `?`. */
+function keyTypeOfLine(keyLine: string): string {
+  const fields = keyLine.trim().split(/\s+/);
+  // `<host> <keytype> <blob>` → keytype is the second-to-last field.
+  return fields.length >= 2 ? (fields[fields.length - 2] ?? "?") : "?";
 }
 
 /**
@@ -248,11 +279,23 @@ export async function plantVerifiedHostKey(
     );
   }
 
-  const keyLine = parseScannedKeyLine(res.stdout);
-  const scannedFp = fingerprintOfKeyLine(keyLine);
-  if (scannedFp !== expectedFingerprint) {
-    throw new HostKeyMismatchError(expectedFingerprint, scannedFp);
+  // Fingerprint EVERY scanned key line and match the pinned fingerprint against
+  // ANY of them. Real ssh-keyscan offers one key per host-key type (rsa first,
+  // then ed25519/ecdsa); the operator may have pinned any single type, so we
+  // must not assume the first line is the relevant one.
+  const keyLines = parseScannedKeyLines(res.stdout);
+  const observed = keyLines.map((line) => ({
+    line,
+    type: keyTypeOfLine(line),
+    fp: fingerprintOfKeyLine(line),
+  }));
+  const match = observed.find((k) => k.fp === expectedFingerprint);
+  if (match === undefined) {
+    // Surface ALL observed fingerprints, typed, so the operator can compare.
+    const summary = observed.map((k) => `${k.type} ${k.fp}`).join(", ");
+    throw new HostKeyMismatchError(expectedFingerprint, summary);
   }
+  const keyLine = match.line;
 
   // Idempotency: if this exact key line is already recorded, do not duplicate.
   const path = knownHostsPathFor(vm, deps.knownHostsDir);
