@@ -85,6 +85,14 @@ export interface AuditCheck {
   description: string;
   probeCommand: string;
   expect: RegExp | string;
+  /**
+   * The probe needs root (e.g. `sshd -T`, `ufw status`, `aa-status`). When the
+   * auditing user lacks it, the probe yields nothing or a permission error —
+   * that is reported as `unknown`, not `fail`: a missing privilege is not a
+   * hardening regression (live-confirmed against the platform VM, where three
+   * controls false-FAILed as the unprivileged `agent` user).
+   */
+  requiresSudo?: boolean;
 }
 
 /**

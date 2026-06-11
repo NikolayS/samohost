@@ -208,12 +208,14 @@ const auditChecks: AuditCheck[] = [
     probeCommand: "sshd -T 2>/dev/null | grep '^port '",
     // Concrete port is validated against the spec at audit time; presence here.
     expect: /^port \d+$/m,
+    requiresSudo: true,
   },
   {
     id: "ufw-active",
     description: "ufw is active and default-deny incoming",
     probeCommand: "ufw status verbose",
     expect: /Status: active/,
+    requiresSudo: true,
   },
   {
     id: "fail2ban-active",
@@ -244,6 +246,7 @@ const auditChecks: AuditCheck[] = [
     description: "AppArmor is enabled with profiles in enforce mode",
     probeCommand: "aa-status",
     expect: /profiles are in enforce mode/,
+    requiresSudo: true,
   },
 ];
 

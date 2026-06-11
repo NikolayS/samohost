@@ -24,10 +24,18 @@ export interface StatusInput {
   audit: boolean;
 }
 
+export type AuditStatus = "pass" | "fail" | "unknown";
+
 export interface AuditResult {
   id: string;
   description: string;
   ok: boolean;
+  /**
+   * `unknown` = the probe could not be evaluated (needs root the auditing
+   * user lacks: empty output or a permission error). Distinct from `fail`,
+   * which means the control was observed NOT active.
+   */
+  status: AuditStatus;
   stdout: string;
   stderr: string;
   exitCode: number;
@@ -66,9 +74,58 @@ function formatRecord(r: VmRecord): string {
 }
 
 function formatAudit(results: AuditResult[]): string {
-  return results
-    .map((r) => `${r.ok ? "PASS" : "FAIL"}  ${r.id}  ${r.description}`)
-    .join("\n");
+  const label: Record<AuditStatus, string> = {
+    pass: "PASS   ",
+    fail: "FAIL   ",
+    unknown: "UNKNOWN",
+  };
+  const rows = results.map(
+    (r) =>
+      `${label[r.status]}  ${r.id}  ${r.description}` +
+      (r.status === "unknown" ? "  (probe needs root — not verifiable as this user)" : ""),
+  );
+  const n = (s: AuditStatus) => results.filter((r) => r.status === s).length;
+  rows.push(
+    `\n${n("pass")} pass / ${n("fail")} fail / ${n("unknown")} unknown`,
+  );
+  return rows.join("\n");
+}
+
+/** Output that signals "the probe ran but was not allowed", not "control off". */
+const PERMISSION_RE =
+  /permission denied|you need to be root|must be root|not permitted|operation not permitted/i;
+
+function evaluate(
+  check: AuditCheck,
+  observed: string | undefined,
+  sshStderr: string,
+): AuditResult {
+  if (observed === undefined) {
+    return result(check, "unknown", "", `audit section missing from remote output (ssh stderr: ${sshStderr.slice(0, 200)})`, 255);
+  }
+  if (matches(check, observed)) return result(check, "pass", observed, "", 0);
+  if (check.requiresSudo && (observed.trim() === "" || PERMISSION_RE.test(observed))) {
+    return result(check, "unknown", observed, "probe requires root; rerun audit as a user with the matching sudo grants to verify", 0);
+  }
+  return result(check, "fail", observed, "", 0);
+}
+
+function result(
+  check: AuditCheck,
+  status: AuditStatus,
+  stdout: string,
+  stderr: string,
+  exitCode: number,
+): AuditResult {
+  return {
+    id: check.id,
+    description: check.description,
+    ok: status === "pass",
+    status,
+    stdout,
+    stderr,
+    exitCode,
+  };
 }
 
 async function runAudit(
@@ -80,20 +137,9 @@ async function runAudit(
   const checks = hardeningModule.auditChecks;
   const res = await remote(vm, buildAuditScript(checks));
   const sections = parseAuditOutput(res.stdout, checks);
-  return checks.map((check) => {
-    const observed = sections.get(check.id);
-    return {
-      id: check.id,
-      description: check.description,
-      ok: observed !== undefined && matches(check, observed),
-      stdout: observed ?? "",
-      stderr:
-        observed === undefined
-          ? `audit section missing from remote output (ssh stderr: ${res.stderr.slice(0, 200)})`
-          : "",
-      exitCode: observed === undefined ? 255 : 0,
-    };
-  });
+  return checks.map((check) =>
+    evaluate(check, sections.get(check.id), res.stderr),
+  );
 }
 
 function defaultRemoteRunner(): RemoteRunner {
@@ -138,11 +184,12 @@ export async function runStatus(
 
   try {
     const audit = await runAudit(record, remote);
-    const result: StatusResult = { record, audit };
-    const ok = audit.every((r) => r.ok);
-    if (opts.json) out(JSON.stringify(result, null, 2));
+    const statusResult: StatusResult = { record, audit };
+    // unknown is tolerated for the exit code (visible in output); fail is not.
+    const anyFail = audit.some((r) => r.status === "fail");
+    if (opts.json) out(JSON.stringify(statusResult, null, 2));
     else out(`${formatRecord(record)}\n\naudit:\n${formatAudit(audit)}`);
-    return ok ? 0 : 1;
+    return anyFail ? 1 : 0;
   } catch (e) {
     err(`error: audit failed: ${e instanceof Error ? e.message : String(e)}`);
     return 1;

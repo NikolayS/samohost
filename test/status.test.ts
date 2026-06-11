@@ -158,6 +158,40 @@ describe("runStatus", () => {
     expect(c.o).not.toContain("FAIL");
   });
 
+  test("--audit reports UNKNOWN (not FAIL) for root-only probes blocked by privileges, exit 0", async () => {
+    store.upsert(rec());
+    // Simulate the unprivileged-agent case observed live on the platform VM:
+    // root-only probes emit a permission error or nothing; the rest pass.
+    const remote: RemoteRunner = () =>
+      Promise.resolve({
+        code: 0,
+        stdout: delimitedOutput((id) => {
+          const check = hardeningModule.auditChecks.find((c) => c.id === id);
+          if (check?.requiresSudo) return "ERROR: You need to be root to run this script";
+          return PASS_BODIES[id] ?? "1";
+        }),
+        stderr: "",
+      });
+    const c = capture();
+    const code = await runStatus(
+      { target: "samo-we-field-record", audit: true },
+      { json: true },
+      store,
+      c.out,
+      c.err,
+      remote,
+    );
+    expect(code).toBe(0); // unknown tolerated; only fail exits 1
+    const parsed = JSON.parse(c.o);
+    const byId = Object.fromEntries(
+      parsed.audit.map((r: { id: string; status: string }) => [r.id, r.status]),
+    );
+    expect(byId["ufw-active"]).toBe("unknown");
+    expect(byId["apparmor-enforced"]).toBe("unknown");
+    expect(byId["fail2ban-active"]).toBe("pass");
+    expect(byId["sysctl-rpfilter"]).toBe("pass");
+  });
+
   test("--audit exits 1 when a probe does not match", async () => {
     store.upsert(rec());
     const remote: RemoteRunner = () =>
