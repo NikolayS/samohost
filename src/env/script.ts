@@ -8,10 +8,15 @@
  *
  * Secret handling (the load-bearing design decision): samohost NEVER sees env
  * values. The create script composes the env file ON THE HOST from an
- * operator-managed template (`/opt/<app>/envs.template.env`), then appends the
- * per-env PORT and — for db-backed envs — a DATABASE_URL whose password is
- * generated on the host (`openssl rand`). Nothing secret transits samohost's
- * stdout parsing: the script never echoes the env file or the password.
+ * operator-managed template (`/opt/<app>/envs.template.env`), appends the
+ * per-env PORT, and — per-env database wiring, issue #11 — rewrites the
+ * db-name path component of every env var listed in the app's `envDbVars`
+ * (default `["DATABASE_URL"]`) so it points at the per-env database while
+ * keeping scheme/user/password/host/port/query untouched. For the template
+ * backend the env keeps the SAME database roles as production (no per-env
+ * role): template-copied grants and RLS policies apply unchanged. Nothing
+ * secret transits samohost's stdout parsing: the script never echoes the env
+ * file or any URL value.
  *
  * Privilege model: the hardened host has `Defaults use_pty` + exact-path
  * NOPASSWD grants, so every privileged line is a full-path `sudo /usr/bin/...`
@@ -43,6 +48,82 @@ export type EnvPhaseName =
 
 const HEALTH_RETRIES = 10;
 const HEALTH_SLEEP_SEC = 3;
+
+/** Default DB var mapping when the app declares none (issue #11). */
+export const DEFAULT_ENV_DB_VARS: readonly string[] = ["DATABASE_URL"];
+
+/**
+ * Bash function: two-strategy branch checkout (issue #11 finding 5). A
+ * `git clone --reference` off the production checkout is cheap, but git
+ * rejects SHALLOW (or otherwise unusable) reference repos; the old
+ * `A && clone || fetch && checkout` chain then ran the fetch against the
+ * nonexistent env dir, masking the real error. Now: explicit fallback to a
+ * plain clone of the same origin URL, with a message NAMING which strategy
+ * failed and why. (Closing brace at column 0 — tests extract and execute it.)
+ */
+const CLONE_FN_LINES: string[] = [
+  "samohost_clone_env_dir() {",
+  "  local origin_url",
+  '  origin_url="$(git -C "$SAMOHOST_APP_DIR" remote get-url origin)" || {',
+  '    echo "samohost: cannot read the origin URL from $SAMOHOST_APP_DIR" >&2',
+  "    return 1",
+  "  }",
+  '  if [[ -d "$SAMOHOST_ENV_DIR/.git" ]]; then',
+  '    git -C "$SAMOHOST_ENV_DIR" fetch origin "$SAMOHOST_BRANCH" \\',
+  '      && git -C "$SAMOHOST_ENV_DIR" checkout -B "$SAMOHOST_BRANCH" "origin/$SAMOHOST_BRANCH"',
+  "    return",
+  "  fi",
+  '  if git clone --reference "$SAMOHOST_APP_DIR" --dissociate \\',
+  '       --branch "$SAMOHOST_BRANCH" --single-branch \\',
+  '       "$origin_url" "$SAMOHOST_ENV_DIR"; then',
+  "    return 0",
+  "  fi",
+  '  echo "samohost: strategy 1 (git clone --reference $SAMOHOST_APP_DIR) failed — the production checkout is unusable as a clone reference (e.g. a shallow checkout); falling back to a plain clone of $origin_url" >&2',
+  '  rm -rf "$SAMOHOST_ENV_DIR"',
+  '  if git clone --branch "$SAMOHOST_BRANCH" --single-branch \\',
+  '       "$origin_url" "$SAMOHOST_ENV_DIR"; then',
+  "    return 0",
+  "  fi",
+  '  echo "samohost: strategy 2 (plain git clone of $origin_url, branch $SAMOHOST_BRANCH) ALSO failed — clone phase cannot proceed" >&2',
+  "  return 1",
+  "}",
+];
+
+/**
+ * Bash function: rewire each mapped DB env var (issue #11 findings 1+2+3)
+ * inside the composed .env so its URL points at the per-env database. A
+ * faithful operator template otherwise wires previews straight into the
+ * PRODUCTION database (proven at runtime in the issue's sandbox evidence).
+ * All parsing happens ON THE HOST; values are never echoed. Handled URL
+ * shape: `scheme://user:pass@host[:port]/dbname[?params]` (port and params
+ * optional; value optionally double-quoted). ONLY the db-name path component
+ * changes. Original lines are STRIPPED (not just overridden): systemd
+ * EnvironmentFile is last-wins, but dotenv loaders are app-dependent, so
+ * append-only composition is unsafe. (Closing brace at column 0 — tests
+ * extract and execute this function against prod-shaped fixtures.)
+ */
+const REWIRE_DB_VARS_FN_LINES: string[] = [
+  "samohost_rewire_db_vars() {",
+  '  local envfile="$1" var line val rewritten',
+  '  for var in "${SAMOHOST_ENV_DB_VARS[@]}"; do',
+  '    line="$(grep -E "^${var}=" "$envfile" | tail -n 1 || true)"',
+  '    if [[ -z "$line" ]]; then',
+  "      echo \"samohost: env template is missing ${var} (declared in the app's envDbVars) — refusing to compose an env that could inherit the production database\" >&2",
+  "      return 1",
+  "    fi",
+  '    val="${line#*=}"',
+  "    if ! printf '%s' \"$val\" | grep -Eq '^\"?[A-Za-z0-9+]+://[^/]+/'; then",
+  '      echo "samohost: ${var} in the env template is not a URL with a database path component — cannot rewire it to the per-env database" >&2',
+  "      return 1",
+  "    fi",
+  "    rewritten=\"$(printf '%s' \"$val\" | sed -E 's|^(\"?[A-Za-z0-9+]+://[^/]+/)[^?\"]*|\\1'\"$SAMOHOST_DB_NAME\"'|')\"",
+  '    grep -vE "^${var}=" "$envfile" > "${envfile}.rewired" || true',
+  "    printf '%s=%s\\n' \"$var\" \"$rewritten\" >> \"${envfile}.rewired\"",
+  '    mv "${envfile}.rewired" "$envfile"',
+  '    chmod 600 "$envfile"',
+  "  done",
+  "}",
+];
 
 /** Single-quote for safe embedding in generated bash (same as app/script.ts). */
 function sq(s: string): string {
@@ -133,17 +214,14 @@ export function buildEnvCreateScript(
     "",
   ];
 
-  // ----- clone: reference clone from the production checkout (cheap), then
-  // fetch + checkout the branch.
+  // ----- clone: reference clone from the production checkout (cheap) with an
+  // explicit plain-clone fallback for shallow/unusable references (issue #11
+  // finding 5); existing env dirs take the fetch+checkout path.
+  lines.push(...CLONE_FN_LINES, "");
   lines.push(
     ...phaseBlock("clone", "branch checkout into the env dir", [
       'mkdir -p "$SAMOHOST_ENVS_ROOT"',
-      'if [[ ! -d "$SAMOHOST_ENV_DIR/.git" ]] \\',
-      '   && git clone --reference "$SAMOHOST_APP_DIR" --dissociate \\',
-      '        --branch "$SAMOHOST_BRANCH" --single-branch \\',
-      '        "$(git -C "$SAMOHOST_APP_DIR" remote get-url origin)" "$SAMOHOST_ENV_DIR" \\',
-      '   || git -C "$SAMOHOST_ENV_DIR" fetch origin "$SAMOHOST_BRANCH" \\',
-      '   && git -C "$SAMOHOST_ENV_DIR" checkout -B "$SAMOHOST_BRANCH" "origin/$SAMOHOST_BRANCH"; ',
+      "if samohost_clone_env_dir; ",
     ]),
   );
 
@@ -199,24 +277,28 @@ export function buildEnvCreateScript(
   } else if (t.dbBackend === "template") {
     const dbName = t.dbName ?? t.name.replace(/-/g, "_");
     const tpl = t.templateDb ?? `${app.name.replace(/-/g, "_")}_template`;
+    const envDbVars = app.envDbVars ?? [...DEFAULT_ENV_DB_VARS];
     lines.push(
       `SAMOHOST_DB_NAME=${sq(dbName)}`,
       `SAMOHOST_TEMPLATE_DB=${sq(tpl)}`,
-      "# Per-env role password generated ON THE HOST, never echoed.",
-      'SAMOHOST_DB_PASSWORD="$(openssl rand -hex 16)"',
+      "# Env vars whose URLs are rewired to the per-env db (AppRecord.envDbVars).",
+      `SAMOHOST_ENV_DB_VARS=(${envDbVars.map(sq).join(" ")})`,
+      "",
+      ...REWIRE_DB_VARS_FN_LINES,
+      "",
+      // NO per-env role / password (issue #11 findings 2+3): the env keeps the
+      // SAME roles as production, so template-copied grants and RLS policies
+      // apply unchanged. Isolation between envs on the same host is accepted
+      // as weaker for the SOLO plan (documented in SPEC-DELTA §4).
       ...phaseBlock(
         "db",
-        "template-database copy (fallback until DBLab Engine is confirmed)",
+        "drop-if-exists + fresh template copy (re-run idempotent; a re-run RESETS env data — previews are disposable)",
         [
           // Exact-path sudo: grants are listed in the host-prep script.
-          'if sudo -u postgres /usr/bin/createdb --template="$SAMOHOST_TEMPLATE_DB" "$SAMOHOST_DB_NAME" \\',
-          '   && printf \'CREATE ROLE "%s" LOGIN PASSWORD \'"\'"\'%s\'"\'"\';\\nGRANT ALL ON DATABASE "%s" TO "%s";\\n\' \\',
-          '        "$SAMOHOST_DB_NAME" "$SAMOHOST_DB_PASSWORD" "$SAMOHOST_DB_NAME" "$SAMOHOST_DB_NAME" \\',
-          "      | sudo -u postgres /usr/bin/psql --quiet --file=- >/dev/null; ",
+          'if sudo -u postgres /usr/bin/dropdb --if-exists "$SAMOHOST_DB_NAME" \\',
+          '   && sudo -u postgres /usr/bin/createdb --template="$SAMOHOST_TEMPLATE_DB" "$SAMOHOST_DB_NAME"; ',
         ],
       ),
-      'SAMOHOST_DATABASE_URL="postgresql://${SAMOHOST_DB_NAME}:${SAMOHOST_DB_PASSWORD}@localhost:5432/${SAMOHOST_DB_NAME}"',
-      "",
     );
   }
 
@@ -226,7 +308,15 @@ export function buildEnvCreateScript(
     "   && chmod 600 \"$SAMOHOST_ENV_DIR/.env\" \\",
     '   && printf \'\\nPORT=%s\\n\' "$SAMOHOST_PORT" >> "$SAMOHOST_ENV_DIR/.env" \\',
   ];
-  if (t.dbBackend !== "none") {
+  if (t.dbBackend === "template") {
+    // Rewire every mapped var to the per-env db ON THE HOST (issue #11).
+    envfileBody.push('   && samohost_rewire_db_vars "$SAMOHOST_ENV_DIR/.env" \\');
+  } else if (t.dbBackend === "dblab") {
+    // TODO(issue #11 + issue #7): apply the envDbVars mapping to dblab clones
+    // too — rewrite host:port (and keep template creds, which exist in the
+    // physical clone) per `dblab clone status` instead of appending only
+    // DATABASE_URL. Entangled with #7's clone-status port-field fix; the
+    // dblab shape is left as-is until that lands.
     envfileBody.push(
       '   && printf \'DATABASE_URL=%s\\n\' "$SAMOHOST_DATABASE_URL" >> "$SAMOHOST_ENV_DIR/.env" \\',
     );
@@ -310,6 +400,8 @@ export function buildEnvDestroyScript(
     `# --- unit-stop ---`,
     marker("unit-stop", "start"),
     'sudo /usr/bin/systemctl disable --now "$SAMOHOST_UNIT_INSTANCE" 2>/dev/null || true',
+    "# Clear any residual 'failed' unit state (issue #11 finding 8; cosmetic).",
+    'sudo /usr/bin/systemctl reset-failed "$SAMOHOST_UNIT_INSTANCE" 2>/dev/null || true',
     marker("unit-stop", "ok"),
     "",
     `# --- vhost-remove ---`,
@@ -366,6 +458,8 @@ export function buildEnvDestroyScript(
 export function buildHostPrepScript(app: AppRecord, sshUser: string): string {
   const root = envsRoot(app);
   const unit = app.serviceUnit;
+  const envDbVars = app.envDbVars ?? [...DEFAULT_ENV_DB_VARS];
+  const defaultTemplateDb = `${app.name.replace(/-/g, "_")}_template`;
   return [
     "#!/usr/bin/env bash",
     `# samohost host-prep for app '${app.name}' — ONE-TIME, run by an operator with root.`,
@@ -373,8 +467,14 @@ export function buildHostPrepScript(app: AppRecord, sshUser: string): string {
     "set -euo pipefail",
     "",
     `# 1. Env template file: base env vars (secrets) for every preview env.`,
-    `#    Copy from the production env file and adjust; chmod 600.`,
-    `#    samohost env-create copies it on-host and appends PORT/DATABASE_URL.`,
+    `#    Copy from the production env file (MINUS PORT) and adjust; chmod 600.`,
+    `#    samohost env-create copies it on-host, appends PORT, and rewrites the`,
+    `#    DATABASE NAME of each var in the app's envDbVars to the per-env db`,
+    `#    (issue #11): this app's envDbVars = ${envDbVars.join(", ")}.`,
+    `#    Each of those vars MUST be present in the template, pointing at the`,
+    `#    production-shaped URL (scheme://user:pass@host[:port]/dbname[?params]).`,
+    `#    Expected template database for --db template: ${defaultTemplateDb}`,
+    `#    (override per env with --template-db).`,
     `install -m 600 -o ${sshUser} -g ${sshUser} /dev/null ${root}.template.env`,
     `echo 'EDIT ${root}.template.env: populate base env vars for previews' >&2`,
     "",
@@ -407,6 +507,7 @@ export function buildHostPrepScript(app: AppRecord, sshUser: string): string {
     `cat > /etc/sudoers.d/samohost-env-${app.name} <<SUDOERS`,
     `${sshUser} ALL=(root) NOPASSWD: /usr/bin/systemctl enable --now ${unit}@*.service`,
     `${sshUser} ALL=(root) NOPASSWD: /usr/bin/systemctl disable --now ${unit}@*.service`,
+    `${sshUser} ALL=(root) NOPASSWD: /usr/bin/systemctl reset-failed ${unit}@*.service`,
     `${sshUser} ALL=(root) NOPASSWD: /usr/bin/systemctl reload caddy`,
     `${sshUser} ALL=(root) NOPASSWD: /usr/bin/tee /etc/caddy/sites.d/*.caddy`,
     `${sshUser} ALL=(root) NOPASSWD: /usr/bin/rm -f /etc/caddy/sites.d/*.caddy`,
@@ -436,5 +537,6 @@ export function targetFromRecord(env: EnvRecord): EnvScriptTarget {
     vhost: env.vhost,
     dbBackend: env.dbBackend,
     ...(env.dbName !== undefined ? { dbName: env.dbName } : {}),
+    ...(env.templateDb !== undefined ? { templateDb: env.templateDb } : {}),
   };
 }
