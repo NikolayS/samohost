@@ -15,6 +15,20 @@ import { homedir } from "node:os";
 import { isIP } from "node:net";
 import type { Provider, VmRecord } from "../types.ts";
 import type { StateStore } from "../state/store.ts";
+import type { SpawnFn } from "../ssh/runner.ts";
+
+/**
+ * Effects needed to plant the verified host key at adopt time. Injected so the
+ * flow is unit-tested offline (no real ssh-keyscan / network).
+ *
+ *  - `spawn`: the same spawn abstraction the ssh runner uses; adopt invokes
+ *    `ssh-keyscan -p <port> <host>` through it.
+ *  - `knownHostsDir`: per-VM known_hosts directory the key line is written into.
+ */
+export interface AdoptHostKeyDeps {
+  spawn: SpawnFn;
+  knownHostsDir: string;
+}
 
 /** Normalized adopt input (produced by the CLI parser). */
 export interface AdoptInput {
@@ -70,13 +84,15 @@ export function validateAdopt(input: AdoptInput): string[] {
  * never read; a missing file is a warning, not an error), writes the record via
  * the store with a fresh uuid, and prints it (line or `--json`). No network I/O.
  */
-export function runAdopt(
+export async function runAdopt(
   input: AdoptInput,
   opts: { json: boolean },
   store: StateStore,
   out: (s: string) => void,
   err: (s: string) => void,
-): number {
+  hostKeyDeps?: AdoptHostKeyDeps,
+): Promise<number> {
+  void hostKeyDeps; // RED skeleton: not wired yet (see plantVerifiedHostKey)
   const errors = validateAdopt(input);
   if (errors.length > 0) {
     for (const e of errors) err(`error: ${e}`);
@@ -121,4 +137,20 @@ export function runAdopt(
     );
   }
   return 0;
+}
+
+/**
+ * Scan the host key over the network (via the injected spawn → `ssh-keyscan`),
+ * confirm it matches the out-of-band-verified `expectedFingerprint`, and on a
+ * match append the exact key line to the per-VM known_hosts file.
+ *
+ * RED skeleton: NOT YET IMPLEMENTED — this is the dead wiring #4 is about. The
+ * accompanying tests fail until the GREEN commit implements it.
+ */
+export async function plantVerifiedHostKey(
+  _vm: VmRecord,
+  _expectedFingerprint: string,
+  _deps: AdoptHostKeyDeps,
+): Promise<void> {
+  // intentionally does nothing yet
 }
