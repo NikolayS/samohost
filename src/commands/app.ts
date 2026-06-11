@@ -61,9 +61,17 @@ export interface AppDeployInput {
   /** Git ref to resolve to a SHA via `gh api`. Defaults to the app branch. */
   ref?: string;
   skipCiGate: boolean;
+  /** Bypass the known-bad-SHA guard (issue #2: a FALSE rollback brands a good
+   * SHA known-bad and wedges redeploys). Logged loudly when used. */
+  force?: boolean;
 }
 
 export interface AppStatusInput {
+  vm: string;
+  app: string;
+}
+
+export interface AppClearFailedInput {
   vm: string;
   app: string;
 }
@@ -209,6 +217,63 @@ export function runAppStatus(
 }
 
 // ---------------------------------------------------------------------------
+// clear-failed
+// ---------------------------------------------------------------------------
+
+/**
+ * Operator escape hatch (issue #2 downstream finding): a rollback — even a
+ * FALSE one caused by a probe defect — records the deployed SHA as failedSha,
+ * and the known-bad-SHA guard then refuses every redeploy of it. This clears
+ * the record so the SHA can be deployed again. Offline; touches only samohost
+ * state, never the VM.
+ */
+export function runAppClearFailed(
+  input: AppClearFailedInput,
+  opts: { json: boolean },
+  vmStore: StateStore,
+  appStore: AppStore,
+  out: (s: string) => void,
+  err: (s: string) => void,
+): number {
+  const vm = findVm(vmStore, input.vm);
+  if (vm === undefined) {
+    err(`error: VM not found in state: ${input.vm}`);
+    return 1;
+  }
+  const app = appStore.get(vm.id, input.app);
+  if (app === undefined) {
+    err(`error: app not found on vm ${vm.name}: ${input.app}`);
+    return 1;
+  }
+
+  if (app.failedSha === undefined) {
+    if (opts.json) {
+      out(JSON.stringify(app, null, 2));
+    } else {
+      out(
+        `app ${app.name} on vm ${vm.name} has no failedSha recorded — nothing to clear`,
+      );
+    }
+    return 0;
+  }
+
+  const cleared = app.failedSha;
+  const updated: AppRecord = { ...app };
+  delete updated.failedSha;
+  const saved = appStore.upsert(updated);
+
+  if (opts.json) {
+    out(JSON.stringify(saved, null, 2));
+  } else {
+    out(
+      `cleared failedSha ${cleared} for app ${app.name} on vm ${vm.name} — ` +
+        `the known-bad-SHA guard will no longer refuse deploys of this commit`,
+    );
+  }
+  return 0;
+}
+
+// ---------------------------------------------------------------------------
 // deploy
 // ---------------------------------------------------------------------------
 
@@ -287,13 +352,27 @@ export async function runAppDeploy(
   }
 
   // ---- known-bad-SHA guard (samohost state, not env file) ----------------
+  // Escape hatches (issue #2): a rollback caused by a deploy-tooling defect
+  // (e.g. a misconfigured RLS probe) brands a perfectly good SHA known-bad and
+  // wedges every redeploy. `app clear-failed` removes the record; --force
+  // bypasses the guard for one deploy, loudly.
   if (app.failedSha !== undefined && app.failedSha === sha) {
-    err(
-      `error: ${sha} matches this app's recorded failedSha — a prior deploy of ` +
-        `this exact SHA failed and was rolled back. Refusing to redeploy a ` +
-        `known-bad commit. Push a fix, or clear failedSha to force.`,
-    );
-    return 1;
+    if (input.force === true) {
+      err(
+        `WARNING: --force given — BYPASSING the known-bad-SHA guard: ${sha} ` +
+          `matches this app's recorded failedSha (a prior deploy of this exact ` +
+          `SHA failed and was rolled back). Proceeding anyway.`,
+      );
+    } else {
+      err(
+        `error: ${sha} matches this app's recorded failedSha — a prior deploy of ` +
+          `this exact SHA failed and was rolled back. Refusing to redeploy a ` +
+          `known-bad commit. Push a fix, run ` +
+          `\`samohost app clear-failed ${input.vm} ${input.app}\` if the failure ` +
+          `was a tooling defect (e.g. a false rollback), or rerun with --force.`,
+      );
+      return 1;
+    }
   }
 
   // ---- CI-green gate ------------------------------------------------------
