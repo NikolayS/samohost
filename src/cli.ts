@@ -14,6 +14,9 @@
 import { readFileSync } from "node:fs";
 import type { Provider, ProvisionSpec } from "./types.ts";
 import { runPreview } from "./commands/preview.ts";
+import { runAdopt, type AdoptInput } from "./commands/adopt.ts";
+import { runList } from "./commands/list.ts";
+import { StateStore } from "./state/store.ts";
 
 export const VERSION = "0.1.0";
 
@@ -22,6 +25,9 @@ const HELP = `samohost ${VERSION} — provision security-hardened Linux VMs
 Usage:
   samohost preview --provider <hetzner|aws> --region <r> --type <t> \\
       --ssh-pubkey <key|@file> [options]
+  samohost adopt --name <n> --ip <ip> --ssh-user <u> --ssh-key <path> \\
+      --host-key-fingerprint 'SHA256:...' [options]
+  samohost list [--json]
   samohost --help
   samohost --version
 
@@ -37,6 +43,22 @@ preview options:
   --trusted-ip <ip>          never-banned IP for fail2ban (repeatable)
   --timeout <seconds>        boot-ready timeout (default: 600)
   --json                     emit a JSON envelope instead of raw YAML
+
+adopt options (register an existing hardened VM, no network call):
+  --name <name>                       VM name (required)
+  --ip <ipv4|ipv6>                    reachable address (required)
+  --ssh-user <user>                   remote login user (required)
+  --ssh-key <path>                    private key path, ~ expanded (required)
+  --host-key-fingerprint <SHA256:..>  out-of-band verified host key (REQUIRED)
+  --ssh-port <port>                   SSH port (default: 22)
+  --provider <hetzner|aws>            optional provider tag
+  --provider-id <id>                  optional provider-native resource id
+  --region <region>                   optional region tag
+  --type <type>                       optional server type tag
+  --json                              print the raw record as JSON
+
+list options:
+  --json                     emit the raw records array instead of a table
 `;
 
 export interface ParsedPreview {
@@ -46,8 +68,21 @@ export interface ParsedPreview {
   json: boolean;
 }
 
+export interface ParsedAdopt {
+  kind: "adopt";
+  input: AdoptInput;
+  json: boolean;
+}
+
+export interface ParsedList {
+  kind: "list";
+  json: boolean;
+}
+
 export type ParsedCommand =
   | ParsedPreview
+  | ParsedAdopt
+  | ParsedList
   | { kind: "help" }
   | { kind: "version" };
 
@@ -77,6 +112,12 @@ export function parseArgs(
 
   if (first === "preview") {
     return parsePreview(argv.slice(1), resolvePubkeyFile);
+  }
+  if (first === "adopt") {
+    return parseAdopt(argv.slice(1));
+  }
+  if (first === "list") {
+    return parseList(argv.slice(1));
   }
 
   // A bare --help/--version may also appear after an (absent) command.
@@ -189,6 +230,124 @@ function parsePreview(
   return { kind: "preview", spec, sshPubkey, json };
 }
 
+function parseAdopt(args: string[]): ParsedAdopt {
+  let name: string | undefined;
+  let ip: string | undefined;
+  let sshPort = 22;
+  let sshUser: string | undefined;
+  let sshKey: string | undefined;
+  let hostKeyFingerprint: string | undefined;
+  let provider: string | undefined;
+  let providerId: string | undefined;
+  let region: string | undefined;
+  let type: string | undefined;
+  let json = false;
+
+  const next = (i: number, flag: string): string => {
+    const v = args[i + 1];
+    if (v === undefined) throw new UsageError(`missing value for ${flag}`);
+    return v;
+  };
+
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i]!;
+    switch (a) {
+      case "--name":
+        name = next(i, a);
+        i++;
+        break;
+      case "--ip":
+        ip = next(i, a);
+        i++;
+        break;
+      case "--ssh-port":
+        sshPort = parseIntFlag(next(i, a), a);
+        i++;
+        break;
+      case "--ssh-user":
+        sshUser = next(i, a);
+        i++;
+        break;
+      case "--ssh-key":
+        sshKey = next(i, a);
+        i++;
+        break;
+      case "--host-key-fingerprint":
+        hostKeyFingerprint = next(i, a);
+        i++;
+        break;
+      case "--provider":
+        provider = next(i, a);
+        i++;
+        break;
+      case "--provider-id":
+        providerId = next(i, a);
+        i++;
+        break;
+      case "--region":
+        region = next(i, a);
+        i++;
+        break;
+      case "--type":
+        type = next(i, a);
+        i++;
+        break;
+      case "--json":
+        json = true;
+        break;
+      default:
+        throw new UsageError(`unknown flag: ${a}`);
+    }
+  }
+
+  if (name === undefined) throw new UsageError("--name is required");
+  if (ip === undefined) throw new UsageError("--ip is required");
+  if (sshUser === undefined) throw new UsageError("--ssh-user is required");
+  if (sshKey === undefined) throw new UsageError("--ssh-key is required");
+  if (hostKeyFingerprint === undefined) {
+    throw new UsageError(
+      "--host-key-fingerprint is required: adopt pins the host key and all " +
+        "later SSH uses StrictHostKeyChecking=yes, so out-of-band verification " +
+        "of the fingerprint is mandatory (an unpinned host invites a MITM). " +
+        "Get it with: ssh-keyscan -p <port> <ip> | ssh-keygen -lf -",
+    );
+  }
+  let providerNarrowed: Provider | undefined;
+  if (provider !== undefined) {
+    if (!isProvider(provider)) {
+      throw new UsageError(`invalid --provider: ${provider} (hetzner|aws)`);
+    }
+    providerNarrowed = provider;
+  }
+
+  const input: AdoptInput = {
+    name,
+    ip,
+    sshPort,
+    sshUser,
+    sshKey,
+    hostKeyFingerprint,
+    ...(providerNarrowed !== undefined ? { provider: providerNarrowed } : {}),
+    ...(providerId !== undefined ? { providerId } : {}),
+    ...(region !== undefined ? { region } : {}),
+    ...(type !== undefined ? { type } : {}),
+  };
+  return { kind: "adopt", input, json };
+}
+
+function parseList(args: string[]): ParsedList {
+  let json = false;
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i]!;
+    if (a === "--json") {
+      json = true;
+    } else {
+      throw new UsageError(`unknown flag: ${a}`);
+    }
+  }
+  return { kind: "list", json };
+}
+
 function parseIntFlag(v: string, flag: string): number {
   const n = Number(v);
   if (!Number.isInteger(n)) {
@@ -232,6 +391,10 @@ export function main(
       return 0;
     case "preview":
       return runPreview(cmd.spec, cmd.sshPubkey, { json: cmd.json }, out, err);
+    case "adopt":
+      return runAdopt(cmd.input, { json: cmd.json }, new StateStore(), out, err);
+    case "list":
+      return runList({ json: cmd.json }, new StateStore(), out, err);
   }
 }
 
