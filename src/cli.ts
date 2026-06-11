@@ -123,7 +123,8 @@ app register options (write an AppRecord; offline, no network):
   --build-cmd <cmd>          build command (default: npm run build)
   --migrate-cmd <cmd>        optional migration command
   --seed-cmd <cmd>           optional idempotent seed command
-  --env-file <path>          remote env file path (NEVER read/written by samohost)
+  --env-file <path>          remote env file; sourced (read-only) by the deploy
+                             script before install — NEVER written by samohost
   --assert-rls               require app to connect as a non-superuser (RLS gate)
   --json                     print the raw record as JSON
 

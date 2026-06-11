@@ -15,6 +15,9 @@ SAMOHOST_HEALTH_URL='http://localhost:3000/api/version'
 
 cd "$SAMOHOST_APP_DIR"
 
+# --- env: source the app env file (READ-ONLY; never written, never echoed) ---
+set -a; . '/opt/field-record/staging.env'; set +a
+
 # --- fetch: bring the target SHA into the local object store ---
 echo "<<<SAMOHOST_PHASE:fetch:start>>>"
 if git fetch origin --quiet \

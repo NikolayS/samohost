@@ -134,8 +134,10 @@ export interface AppAssertions {
  * Declarative spec for a deployable app (SPEC-DELTA §3 "app module"). This is
  * the generalization of field-record's deploy.sh inputs into typed config.
  *
- * NOTE on secrets: `envFile` is a path to a remote env file. samohost NEVER
- * reads or writes it (divergence from deploy.sh, which rotated APP_DATABASE_URL
+ * NOTE on secrets: `envFile` is a path to a remote env file. The deploy script
+ * SOURCES it read-only before install (issue #2: pushed scripts inherit nothing
+ * from the service environment, so migrate/seed/probes need it), but samohost
+ * NEVER writes it (divergence from deploy.sh, which rotated APP_DATABASE_URL
  * into staging.env). Deployed-SHA bookkeeping lives in samohost state
  * ({@link AppRecord}), not in any remote env file.
  */
@@ -158,7 +160,8 @@ export interface AppSpec {
   healthUrl: string;
   /** systemd unit name (e.g. "field-record"). Restarted via full-path sudo. */
   serviceUnit: string;
-  /** Remote env file path. NEVER read/written by samohost (see interface note). */
+  /** Remote env file path. Sourced read-only by the deploy script before
+   * install; NEVER written by samohost (see interface note). */
   envFile?: string;
   /** Optional pluggable post-deploy assertions. */
   assertions?: AppAssertions;

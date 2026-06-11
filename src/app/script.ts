@@ -24,7 +24,11 @@
  *  2. NO env-file bookkeeping. deploy.sh writes DEPLOYED_SHA / DEPLOY_FAILED_SHA
  *     (and rotated APP_DATABASE_URL) INTO the remote staging.env. samohost keeps
  *     all that in its own state (AppRecord.deployedSha / .failedSha); this
- *     script NEVER reads or writes the app's env file, and NEVER echoes secrets.
+ *     script NEVER writes the app's env file, and NEVER echoes secrets. It DOES
+ *     source the registered envFile (read-only) before install — issue #2: a
+ *     pushed script runs over `ssh ... bash -s` and inherits NOTHING from the
+ *     systemd unit's environment, so without sourcing, migrate/seed/RLS probes
+ *     ran with no app env at all (migrate died on "DATABASE_URL ... required").
  *     The known-bad-SHA guard is enforced caller-side (samohost state), not in
  *     this script.
  *
@@ -119,6 +123,21 @@ export function buildDeployScript(app: AppRecord, target: DeployTarget): string 
     'cd "$SAMOHOST_APP_DIR"',
     "",
   );
+
+  // ----- env (optional) ------------------------------------------------------
+  // Source the registered env file READ-ONLY, exported, BEFORE install: a
+  // pushed script inherits nothing from the service environment, and install/
+  // build/migrate/seed/probes must all see the same app env (NODE_ENV,
+  // DATABASE_URL, ...). Issue #2 bug 1: without this, migrate died with
+  // "DATABASE_URL environment variable is required". The file is never
+  // written and its values are never echoed.
+  if (app.envFile !== undefined) {
+    push(
+      "# --- env: source the app env file (READ-ONLY; never written, never echoed) ---",
+      `set -a; . ${sq(app.envFile)}; set +a`,
+      "",
+    );
+  }
 
   // ----- fetch -------------------------------------------------------------
   // git fetch, then verify the exact target SHA exists in the object store.
