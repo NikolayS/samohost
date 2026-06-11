@@ -1,0 +1,94 @@
+#cloud-config
+package_update: true
+package_upgrade: true
+packages:
+  - apparmor
+  - apparmor-utils
+  - fail2ban
+  - nftables
+  - ufw
+  - unattended-upgrades
+users:
+  - default
+  - name: samo
+    groups: sudo
+    shell: /bin/bash
+    sudo: ALL=(ALL) NOPASSWD:ALL
+    lock_passwd: true
+    ssh_authorized_keys:
+      - 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAISAMOHOSTtestkeyFIXEDvalueFORsnapshot01 samo@fixture'
+write_files:
+  - path: /etc/apt/apt.conf.d/20auto-upgrades
+    permissions: '0644'
+    content: |
+      # Managed by samohost — enable automatic security updates
+      APT::Periodic::Update-Package-Lists "1";
+      APT::Periodic::Unattended-Upgrade "1";
+  - path: /etc/fail2ban/jail.local
+    permissions: '0644'
+    content: |
+      # Managed by samohost — fail2ban jail
+      [DEFAULT]
+      backend = systemd
+      banaction = nftables-multiport
+      banaction_allports = nftables-allports
+      ignoreip = 127.0.0.1/8 ::1 203.0.113.7 198.51.100.4
+      bantime = 1h
+      findtime = 10m
+      maxretry = 5
+
+      [sshd]
+      enabled = true
+      port = 2223
+      filter = sshd
+  - path: /etc/ssh/sshd_config.d/10-samohost.conf
+    permissions: '0644'
+    content: |
+      # Managed by samohost — hardening baseline
+      Port 2223
+      PasswordAuthentication no
+      PermitRootLogin no
+      KbdInteractiveAuthentication no
+      ChallengeResponseAuthentication no
+      MaxStartups 100:30:200
+      X11Forwarding no
+      AllowUsers samo
+  - path: /etc/sysctl.d/99-samohost.conf
+    permissions: '0644'
+    content: |
+      # Managed by samohost — sysctl network hardening
+      net.ipv4.conf.all.rp_filter = 1
+      net.ipv4.conf.default.rp_filter = 1
+      net.ipv4.conf.all.accept_redirects = 0
+      net.ipv4.conf.default.accept_redirects = 0
+      net.ipv6.conf.all.accept_redirects = 0
+      net.ipv6.conf.default.accept_redirects = 0
+      net.ipv4.conf.all.send_redirects = 0
+      net.ipv4.conf.default.send_redirects = 0
+      net.ipv4.conf.all.accept_source_route = 0
+      net.ipv6.conf.all.accept_source_route = 0
+      net.ipv4.tcp_syncookies = 1
+      net.ipv4.icmp_echo_ignore_broadcasts = 1
+  - path: /etc/systemd/system/ssh.socket.d/port.conf
+    permissions: '0644'
+    content: |
+      # Managed by samohost — Ubuntu 24.04 socket activation override
+      [Socket]
+      ListenStream=
+      ListenStream=0.0.0.0:2223
+runcmd:
+  - systemctl daemon-reload
+  - systemctl restart ssh.socket
+  - systemctl restart ssh
+  - ufw --force reset
+  - ufw default deny incoming
+  - ufw default allow outgoing
+  - ufw allow 2223/tcp
+  - ufw --force enable
+  - systemctl enable --now fail2ban
+  - sysctl --system
+  - systemctl enable --now unattended-upgrades
+  - systemctl enable --now apparmor
+  - 'aa-enforce /etc/apparmor.d/* || true'
+  - mkdir -p /var/lib/samohost
+  - 'echo 97e8a741 > /var/lib/samohost/provision-complete'
