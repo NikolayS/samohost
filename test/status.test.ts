@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { parseArgs } from "../src/cli.ts";
 import { runStatus, type RemoteRunner } from "../src/commands/status.ts";
+import { hardeningModule } from "../src/cloudinit/hardening.ts";
 import { StateStore } from "../src/state/store.ts";
 import type { VmRecord } from "../src/types.ts";
 
@@ -107,35 +108,33 @@ describe("runStatus", () => {
     expect(c.e).toContain("not found");
   });
 
-  test("--audit runs every hardening probe and returns PASS rows", async () => {
+  /** Canned per-check bodies that satisfy every hardening expect. */
+  const PASS_BODIES: Record<string, string> = {
+    "ssh-port": "port 2223",
+    "ufw-active": "Status: active\nDefault: deny (incoming)",
+    "fail2ban-active": "active",
+    "sysctl-rpfilter": "1",
+    "sysctl-syncookies": "1",
+    "sysctl-redirects": "0",
+    "apparmor-enforced": "12 profiles are in enforce mode.",
+  };
+
+  function delimitedOutput(body: (id: string) => string): string {
+    return hardeningModule.auditChecks
+      .map((ch) => `<<<SAMOHOST_AUDIT:${ch.id}>>>\n${body(ch.id)}`)
+      .join("\n");
+  }
+
+  test("--audit batches ALL probes into a SINGLE connection and returns PASS rows", async () => {
     store.upsert(rec());
     const seen: string[] = [];
     const remote: RemoteRunner = (_vm, command) => {
       seen.push(command);
-      if (command.includes("sshd -T")) {
-        return Promise.resolve({ code: 0, stdout: "port 2223\n", stderr: "" });
-      }
-      if (command.includes("ufw status")) {
-        return Promise.resolve({
-          code: 0,
-          stdout: "Status: active\nDefault: deny (incoming)\n",
-          stderr: "",
-        });
-      }
-      if (command.includes("systemctl is-active fail2ban")) {
-        return Promise.resolve({ code: 0, stdout: "active\n", stderr: "" });
-      }
-      if (command.includes("accept_redirects")) {
-        return Promise.resolve({ code: 0, stdout: "0\n", stderr: "" });
-      }
-      if (command.includes("aa-status")) {
-        return Promise.resolve({
-          code: 0,
-          stdout: "12 profiles are in enforce mode.\n",
-          stderr: "",
-        });
-      }
-      return Promise.resolve({ code: 0, stdout: "1\n", stderr: "" });
+      return Promise.resolve({
+        code: 0,
+        stdout: delimitedOutput((id) => PASS_BODIES[id] ?? "1"),
+        stderr: "",
+      });
     };
 
     const c = capture();
@@ -148,15 +147,25 @@ describe("runStatus", () => {
       remote,
     );
     expect(code).toBe(0);
-    expect(seen.length).toBeGreaterThan(3);
+    // The whole point: ONE ssh connection regardless of check count.
+    // Per-check connections are a rapid-SYN burst that xt_recent bans.
+    expect(seen.length).toBe(1);
+    for (const ch of hardeningModule.auditChecks) {
+      expect(seen[0]).toContain(ch.probeCommand);
+    }
     expect(c.o).toContain("audit:");
     expect(c.o).toContain("PASS");
+    expect(c.o).not.toContain("FAIL");
   });
 
   test("--audit exits 1 when a probe does not match", async () => {
     store.upsert(rec());
     const remote: RemoteRunner = () =>
-      Promise.resolve({ code: 0, stdout: "inactive\n", stderr: "" });
+      Promise.resolve({
+        code: 0,
+        stdout: delimitedOutput(() => "inactive"),
+        stderr: "",
+      });
     const c = capture();
     const code = await runStatus(
       { target: "samo-we-field-record", audit: true },

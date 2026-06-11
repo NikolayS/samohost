@@ -8,6 +8,7 @@
  */
 
 import { spawnSync } from "node:child_process";
+import { buildAuditScript, parseAuditOutput } from "../audit/batch.ts";
 import { hardeningModule } from "../cloudinit/hardening.ts";
 import {
   defaultKnownHostsDir,
@@ -74,19 +75,25 @@ async function runAudit(
   vm: VmRecord,
   remote: RemoteRunner,
 ): Promise<AuditResult[]> {
-  const results: AuditResult[] = [];
-  for (const check of hardeningModule.auditChecks) {
-    const res = await remote(vm, check.probeCommand);
-    results.push({
+  // ONE connection for the whole audit — per-check connections are a rapid-SYN
+  // burst that kernel-level SSH rate limiting (xt_recent) treats as an attack.
+  const checks = hardeningModule.auditChecks;
+  const res = await remote(vm, buildAuditScript(checks));
+  const sections = parseAuditOutput(res.stdout, checks);
+  return checks.map((check) => {
+    const observed = sections.get(check.id);
+    return {
       id: check.id,
       description: check.description,
-      ok: res.code === 0 && matches(check, res.stdout),
-      stdout: res.stdout,
-      stderr: res.stderr,
-      exitCode: res.code,
-    });
-  }
-  return results;
+      ok: observed !== undefined && matches(check, observed),
+      stdout: observed ?? "",
+      stderr:
+        observed === undefined
+          ? `audit section missing from remote output (ssh stderr: ${res.stderr.slice(0, 200)})`
+          : "",
+      exitCode: observed === undefined ? 255 : 0,
+    };
+  });
 }
 
 function defaultRemoteRunner(): RemoteRunner {

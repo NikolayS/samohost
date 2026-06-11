@@ -311,6 +311,10 @@ export async function runRemote(
   ensureKnownHosts(vm, deps.knownHostsDir);
 
   const controlDir = deps.controlDir ?? join(dirname(deps.knownHostsDir), "cm");
+  // ControlMaster silently degrades to one-TCP-connection-per-command when the
+  // socket dir is missing — and rapid separate connections are what kernel SSH
+  // rate limiters ban. Make multiplexing actually work.
+  mkdirSync(controlDir, { recursive: true, mode: 0o700 });
   const args = buildSshArgs(vm, command, {
     knownHostsDir: deps.knownHostsDir,
     controlDir,
