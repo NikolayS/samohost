@@ -695,3 +695,75 @@ describe("issue #7 (closing the PR #12 TODO): dblab envDbVars host:port mapping"
     expect(r.stderr).toContain("DATABASE_URL");
   });
 });
+
+describe("issue #7: clone globals sync (logical retrieval drops cluster roles/grants/policies)", () => {
+  // Live-verified 2026-06-12 on samo-we-field-record: the engine's retrieval
+  // mode is LOGICAL (pg_dump/pg_restore of the database only) — the restored
+  // clone had NO prod roles, NO grants, and ZERO of prod's 14 RLS policies
+  // (they were silently dropped at restore time because the roles they
+  // reference did not exist in the clone's cluster). Rewiring host:port at a
+  // clone in that state hands the app a database where its own credentials
+  // and RLS contract are broken. The db phase therefore replays the globals
+  // from the prod catalogs ON-HOST and verifies parity before the env file
+  // is composed.
+
+  const dblabScript = () => buildEnvCreateScript(app(), target({ dbBackend: "dblab" }));
+
+  test("db phase replays roles (with password hashes), ownership, grants, and policies from prod catalogs", () => {
+    const s = dblabScript();
+    expect(s).toContain("samohost_sync_clone_globals() {");
+    // Roles with their scram hashes come from pg_authid via the exact-path
+    // sudo psql grant (host-prep) — superuser-only catalog, host-side only.
+    expect(s).toContain("sudo -u postgres /usr/bin/psql");
+    expect(s).toContain("pg_authid");
+    expect(s).toContain("rolpassword");
+    expect(s).toContain("BYPASSRLS");
+    // Ownership + grants + policies are regenerated from prod's catalogs.
+    expect(s).toContain("OWNER TO");
+    expect(s).toContain("table_privileges");
+    expect(s).toContain("pg_policies");
+    expect(s).toContain("CREATE POLICY");
+    expect(bashSyntaxOk(s)).toBe(true);
+  });
+
+  test("sync runs INSIDE the db phase, after port extraction, before envfile", () => {
+    const s = dblabScript();
+    const dbStart = s.indexOf("<<<SAMOHOST_PHASE:db:start>>>");
+    const sync = s.indexOf("samohost_sync_clone_globals\n");
+    const envfileStart = s.indexOf("<<<SAMOHOST_PHASE:envfile:start>>>");
+    expect(sync).toBeGreaterThan(dbStart);
+    expect(sync).toBeLessThan(envfileStart);
+    // The phase condition includes the sync (a failed sync fails the phase).
+    expect(s).toMatch(/&& samohost_sync_clone_globals/);
+  });
+
+  test("verifies parity: clone policy count must reach prod's before the phase passes", () => {
+    const s = dblabScript();
+    expect(s).toContain("FROM pg_policies");
+    // A parity comparison gates success (prod count vs clone count).
+    expect(s).toMatch(/-ge "\$\{?prod_policies\}?"|-ge "\$prod_policies"/);
+    expect(s).toContain("policy");
+  });
+
+  test("password hashes never reach stdout/stderr: apply output is suppressed", () => {
+    const s = dblabScript();
+    const fn = extractFn(s, "samohost_sync_clone_globals");
+    // Every psql APPLY into the clone silences both streams (error text can
+    // quote failing statements, which may contain role password hashes).
+    for (const line of fn.split("\n")) {
+      if (line.includes("PGPASSWORD") && line.includes("psql")) {
+        expect(line).toContain(">/dev/null 2>&1");
+      }
+    }
+    // And nothing echoes generated DDL.
+    expect(fn).not.toMatch(/echo .*rolpassword/i);
+  });
+
+  test("non-dblab backends carry NO globals sync", () => {
+    for (const db of ["template", "none"] as const) {
+      expect(buildEnvCreateScript(app(), target({ dbBackend: db }))).not.toContain(
+        "samohost_sync_clone_globals",
+      );
+    }
+  });
+});
