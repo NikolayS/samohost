@@ -129,6 +129,24 @@ function resolve(
 }
 
 /**
+ * A preview domain must be a well-formed dotted DNS name (e.g. `samo.cat`):
+ * at least two labels, each label [a-z0-9] with internal hyphens allowed, no
+ * leading/trailing hyphen or dot, total length sane. This is deliberately
+ * strict — anything that fails here (incl. the value `undefined`, "", or a
+ * single label) would otherwise render an unservable vhost.
+ */
+export function isValidPreviewDomain(domain: unknown): domain is string {
+  if (typeof domain !== "string" || domain.length === 0 || domain.length > 253) {
+    return false;
+  }
+  const label = "[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?";
+  // ≥2 labels, lowercase; the final label (TLD) must be alphabetic.
+  return new RegExp(
+    `^${label}(?:\\.${label})*\\.[a-z]{2,63}$`,
+  ).test(domain.toLowerCase()) && domain === domain.toLowerCase();
+}
+
+/**
  * Derive the script target for a NEW env of (app, branch): sanitized name
  * (collision-aware against existing envs), lowest free port from the pool,
  * vhost under the preview domain. Pure given the existing-env snapshot.
@@ -142,6 +160,19 @@ export function deriveTarget(
   pool: PortPool = DEFAULT_POOL,
   templateDb?: string,
 ): EnvScriptTarget | { error: string } {
+  // Fail closed on a bad preview domain. The TS type says `string`, but JS
+  // callers (e.g. an ad-hoc driver reading a nonexistent `app.previewDomain`
+  // field) can pass `undefined`, which a template literal turns into the
+  // literal vhost `<name>.undefined`. That bogus vhost was written to a live
+  // Caddy snippet and broke every *.samo.cat preview (field-record-1#117 →
+  // HTTP 525). Validate here so an invalid domain can never reach a vhost.
+  if (!isValidPreviewDomain(previewDomain)) {
+    return {
+      error:
+        `invalid preview domain ${JSON.stringify(previewDomain)} — expected a ` +
+        `dotted DNS name like "samo.cat" (set --preview-domain or fix the caller)`,
+    };
+  }
   const names = new Map(existingOnVm.map((e) => [e.name, e.branch]));
   const name = envName(app.name, branch, names);
   const port = allocatePort(

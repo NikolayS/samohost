@@ -190,6 +190,35 @@ describe("deriveTarget", () => {
     if ("error" in d) throw new Error(d.error);
     expect(d.templateDb).toBeUndefined();
   });
+
+  // Regression: a JS caller (e.g. an ad-hoc driver reading a nonexistent
+  // `app.previewDomain` field) once passed the value `undefined` straight
+  // through, rendering the literal vhost `field-record-main.undefined` into a
+  // live Caddy snippet (field-record-1#117, *.samo.cat → HTTP 525). deriveTarget
+  // must NEVER emit a vhost containing an invalid preview domain — it fails
+  // closed with an error instead.
+  test("rejects an undefined preview domain (never emits .undefined vhost)", () => {
+    // Simulate the JS-side `undefined` that bypasses the TS string type.
+    const t = deriveTarget(
+      appRec(), "main", "dblab", undefined as unknown as string, [],
+    );
+    expect("error" in t).toBe(true);
+    if ("error" in t) expect(t.error).toMatch(/preview domain/i);
+  });
+
+  test("rejects an empty / malformed preview domain", () => {
+    for (const bad of ["", "undefined", "no-dot", "-bad.samo.cat", ".samo.cat"]) {
+      const t = deriveTarget(appRec(), "main", "dblab", bad, []);
+      expect("error" in t).toBe(true);
+    }
+  });
+
+  test("accepts a well-formed preview domain", () => {
+    const t = deriveTarget(appRec(), "main", "dblab", "samo.cat", []);
+    if ("error" in t) throw new Error(t.error);
+    expect(t.vhost).toBe("field-record-1-main.samo.cat");
+    expect(t.vhost).not.toContain("undefined");
+  });
 });
 
 // ---------------------------------------------------------------------------
