@@ -740,8 +740,14 @@ describe("issue #7: clone globals sync (logical retrieval drops cluster roles/gr
   test("verifies parity: clone policy count must reach prod's before the phase passes", () => {
     const s = dblabScript();
     expect(s).toContain("FROM pg_policies");
-    // A parity comparison gates success (prod count vs clone count).
-    expect(s).toMatch(/-ge "\$\{?prod_policies\}?"|-ge "\$prod_policies"/);
+    // A parity comparison gates success (prod count vs clone count) — now via
+    // the fail-closed helper (PR #22 review finding 1) instead of the old
+    // inline `clone -ge $prod_policies` that degraded to `-ge 0` on an empty
+    // prod capture.
+    const fn = extractFn(s, "samohost_sync_clone_globals");
+    expect(fn).toContain('samohost_parity_check "RLS policies"');
+    const parity = extractFn(s, "samohost_parity_check");
+    expect(parity).toMatch(/-lt "\$prod"/);
     expect(s).toContain("policy");
   });
 
@@ -1172,7 +1178,7 @@ describe("PR #22 review finding 3 (MINOR): partial grant/ownership replay must b
     const fn = extractFn(s, "samohost_sync_clone_globals");
     expect(fn).toContain("ON_ERROR_STOP");
     for (const line of fn.split("\n")) {
-      if (line.includes("ON_ERROR_STOP")) {
+      if (line.includes("ON_ERROR_STOP") && !line.trim().startsWith("#")) {
         expect(line).toContain(">/dev/null 2>&1");
         expect(line).not.toContain("|| true");
       }

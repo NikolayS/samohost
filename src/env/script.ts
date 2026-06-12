@@ -202,6 +202,98 @@ const REWIRE_DB_HOSTPORT_FN_LINES: string[] = [
 ];
 
 /**
+ * Bash function: print the role component of every mapped envDbVars URL in
+ * the operator template, one per line (PR #22 review finding 2). These are,
+ * by definition, the roles the app signs in as — the seed of the scoped
+ * app-role set the clone role replay is limited to. Values are parsed
+ * ON THE HOST and only the ROLE NAME (never password/host/db) is printed.
+ * (Closing brace at column 0 — tests extract and execute this function.)
+ */
+const APP_URL_ROLES_FN_LINES: string[] = [
+  "samohost_app_url_roles() {",
+  "  local var line",
+  '  for var in "${SAMOHOST_ENV_DB_VARS[@]}"; do',
+  '    line="$(grep -E "^${var}=" "$SAMOHOST_ENV_TEMPLATE" | tail -n 1)"',
+  '    [[ -n "$line" ]] || continue',
+  "    printf '%s\\n' \"${line#*=}\" \\",
+  "      | sed -nE 's|^\"?[A-Za-z0-9+]+://([^:/@?\"]+)(:[^@/]*)?@.*|\\1|p'",
+  "  done",
+  "}",
+];
+
+/**
+ * Bash function: turn prod pg_authid rows (`rolname|rolcanlogin|rolpassword`,
+ * the exact `psql -At` shape, dry-run-verified on prod 2026-06-12) into role
+ * DDL for the clone — but ONLY for roles listed in the scoped app-role file
+ * ($1), and ALWAYS stripped of every cluster superpower (PR #22 review
+ * finding 2: the old replay copied prod's SUPERUSER/BYPASSRLS/CREATEROLE
+ * bits into the preview clone for every non-builtin role — a privilege
+ * escalation surface). A preview app role needs LOGIN + its grants + its
+ * RLS-subject status, never cluster superpowers; prod's table-OWNER role
+ * keeps owner-bypass RLS semantics without BYPASSRLS. Password hashes are
+ * kept (sign-in with prod credentials must work) for the scoped roles only;
+ * they flow stdin->stdout only and are never echoed in messages. The
+ * CREATE-then-ALTER split makes the strip authoritative even on engines
+ * whose retrieval already carried the role (CREATE fails as a duplicate,
+ * ALTER still applies). (Closing brace at column 0 — tests execute this.)
+ */
+const EMIT_SCOPED_ROLE_SQL_FN_LINES: string[] = [
+  "samohost_emit_scoped_role_sql() {",
+  '  local scoped_file="$1" rolname canlogin hash login',
+  "  while IFS='|' read -r rolname canlogin hash; do",
+  '    [[ -n "$rolname" ]] || continue',
+  '    grep -qxF "$rolname" "$scoped_file" || continue',
+  '    if ! [[ "$rolname" =~ ^[a-z_][a-z0-9_]*$ ]]; then',
+  '      echo "samohost: clone role replay: skipping a role whose name is not a plain identifier" >&2',
+  "      continue",
+  "    fi",
+  "    if [[ \"$hash\" == *\"'\"* || \"$hash\" == *\"\\\\\"* ]]; then",
+  '      echo "samohost: clone role replay: skipping role ${rolname} — its hash contains quoting metacharacters" >&2',
+  "      continue",
+  "    fi",
+  '    if [[ "$canlogin" == "t" ]]; then login=" LOGIN"; else login=" NOLOGIN"; fi',
+  "    printf 'CREATE ROLE \"%s\";\\n' \"$rolname\"",
+  '    if [[ -n "$hash" ]]; then',
+  "      printf 'ALTER ROLE \"%s\" NOSUPERUSER NOBYPASSRLS NOCREATEROLE NOCREATEDB NOREPLICATION%s PASSWORD \\047%s\\047;\\n' \"$rolname\" \"$login\" \"$hash\"",
+  "    else",
+  "      printf 'ALTER ROLE \"%s\" NOSUPERUSER NOBYPASSRLS NOCREATEROLE NOCREATEDB NOREPLICATION%s;\\n' \"$rolname\" \"$login\"",
+  "    fi",
+  "  done",
+  "}",
+];
+
+/**
+ * Bash function: numeric parity gate between prod and the clone for one
+ * counting query (PR #22 review finding 1). FAILS CLOSED: both counts must
+ * capture successfully AND be numeric before any comparison happens — the
+ * old inline gate let an empty prod count degrade `clone -ge ""` into
+ * `-ge 0`, serving a clone with missing RLS (the exact #11 bypass class the
+ * gate exists to stop). Count reads suppress stderr (psql error text can
+ * quote SQL); the failure message reports only validated numerics, never
+ * raw query output. (Closing brace at column 0 — tests execute this.)
+ */
+const PARITY_CHECK_FN_LINES: string[] = [
+  "samohost_parity_check() {",
+  '  local what="$1" sql="$2" prod clone',
+  '  prod="$(sudo -u postgres /usr/bin/psql -At -d "$prod_db" -c "$sql" 2>/dev/null)" || prod=""',
+  '  if ! [[ "$prod" =~ ^[0-9]+$ ]]; then',
+  '    echo "samohost: clone globals parity gate (${what}): could not read a numeric PRODUCTION count — failing CLOSED (an unverifiable clone is never served)" >&2',
+  "    return 1",
+  "  fi",
+  '  clone="$(PGPASSWORD="$SAMOHOST_DB_PASSWORD" psql -h 127.0.0.1 -p "$SAMOHOST_DB_PORT" -U samohost_env -d "$prod_db" -At -c "$sql" 2>/dev/null)" || clone=""',
+  '  if ! [[ "$clone" =~ ^[0-9]+$ ]]; then',
+  '    echo "samohost: clone globals parity gate (${what}): could not read a numeric CLONE count — failing CLOSED" >&2',
+  "    return 1",
+  "  fi",
+  '  if [[ "$prod" -gt 0 && "$clone" -eq 0 ]] || [[ "$clone" -lt "$prod" ]]; then',
+  '    echo "samohost: clone globals parity gate (${what}) FAILED (prod=${prod}, clone=${clone}) — the clone would not honor the app\'s RLS/credentials contract" >&2',
+  "    return 1",
+  "  fi",
+  "  return 0",
+  "}",
+];
+
+/**
  * Bash function: replay prod's cluster globals into the clone (issue #7,
  * live-verified gap). The engine's LOGICAL retrieval mode (pg_dump/pg_restore
  * of the database only) does NOT carry cluster globals: a fresh clone held
@@ -210,49 +302,78 @@ const REWIRE_DB_HOSTPORT_FN_LINES: string[] = [
  * and ALL RLS policies too. Rewiring envDbVars at a clone in that state hands
  * the app a database its own credentials cannot use.
  *
- * So the db phase regenerates, from the PROD catalogs, and applies to the
- * clone: (1) roles with attributes + password hashes (pg_authid via the
- * exact-path sudo psql grant — hashes move host-side only, both psql ends
- * silenced because error text can quote failing DDL), (2) table ownership,
- * (3) table grants, (4) RLS policies (deparsed from pg_policies). Then it
- * GATES on parity: the clone must reach prod's policy count, or the phase
- * fails. On engines whose retrieval does carry globals (physical mode) the
- * replay degrades to duplicate-DDL errors (ignored) and parity already holds.
+ * Post-review (PR #22) shape:
+ *   0. Derive prod_db from envDbVars[0] and VALIDATE it (finding 4); a
+ *      mis-parse can capture credentials, so the derived value is never
+ *      echoed. Then derive the SCOPED app-role set: envDbVars URL roles +
+ *      every grantee/owner referenced by the grant/policy replay (computed
+ *      from the prod catalogs; dry-run-verified read-only on prod).
+ *   1. Roles: scoped to that set, every cluster superpower stripped, hashes
+ *      kept (finding 2) — host-side only, both psql ends silenced.
+ *   2./3. Table ownership + grants: idempotent DDL applied under
+ *      ON_ERROR_STOP; failures are COUNTED via exit codes (never echoed —
+ *      error text can quote DDL) and fail the phase (finding 3).
+ *   4. RLS policies: duplicates fail on engines whose retrieval carries
+ *      policies, so errors stay ignored — the parity gate is the authority.
+ *   5./6. Fail-closed gates: apply-failure count, then policy/grant/ownership
+ *      parity via samohost_parity_check (finding 1).
  * (Closing brace at column 0 — tests extract this function.)
  */
 const SYNC_CLONE_GLOBALS_FN_LINES: string[] = [
   "samohost_sync_clone_globals() {",
-  "  local prod_db prod_policies clone_policies",
+  "  local prod_db scoped_roles apply_failures=0",
   "  # The production database the operator template points at (path component",
   "  # of the first mapped var) — the same database name exists in the clone.",
   '  prod_db="$(grep -E "^${SAMOHOST_ENV_DB_VARS[0]}=" "$SAMOHOST_ENV_TEMPLATE" | tail -n 1 \\',
-  "    | sed -E 's|^[^=]*=\"?[A-Za-z0-9+]+://[^/]*/||; s|[?\"].*$||')\"",
-  '  if [[ -z "$prod_db" ]]; then',
-  '    echo "samohost: cannot derive the production database name from ${SAMOHOST_ENV_DB_VARS[0]} in the env template" >&2',
+  "    | sed -nE 's|^[^=]*=\"?[A-Za-z0-9+]+://[^/]+/([^?\"]*).*|\\1|p')\"",
+  '  if ! [[ "$prod_db" =~ ^[A-Za-z0-9_][A-Za-z0-9_-]*$ ]]; then',
+  '    echo "samohost: cannot derive a valid production database name from ${SAMOHOST_ENV_DB_VARS[0]} in the env template (no plain database path component; the derived value is never echoed because a mis-parse can capture credentials) — refusing the globals sync" >&2',
   "    return 1",
   "  fi",
-  "  # 1. Roles: attributes + password hashes (superuser-only pg_authid read).",
-  '  sudo -u postgres /usr/bin/psql -At -d "$prod_db" -c "SELECT \'CREATE ROLE \'||quote_ident(rolname)||CASE WHEN rolsuper THEN \' SUPERUSER\' ELSE \'\' END||CASE WHEN rolcreatedb THEN \' CREATEDB\' ELSE \'\' END||CASE WHEN rolcreaterole THEN \' CREATEROLE\' ELSE \'\' END||CASE WHEN rolbypassrls THEN \' BYPASSRLS\' ELSE \'\' END||CASE WHEN rolcanlogin THEN \' LOGIN\' ELSE \'\' END||COALESCE(\' PASSWORD \'||quote_literal(rolpassword),\'\')||\';\' FROM pg_authid WHERE rolname NOT LIKE \'pg\\_%\' AND rolname <> \'postgres\'" \\',
+  "  # 0. The app-role set this env actually needs: the role components of the",
+  "  #    mapped envDbVars URLs plus every grantee/owner the grant+policy",
+  "  #    replay below references. Anything else (ops/CI/dump roles, prod",
+  "  #    superusers) stays OUT of the preview clone.",
+  '  scoped_roles="$(mktemp)"',
+  "  {",
+  "    samohost_app_url_roles",
+  '    sudo -u postgres /usr/bin/psql -At -d "$prod_db" -c "SELECT DISTINCT r FROM (SELECT unnest(roles)::text AS r FROM pg_policies UNION SELECT grantee FROM information_schema.table_privileges WHERE table_schema NOT IN (\'pg_catalog\',\'information_schema\') UNION SELECT tableowner FROM pg_tables WHERE schemaname NOT IN (\'pg_catalog\',\'information_schema\')) s" 2>/dev/null',
+  "  } | grep -E '^[a-z_][a-z0-9_]*$' | grep -vE '^(postgres|public)$' | grep -v '^pg_' | sort -u > \"$scoped_roles\"",
+  '  if ! [[ -s "$scoped_roles" ]]; then',
+  '    rm -f "$scoped_roles"',
+  '    echo "samohost: clone role replay derived an EMPTY app-role set (envDbVars URL roles + grant/policy grantees) — failing CLOSED" >&2',
+  "    return 1",
+  "  fi",
+  "  # 1. Roles: hashes replayed for the SCOPED app roles only, superpowers",
+  "  #    stripped. Hashes move host-side only; both psql ends silenced because",
+  "  #    error text can quote failing DDL.",
+  '  sudo -u postgres /usr/bin/psql -At -d "$prod_db" -c "SELECT rolname, rolcanlogin, rolpassword FROM pg_authid WHERE rolname NOT LIKE \'pg\\_%\' AND rolname <> \'postgres\'" 2>/dev/null \\',
+  '    | samohost_emit_scoped_role_sql "$scoped_roles" \\',
   '    | PGPASSWORD="$SAMOHOST_DB_PASSWORD" psql -h 127.0.0.1 -p "$SAMOHOST_DB_PORT" -U samohost_env -d postgres -f - >/dev/null 2>&1 || true',
+  '  rm -f "$scoped_roles"',
   "  # 2. Table ownership (prod's owner role; owner-bypass RLS semantics match).",
+  "  #    Idempotent DDL: ON_ERROR_STOP failures are real and counted by exit",
+  "  #    code only — output stays suppressed.",
   '  sudo -u postgres /usr/bin/psql -At -d "$prod_db" -c "SELECT \'ALTER TABLE \'||quote_ident(schemaname)||\'.\'||quote_ident(tablename)||\' OWNER TO \'||quote_ident(tableowner)||\';\' FROM pg_tables WHERE schemaname NOT IN (\'pg_catalog\',\'information_schema\')" \\',
-  '    | PGPASSWORD="$SAMOHOST_DB_PASSWORD" psql -h 127.0.0.1 -p "$SAMOHOST_DB_PORT" -U samohost_env -d "$prod_db" -f - >/dev/null 2>&1 || true',
-  "  # 3. Table grants.",
+  '    | PGPASSWORD="$SAMOHOST_DB_PASSWORD" psql -v ON_ERROR_STOP=1 -h 127.0.0.1 -p "$SAMOHOST_DB_PORT" -U samohost_env -d "$prod_db" -f - >/dev/null 2>&1 || apply_failures=$((apply_failures+1))',
+  "  # 3. Table grants (idempotent; same exit-code failure counting).",
   '  sudo -u postgres /usr/bin/psql -At -d "$prod_db" -c "SELECT \'GRANT \'||privilege_type||\' ON \'||quote_ident(table_schema)||\'.\'||quote_ident(table_name)||\' TO \'||quote_ident(grantee)||\';\' FROM information_schema.table_privileges WHERE grantee NOT IN (\'postgres\',\'PUBLIC\') AND table_schema NOT IN (\'pg_catalog\',\'information_schema\')" \\',
-  '    | PGPASSWORD="$SAMOHOST_DB_PASSWORD" psql -h 127.0.0.1 -p "$SAMOHOST_DB_PORT" -U samohost_env -d "$prod_db" -f - >/dev/null 2>&1 || true',
+  '    | PGPASSWORD="$SAMOHOST_DB_PASSWORD" psql -v ON_ERROR_STOP=1 -h 127.0.0.1 -p "$SAMOHOST_DB_PORT" -U samohost_env -d "$prod_db" -f - >/dev/null 2>&1 || apply_failures=$((apply_failures+1))',
   "  # 4. RLS policies (deparsed; restore dropped them with the roles missing).",
+  "  #    CREATE POLICY duplicates FAIL on engines whose retrieval already",
+  "  #    carries policies, so errors stay ignored — parity below is the gate.",
   '  sudo -u postgres /usr/bin/psql -At -d "$prod_db" -c "SELECT \'CREATE POLICY \'||quote_ident(policyname)||\' ON \'||quote_ident(schemaname)||\'.\'||quote_ident(tablename)||\' AS \'||permissive||\' FOR \'||cmd||\' TO \'||(SELECT string_agg(CASE WHEN r=\'public\' THEN \'PUBLIC\' ELSE quote_ident(r) END, \', \') FROM unnest(roles) AS r)||COALESCE(\' USING (\'||qual||\')\',\'\')||COALESCE(\' WITH CHECK (\'||with_check||\')\',\'\')||\';\' FROM pg_policies" \\',
   '    | PGPASSWORD="$SAMOHOST_DB_PASSWORD" psql -h 127.0.0.1 -p "$SAMOHOST_DB_PORT" -U samohost_env -d "$prod_db" -f - >/dev/null 2>&1 || true',
-  "  # 5. Parity gate: an env whose clone cannot honor the app's RLS contract",
-  "  #    is never composed.",
-  '  prod_policies="$(sudo -u postgres /usr/bin/psql -At -d "$prod_db" -c \'SELECT count(*) FROM pg_policies\')"',
-  '  clone_policies="$(PGPASSWORD="$SAMOHOST_DB_PASSWORD" \\',
-  '    psql -h 127.0.0.1 -p "$SAMOHOST_DB_PORT" -U samohost_env -d "$prod_db" -At -c \'SELECT count(*) FROM pg_policies\' 2>/dev/null)"',
-  '  if [[ "$clone_policies" =~ ^[0-9]+$ ]] && [[ "$clone_policies" -ge "$prod_policies" ]]; then',
-  "    return 0",
+  "  # 5. Apply-failure gate: failures are counted, never echoed.",
+  '  if [[ "$apply_failures" -gt 0 ]]; then',
+  '    echo "samohost: clone globals sync: ${apply_failures} ownership/grant apply batch(es) failed inside the clone — failing CLOSED (details suppressed: psql error text can quote DDL)" >&2',
+  "    return 1",
   "  fi",
-  '  echo "samohost: clone globals sync failed parity check (prod policies=${prod_policies:-?}, clone=${clone_policies:-?}) — the clone would not honor the app\'s RLS/credentials contract" >&2',
-  "  return 1",
+  "  # 6. Parity gates (fail CLOSED): an env whose clone cannot honor the",
+  "  #    app's RLS/grant contract is never composed.",
+  '  samohost_parity_check "RLS policies" "SELECT count(*) FROM pg_policies" \\',
+  '    && samohost_parity_check "table grants" "SELECT count(*) FROM information_schema.table_privileges WHERE grantee NOT IN (\'postgres\',\'PUBLIC\') AND table_schema NOT IN (\'pg_catalog\',\'information_schema\')" \\',
+  '    && samohost_parity_check "table ownership" "SELECT count(*) FROM pg_tables WHERE schemaname NOT IN (\'pg_catalog\',\'information_schema\') AND tableowner <> \'postgres\'"',
   "}",
 ];
 
@@ -403,6 +524,12 @@ export function buildEnvCreateScript(
       `SAMOHOST_ENV_DB_VARS=(${envDbVars.map(sq).join(" ")})`,
       "",
       ...CLONE_PORT_FN_LINES,
+      "",
+      ...APP_URL_ROLES_FN_LINES,
+      "",
+      ...EMIT_SCOPED_ROLE_SQL_FN_LINES,
+      "",
+      ...PARITY_CHECK_FN_LINES,
       "",
       ...SYNC_CLONE_GLOBALS_FN_LINES,
       "",
