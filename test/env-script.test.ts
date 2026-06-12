@@ -1273,13 +1273,17 @@ describe("schema-grant replay (live-validation finding 2026-06-12)", () => {
     // The schema-grant replay step must query schema privileges and emit grants.
     expect(fn).toContain("ON SCHEMA");
     expect(fn).toContain("GRANT");
-    // Must be applied to the clone under ON_ERROR_STOP (idempotent, but real
-    // failures — e.g. role doesn't exist yet — are errors).
+    expect(fn).toContain("has_schema_privilege");
+    // Must be applied to the clone under ON_ERROR_STOP with streams suppressed
+    // (idempotent, but failures — e.g. role doesn't exist yet — are real errors).
+    // The apply line follows the schema-grant query pipe; check that the
+    // ON_ERROR_STOP apply is present in the schema-grant vicinity.
     const lines = fn.split("\n");
-    const schemaGrantLine = lines.find(
-      (l) => l.includes("ON SCHEMA") && l.includes("PGPASSWORD") && l.includes("psql"),
-    );
-    expect(schemaGrantLine).toBeDefined();
-    expect(schemaGrantLine).toContain(">/dev/null 2>&1");
+    const schemaGrantQueryIdx = lines.findIndex((l) => l.includes("has_schema_privilege"));
+    expect(schemaGrantQueryIdx).toBeGreaterThan(-1);
+    // Within the next few lines, ON_ERROR_STOP and >/dev/null 2>&1 must appear.
+    const nearby = lines.slice(schemaGrantQueryIdx, schemaGrantQueryIdx + 5).join("\n");
+    expect(nearby).toContain("ON_ERROR_STOP");
+    expect(nearby).toContain(">/dev/null 2>&1");
   });
 });
