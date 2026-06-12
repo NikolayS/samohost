@@ -22,6 +22,16 @@ import {
 import { runList } from "./commands/list.ts";
 import { runStatus, type StatusInput } from "./commands/status.ts";
 import {
+  runSsh,
+  defaultSshSessionDeps,
+  type SshInput,
+} from "./commands/ssh.ts";
+import {
+  runLogs,
+  DEFAULT_LOG_LINES,
+  type LogsInput,
+} from "./commands/logs.ts";
+import {
   runAppRegister,
   runAppPlan,
   runAppDeploy,
@@ -79,6 +89,8 @@ Usage:
       --host-key-fingerprint 'SHA256:...' [options]
   samohost list [--json]
   samohost status <vm-name-or-id> [--audit] [--json]
+  samohost ssh <vm-name-or-id> [-- <command...>]
+  samohost logs <vm-name-or-id> [--unit <name>] [--lines <n>] [--follow]
   samohost app register <vm> --name <n> --repo <owner/name> \\
       --service-unit <u> --health-url <url> [options]
   samohost app plan <vm> <app> --sha <sha>
@@ -147,6 +159,21 @@ list options:
 
 status options:
   --audit                    run live hardening probes over pinned SSH
+
+ssh (interactive session — or run a one-off command — over the pinned host
+key; same machinery as status --audit: per-VM known_hosts, strict checking,
+the recorded user/port/key; no keyscan, no trust-on-first-use):
+  -- <command...>            run this command instead of opening a shell;
+                             everything after -- is passed to the remote
+                             verbatim and the remote exit code is returned
+
+logs options (systemd journal over the pinned SSH; uses the granted
+non-interactive sudo path /usr/bin/journalctl):
+  --unit <name>              systemd unit to read (default: the single
+                             registered app's service unit; required when
+                             0 or >1 apps are registered on the VM)
+  --lines <n>                how many recent lines (default: ${DEFAULT_LOG_LINES})
+  --follow                   keep streaming (-f) until interrupted
   --json                     emit a JSON status/audit result
 
 app register options (write an AppRecord; offline, no network):
@@ -244,6 +271,16 @@ export interface ParsedStatus {
   json: boolean;
 }
 
+export interface ParsedSsh {
+  kind: "ssh";
+  input: SshInput;
+}
+
+export interface ParsedLogs {
+  kind: "logs";
+  input: LogsInput;
+}
+
 export interface ParsedAppRegister {
   kind: "app-register";
   input: AppRegisterInput;
@@ -317,6 +354,8 @@ export type ParsedCommand =
   | ParsedAdopt
   | ParsedList
   | ParsedStatus
+  | ParsedSsh
+  | ParsedLogs
   | ParsedAppRegister
   | ParsedAppPlan
   | ParsedAppDeploy
@@ -372,6 +411,12 @@ export function parseArgs(
   }
   if (first === "status") {
     return parseStatus(argv.slice(1));
+  }
+  if (first === "ssh") {
+    return parseSsh(argv.slice(1));
+  }
+  if (first === "logs") {
+    return parseLogs(argv.slice(1));
   }
   if (first === "app") {
     return parseApp(argv.slice(1));
@@ -718,6 +763,79 @@ function parseStatus(args: string[]): ParsedStatus {
     throw new UsageError("status requires a VM name or id");
   }
   return { kind: "status", input: { target, audit }, json };
+}
+
+function parseSsh(args: string[]): ParsedSsh {
+  let target: string | undefined;
+  let remoteCommand: string | undefined;
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i]!;
+    if (a === "--") {
+      const rest = args.slice(i + 1);
+      if (rest.length === 0) {
+        throw new UsageError("ssh: nothing after -- (drop it for an interactive session)");
+      }
+      remoteCommand = rest.join(" ");
+      break;
+    }
+    if (a.startsWith("-")) throw new UsageError(`unknown flag: ${a}`);
+    if (target !== undefined) throw new UsageError(`unexpected extra argument: ${a}`);
+    target = a;
+  }
+  if (target === undefined) {
+    throw new UsageError("ssh requires a VM name or id");
+  }
+  return {
+    kind: "ssh",
+    input: {
+      target,
+      ...(remoteCommand !== undefined ? { remoteCommand } : {}),
+    },
+  };
+}
+
+function parseLogs(args: string[]): ParsedLogs {
+  let target: string | undefined;
+  let unit: string | undefined;
+  let lines = DEFAULT_LOG_LINES;
+  let follow = false;
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i]!;
+    switch (a) {
+      case "--unit":
+        unit = takeValue(args, i, a);
+        i++;
+        break;
+      case "--lines":
+        lines = parseIntFlag(takeValue(args, i, a), a);
+        if (lines <= 0) {
+          throw new UsageError(`--lines must be a positive integer, got: ${lines}`);
+        }
+        i++;
+        break;
+      case "--follow":
+        follow = true;
+        break;
+      default:
+        if (a.startsWith("-")) throw new UsageError(`unknown flag: ${a}`);
+        if (target !== undefined) {
+          throw new UsageError(`unexpected extra argument: ${a}`);
+        }
+        target = a;
+    }
+  }
+  if (target === undefined) {
+    throw new UsageError("logs requires a VM name or id");
+  }
+  return {
+    kind: "logs",
+    input: {
+      target,
+      lines,
+      follow,
+      ...(unit !== undefined ? { unit } : {}),
+    },
+  };
 }
 
 type AppSub = "register" | "plan" | "deploy" | "status" | "clear-failed";
@@ -1199,6 +1317,17 @@ export async function main(
       return runList({ json: cmd.json }, new StateStore(), out, err);
     case "status":
       return runStatus(cmd.input, { json: cmd.json }, new StateStore(), out, err);
+    case "ssh":
+      return runSsh(cmd.input, new StateStore(), defaultSshSessionDeps(), out, err);
+    case "logs":
+      return runLogs(
+        cmd.input,
+        new StateStore(),
+        defaultAppStore(),
+        defaultSshSessionDeps(),
+        out,
+        err,
+      );
     case "app-register":
       return runAppRegister(
         cmd.input,

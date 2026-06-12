@@ -20,8 +20,8 @@ credentials come from the environment: `HCLOUD_TOKEN` for Hetzner.
 
 ## Command surface
 
-Every command supports `--json`. Read-only commands make no provider calls
-unless noted.
+Every command supports `--json` except the interactive/streaming pair
+(`ssh`, `logs`). Read-only commands make no provider calls unless noted.
 
 ```bash
 # Provision / teardown a hardened VM (real Hetzner API; needs HCLOUD_TOKEN)
@@ -35,6 +35,10 @@ samohost adopt --name web --ip 10.0.0.5 --ssh-user samo --ssh-key ~/.ssh/id_ed25
 # Observe
 samohost list
 samohost status web --audit                # SSHes in, runs read-only hardening probes (pass/fail/unknown)
+samohost ssh web                           # interactive shell over the pinned host key (no keyscan, no TOFU)
+samohost ssh web -- uptime -p              # …or run a one-off command; remote exit code is returned
+samohost logs web --lines 200 --follow     # systemd journal via sudo journalctl; unit defaults to the single
+                                           # registered app's service unit (use --unit with 0 or >1 apps)
 
 # Deploy an app (CI-gated, RLS-checked, env-file sourced, rollback-safe)
 samohost app register web --name field-record --repo owner/repo --service-unit field-record --health-url http://127.0.0.1:3000/api/version --env-file /opt/app/staging.env --assert-rls --rls-url-var APP_DATABASE_URL
@@ -53,6 +57,21 @@ samohost env destroy web field-record --branch feat/x
 # Preview DNS preflight (read-only)
 samohost dns status example.com --expect-ip 10.0.0.5 --cf-zone example.com
 ```
+
+### SPEC v0.1 coverage
+
+Implemented from the [SPEC v0.1](SPEC.md) minimum surface: `provision`
+(Hetzner), `preview` (offline, Hetzner + AWS render), `list`, `status`
+(+`--audit`), `ssh`, `logs`, `destroy` — plus `adopt` and the `app`/`env`/`dns`
+families added by [SPEC-DELTA](SPEC-DELTA.md). Still **deferred** from v0.1
+scope (the README documents only what works):
+
+- **postgres module** (PG17 + PostgREST + Caddy + audit checks) —
+  [#26](https://github.com/NikolayS/samohost/issues/26). `--module postgres`
+  currently renders the hardening baseline only.
+- **AWS adapter** for `provision`/`destroy` —
+  [#15](https://github.com/NikolayS/samohost/issues/15) (item 1). `provision
+  --provider aws` is rejected at parse time; `preview --provider aws` works.
 
 ## 5-minute quickstart (adopt → deploy)
 
@@ -75,7 +94,7 @@ samohost app deploy web myapp --sha <sha>           # fetch → build → migrat
 
 ## How it's tested
 
-- **Unit + golden/snapshot:** `bun test` (385 tests; rendered deploy/env scripts
+- **Unit + golden/snapshot:** `bun test` (457 tests; rendered deploy/env scripts
   are snapshot-pinned so a contract change is a visible diff). Typecheck with
   `bunx tsc --noEmit`. CI runs both on every PR.
 - **Executed validation:** write-path changes are re-run end-to-end in a
