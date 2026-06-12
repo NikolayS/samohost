@@ -39,6 +39,9 @@ export interface AppRegisterInput {
   buildCmd: string;
   serviceUnit: string;
   healthUrl: string;
+  /** Public production host for the durable main-env Caddy vhost
+   * (field-record-1#117 ITEM C). Absent → host-prep emits no main vhost. */
+  mainHost?: string;
   migrateCmd?: string;
   seedCmd?: string;
   envFile?: string;
@@ -113,6 +116,7 @@ export function runAppRegister(
     buildCmd: input.buildCmd,
     healthUrl: input.healthUrl,
     serviceUnit: input.serviceUnit,
+    ...(input.mainHost !== undefined ? { mainHost: input.mainHost } : {}),
     ...(input.migrateCmd !== undefined ? { migrateCmd: input.migrateCmd } : {}),
     ...(input.seedCmd !== undefined ? { seedCmd: input.seedCmd } : {}),
     ...(input.envFile !== undefined ? { envFile: input.envFile } : {}),
@@ -214,6 +218,7 @@ export function runAppStatus(
       `app_dir: ${app.appDir}`,
       `service_unit: ${app.serviceUnit}`,
       `health_url: ${app.healthUrl}`,
+      `main_host: ${app.mainHost ?? "-"}`,
       `deployed_sha: ${app.deployedSha ?? "-"}`,
       `failed_sha: ${app.failedSha ?? "-"}`,
       `last_deploy_at: ${app.lastDeployAt ?? "-"}`,

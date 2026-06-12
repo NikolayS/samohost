@@ -158,6 +158,16 @@ export interface AppSpec {
   seedCmd?: string;
   /** Health URL polled after restart (e.g. http://localhost:3000/api/version). */
   healthUrl: string;
+  /**
+   * PUBLIC host of the PRODUCTION (main-env) app, e.g.
+   * `field-record-1.samo.team` (field-record-1#117 ITEM C, 7th drift class).
+   * When set, host-prep emits a durable Caddy vhost snippet
+   * `/etc/caddy/sites.d/00-main-<name>.caddy` proxying this host to the
+   * production port (derived from {@link healthUrl}), so the main vhost is
+   * provisioned state instead of a hand-applied VM-local edit that the next
+   * Caddyfile churn de-references. Optional for back-compat.
+   */
+  mainHost?: string;
   /** systemd unit name (e.g. "field-record"). Restarted via full-path sudo. */
   serviceUnit: string;
   /** Remote env file path. Sourced read-only by the deploy script before

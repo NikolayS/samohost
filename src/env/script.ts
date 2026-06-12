@@ -742,17 +742,88 @@ export function buildEnvDestroyScript(
 }
 
 /**
+ * Main-env vhost host validation (field-record-1#117 ITEM C). Local mirror of
+ * commands/env.ts `isValidPreviewDomain` — importing it here would create an
+ * import cycle (commands/env.ts imports this module). The host is embedded in
+ * a ROOT-run script, so fail closed on anything that is not a dotted
+ * lowercase DNS name (same posture as the invalid-preview-domain fix, #28).
+ */
+function isValidMainHost(host: string): boolean {
+  if (host.length === 0 || host.length > 253) return false;
+  const label = "[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?";
+  return (
+    new RegExp(`^${label}(?:\\.${label})*\\.[a-z]{2,63}$`).test(
+      host.toLowerCase(),
+    ) && host === host.toLowerCase()
+  );
+}
+
+/**
+ * Production app port for the main-env vhost, derived from
+ * {@link AppRecord.healthUrl} (the only place the app record carries the
+ * production listen port, e.g. http://localhost:3000/api/version → 3000).
+ * Fails closed on an unparseable URL — never render a vhost pointing at a
+ * guessed port.
+ */
+function mainEnvPort(app: AppRecord): number {
+  let u: URL;
+  try {
+    u = new URL(app.healthUrl);
+  } catch {
+    throw new Error(
+      `cannot derive the main-env vhost port for app '${app.name}': ` +
+        `unparseable healthUrl ${JSON.stringify(app.healthUrl)} — fix the ` +
+        `app record (or unset mainHost)`,
+    );
+  }
+  if (u.port !== "") return Number(u.port);
+  return u.protocol === "https:" ? 443 : 80;
+}
+
+/**
  * Render the ONE-TIME host preparation an operator with root must review and
  * apply before `env create` can run on a (vm, app): the systemd template unit,
- * the Caddy sites.d include, the env template file, and the exact-path sudoers
- * grants the env scripts rely on. This script is NOT meant to be piped to bash
- * by samohost — it is printed for human review (`samohost env plan --host-prep`).
+ * the Caddy sites.d include, the durable main-env vhost (when
+ * {@link AppRecord.mainHost} is set), the env template file, and the
+ * exact-path sudoers grants the env scripts rely on. This script is NOT meant
+ * to be piped to bash by samohost — it is printed for human review
+ * (`samohost env plan --host-prep`).
  */
 export function buildHostPrepScript(app: AppRecord, sshUser: string): string {
   const root = envsRoot(app);
   const unit = app.serviceUnit;
   const envDbVars = app.envDbVars ?? [...DEFAULT_ENV_DB_VARS];
   const defaultTemplateDb = `${app.name.replace(/-/g, "_")}_template`;
+
+  // Durable MAIN-env vhost (field-record-1#117 ITEM C, 7th drift class): the
+  // production vhost must be provisioned state in sites.d, not a hand-applied
+  // VM-local Caddy edit that the next Caddyfile churn de-references together
+  // with every preview snippet (observed: Cloudflare 521 on *.samo.cat).
+  const mainVhostLines: string[] = [];
+  if (app.mainHost !== undefined) {
+    if (!isValidMainHost(app.mainHost)) {
+      throw new Error(
+        `invalid mainHost ${JSON.stringify(app.mainHost)} for app ` +
+          `'${app.name}' — expected a dotted lowercase DNS name like ` +
+          `"field-record-1.samo.team" (embedded in a root-run script; ` +
+          `failing closed)`,
+      );
+    }
+    const port = mainEnvPort(app);
+    mainVhostLines.push(
+      "",
+      `#    Durable MAIN-env vhost: deterministic content, so the plain '>'`,
+      `#    overwrite is idempotent (re-running host-prep rewrites the same`,
+      `#    bytes in place — no append-drift). The 00- prefix sorts it first.`,
+      `#    Host and port are strictly validated above (root-run script).`,
+      `cat > /etc/caddy/sites.d/00-main-${app.name}.caddy <<'CADDY'`,
+      `${app.mainHost} {`,
+      `\treverse_proxy localhost:${port}`,
+      `}`,
+      "CADDY",
+    );
+  }
+
   return [
     "#!/usr/bin/env bash",
     `# samohost host-prep for app '${app.name}' — ONE-TIME, run by an operator with root.`,
@@ -789,10 +860,12 @@ export function buildHostPrepScript(app: AppRecord, sshUser: string): string {
     "UNIT",
     "systemctl daemon-reload",
     "",
-    `# 3. Caddy: include per-env vhost snippets.`,
+    `# 3. Caddy: include per-env vhost snippets + the durable MAIN-env vhost`,
+    `#    (field-record-1#117 ITEM C, 7th drift class).`,
     "mkdir -p /etc/caddy/sites.d",
     `grep -q 'import sites.d/\\*.caddy' /etc/caddy/Caddyfile \\`,
     `  || printf '\\nimport sites.d/*.caddy\\n' >> /etc/caddy/Caddyfile`,
+    ...mainVhostLines,
     "systemctl reload caddy",
     "",
     `# 4. Exact-path sudoers grants (Defaults use_pty is in effect; the env`,

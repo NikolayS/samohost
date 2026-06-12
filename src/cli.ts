@@ -54,6 +54,7 @@ import {
   defaultEnvExecDeps,
   defaultEnvStore,
   DEFAULT_PREVIEW_DOMAIN,
+  isValidPreviewDomain,
   type EnvPlanInput,
   type EnvCreateInput,
   type EnvListInput,
@@ -889,6 +890,7 @@ function parseAppRegister(args: string[]): ParsedAppRegister {
   let buildCmd = "npm run build";
   let serviceUnit: string | undefined;
   let healthUrl: string | undefined;
+  let mainHost: string | undefined;
   let migrateCmd: string | undefined;
   let seedCmd: string | undefined;
   let envFile: string | undefined;
@@ -907,6 +909,21 @@ function parseAppRegister(args: string[]): ParsedAppRegister {
       case "--build-cmd": buildCmd = takeValue(args, i, a); i++; break;
       case "--service-unit": serviceUnit = takeValue(args, i, a); i++; break;
       case "--health-url": healthUrl = takeValue(args, i, a); i++; break;
+      case "--main-host": {
+        // Public PRODUCTION host for the durable main-env Caddy vhost
+        // (field-record-1#117 ITEM C). Embedded in a root-run host-prep
+        // script — validate strictly, same posture as --preview-domain.
+        const v = takeValue(args, i, a);
+        if (!isValidPreviewDomain(v)) {
+          throw new UsageError(
+            `invalid --main-host: ${v} (expected a dotted lowercase DNS ` +
+              `name like field-record-1.samo.team)`,
+          );
+        }
+        mainHost = v;
+        i++;
+        break;
+      }
       case "--migrate-cmd": migrateCmd = takeValue(args, i, a); i++; break;
       case "--seed-cmd": seedCmd = takeValue(args, i, a); i++; break;
       case "--env-file": envFile = takeValue(args, i, a); i++; break;
@@ -958,6 +975,7 @@ function parseAppRegister(args: string[]): ParsedAppRegister {
     serviceUnit,
     healthUrl,
     rlsNonSuperuser,
+    ...(mainHost !== undefined ? { mainHost } : {}),
     ...(migrateCmd !== undefined ? { migrateCmd } : {}),
     ...(seedCmd !== undefined ? { seedCmd } : {}),
     ...(envFile !== undefined ? { envFile } : {}),

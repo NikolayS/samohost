@@ -125,6 +125,37 @@ describe("parseArgs app", () => {
     ).toThrow(/invalid --rls-url-var/);
   });
 
+  // field-record-1#117 ITEM C (7th drift class): the production public host
+  // must be registrable so host-prep can emit the durable main-env vhost.
+  test("register parses --main-host and validates it strictly (#117 ITEM C)", () => {
+    const cmd = parseArgs([
+      "app", "register", "vm",
+      "--name", "field-record",
+      "--repo", "Tanya301/field-record-1",
+      "--service-unit", "field-record",
+      "--health-url", "http://localhost:3000/api/version",
+      "--main-host", "field-record-1.samo.team",
+    ]);
+    if (cmd.kind !== "app-register") throw new Error("expected app-register");
+    expect(cmd.input.mainHost).toBe("field-record-1.samo.team");
+    // No flag → undefined (host-prep then omits the main vhost snippet).
+    const bare = parseArgs([
+      "app", "register", "vm", "--name", "x", "--repo", "o/r",
+      "--service-unit", "x", "--health-url", "http://h",
+    ]);
+    if (bare.kind !== "app-register") throw new Error("expected app-register");
+    expect(bare.input.mainHost).toBeUndefined();
+    // The host is embedded in a ROOT-run host-prep script — validate strictly
+    // (dotted lowercase DNS name), same posture as the preview-domain fix.
+    expect(() =>
+      parseArgs([
+        "app", "register", "vm", "--name", "x", "--repo", "o/r",
+        "--service-unit", "x", "--health-url", "http://h",
+        "--main-host", "bad host!",
+      ]),
+    ).toThrow(/--main-host/);
+  });
+
   test("register rejects a non owner/name repo", () => {
     expect(() =>
       parseArgs([
@@ -259,6 +290,29 @@ describe("app commands", () => {
     expect(appStore.get("vm-1111", "field-record")?.envDbVars).toEqual([
       "DATABASE_URL", "APP_DATABASE_URL",
     ]);
+  });
+
+  // Persistence guard (#117 ITEM C): a parsed-but-dropped mainHost would make
+  // `--main-host` a silent no-op — host-prep would render WITHOUT the main
+  // vhost while the operator believes it is covered.
+  test("register persists mainHost on the AppRecord (#117 ITEM C)", () => {
+    const c = capture();
+    const code = runAppRegister(
+      {
+        vm: "samo-we-field-record", name: "field-record",
+        repo: "Tanya301/field-record-1", branch: "main",
+        appDir: "/opt/field-record/app", buildCmd: "npm run build",
+        serviceUnit: "field-record",
+        healthUrl: "http://localhost:3000/api/version",
+        rlsNonSuperuser: false,
+        mainHost: "field-record-1.samo.team",
+      },
+      { json: false }, vmStore, appStore, c.out, c.err,
+    );
+    expect(code).toBe(0);
+    expect(appStore.get("vm-1111", "field-record")?.mainHost).toBe(
+      "field-record-1.samo.team",
+    );
   });
 
   test("register fails for an unknown VM", () => {
