@@ -71,14 +71,23 @@ describe("buildEnvCreateScript", () => {
     );
   });
 
-  test("dblab backend is GATED on a running engine (installed shape is not enough)", () => {
+  test("dblab backend is GATED on the LIVE engine API, not the retired unit (issue #7)", () => {
     const s = buildEnvCreateScript(app(), target({ dbBackend: "dblab" }));
     expect(s).toContain("<<<SAMOHOST_PHASE:db-preflight:start>>>");
-    expect(s).toContain("systemctl is-active --quiet dblab.service");
+    // Runtime-verified 2026-06-12: the engine runs as the dblab_server docker
+    // container; the legacy dblab.service unit's ExecStart binary does not
+    // exist. The gate is the engine's own healthz endpoint.
+    expect(s).toContain("curl -fsS --max-time 5 http://127.0.0.1:2345/healthz");
+    expect(s).not.toContain("systemctl is-active --quiet dblab.service");
+    // CLI resolution: PATH first, then ~/bin/dblab (where the runbook installs
+    // it; not on PATH in non-login shells) — bound to one var used everywhere.
     expect(s).toContain("command -v dblab");
+    expect(s).toContain('$HOME/bin/dblab');
+    expect(s).toContain("SAMOHOST_DBLAB_BIN");
     expect(s).toContain("samohost env preflight"); // pointer to the diagnosis cmd
+    expect(s).toContain("docs/dblab-install-runbook.md"); // pointer to the install
     // The gate precedes any clone attempt.
-    expect(s.indexOf("db-preflight:start")).toBeLessThan(s.indexOf("dblab clone create"));
+    expect(s.indexOf("db-preflight:start")).toBeLessThan(s.indexOf("clone create"));
     // Non-dblab backends have no engine gate.
     for (const db of ["template", "none"] as const) {
       expect(buildEnvCreateScript(app(), target({ dbBackend: db }))).not.toContain("db-preflight");
@@ -87,7 +96,8 @@ describe("buildEnvCreateScript", () => {
 
   test("dblab backend: clone create + on-host password, no samohost-side secrets", () => {
     const s = buildEnvCreateScript(app(), target({ dbBackend: "dblab" }));
-    expect(s).toContain("dblab clone create --id");
+    // Every dblab CLI call goes through the resolved binary, never bare `dblab`.
+    expect(s).toContain('"$SAMOHOST_DBLAB_BIN" clone create --id');
     expect(s).toContain("openssl rand -hex 16"); // generated ON HOST
     expect(s).toContain("<<<SAMOHOST_PHASE:db:start>>>");
     // The script must never echo the env file or the password.
@@ -147,9 +157,14 @@ describe("buildEnvDestroyScript", () => {
     expect(s).not.toContain("set -euo");
   });
 
-  test("dblab destroy deletes the clone", () => {
+  test("dblab destroy deletes the clone via the resolved CLI (issue #7)", () => {
     const s = buildEnvDestroyScript(app(), target({ dbBackend: "dblab" }));
-    expect(s).toContain("dblab clone destroy");
+    expect(s).toContain('"$SAMOHOST_DBLAB_BIN" clone destroy');
+    // Same two-path CLI resolution as create (PATH, then ~/bin/dblab).
+    expect(s).toContain("command -v dblab");
+    expect(s).toContain("$HOME/bin/dblab");
+    // Idempotent: a missing CLI must not abort the rest of the teardown.
+    expect(s).toMatch(/clone destroy[^\n]*\|\| true/);
   });
 
   test("template destroy drops db and role via exact-path sudo", () => {
@@ -469,5 +484,807 @@ describe("issue #11 finding 8: destroy resets the failed unit; host-prep grants 
   test("host-prep documents the envDbVars template contract", () => {
     const s = buildHostPrepScript(app(), "agent");
     expect(s).toContain("envDbVars");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Issue #7 — dblab backend contract fixes (runtime-verified 2026-06-12 against
+// DBLab v4.1.3 live on samo-we-field-record)
+// ---------------------------------------------------------------------------
+
+/**
+ * REAL clone-status JSON captured from the live engine (dblab clone status,
+ * v4.1.3, 2026-06-12) — the port is a STRING nested at `.db.port`, NOT a
+ * top-level number. Stored verbatim (password field is empty in the real
+ * output) so the parsing tests run against the prod shape, not a hand-rolled
+ * mock.
+ */
+const CLONE_STATUS_FIXTURE = join(
+  import.meta.dir,
+  "fixtures",
+  "dblab-clone-status.json",
+);
+
+/** Run the generated samohost_clone_port fn against a stub dblab CLI that
+ * replays the captured prod JSON. `breakPython` forces the sed fallback. */
+function runClonePort(opts: { breakPython?: boolean; json?: string } = {}) {
+  const dir = mkdtempSync(join(tmpdir(), "samohost-cloneport-"));
+  try {
+    const jsonPath = join(dir, "status.json");
+    writeFileSync(
+      jsonPath,
+      opts.json ?? readFileSync(CLONE_STATUS_FIXTURE, "utf8"),
+    );
+    const stub = join(dir, "dblab-stub");
+    writeFileSync(stub, `#!/usr/bin/env bash\ncat '${jsonPath}'\n`, {
+      mode: 0o755,
+    });
+    const fn = extractFn(
+      buildEnvCreateScript(app(), target({ dbBackend: "dblab" })),
+      "samohost_clone_port",
+    );
+    const prog = [
+      "set -uo pipefail",
+      // Optionally hide python3 from the function to exercise the sed path.
+      ...(opts.breakPython
+        ? [
+            "command() {",
+            '  if [[ "${2:-}" == python3 ]]; then return 1; fi',
+            '  builtin command "$@"',
+            "}",
+          ]
+        : []),
+      `SAMOHOST_DBLAB_BIN='${stub}'`,
+      "SAMOHOST_CLONE_ID='smoke-shape-1'",
+      fn,
+      "samohost_clone_port",
+    ].join("\n");
+    return spawnSync("bash", ["-c", prog], { encoding: "utf8" });
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+describe("issue #7: clone port parsed from the NESTED .db.port string", () => {
+  test("script no longer greps a top-level \"port\" (the old sed matched the wrong/no field)", () => {
+    const s = buildEnvCreateScript(app(), target({ dbBackend: "dblab" }));
+    expect(s).not.toContain('"port"[^0-9]');
+    expect(s).toContain("samohost_clone_port() {");
+    // Extraction result is validated as numeric inside the db phase.
+    expect(s).toMatch(/SAMOHOST_DB_PORT.*=~ \^\[0-9\]\+\$/);
+    // No hard jq dependency (jq presence on hosts is not guaranteed).
+    expect(s).not.toMatch(/\bjq\b/);
+  });
+
+  test("executed (python3 path): real v4.1.3 status JSON → 6000", () => {
+    const r = runClonePort();
+    expect(r.status).toBe(0);
+    expect(r.stdout.trim()).toBe("6000");
+  });
+
+  test("executed (sed fallback, python3 absent): real v4.1.3 status JSON → 6000", () => {
+    const r = runClonePort({ breakPython: true });
+    expect(r.status).toBe(0);
+    expect(r.stdout.trim()).toBe("6000");
+  });
+
+  test("executed: compact (non-pretty) JSON parses identically", () => {
+    const compact = JSON.stringify(
+      JSON.parse(readFileSync(CLONE_STATUS_FIXTURE, "utf8")),
+    );
+    expect(runClonePort({ json: compact }).stdout.trim()).toBe("6000");
+    expect(
+      runClonePort({ json: compact, breakPython: true }).stdout.trim(),
+    ).toBe("6000");
+  });
+});
+
+/** Execute the generated samohost_rewire_db_hostport against a temp .env. */
+function runRewireHostport(
+  envContent: string,
+  vars: string[],
+  port: string,
+): RewireRun {
+  const dir = mkdtempSync(join(tmpdir(), "samohost-rewirehp-"));
+  try {
+    const envPath = join(dir, ".env");
+    writeFileSync(envPath, envContent, { mode: 0o600 });
+    const script = buildEnvCreateScript(
+      app({ envDbVars: vars }),
+      target({ dbBackend: "dblab" }),
+    );
+    const fn = extractFn(script, "samohost_rewire_db_hostport");
+    const prog = [
+      "set -uo pipefail",
+      `SAMOHOST_DB_PORT='${port}'`,
+      `SAMOHOST_ENV_DB_VARS=(${vars.map((v) => `'${v}'`).join(" ")})`,
+      fn,
+      `samohost_rewire_db_hostport '${envPath}'`,
+    ].join("\n");
+    const res = spawnSync("bash", ["-c", prog], { encoding: "utf8" });
+    return {
+      code: res.status ?? -1,
+      stdout: res.stdout ?? "",
+      stderr: res.stderr ?? "",
+      env: readFileSync(envPath, "utf8"),
+    };
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+describe("issue #7 (closing the PR #12 TODO): dblab envDbVars host:port mapping", () => {
+  test("dblab create script declares the mapped vars and rewires them on-host", () => {
+    const s = buildEnvCreateScript(
+      app({ envDbVars: ["DATABASE_URL", "APP_DATABASE_URL"] }),
+      target({ dbBackend: "dblab" }),
+    );
+    expect(s).toContain("SAMOHOST_ENV_DB_VARS=('DATABASE_URL' 'APP_DATABASE_URL')");
+    expect(s).toContain("samohost_rewire_db_hostport() {");
+    expect(s).toContain('samohost_rewire_db_hostport "$SAMOHOST_ENV_DIR/.env"');
+    // The old append-only DATABASE_URL shape is GONE: the clone is a physical
+    // copy carrying prod's roles, so the template's credentials stay and only
+    // host:port is repointed at the clone.
+    expect(s).not.toContain("SAMOHOST_DATABASE_URL");
+    expect(s).not.toMatch(/printf 'DATABASE_URL=/);
+    expect(bashSyntaxOk(s)).toBe(true);
+  });
+
+  test("dblab envDbVars defaults to DATABASE_URL when the app declares none", () => {
+    const s = buildEnvCreateScript(app(), target({ dbBackend: "dblab" }));
+    expect(s).toContain("SAMOHOST_ENV_DB_VARS=('DATABASE_URL')");
+  });
+
+  test("executed: rewrites ONLY host:port to 127.0.0.1:<clone-port>; creds/dbname/query kept", () => {
+    const r = runRewireHostport(
+      [
+        `DATABASE_URL=${PROD_ADMIN_URL}`,
+        `APP_DATABASE_URL=${PROD_APP_URL}`,
+        "NODE_ENV=production",
+        "",
+      ].join("\n"),
+      ["DATABASE_URL", "APP_DATABASE_URL"],
+      "6000",
+    );
+    expect(r.code).toBe(0);
+    // Same-roles philosophy as #12: the clone is a physical copy, prod roles
+    // and passwords exist in it — user/password/dbname/query carry over.
+    expect(r.env).toContain(
+      "DATABASE_URL=postgresql://postgres:s3kr3t-admin@127.0.0.1:6000/field_record",
+    );
+    expect(r.env).toContain(
+      "APP_DATABASE_URL=postgresql://app_user:app-pw-9@127.0.0.1:6000/field_record?sslmode=disable",
+    );
+    // Originals stripped, exactly one line per var, prod host:port gone.
+    expect(r.env.match(/^DATABASE_URL=/gm)).toHaveLength(1);
+    expect(r.env.match(/^APP_DATABASE_URL=/gm)).toHaveLength(1);
+    expect(r.env).not.toContain("@localhost:5432");
+    // Unmapped vars pass through untouched.
+    expect(r.env).toContain("NODE_ENV=production");
+    // Secret values are NEVER echoed.
+    expect(r.stdout + r.stderr).not.toContain("s3kr3t-admin");
+    expect(r.stdout + r.stderr).not.toContain("app-pw-9");
+  });
+
+  test("executed: URL without explicit port still gains the clone port", () => {
+    const r = runRewireHostport(
+      "DATABASE_URL=postgresql://u:pw@dbhost/prod_db?sslmode=disable\n",
+      ["DATABASE_URL"],
+      "6042",
+    );
+    expect(r.code).toBe(0);
+    expect(r.env).toContain(
+      "DATABASE_URL=postgresql://u:pw@127.0.0.1:6042/prod_db?sslmode=disable",
+    );
+  });
+
+  test("executed: a MISSING mapped var fails loudly (no silent prod inheritance)", () => {
+    const r = runRewireHostport(
+      `DATABASE_URL=${PROD_ADMIN_URL}\n`,
+      ["DATABASE_URL", "APP_DATABASE_URL"],
+      "6000",
+    );
+    expect(r.code).not.toBe(0);
+    expect(r.stderr).toContain("APP_DATABASE_URL");
+    expect(r.stderr).not.toContain("s3kr3t-admin");
+  });
+
+  test("executed: a non-URL value fails with a clear message naming the var", () => {
+    const r = runRewireHostport("DATABASE_URL=not-a-url\n", ["DATABASE_URL"], "6000");
+    expect(r.code).not.toBe(0);
+    expect(r.stderr).toContain("DATABASE_URL");
+  });
+});
+
+describe("issue #7: clone globals sync (logical retrieval drops cluster roles/grants/policies)", () => {
+  // Live-verified 2026-06-12 on samo-we-field-record: the engine's retrieval
+  // mode is LOGICAL (pg_dump/pg_restore of the database only) — the restored
+  // clone had NO prod roles, NO grants, and ZERO of prod's 14 RLS policies
+  // (they were silently dropped at restore time because the roles they
+  // reference did not exist in the clone's cluster). Rewiring host:port at a
+  // clone in that state hands the app a database where its own credentials
+  // and RLS contract are broken. The db phase therefore replays the globals
+  // from the prod catalogs ON-HOST and verifies parity before the env file
+  // is composed.
+
+  const dblabScript = () => buildEnvCreateScript(app(), target({ dbBackend: "dblab" }));
+
+  test("db phase replays roles (with password hashes), ownership, grants, and policies from prod catalogs", () => {
+    const s = dblabScript();
+    expect(s).toContain("samohost_sync_clone_globals() {");
+    // Roles with their scram hashes come from pg_authid via the exact-path
+    // sudo psql grant (host-prep) — superuser-only catalog, host-side only.
+    expect(s).toContain("sudo -u postgres /usr/bin/psql");
+    expect(s).toContain("pg_authid");
+    expect(s).toContain("rolpassword");
+    expect(s).toContain("BYPASSRLS");
+    // Ownership + grants + policies are regenerated from prod's catalogs.
+    expect(s).toContain("OWNER TO");
+    expect(s).toContain("table_privileges");
+    expect(s).toContain("pg_policies");
+    expect(s).toContain("CREATE POLICY");
+    expect(bashSyntaxOk(s)).toBe(true);
+  });
+
+  test("sync runs INSIDE the db phase, after port extraction, before envfile", () => {
+    const s = dblabScript();
+    const dbStart = s.indexOf("<<<SAMOHOST_PHASE:db:start>>>");
+    const sync = s.indexOf("samohost_sync_clone_globals\n");
+    const envfileStart = s.indexOf("<<<SAMOHOST_PHASE:envfile:start>>>");
+    expect(sync).toBeGreaterThan(dbStart);
+    expect(sync).toBeLessThan(envfileStart);
+    // The phase condition includes the sync (a failed sync fails the phase).
+    expect(s).toMatch(/&& samohost_sync_clone_globals/);
+  });
+
+  test("verifies parity: clone policy count must reach prod's before the phase passes", () => {
+    const s = dblabScript();
+    expect(s).toContain("FROM pg_policies");
+    // A parity comparison gates success (prod count vs clone count) — now via
+    // the fail-closed helper (PR #22 review finding 1) instead of the old
+    // inline `clone -ge $prod_policies` that degraded to `-ge 0` on an empty
+    // prod capture.
+    const fn = extractFn(s, "samohost_sync_clone_globals");
+    expect(fn).toContain('samohost_parity_check "RLS policies"');
+    const parity = extractFn(s, "samohost_parity_check");
+    expect(parity).toMatch(/-lt "\$prod"/);
+    expect(s).toContain("policy");
+  });
+
+  test("password hashes never reach stdout/stderr: apply output is suppressed", () => {
+    const s = dblabScript();
+    const fn = extractFn(s, "samohost_sync_clone_globals");
+    // Every psql APPLY into the clone silences both streams (error text can
+    // quote failing statements, which may contain role password hashes).
+    for (const line of fn.split("\n")) {
+      if (line.includes("PGPASSWORD") && line.includes("psql")) {
+        expect(line).toContain(">/dev/null 2>&1");
+      }
+    }
+    // And nothing echoes generated DDL.
+    expect(fn).not.toMatch(/echo .*rolpassword/i);
+  });
+
+  test("non-dblab backends carry NO globals sync", () => {
+    for (const db of ["template", "none"] as const) {
+      expect(buildEnvCreateScript(app(), target({ dbBackend: db }))).not.toContain(
+        "samohost_sync_clone_globals",
+      );
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// PR #22 independent review findings — the role/policy replay is the #11-class
+// safety mechanism, so its gates must fail CLOSED and its role copy must be
+// scoped to the app's roles with cluster superpowers stripped.
+// ---------------------------------------------------------------------------
+
+/** Like extractFn but returns null when the function is not (yet) generated. */
+function extractFnOptional(script: string, name: string): string | null {
+  const re = new RegExp(`(${name}\\(\\) \\{[\\s\\S]*?\\n\\})`);
+  const m = script.match(re);
+  return m === null ? null : m[1]!;
+}
+
+/**
+ * REAL pg_authid row shape, dry-run-verified against prod (samo-we-field-record,
+ * 2026-06-12): `psql -At -c "SELECT rolname, rolcanlogin, rolpassword FROM
+ * pg_authid ..."` emits `rolname|t|SCRAM-SHA-256$4096:<salt>$<stored>:<server>`
+ * (NULL password -> empty third field). Names mirror prod's actual split:
+ * app roles (field_record = envDbVars[0]/table owner, app_user = RLS subject)
+ * vs ops roles (ci_user, ci_app_user, dblab_dump — BYPASSRLS/CI roles the app
+ * never uses). Hashes are FAKE (shape-true base64), never prod values.
+ */
+const AUTHID_ROWS_FIXTURE = join(
+  import.meta.dir,
+  "fixtures",
+  "dblab-pg-authid-rows.txt",
+);
+const FAKE_SCRAM_FIELD_RECORD =
+  "SCRAM-SHA-256$4096:RnJTYWx0$RnJTdG9yZWRLZXk=:RnJTZXJ2ZXJLZXk=";
+const FAKE_SCRAM_APP_USER =
+  "SCRAM-SHA-256$4096:QXBwU2FsdA==$QXBwU3RvcmVkS2V5:QXBwU2VydmVyS2V5";
+const FAKE_SCRAM_DBLAB_DUMP =
+  "SCRAM-SHA-256$4096:RGJsYWJTYWx0$RGJsYWJTdG9yZWQ=:RGJsYWJTZXJ2ZXI=";
+
+/** Prod-shaped operator template (same var/URL shapes as /opt/field-record/
+ * envs.template.env; role components verified on-host 2026-06-12). */
+const SYNC_TEMPLATE_DEFAULT = [
+  "DATABASE_URL=postgresql://field_record:admin-pw-X@localhost:5432/field_record",
+  "APP_DATABASE_URL=postgresql://app_user:app-pw-9@localhost:5432/field_record?sslmode=disable",
+  "NODE_ENV=production",
+  "",
+].join("\n");
+
+/**
+ * What prod psql emits TODAY for the legacy DDL-building pg_authid query
+ * (CASE rolsuper/rolcreatedb/rolcreaterole/rolbypassrls/rolcanlogin order,
+ * shape verified live in the original PR #22 work). Lets the harness stay
+ * prod-shape-faithful for whichever query generation the script embeds.
+ */
+const AUTHID_DDL_LEGACY = [
+  `CREATE ROLE field_record SUPERUSER CREATEDB CREATEROLE BYPASSRLS LOGIN PASSWORD '${FAKE_SCRAM_FIELD_RECORD}';`,
+  `CREATE ROLE app_user LOGIN PASSWORD '${FAKE_SCRAM_APP_USER}';`,
+  "CREATE ROLE ci_user BYPASSRLS LOGIN PASSWORD 'SCRAM-SHA-256$4096:Q2lTYWx0$Q2lTdG9yZWRLZXk=:Q2lTZXJ2ZXJLZXk=';",
+  "CREATE ROLE ci_app_user LOGIN PASSWORD 'SCRAM-SHA-256$4096:Q2lBcHBTYWx0$Q2lBcHBTdG9yZWQ=:Q2lBcHBTZXJ2ZXI=';",
+  `CREATE ROLE dblab_dump BYPASSRLS LOGIN PASSWORD '${FAKE_SCRAM_DBLAB_DUMP}';`,
+  "CREATE ROLE analytics_group;",
+  "",
+].join("\n");
+
+/**
+ * Stub `sudo` (prod-side psql): keyed on recognizable SQL fragments, each
+ * branch replays what PROD psql returns for that query (fragments + output
+ * shapes dry-run against the live prod db, read-only, 2026-06-12).
+ *
+ * The schema-grants branch (ON SCHEMA) is dispatched before the generic
+ * table-grants branch (GRANT) so the two don't collide.
+ */
+const SUDO_STUB = [
+  "sudo() {",
+  '  local sql="${!#}"',
+  '  if [[ "$sql" == *"count(*)"* ]]; then',
+  '    if [[ "$sql" == *"pg_policies"* ]]; then cat "$FIX/prod_policies"',
+  '    elif [[ "$sql" == *"table_privileges"* ]]; then cat "$FIX/prod_grants"',
+  '    elif [[ "$sql" == *"pg_tables"* ]]; then cat "$FIX/prod_ownership"',
+  "    fi",
+  '    [[ -s "$FIX/prod_counts_fail" ]] && return 1',
+  "    return 0",
+  "  fi",
+  '  if [[ "$sql" == *"pg_authid"* ]]; then',
+  '    if [[ "$sql" == *"CREATE ROLE"* ]]; then cat "$FIX/prod_authid_ddl"',
+  '    else cat "$FIX/prod_authid_rows"; fi',
+  "    return 0",
+  "  fi",
+  '  if [[ "$sql" == *"CREATE POLICY"* ]]; then cat "$FIX/prod_policy_ddl"; return 0; fi',
+  '  if [[ "$sql" == *"unnest(roles)"* ]]; then cat "$FIX/prod_scoped_roles"; return 0; fi',
+  '  if [[ "$sql" == *"OWNER TO"* ]]; then cat "$FIX/prod_owner_ddl"; return 0; fi',
+  // Schema grants branch: one call per scoped role (WHERE r.rolname = '<role>').
+  // The fixture models what prod returns for that specific role — in the real test
+  // each call returns grants for one role; the harness returns the full fixture
+  // which is correct because the default fixture only has scoped-role grants.
+  '  if [[ "$sql" == *"ON SCHEMA"* ]]; then cat "$FIX/prod_schema_grant_ddl"; return 0; fi',
+  '  if [[ "$sql" == *"GRANT "* ]]; then cat "$FIX/prod_grant_ddl"; return 0; fi',
+  "  return 0",
+  "}",
+].join("\n");
+
+/**
+ * Stub `psql` (clone-side): `-f -` applies append their stdin batch to
+ * applied.sql (the harness's side channel) and fail when the batch contains
+ * $CLONE_APPLY_FAIL_ON (simulating a real in-clone DDL failure); `-c` count
+ * reads replay the clone fixtures.
+ */
+const PSQL_STUB = [
+  "psql() {",
+  '  local sql="" isfile=0 prev="" a batch',
+  '  for a in "$@"; do',
+  '    if [[ "$prev" == "-c" ]]; then sql="$a"; fi',
+  '    if [[ "$a" == "-f" ]]; then isfile=1; fi',
+  '    prev="$a"',
+  "  done",
+  '  if [[ "$isfile" == 1 ]]; then',
+  '    batch="$(cat)"',
+  '    printf \'%s\\n\' "$batch" >> "$FIX/applied.sql"',
+  '    if [[ -n "$CLONE_APPLY_FAIL_ON" && "$batch" == *"$CLONE_APPLY_FAIL_ON"* ]]; then return 1; fi',
+  "    return 0",
+  "  fi",
+  '  if [[ "$sql" == *"pg_policies"* ]]; then cat "$FIX/clone_policies"',
+  '  elif [[ "$sql" == *"table_privileges"* ]]; then cat "$FIX/clone_grants"',
+  '  elif [[ "$sql" == *"pg_tables"* ]]; then cat "$FIX/clone_ownership"',
+  "  fi",
+  "  return 0",
+  "}",
+].join("\n");
+
+interface SyncGlobalsOpts {
+  template?: string;
+  prodAuthidRows?: string;
+  prodScopedRoles?: string;
+  prodPolicies?: string;
+  prodGrants?: string;
+  prodOwnership?: string;
+  prodCountsFail?: boolean;
+  clonePolicies?: string;
+  cloneGrants?: string;
+  cloneOwnership?: string;
+  cloneApplyFailOn?: string;
+  /** DDL the prod-side sudo stub returns for schema-grant queries (ON SCHEMA). */
+  prodSchemaGrantDdl?: string;
+}
+
+interface SyncGlobalsRun {
+  code: number;
+  stdout: string;
+  stderr: string;
+  /** Every DDL batch the clone-side psql received (harness side channel). */
+  applied: string;
+}
+
+/** Execute the generated globals-sync path against prod-shaped fixtures. */
+function runSyncGlobals(opts: SyncGlobalsOpts = {}): SyncGlobalsRun {
+  const dir = mkdtempSync(join(tmpdir(), "samohost-syncglobals-"));
+  try {
+    const fix = (name: string, content: string) =>
+      writeFileSync(join(dir, name), content);
+    fix("template.env", opts.template ?? SYNC_TEMPLATE_DEFAULT);
+    fix(
+      "prod_authid_rows",
+      opts.prodAuthidRows ?? readFileSync(AUTHID_ROWS_FIXTURE, "utf8"),
+    );
+    fix("prod_authid_ddl", AUTHID_DDL_LEGACY);
+    // Live union-query result (policies roles + grantees + owners) on prod:
+    // app_user, field_record, public.
+    fix("prod_scoped_roles", opts.prodScopedRoles ?? "app_user\nfield_record\npublic\n");
+    fix("prod_policies", opts.prodPolicies ?? "14");
+    fix("prod_grants", opts.prodGrants ?? "315");
+    fix("prod_ownership", opts.prodOwnership ?? "29");
+    fix("prod_counts_fail", opts.prodCountsFail ? "1" : "");
+    fix("clone_policies", opts.clonePolicies ?? "14");
+    fix("clone_grants", opts.cloneGrants ?? "315");
+    fix("clone_ownership", opts.cloneOwnership ?? "29");
+    fix("prod_owner_ddl", "ALTER TABLE public.app_users OWNER TO field_record;\n");
+    fix("prod_grant_ddl", "GRANT SELECT ON public.app_users TO app_user;\n");
+    // Prod-verified: field_record is the DB owner so it gets CREATE on public
+    // via pg_database_owner=UC — replayed explicitly because the clone's DB
+    // owner is postgres. Dry-run shape: GRANT CREATE ON SCHEMA public TO ...;
+    fix(
+      "prod_schema_grant_ddl",
+      opts.prodSchemaGrantDdl ??
+        "GRANT USAGE ON SCHEMA public TO field_record;\nGRANT CREATE ON SCHEMA public TO field_record;\nGRANT USAGE ON SCHEMA public TO app_user;\n",
+    );
+    fix(
+      "prod_policy_ddl",
+      "CREATE POLICY p ON public.app_users AS PERMISSIVE FOR SELECT TO app_user USING (true);\n",
+    );
+    fix("applied.sql", "");
+    const script = buildEnvCreateScript(
+      app({ envDbVars: ["DATABASE_URL", "APP_DATABASE_URL"] }),
+      target({ dbBackend: "dblab" }),
+    );
+    const fns = [
+      "samohost_app_url_roles",
+      "samohost_emit_scoped_role_sql",
+      "samohost_parity_check",
+      "samohost_sync_clone_globals",
+    ]
+      .map((n) => extractFnOptional(script, n))
+      .filter((f): f is string => f !== null);
+    const prog = [
+      "set -uo pipefail",
+      `FIX='${dir}'`,
+      `CLONE_APPLY_FAIL_ON='${opts.cloneApplyFailOn ?? ""}'`,
+      `SAMOHOST_ENV_TEMPLATE='${join(dir, "template.env")}'`,
+      "SAMOHOST_ENV_DB_VARS=('DATABASE_URL' 'APP_DATABASE_URL')",
+      "SAMOHOST_DB_PASSWORD='harness-stub-pw'",
+      "SAMOHOST_DB_PORT='6000'",
+      SUDO_STUB,
+      PSQL_STUB,
+      ...fns,
+      "samohost_sync_clone_globals",
+    ].join("\n");
+    const res = spawnSync("bash", ["-c", prog], { encoding: "utf8" });
+    return {
+      code: res.status ?? -1,
+      stdout: res.stdout ?? "",
+      stderr: res.stderr ?? "",
+      applied: readFileSync(join(dir, "applied.sql"), "utf8"),
+    };
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+describe("PR #22 review finding 1 (MAJOR): parity gate fails CLOSED", () => {
+  test("executed: EMPTY prod policy count must FAIL the phase, not pass it", () => {
+    // The exact fail-open bug: an empty prod count made `clone -ge ""` evaluate
+    // as `-ge 0` and serve a clone with missing RLS (the #11 bypass class).
+    const r = runSyncGlobals({ prodPolicies: "", clonePolicies: "0" });
+    expect(r.code).not.toBe(0);
+    expect(r.stderr.toLowerCase()).toContain("parity");
+  });
+
+  test("executed: a FAILING prod count capture (non-zero exit, empty output) must FAIL", () => {
+    const r = runSyncGlobals({ prodPolicies: "", prodCountsFail: true });
+    expect(r.code).not.toBe(0);
+  });
+
+  test("executed: a non-numeric prod policy count must FAIL the phase", () => {
+    const r = runSyncGlobals({
+      prodPolicies: "ERROR:  permission denied",
+      clonePolicies: "0",
+    });
+    expect(r.code).not.toBe(0);
+    // The unvalidated capture must never be echoed back verbatim either way;
+    // the gate message reports the gate, not raw query output.
+    expect(r.stdout).toBe("");
+  });
+
+  test("executed: an empty CLONE count stays a failure (closed side stays closed)", () => {
+    const r = runSyncGlobals({ clonePolicies: "" });
+    expect(r.code).not.toBe(0);
+  });
+
+  test("executed: prod>0 with clone=0 fails; healthy parity passes", () => {
+    expect(runSyncGlobals({ clonePolicies: "0" }).code).not.toBe(0);
+    expect(runSyncGlobals().code).toBe(0);
+  });
+
+  test("script text: a parity helper validates BOTH prod and clone counts numerically", () => {
+    const s = buildEnvCreateScript(app(), target({ dbBackend: "dblab" }));
+    const fn = extractFn(s, "samohost_parity_check");
+    // Two independent numeric validations: prod side AND clone side.
+    expect(fn.match(/=~ \^\[0-9\]\+\$/g)?.length ?? 0).toBeGreaterThanOrEqual(2);
+    // The clone-side count read keeps stderr suppressed (error text from a
+    // psql failure can quote SQL); only the captured count is used.
+    expect(fn).toContain("2>/dev/null");
+  });
+});
+
+describe("PR #22 review finding 2 (MAJOR): role replay scoped to app roles, superpowers stripped", () => {
+  test("executed: ONLY app-referenced roles are replayed — ops/superuser roles ABSENT", () => {
+    const r = runSyncGlobals();
+    expect(r.code).toBe(0);
+    // The app's roles (envDbVars URL roles + grant/policy grantees + owner).
+    expect(r.applied).toContain('"app_user"');
+    expect(r.applied).toContain('"field_record"');
+    // Prod's unrelated ops roles must never reach the preview clone.
+    expect(r.applied).not.toContain("ci_user");
+    expect(r.applied).not.toContain("ci_app_user");
+    expect(r.applied).not.toContain("dblab_dump");
+    expect(r.applied).not.toContain("analytics_group");
+  });
+
+  test("executed: replayed roles are stripped of every cluster superpower", () => {
+    const r = runSyncGlobals();
+    expect(r.applied).toMatch(
+      /ALTER ROLE "field_record" NOSUPERUSER NOBYPASSRLS NOCREATEROLE NOCREATEDB NOREPLICATION LOGIN PASSWORD/,
+    );
+    expect(r.applied).toMatch(
+      /ALTER ROLE "app_user" NOSUPERUSER NOBYPASSRLS NOCREATEROLE NOCREATEDB NOREPLICATION LOGIN PASSWORD/,
+    );
+    // \b…\b does not match the NO- forms, so any bare grant of a superpower fails here.
+    expect(r.applied).not.toMatch(/(?<!NO)\bSUPERUSER\b/);
+    expect(r.applied).not.toMatch(/(?<!NO)\bBYPASSRLS\b/);
+    expect(r.applied).not.toMatch(/(?<!NO)\bCREATEROLE\b/);
+    expect(r.applied).not.toMatch(/(?<!NO)\bCREATEDB\b/);
+    expect(r.applied).not.toMatch(/(?<!NO)\bREPLICATION\b/);
+  });
+
+  test("executed: password hashes carry over for the scoped roles (sign-in works), never on stdout/stderr", () => {
+    const r = runSyncGlobals();
+    expect(r.applied).toContain(FAKE_SCRAM_FIELD_RECORD);
+    expect(r.applied).toContain(FAKE_SCRAM_APP_USER);
+    expect(r.applied).not.toContain(FAKE_SCRAM_DBLAB_DUMP);
+    expect(r.stdout + r.stderr).not.toContain("SCRAM-SHA-256");
+  });
+
+  test("executed helper: samohost_emit_scoped_role_sql emits only scoped roles from prod-shaped pg_authid rows", () => {
+    const s = buildEnvCreateScript(app(), target({ dbBackend: "dblab" }));
+    const fn = extractFn(s, "samohost_emit_scoped_role_sql");
+    const dir = mkdtempSync(join(tmpdir(), "samohost-emitrole-"));
+    try {
+      const scoped = join(dir, "scoped");
+      writeFileSync(scoped, "app_user\nanalytics_group\n");
+      const prog = [fn, `samohost_emit_scoped_role_sql '${scoped}'`].join("\n");
+      const r = spawnSync("bash", ["-c", prog], {
+        input: readFileSync(AUTHID_ROWS_FIXTURE, "utf8"),
+        encoding: "utf8",
+      });
+      expect(r.status).toBe(0);
+      expect(r.stdout).toContain('CREATE ROLE "app_user";');
+      expect(r.stdout).toContain(
+        `ALTER ROLE "app_user" NOSUPERUSER NOBYPASSRLS NOCREATEROLE NOCREATEDB NOREPLICATION LOGIN PASSWORD '${FAKE_SCRAM_APP_USER}';`,
+      );
+      // NOLOGIN group role without a hash: no PASSWORD clause, NOLOGIN kept.
+      expect(r.stdout).toContain(
+        'ALTER ROLE "analytics_group" NOSUPERUSER NOBYPASSRLS NOCREATEROLE NOCREATEDB NOREPLICATION NOLOGIN;',
+      );
+      // Unscoped rows (incl. superuser ops roles) are dropped entirely.
+      expect(r.stdout).not.toContain("field_record");
+      expect(r.stdout).not.toContain("dblab_dump");
+      expect(r.stderr).not.toContain("SCRAM-SHA-256");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("executed helper: a hash with quoting metacharacters is skipped, not interpolated, not echoed", () => {
+    const s = buildEnvCreateScript(app(), target({ dbBackend: "dblab" }));
+    const fn = extractFn(s, "samohost_emit_scoped_role_sql");
+    const dir = mkdtempSync(join(tmpdir(), "samohost-emitrole-"));
+    try {
+      const scoped = join(dir, "scoped");
+      writeFileSync(scoped, "weird_role\n");
+      const prog = [fn, `samohost_emit_scoped_role_sql '${scoped}'`].join("\n");
+      const r = spawnSync("bash", ["-c", prog], {
+        input: "weird_role|t|SCRAM-SHA-256$4096:a'b$c:d\n",
+        encoding: "utf8",
+      });
+      expect(r.status).toBe(0);
+      expect(r.stdout).not.toContain("PASSWORD");
+      expect(r.stdout).not.toContain("a'b");
+      expect(r.stderr).not.toContain("a'b");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("executed helper: samohost_app_url_roles extracts the role component of each mapped var, leaking no values", () => {
+    const s = buildEnvCreateScript(
+      app({ envDbVars: ["DATABASE_URL", "APP_DATABASE_URL"] }),
+      target({ dbBackend: "dblab" }),
+    );
+    const fn = extractFn(s, "samohost_app_url_roles");
+    const dir = mkdtempSync(join(tmpdir(), "samohost-urlroles-"));
+    try {
+      const tpl = join(dir, "template.env");
+      writeFileSync(tpl, SYNC_TEMPLATE_DEFAULT);
+      const prog = [
+        "set -uo pipefail",
+        `SAMOHOST_ENV_TEMPLATE='${tpl}'`,
+        "SAMOHOST_ENV_DB_VARS=('DATABASE_URL' 'APP_DATABASE_URL')",
+        fn,
+        "samohost_app_url_roles",
+      ].join("\n");
+      const r = spawnSync("bash", ["-c", prog], { encoding: "utf8" });
+      expect(r.status).toBe(0);
+      const lines = r.stdout.trim().split("\n").sort();
+      expect(lines).toEqual(["app_user", "field_record"]);
+      expect(r.stdout + r.stderr).not.toContain("admin-pw-X");
+      expect(r.stdout + r.stderr).not.toContain("app-pw-9");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("script text: the unscoped pg_authid attribute passthrough is GONE", () => {
+    const s = buildEnvCreateScript(app(), target({ dbBackend: "dblab" }));
+    const fn = extractFn(s, "samohost_sync_clone_globals");
+    // The old query copied prod's rolsuper/rolbypassrls/rolcreaterole bits
+    // verbatim into the clone for EVERY non-builtin role.
+    expect(fn).not.toContain("WHEN rolsuper");
+    expect(fn).not.toContain("WHEN rolbypassrls");
+    expect(s).toContain("NOSUPERUSER");
+    expect(s).toContain("NOBYPASSRLS");
+  });
+});
+
+describe("PR #22 review finding 3 (MINOR): partial grant/ownership replay must be visible", () => {
+  test("executed: a FAILING ownership apply fails the phase (counted via exit codes, output suppressed)", () => {
+    const r = runSyncGlobals({ cloneApplyFailOn: "OWNER TO" });
+    expect(r.code).not.toBe(0);
+    // Failures are COUNTED, never echoed: psql error text can quote DDL.
+    expect(r.stdout + r.stderr).not.toContain("SCRAM-SHA-256");
+    expect(r.stdout + r.stderr).not.toContain("OWNER TO public.app_users");
+  });
+
+  test("executed: a FAILING grants apply fails the phase", () => {
+    const r = runSyncGlobals({ cloneApplyFailOn: "GRANT SELECT" });
+    expect(r.code).not.toBe(0);
+  });
+
+  test("executed: clone grant count below prod fails parity", () => {
+    const r = runSyncGlobals({ cloneGrants: "0" });
+    expect(r.code).not.toBe(0);
+    expect(r.stderr.toLowerCase()).toContain("grant");
+  });
+
+  test("script text: ownership/grant applies run under ON_ERROR_STOP with streams suppressed", () => {
+    const s = buildEnvCreateScript(app(), target({ dbBackend: "dblab" }));
+    const fn = extractFn(s, "samohost_sync_clone_globals");
+    expect(fn).toContain("ON_ERROR_STOP");
+    for (const line of fn.split("\n")) {
+      if (line.includes("ON_ERROR_STOP") && !line.trim().startsWith("#")) {
+        expect(line).toContain(">/dev/null 2>&1");
+        expect(line).not.toContain("|| true");
+      }
+    }
+  });
+});
+
+describe("PR #22 review finding 4 (MINOR): prod_db derivation is validated", () => {
+  test("executed: a mapped var with NO database path component fails the phase, names the var, leaks nothing", () => {
+    const r = runSyncGlobals({
+      template: [
+        "DATABASE_URL=postgresql://field_record:admin-pw-X@localhost:5432",
+        "APP_DATABASE_URL=postgresql://app_user:app-pw-9@localhost:5432/field_record",
+        "",
+      ].join("\n"),
+    });
+    expect(r.code).not.toBe(0);
+    expect(r.stderr).toContain("DATABASE_URL");
+    // A mis-parse can capture the WHOLE line (credentials included) — the
+    // failure message must never echo the derived value.
+    expect(r.stdout + r.stderr).not.toContain("admin-pw-X");
+  });
+
+  test("executed: a garbage (non-URL) first mapped var fails the phase", () => {
+    const r = runSyncGlobals({
+      template: "DATABASE_URL=not-a-url\nAPP_DATABASE_URL=also-not\n",
+    });
+    expect(r.code).not.toBe(0);
+  });
+
+  test("executed: a MISSING first mapped var fails the phase", () => {
+    const r = runSyncGlobals({ template: "NODE_ENV=production\n" });
+    expect(r.code).not.toBe(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Schema-grant replay (live-validation finding, 2026-06-12): the globals sync
+// was missing schema-level GRANT USAGE/CREATE ON SCHEMA statements. When prod's
+// database owner role (e.g. field_record) is NOT the clone's DB owner (postgres
+// is), the role loses CREATE on the public schema — causing migration failures
+// with "permission denied for schema public" at app startup.
+// ---------------------------------------------------------------------------
+describe("schema-grant replay (live-validation finding 2026-06-12)", () => {
+  test("executed: schema grants from prod are applied to the clone", () => {
+    const r = runSyncGlobals();
+    expect(r.code).toBe(0);
+    // field_record must receive GRANT CREATE ON SCHEMA public (prod-sourced).
+    expect(r.applied).toContain("GRANT CREATE ON SCHEMA public TO field_record");
+    expect(r.applied).toContain("GRANT USAGE ON SCHEMA public TO field_record");
+    expect(r.applied).toContain("GRANT USAGE ON SCHEMA public TO app_user");
+  });
+
+  test("executed: schema-grant apply failure is counted and fails the phase", () => {
+    const r = runSyncGlobals({ cloneApplyFailOn: "GRANT CREATE ON SCHEMA" });
+    expect(r.code).not.toBe(0);
+  });
+
+  test("script text: schema-grant SQL uses per-role WHERE clause (scoping by construction)", () => {
+    // The implementation uses WHERE r.rolname = '$_sr_role' in a while-read loop
+    // over scoped_roles. Since scoped_roles only contains app-referenced roles,
+    // the SQL never queries for ops/CI roles — scoping is by construction, not
+    // post-filter. Verify the generated script has this WHERE clause.
+    const s = buildEnvCreateScript(app(), target({ dbBackend: "dblab" }));
+    const fn = extractFn(s, "samohost_sync_clone_globals");
+    // The while loop reads from scoped_roles and uses $_sr_role in the SQL.
+    expect(fn).toContain("while IFS= read -r _sr_role");
+    expect(fn).toContain("r.rolname = '$_sr_role'");
+    expect(fn).toContain('done < "$scoped_roles"');
+  });
+
+  test("script text: schema-grant step is present in samohost_sync_clone_globals", () => {
+    const s = buildEnvCreateScript(app(), target({ dbBackend: "dblab" }));
+    const fn = extractFn(s, "samohost_sync_clone_globals");
+    // The schema-grant replay step must query schema privileges and emit grants.
+    expect(fn).toContain("ON SCHEMA");
+    expect(fn).toContain("GRANT");
+    expect(fn).toContain("has_schema_privilege");
+    // Must be applied to the clone under ON_ERROR_STOP with streams suppressed
+    // (idempotent, but failures — e.g. role doesn't exist yet — are real errors).
+    // The apply line follows the schema-grant query pipe; check that the
+    // ON_ERROR_STOP apply is present in the schema-grant vicinity.
+    const lines = fn.split("\n");
+    const schemaGrantQueryIdx = lines.findIndex((l) => l.includes("has_schema_privilege"));
+    expect(schemaGrantQueryIdx).toBeGreaterThan(-1);
+    // Within the next few lines, ON_ERROR_STOP and >/dev/null 2>&1 must appear.
+    const nearby = lines.slice(schemaGrantQueryIdx, schemaGrantQueryIdx + 5).join("\n");
+    expect(nearby).toContain("ON_ERROR_STOP");
+    expect(nearby).toContain(">/dev/null 2>&1");
   });
 });

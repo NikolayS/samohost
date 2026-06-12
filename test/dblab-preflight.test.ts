@@ -11,65 +11,74 @@ function sections(o: Record<string, string>): Map<string, string> {
 }
 
 /**
- * The LIVE SOLO VM shape (verified 2026-06-11): unit file exists with
- * ExecStart=/usr/local/bin/dblab-engine, service inactive/dead + disabled, no
- * binaries, PG18 up on 127.0.0.1:5432, ZFS datasets reserved.
+ * The LIVE SOLO VM shape (runtime-verified 2026-06-12, issue #7): the engine
+ * runs as the `dblab_server` docker container (postgresai/dblab-server:4.1.3),
+ * healthz answers on 127.0.0.1:2345, the CLI lives at ~agent/bin/dblab (NOT on
+ * PATH in non-login shells), and the legacy dblab.service ExecStart binary
+ * does not exist. healthz body captured verbatim from the live engine.
  */
 const LIVE_VM = {
-  "unit-file": "Description=Database Lab Engine\nExecStart=/usr/local/bin/dblab-engine",
-  "unit-active": "inactive",
-  "unit-enabled": "disabled",
-  "cli-binary": "NO_CLI",
-  "engine-binary": "NO_ENGINE_BINARY",
-  "api-listen": "127.0.0.1:5432\n0.0.0.0:2223\n0.0.0.0:443",
+  "engine-healthz":
+    '{"version":"v4.1.3-20260508-1125","edition":"community","instanceID":"d8lkc7q52olc73a3g70g"}',
+  "engine-container": "postgresai/dblab-server:4.1.3 Up 2 hours",
+  "cli-binary": "/home/agent/bin/dblab",
+  "api-listen": "127.0.0.1:5432\n127.0.0.1:2345\n0.0.0.0:2223\n0.0.0.0:443",
   "zfs-datasets": "tank/dblab\ntank/postgresql\ntank/previews",
   "postgres-local": "127.0.0.1:5432 - accepting connections",
 };
 
-describe("evaluateDblabPreflight", () => {
-  test("LIVE VM shape: engine BLOCKED (installed-shape only), template READY", () => {
+/** The pre-install shape (engine down, no CLI anywhere). */
+const ENGINE_DOWN = {
+  ...LIVE_VM,
+  "engine-healthz": "NO_HEALTHZ",
+  "engine-container": "NO_CONTAINER",
+  "cli-binary": "NO_CLI",
+  "api-listen": "127.0.0.1:5432\n0.0.0.0:2223\n0.0.0.0:443",
+};
+
+describe("evaluateDblabPreflight (issue #7: healthz is the gate, not the retired unit)", () => {
+  test("LIVE VM shape: engine READY via healthz + home-dir CLI; legacy unit irrelevant", () => {
     const r = evaluateDblabPreflight(sections(LIVE_VM));
+    expect(r.engine).toBe("READY");
+    expect(r.templateFallback).toBe("READY");
+    expect(r.reasons.filter((x) => x.startsWith("engine:"))).toEqual([]);
+    // The container model is REPORTED (image + status), not just probed.
+    const container = r.checks.find((c) => c.id === "engine-container");
+    expect(container?.status).toBe("pass");
+    expect(container?.detail).toContain("postgresai/dblab-server:4.1.3");
+    // CLI detail names the resolved path (PATH or ~/bin fallback).
+    const cli = r.checks.find((c) => c.id === "cli-binary");
+    expect(cli?.status).toBe("pass");
+    expect(cli?.detail).toContain("/home/agent/bin/dblab");
+  });
+
+  test("engine down (pre-install shape): BLOCKED with healthz + runbook + CLI reasons", () => {
+    const r = evaluateDblabPreflight(sections(ENGINE_DOWN));
     expect(r.engine).toBe("BLOCKED");
     expect(r.templateFallback).toBe("READY");
     const joined = r.reasons.join("\n");
-    expect(joined).toContain("INSTALLED SHAPE ONLY");
-    expect(joined).toContain("disabled");
-    expect(joined).toContain("/usr/local/bin/dblab-engine missing");
-    expect(joined).toContain("dblab CLI not on PATH");
+    expect(joined).toContain("healthz");
+    expect(joined).toContain("docs/dblab-install-runbook.md");
+    expect(joined).toContain("dblab_server");
+    expect(joined).toContain("dblab CLI not found");
+    expect(joined).toContain("~/bin/dblab");
     expect(joined).toContain("tank/dblab ZFS dataset is reserved");
   });
 
-  test("fully running engine: READY with no engine reasons", () => {
+  test("healthz answers but CLI missing everywhere: BLOCKED naming the CLI", () => {
     const r = evaluateDblabPreflight(
-      sections({
-        ...LIVE_VM,
-        "unit-active": "active",
-        "unit-enabled": "enabled",
-        "cli-binary": "/usr/local/bin/dblab",
-        "engine-binary": "ENGINE_BINARY_OK",
-        "api-listen": "127.0.0.1:5432\n127.0.0.1:2345",
-      }),
-    );
-    expect(r.engine).toBe("READY");
-    expect(r.reasons.filter((x) => x.startsWith("engine:"))).toEqual([]);
-  });
-
-  test("active unit but no CLI and no API listener: BLOCKED", () => {
-    const r = evaluateDblabPreflight(
-      sections({ ...LIVE_VM, "unit-active": "active" }),
+      sections({ ...LIVE_VM, "cli-binary": "NO_CLI" }),
     );
     expect(r.engine).toBe("BLOCKED");
+    expect(r.reasons.join("\n")).toContain("dblab CLI not found");
   });
 
-  test("active + API listening but CLI missing: READY via listener evidence", () => {
+  test("CLI present but healthz dead: BLOCKED (container evidence does not substitute)", () => {
     const r = evaluateDblabPreflight(
-      sections({
-        ...LIVE_VM,
-        "unit-active": "active",
-        "api-listen": "127.0.0.1:2345",
-      }),
+      sections({ ...LIVE_VM, "engine-healthz": "NO_HEALTHZ" }),
     );
-    expect(r.engine).toBe("READY");
+    expect(r.engine).toBe("BLOCKED");
+    expect(r.reasons.join("\n")).toContain("healthz");
   });
 
   test("no probe output at all: engine and fallback UNKNOWN", () => {
@@ -88,14 +97,6 @@ describe("evaluateDblabPreflight", () => {
     expect(r.templateFallback).toBe("BLOCKED");
   });
 
-  test("port 5432 listening does NOT count as the dblab API", () => {
-    const r = evaluateDblabPreflight(
-      sections({ ...LIVE_VM, "unit-active": "active", "cli-binary": "NO_CLI" }),
-    );
-    // 127.0.0.1:5432 in api-listen must not satisfy the :2345 check.
-    expect(r.engine).toBe("BLOCKED");
-  });
-
   test("every check id appears exactly once in the report", () => {
     const r = evaluateDblabPreflight(sections(LIVE_VM));
     expect(r.checks.map((c) => c.id).sort()).toEqual(
@@ -104,17 +105,29 @@ describe("evaluateDblabPreflight", () => {
   });
 });
 
-describe("probe script round-trip", () => {
+describe("probe set (issue #7 contract)", () => {
+  test("probes the engine API + container + two-path CLI; never the retired unit", () => {
+    const all = DBLAB_PROBES.map((p) => p.probeCommand).join("\n");
+    expect(all).toContain("curl -fsS --max-time 5 http://127.0.0.1:2345/healthz");
+    expect(all).toContain("dblab_server");
+    expect(all).toContain("command -v dblab");
+    expect(all).toContain("$HOME/bin/dblab");
+    // The legacy unit/binary do not exist on the host — probing them produced
+    // false BLOCKED verdicts.
+    expect(all).not.toContain("dblab.service");
+    expect(all).not.toContain("/usr/local/bin/dblab-engine");
+  });
+
   test("buildAuditScript + parseAuditOutput recover per-probe sections", () => {
     const script = buildAuditScript(DBLAB_PROBES);
-    expect(script).toContain("systemctl is-active dblab.service");
+    expect(script).toContain("healthz");
     expect(script).toContain("zfs list");
     // Simulate combined remote output with delimiters as the script emits them.
     const fake = DBLAB_PROBES.map(
       (p) => `<<<SAMOHOST_AUDIT:${p.id}>>>\noutput-of-${p.id}`,
     ).join("\n");
     const parsed = parseAuditOutput(fake, DBLAB_PROBES);
-    expect(parsed.get("unit-active")).toBe("output-of-unit-active");
+    expect(parsed.get("engine-healthz")).toBe("output-of-engine-healthz");
     expect(parsed.size).toBe(DBLAB_PROBES.length);
   });
 

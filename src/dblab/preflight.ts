@@ -1,11 +1,15 @@
 /**
  * DBLab Engine preflight for SOLO previews (SPEC-DELTA §4 dblab backend).
  *
- * The live VM teaches the distinction this module encodes: an INSTALLED SHAPE
- * (dblab.service unit file exists, ZFS datasets tank/dblab|postgresql|previews
- * reserved) is not a RUNNING ENGINE (unit inactive/dead + disabled, no
- * dblab/dblab-engine binary on PATH, no API listening). `env create --db dblab`
- * must be gated on the latter, not the former.
+ * The runtime-verified contract (issue #7, live install 2026-06-12 on the
+ * SOLO VM, DBLab v4.1.3): the engine runs as the `dblab_server` docker
+ * container (postgresai/dblab-server) with its API on 127.0.0.1:2345; the
+ * legacy `dblab.service` unit's ExecStart binary (/usr/local/bin/dblab-engine)
+ * has no published artifact and the unit is retired — probing it produced
+ * false BLOCKED verdicts once the real engine was live. Liveness is therefore
+ * the engine's own `/healthz` endpoint; drivability is the `dblab` client CLI
+ * resolving on PATH or at ~/bin/dblab (the runbook's install location, which
+ * non-login shells do not have on PATH).
  *
  * Probes are read-only, unprivileged where possible, and batched into ONE SSH
  * connection via audit/batch.ts (same fail2ban-safety requirement as audits).
@@ -25,35 +29,23 @@ export const DBLAB_API_PORT = 2345;
  */
 export const DBLAB_PROBES: AuditCheck[] = [
   {
-    id: "unit-file",
-    description: "dblab.service unit file exists (shows ExecStart)",
+    id: "engine-healthz",
+    description: `engine healthz answering on 127.0.0.1:${DBLAB_API_PORT}`,
+    probeCommand: `curl -fsS --max-time 5 http://127.0.0.1:${DBLAB_API_PORT}/healthz 2>/dev/null || echo NO_HEALTHZ`,
+    expect: "",
+  },
+  {
+    id: "engine-container",
+    description: "dblab_server container (image + status)",
     probeCommand:
-      "systemctl cat dblab.service 2>/dev/null | grep -E '^(ExecStart|Description)=' || echo NO_UNIT",
-    expect: "",
-  },
-  {
-    id: "unit-active",
-    description: "dblab.service is active",
-    probeCommand: "systemctl is-active dblab.service",
-    expect: "",
-  },
-  {
-    id: "unit-enabled",
-    description: "dblab.service is enabled",
-    probeCommand: "systemctl is-enabled dblab.service",
+      "docker ps --filter name=dblab_server --format '{{.Image}} {{.Status}}' 2>/dev/null | grep . || echo NO_CONTAINER",
     expect: "",
   },
   {
     id: "cli-binary",
-    description: "dblab CLI on PATH",
-    probeCommand: "command -v dblab || echo NO_CLI",
-    expect: "",
-  },
-  {
-    id: "engine-binary",
-    description: "engine binary at the unit's ExecStart path",
+    description: "dblab CLI on PATH or at ~/bin/dblab",
     probeCommand:
-      "test -x /usr/local/bin/dblab-engine && echo ENGINE_BINARY_OK || echo NO_ENGINE_BINARY",
+      'command -v dblab 2>/dev/null || { test -x "$HOME/bin/dblab" && echo "$HOME/bin/dblab"; } || echo NO_CLI',
     expect: "",
   },
   {
@@ -105,10 +97,11 @@ function section(
 /**
  * Pure evaluation of the batched probe output (parseAuditOutput sections).
  *
- * engine READY    : unit active AND engine/api evidence (binary or listener)
- * engine BLOCKED  : positive evidence the engine is NOT running (inactive,
- *                   disabled-only shape, binary missing) — installed-shape
- *                   facts (unit file, ZFS datasets) do NOT make it ready.
+ * engine READY    : healthz answers AND the CLI resolves (PATH or ~/bin) —
+ *                   the same two conditions the generated db-preflight phase
+ *                   gates on, so the verdicts cannot diverge.
+ * engine BLOCKED  : healthz dead or CLI missing; container/ZFS facts are
+ *                   reported as context, never as a substitute for healthz.
  * engine UNKNOWN  : probes missing/unreadable (e.g. connection died).
  */
 export function evaluateDblabPreflight(
@@ -119,54 +112,36 @@ export function evaluateDblabPreflight(
 
   const get = (id: string) => section(sections, id);
 
-  // --- unit file (installed shape) ---
-  const unitFile = get("unit-file");
-  const unitFilePresent =
-    unitFile !== undefined && !unitFile.includes("NO_UNIT");
+  // --- engine healthz (the liveness gate) ---
+  const healthz = get("engine-healthz");
+  const healthzOk = healthz !== undefined && !healthz.includes("NO_HEALTHZ");
   checks.push({
-    id: "unit-file",
-    status: unitFile === undefined ? "unknown" : unitFilePresent ? "pass" : "fail",
-    detail: unitFile ?? "no probe output",
+    id: "engine-healthz",
+    status: healthz === undefined ? "unknown" : healthzOk ? "pass" : "fail",
+    detail: healthz ?? "no probe output",
   });
 
-  // --- unit active ---
-  const active = get("unit-active");
-  const isActive = active !== undefined && active.trim() === "active";
+  // --- engine container (the runtime model; reported, not gating) ---
+  const container = get("engine-container");
+  const containerUp =
+    container !== undefined && !container.includes("NO_CONTAINER");
   checks.push({
-    id: "unit-active",
-    status: active === undefined ? "unknown" : isActive ? "pass" : "fail",
-    detail: active ?? "no probe output",
+    id: "engine-container",
+    status:
+      container === undefined ? "unknown" : containerUp ? "pass" : "fail",
+    detail: containerUp ? container : "dblab_server container not running",
   });
 
-  // --- unit enabled ---
-  const enabled = get("unit-enabled");
-  const isEnabled = enabled !== undefined && enabled.trim() === "enabled";
-  checks.push({
-    id: "unit-enabled",
-    status: enabled === undefined ? "unknown" : isEnabled ? "pass" : "fail",
-    detail: enabled ?? "no probe output",
-  });
-
-  // --- binaries ---
+  // --- CLI (two-path resolution: PATH or ~/bin/dblab) ---
   const cli = get("cli-binary");
   const cliPresent = cli !== undefined && !cli.includes("NO_CLI");
   checks.push({
     id: "cli-binary",
     status: cli === undefined ? "unknown" : cliPresent ? "pass" : "fail",
-    detail: cli ?? "no probe output",
+    detail: cliPresent ? cli!.trim() : "not on PATH and no ~/bin/dblab",
   });
 
-  const engineBin = get("engine-binary");
-  const engineBinPresent =
-    engineBin !== undefined && engineBin.includes("ENGINE_BINARY_OK");
-  checks.push({
-    id: "engine-binary",
-    status:
-      engineBin === undefined ? "unknown" : engineBinPresent ? "pass" : "fail",
-    detail: engineBin ?? "no probe output",
-  });
-
-  // --- API listener ---
+  // --- API listener (corroboration only; healthz is authoritative) ---
   const listeners = get("api-listen");
   const apiListening =
     listeners !== undefined &&
@@ -208,33 +183,33 @@ export function evaluateDblabPreflight(
 
   // ---- engine verdict -------------------------------------------------------
   let engine: PreflightStatus;
-  const coreUnknown = active === undefined && cli === undefined;
+  const coreUnknown = healthz === undefined && cli === undefined;
   if (coreUnknown) {
     engine = "UNKNOWN";
     reasons.push("engine: probes returned nothing — connection or probe failure");
-  } else if (isActive && (cliPresent || apiListening)) {
+  } else if (healthzOk && cliPresent) {
     engine = "READY";
   } else {
     engine = "BLOCKED";
-    if (unitFilePresent && !isActive) {
+    if (!healthzOk) {
       reasons.push(
-        "engine: INSTALLED SHAPE ONLY — dblab.service unit file exists but the " +
-          `service is ${active?.trim() ?? "unknown"}` +
-          (isEnabled ? "" : " and disabled"),
+        `engine: no answer on http://127.0.0.1:${DBLAB_API_PORT}/healthz — ` +
+          "the engine is not running; install/start it per docs/dblab-install-runbook.md",
       );
-    } else if (!unitFilePresent) {
-      reasons.push("engine: no dblab.service unit on the host");
-    }
-    if (!engineBinPresent) {
-      reasons.push(
-        "engine: ExecStart binary /usr/local/bin/dblab-engine missing or not " +
-          "executable — the unit cannot start until the engine is installed",
-      );
+      if (!containerUp && container !== undefined) {
+        reasons.push(
+          "engine: dblab_server container is not running (the engine ships " +
+            "as the postgresai/dblab-server docker container)",
+        );
+      }
     }
     if (!cliPresent) {
-      reasons.push("engine: dblab CLI not on PATH — env scripts cannot drive clones");
+      reasons.push(
+        "engine: dblab CLI not found on PATH or at ~/bin/dblab — env scripts " +
+          "cannot drive clones",
+      );
     }
-    if (!apiListening && listeners !== undefined) {
+    if (!apiListening && listeners !== undefined && !healthzOk) {
       reasons.push(`engine: nothing listening on the API port :${DBLAB_API_PORT}`);
     }
     if (datasets.includes("tank/dblab")) {

@@ -121,11 +121,12 @@ recorded pool (lowest-free, ports.ts), fresh checkout in `<app-parent>/envs/<nam
 (`--reference` clone off the production checkout), templated systemd instance
 (`<unit>@<name>.service`), Caddy vhost snippet in `/etc/caddy/sites.d/` + reload,
 DB provisioning:
-- **dblab backend** (default): DBLab Engine thin clone; clone id = env name; env's
-  DATABASE_URL points at the clone port. Destroy = clone delete. The emitted
-  `dblab` CLI calls are PLAN HOOKS — flags to be confirmed once DBLab Engine is
-  live on the VM (datasets already reserved on the platform VM).
-- **template backend** (fallback until DBLab Engine confirmed):
+- **dblab backend** (default): DBLab Engine thin clone; clone id = env name; the
+  mapped `envDbVars` are repointed at the clone's port (see the issue #7
+  contract below). Destroy = clone delete. The CLI calls are runtime-verified
+  against the live v4.1.3 engine (issue #7, 2026-06-12) — no longer plan hooks.
+- **template backend** (fallback when the engine is down; see #21 for the
+  staleness trade-off):
   `dropdb --if-exists <db>` + `createdb --template=<tpl> <db>` — NO per-env
   role (see the issue #11 redesign below). Template db defaults to
   `<app dashes→underscores>_template`; override per env with `--template-db`
@@ -172,10 +173,36 @@ Design now:
 - **Re-run semantics**: the db phase is drop-if-exists + recreate, so create
   re-runs are genuinely idempotent — and a re-run RESETS per-env db data
   (previews are disposable; the CLI failure guidance says so).
-- dblab backend: envDbVars mapping is a TODO entangled with the clone-status
-  port-field fix (issue #7) — clones need host:port rewired per
-  `dblab clone status`, with template creds kept (they exist in the physical
-  clone). Until then dblab keeps its original append-DATABASE_URL shape.
+- **dblab backend mapping (issue #7, closes the PR #12 TODO)**: the dblab
+  envfile phase applies the SAME envDbVars mapping, but rewrites ONLY the
+  host:port of each mapped var to `127.0.0.1:<clone-port>` (the engine's
+  `cloneAccessAddresses` + 6000–6099 port pool), with the clone port read from
+  the NESTED `.db.port` STRING in `dblab clone status` JSON (v4.1.3 contract,
+  fixture captured from the live engine; python3 parse with an anchored-sed
+  fallback — no jq dependency). **Why credentials carry over (and what makes
+  that true):** the SOLO engine's retrieval mode is LOGICAL — live-verified
+  2026-06-12 that a fresh clone holds prod's database (same name, same
+  tables) but NONE of prod's cluster roles, and that the restore silently
+  dropped ALL grants and ALL 14 RLS policies because the roles they reference
+  did not exist in the clone's cluster. So the db phase runs
+  `samohost_sync_clone_globals`: it regenerates, from the PROD catalogs, the
+  roles (attributes + password hashes via pg_authid, read through the
+  exact-path sudo psql grant — hashes move host-side only, never through
+  samohost), table ownership, table grants, and RLS policies (deparsed from
+  pg_policies), applies them to the clone via the script's own on-host clone
+  superuser (`clone create --username/--password` adds exactly that one extra
+  role), and GATES the phase on policy-count parity with prod. After the
+  sync, keeping the operator template's user/password/dbname preserves the
+  prod URL contract ("DATABASE_URL bypasses RLS, APP_DATABASE_URL is the
+  policy-fitted app role") exactly as the template backend's same-roles
+  design does — verified live: sign-in with production credentials succeeds
+  against a preview wired to a clone. On engines whose retrieval carries
+  globals (physical mode) the sync degrades to ignored duplicate-DDL and an
+  already-true parity check. Known limits (fine for this app, documented):
+  sequence/function grants and default privileges are not replayed. The
+  engine-side long-term fix (logicalRestore queryPreprocessing creating
+  roles BEFORE restore, so grants/policies restore natively) is filed as a
+  follow-up. The old append-only `DATABASE_URL=` shape is gone.
 
 **Deterministic template-DB creation (operator runbook).** `createdb -T <src>`
 requires ZERO other connections on `<src>`, and lazy connection pools make the
@@ -210,18 +237,22 @@ are needed and Caddy gets per-vhost certs via HTTP-01. The Cloudflare adapter
 **Preflight:** `samohost dns status samo.cat --expect-ip <vm-ip>` (§5) verifies
 the wildcard exists before any env is created; as of 2026-06-11 it does NOT.
 
-**DBLab preflight (installed shape ≠ running engine).** The live SOLO VM has
-the dblab.service unit file (ExecStart=/usr/local/bin/dblab-engine) and the
-tank/dblab|postgresql|previews ZFS datasets — but the service is inactive+
-disabled, the engine binary and dblab CLI are absent, and nothing listens on
-the API port. `samohost env preflight <vm>` (read-only probes batched into ONE
-SSH connection via audit/batch.ts; pure evaluation in src/dblab/preflight.ts)
-reports the dblab-engine gate as READY | BLOCKED | UNKNOWN with per-check
-detail and reasons, plus the `--db template` fallback's readiness (local
-Postgres on 127.0.0.1:5432 — currently READY). `env create --db dblab` is
-additionally gated ON-HOST: a `db-preflight` script phase refuses to attempt a
-clone unless dblab.service is active AND the dblab CLI exists, pointing at
-`env preflight` for diagnosis.
+**DBLab preflight (the engine is a container; the unit is retired — issue
+#7).** Runtime-verified 2026-06-12: the engine runs as the `dblab_server`
+docker container (postgresai/dblab-server:4.1.3) with its API on
+127.0.0.1:2345; the legacy `dblab.service` unit's ExecStart binary
+(/usr/local/bin/dblab-engine) has no published artifact, and the CLI is
+installed at `~agent/bin/dblab` (NOT on PATH in non-login shells). The
+original preflight gated on the unit and reported false BLOCKED against the
+live engine. Now: `samohost env preflight <vm>` (read-only probes batched into
+ONE SSH connection via audit/batch.ts; pure evaluation in
+src/dblab/preflight.ts) gates the engine verdict on the `/healthz` endpoint
+answering AND the CLI resolving (PATH, then ~/bin/dblab), reports the
+container model (image + status) as context, and never probes the retired
+unit — plus the `--db template` fallback's readiness (local Postgres on
+127.0.0.1:5432). `env create --db dblab` is gated ON-HOST by the same two
+conditions in its `db-preflight` phase (so the verdicts cannot diverge),
+pointing at `env preflight` and docs/dblab-install-runbook.md on failure.
 
 ### 5. DNS provider port + preflight — **IMPLEMENTED (adapter unwired by design)**
 
@@ -285,10 +316,9 @@ Resize, snapshots, drift correction, GCP/DO providers.
   ongoing automation (see docs/dns-preview-authority.md; one manual wildcard
   avoids it entirely).
 - Hetzner `provision`/rebuild path — blocked on HCLOUD_TOKEN availability on the operator machine.
-- DBLab Engine INSTALL on the platform VM — preflight now detects/blocks
-  (installed shape only: unit file + ZFS datasets, no engine binary, service
-  dead); the `dblab` CLI calls in env scripts remain plan hooks until
-  `env preflight` reports READY.
+- ~~DBLab Engine INSTALL on the platform VM~~ — DONE 2026-06-12 (container
+  model per docs/dblab-install-runbook.md); `env preflight` reports READY and
+  the env scripts' CLI calls are runtime-verified (issue #7).
 - GitHub Actions runner registration — blocked on a repo-admin token; exact handoff + execution sequence documented in `docs/runner-admin-handoff.md`.
 
 ## Provision/destroy delta (v0.1 lifecycle, Hetzner-only — feat/provision)
