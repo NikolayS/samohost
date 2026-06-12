@@ -93,21 +93,34 @@ dblab init --environment-id solo --url http://127.0.0.1:2345 \
 - `curl -s http://127.0.0.1:2345/healthz` → healthy; engine container running.
 - One full round-trip:
   `dblab clone create --username samohost_env --password <pw> --id smoke-1`
-  → `dblab clone status smoke-1 | jq -r '.db.port'` returns a port →
+  → `dblab clone status smoke-1 | jq -r '.db.port'` returns a port (jq is fine
+  for an operator one-liner; samohost itself parses without jq, see below) →
   `psql` connects on 127.0.0.1:<port> → `dblab clone destroy smoke-1`.
 - `samohost env preflight <vm>` reports the dblab backend READY.
 
-## samohost contract corrections (for `src/env/script.ts`)
+## samohost contract corrections — LANDED (issue #7, runtime-verified 2026-06-12)
 
-- **Port parsing is wrong today**: `dblab clone status` returns the port at
-  **`.db.port`** as a **string** (verified against `engine/pkg/models/clone.go`
-  + `database.go` @ v4.1.3), not a top-level `"port"` — the current sed for
-  `"port"` matches nothing reliable. Use `jq -r '.db.port'`.
-- Engine liveness gate should probe `http://127.0.0.1:2345/healthz` (and/or the
-  `dblab_server` container), not `systemctl is-active dblab.service` — the unit
-  is being retired.
-- Consider `dblab clone create --branch <git-branch>` (4.x native branching) for
-  per-branch previews instead of bare `--id`.
+All three corrections below are implemented in `src/env/script.ts` +
+`src/dblab/preflight.ts` and verified against the LIVE engine:
+
+- **Port parsing**: `dblab clone status` returns the port at **`.db.port`** as
+  a **string** (verified against `engine/pkg/models/clone.go` + `database.go`
+  @ v4.1.3 AND against the live engine's JSON, captured into
+  `test/fixtures/dblab-clone-status.json`). The generated script's
+  `samohost_clone_port()` parses it with python3 (sed fallback anchored to the
+  `"db"` object) — no jq dependency on hosts.
+- **Engine liveness gate** probes `http://127.0.0.1:2345/healthz` and resolves
+  the CLI via `command -v dblab` then `~/bin/dblab` (the install location
+  above is NOT on PATH in non-login shells). `systemctl is-active
+  dblab.service` is gone everywhere — the unit is retired (its ExecStart
+  binary never existed as a published artifact).
+- **envDbVars mapping**: the dblab envfile phase rewrites ONLY host:port of
+  each mapped var to `127.0.0.1:<clone-port>`; the operator template's
+  user/password/dbname carry over because the clone is a physical copy
+  containing prod's roles (the `--username/--password` clone flags only add an
+  extra role). See SPEC-DELTA §4.
+- Still open (filed separately): `dblab clone create --branch <git-branch>`
+  (4.x native branching) for per-branch previews instead of bare `--id`.
 
 ## Sizing guardrails (8 GB VM with prod + CI)
 

@@ -125,6 +125,81 @@ const REWIRE_DB_VARS_FN_LINES: string[] = [
   "}",
 ];
 
+/**
+ * Bash lines: resolve the dblab CLI into SAMOHOST_DBLAB_BIN (issue #7). The
+ * runbook installs the client to ~agent/bin/dblab, which is NOT on PATH in
+ * non-login shells (`bash -s` over ssh) — so PATH first, then $HOME/bin.
+ * Every later dblab call goes through "$SAMOHOST_DBLAB_BIN".
+ */
+const DBLAB_BIN_RESOLVE_LINES: string[] = [
+  "# Resolve the dblab CLI: PATH first, then ~/bin (runbook install location).",
+  'SAMOHOST_DBLAB_BIN="$(command -v dblab || true)"',
+  'if [[ -z "$SAMOHOST_DBLAB_BIN" && -x "$HOME/bin/dblab" ]]; then',
+  '  SAMOHOST_DBLAB_BIN="$HOME/bin/dblab"',
+  "fi",
+];
+
+/**
+ * Bash function: extract the clone's host port from `dblab clone status`
+ * JSON (issue #7). Runtime-verified against DBLab v4.1.3: the port is a
+ * STRING nested at `.db.port` (see test/fixtures/dblab-clone-status.json,
+ * captured from the live engine) — NOT a top-level `"port"` number, which is
+ * what the previous sed looked for. python3 (ubiquitous on Ubuntu hosts) does
+ * the honest JSON parse; the fallback sed is anchored to the `"db"` object so
+ * it cannot match ports in other objects. No jq: not guaranteed on hosts.
+ * (Closing brace at column 0 — tests extract and execute this function
+ * against the captured prod-shaped fixture.)
+ */
+const CLONE_PORT_FN_LINES: string[] = [
+  "samohost_clone_port() {",
+  "  local status_json",
+  '  status_json="$("$SAMOHOST_DBLAB_BIN" clone status "$SAMOHOST_CLONE_ID" 2>/dev/null)" || return 1',
+  "  if command -v python3 >/dev/null; then",
+  "    printf '%s' \"$status_json\" \\",
+  "      | python3 -c 'import json,sys; print(json.load(sys.stdin)[\"db\"][\"port\"])'",
+  "  else",
+  "    printf '%s' \"$status_json\" | tr -d '\\n' \\",
+  '      | sed -n \'s/.*"db"[[:space:]]*:[[:space:]]*{[^}]*"port"[[:space:]]*:[[:space:]]*"\\{0,1\\}\\([0-9][0-9]*\\)"\\{0,1\\}.*/\\1/p\'',
+  "  fi",
+  "}",
+];
+
+/**
+ * Bash function: rewire each mapped DB env var (the PR #12 TODO, closed by
+ * issue #7) inside the composed .env so its URL points at the DBLab clone.
+ * Unlike the template backend (which rewrites the DB NAME), the clone is a
+ * full Postgres instance on its own port holding a PHYSICAL COPY of prod —
+ * prod's roles, passwords, and database name all exist inside it. So ONLY
+ * host:port is rewritten (to 127.0.0.1:$SAMOHOST_DB_PORT, the engine's
+ * cloneAccessAddresses + port pool); scheme/user/password/dbname/query carry
+ * over from the operator template, preserving the prod URL contract
+ * (e.g. "DATABASE_URL bypasses RLS, APP_DATABASE_URL is the app role").
+ * Same strip-then-append composition and hard-fail rules as the template
+ * rewire. (Closing brace at column 0 — tests extract and execute it.)
+ */
+const REWIRE_DB_HOSTPORT_FN_LINES: string[] = [
+  "samohost_rewire_db_hostport() {",
+  '  local envfile="$1" var line val rewritten',
+  '  for var in "${SAMOHOST_ENV_DB_VARS[@]}"; do',
+  '    line="$(grep -E "^${var}=" "$envfile" | tail -n 1 || true)"',
+  '    if [[ -z "$line" ]]; then',
+  "      echo \"samohost: env template is missing ${var} (declared in the app's envDbVars) — refusing to compose an env that could inherit the production database\" >&2",
+  "      return 1",
+  "    fi",
+  '    val="${line#*=}"',
+  "    if ! printf '%s' \"$val\" | grep -Eq '^\"?[A-Za-z0-9+]+://[^/]+/'; then",
+  '      echo "samohost: ${var} in the env template is not a URL with a host component — cannot rewire it to the DBLab clone" >&2',
+  "      return 1",
+  "    fi",
+  "    rewritten=\"$(printf '%s' \"$val\" | sed -E 's|^(\"?[A-Za-z0-9+]+://)([^/]*@)?[^/?\"]*|\\1\\2127.0.0.1:'\"$SAMOHOST_DB_PORT\"'|')\"",
+  '    grep -vE "^${var}=" "$envfile" > "${envfile}.rewired" || true',
+  "    printf '%s=%s\\n' \"$var\" \"$rewritten\" >> \"${envfile}.rewired\"",
+  '    mv "${envfile}.rewired" "$envfile"',
+  '    chmod 600 "$envfile"',
+  "  done",
+  "}",
+];
+
 /** Single-quote for safe embedding in generated bash (same as app/script.ts). */
 function sq(s: string): string {
   return `'${s.replace(/'/g, `'\\''`)}'`;
@@ -240,38 +315,52 @@ export function buildEnvCreateScript(
   // ----- db ------------------------------------------------------------------
   if (t.dbBackend === "dblab") {
     const dbName = t.dbName ?? t.name;
+    const envDbVars = app.envDbVars ?? [...DEFAULT_ENV_DB_VARS];
     lines.push(
-      // Installed shape (unit file, ZFS datasets) is NOT a running engine.
-      // Gate on the engine actually being active + drivable before any clone
-      // call: fail fast with a pointer at the full diagnosis command.
+      ...DBLAB_BIN_RESOLVE_LINES,
+      "",
+      // Runtime-verified contract (issue #7): the engine runs as the
+      // dblab_server docker container; the legacy dblab.service unit's
+      // ExecStart binary does not exist. Liveness = the engine's own healthz
+      // endpoint answering, drivability = the CLI resolving (PATH or ~/bin).
       ...phaseBlock(
         "db-preflight",
-        "DBLab engine must be RUNNING, not merely installed-shape",
+        "DBLab engine must be RUNNING (healthz) and drivable (CLI), not merely installed-shape",
         [
-          "if systemctl is-active --quiet dblab.service \\",
-          "   && command -v dblab >/dev/null; ",
+          "if curl -fsS --max-time 5 http://127.0.0.1:2345/healthz >/dev/null \\",
+          '   && [[ -n "$SAMOHOST_DBLAB_BIN" ]]; ',
         ],
         [
-          '  echo "DBLab engine not confirmed running on this host — refusing to attempt a clone." >&2',
-          '  echo "Diagnose with: samohost env preflight <vm>   (or use --db template|none)" >&2',
+          '  echo "DBLab engine not confirmed running: healthz (http://127.0.0.1:2345/healthz) did not answer, or no dblab CLI on PATH / at ~/bin/dblab — refusing to attempt a clone." >&2',
+          '  echo "Diagnose with: samohost env preflight <vm>; install per docs/dblab-install-runbook.md (or use --db template|none)" >&2',
           "  exit 1",
         ],
       ),
       `SAMOHOST_CLONE_ID=${sq(dbName)}`,
       "# Per-clone credentials are generated ON THE HOST and never echoed.",
+      "# (They create an ADDITIONAL role on the clone; the app keeps using the",
+      "# template's prod credentials, which exist in the physical copy.)",
       'SAMOHOST_DB_PASSWORD="$(openssl rand -hex 16)"',
+      ...CLONE_PORT_FN_LINES,
       ...phaseBlock(
         "db",
-        "DBLab thin clone (PLAN HOOK: flags to be confirmed against the live DBLab Engine CLI)",
+        "DBLab thin clone + nested .db.port extraction (v4.1.3 contract, issue #7)",
         [
-          'if dblab clone create --id "$SAMOHOST_CLONE_ID" \\',
+          'if "$SAMOHOST_DBLAB_BIN" clone create --id "$SAMOHOST_CLONE_ID" \\',
           '     --username samohost_env --password "$SAMOHOST_DB_PASSWORD" \\',
-          "     >/dev/null; ",
+          "     >/dev/null \\",
+          '   && SAMOHOST_DB_PORT="$(samohost_clone_port)" \\',
+          '   && [[ "$SAMOHOST_DB_PORT" =~ ^[0-9]+$ ]]; ',
+        ],
+        [
+          '  echo "samohost: dblab clone create/status failed, or no numeric port at .db.port in the clone status JSON" >&2',
+          "  exit 1",
         ],
       ),
-      "# The clone's host port comes from clone status JSON, composed on-host.",
-      `SAMOHOST_DB_PORT="$(dblab clone status "$SAMOHOST_CLONE_ID" 2>/dev/null | sed -n 's/.*"port"[^0-9]*\\([0-9]*\\).*/\\1/p' | head -1)"`,
-      'SAMOHOST_DATABASE_URL="postgresql://samohost_env:${SAMOHOST_DB_PASSWORD}@localhost:${SAMOHOST_DB_PORT}/postgres"',
+      "# Env vars whose URLs are repointed at the clone (AppRecord.envDbVars).",
+      `SAMOHOST_ENV_DB_VARS=(${envDbVars.map(sq).join(" ")})`,
+      "",
+      ...REWIRE_DB_HOSTPORT_FN_LINES,
       "",
     );
   } else if (t.dbBackend === "template") {
@@ -312,13 +401,11 @@ export function buildEnvCreateScript(
     // Rewire every mapped var to the per-env db ON THE HOST (issue #11).
     envfileBody.push('   && samohost_rewire_db_vars "$SAMOHOST_ENV_DIR/.env" \\');
   } else if (t.dbBackend === "dblab") {
-    // TODO(issue #11 + issue #7): apply the envDbVars mapping to dblab clones
-    // too — rewrite host:port (and keep template creds, which exist in the
-    // physical clone) per `dblab clone status` instead of appending only
-    // DATABASE_URL. Entangled with #7's clone-status port-field fix; the
-    // dblab shape is left as-is until that lands.
+    // Rewire every mapped var's host:port at the clone ON THE HOST (issue #7,
+    // closing the PR #12 TODO): the clone is a physical copy of prod, so the
+    // template's credentials and database name stay valid inside it.
     envfileBody.push(
-      '   && printf \'DATABASE_URL=%s\\n\' "$SAMOHOST_DATABASE_URL" >> "$SAMOHOST_ENV_DIR/.env" \\',
+      '   && samohost_rewire_db_hostport "$SAMOHOST_ENV_DIR/.env" \\',
     );
   }
   envfileBody.push("   && true; ");
@@ -416,9 +503,15 @@ export function buildEnvDestroyScript(
     const dbName = t.dbName ?? t.name;
     lines.push(
       `SAMOHOST_CLONE_ID=${sq(dbName)}`,
-      `# --- db-drop: delete the DBLab clone ---`,
+      ...DBLAB_BIN_RESOLVE_LINES,
+      `# --- db-drop: delete the DBLab clone (issue #7: resolved CLI; a missing`,
+      `# CLI must not abort teardown — idle clones auto-expire on the engine) ---`,
       marker("db-drop", "start"),
-      'dblab clone destroy "$SAMOHOST_CLONE_ID" 2>/dev/null || true',
+      'if [[ -n "$SAMOHOST_DBLAB_BIN" ]]; then',
+      '  "$SAMOHOST_DBLAB_BIN" clone destroy "$SAMOHOST_CLONE_ID" 2>/dev/null || true',
+      "else",
+      '  echo "samohost: dblab CLI not found (PATH or ~/bin/dblab) — clone left for the engine to expire" >&2',
+      "fi",
       marker("db-drop", "ok"),
       "",
     );
