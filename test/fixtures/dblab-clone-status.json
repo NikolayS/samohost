@@ -1,0 +1,40 @@
+{
+    "id": "smoke-shape-1",
+    "branch": "main",
+    "revision": 0,
+    "protected": false,
+    "deleteAt": null,
+    "createdAt": "2026-06-12T03:05:56Z",
+    "status": {
+        "code": "OK",
+        "message": "Clone is ready to accept Postgres connections."
+    },
+    "db": {
+        "connStr": "host=localhost port=6000 user=samohost_env dbname=postgres",
+        "host": "localhost",
+        "port": "6000",
+        "username": "samohost_env",
+        "password": "",
+        "dbName": "postgres"
+    },
+    "snapshot": {
+        "id": "tank/dblab/dblab_pool@snapshot_20260612030024",
+        "createdAt": "2026-06-12T03:02:00Z",
+        "dataStateAt": "2026-06-12T03:00:24Z",
+        "pool": "tank/dblab/dblab_pool",
+        "numClones": 1,
+        "clones": [],
+        "branch": "main",
+        "message": "",
+        "physicalSize": "0 B",
+        "logicalSize": "53 MiB"
+    },
+    "metadata": {
+        "cloningTime": 2.047159554,
+        "maxIdleMinutes": 60,
+        "protectionLeaseDurationMinutes": 1440,
+        "protectionMaxDurationMinutes": 10080,
+        "cloneDiffSize": "632 KiB",
+        "logicalSize": "42 KiB"
+    }
+}

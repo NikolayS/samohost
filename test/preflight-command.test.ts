@@ -81,20 +81,21 @@ describe("parseArgs env preflight / dns status", () => {
 // env preflight command (fake remote)
 // ---------------------------------------------------------------------------
 
-/** Remote output mirroring the LIVE SOLO VM (installed shape, dead engine). */
+/**
+ * Remote output mirroring the LIVE SOLO VM (runtime-verified 2026-06-12,
+ * issue #7): engine runs as the dblab_server container, healthz answers,
+ * CLI at ~agent/bin/dblab. healthz body captured verbatim.
+ */
 const LIVE_VM_OUTPUT = [
-  "<<<SAMOHOST_AUDIT:unit-file>>>",
-  "ExecStart=/usr/local/bin/dblab-engine",
-  "<<<SAMOHOST_AUDIT:unit-active>>>",
-  "inactive",
-  "<<<SAMOHOST_AUDIT:unit-enabled>>>",
-  "disabled",
+  "<<<SAMOHOST_AUDIT:engine-healthz>>>",
+  '{"version":"v4.1.3-20260508-1125","edition":"community","instanceID":"d8lkc7q52olc73a3g70g"}',
+  "<<<SAMOHOST_AUDIT:engine-container>>>",
+  "postgresai/dblab-server:4.1.3 Up 2 hours",
   "<<<SAMOHOST_AUDIT:cli-binary>>>",
-  "NO_CLI",
-  "<<<SAMOHOST_AUDIT:engine-binary>>>",
-  "NO_ENGINE_BINARY",
+  "/home/agent/bin/dblab",
   "<<<SAMOHOST_AUDIT:api-listen>>>",
   "127.0.0.1:5432",
+  "127.0.0.1:2345",
   "<<<SAMOHOST_AUDIT:zfs-datasets>>>",
   "tank/dblab",
   "tank/postgresql",
@@ -102,6 +103,13 @@ const LIVE_VM_OUTPUT = [
   "<<<SAMOHOST_AUDIT:postgres-local>>>",
   "127.0.0.1:5432 - accepting connections",
 ].join("\n");
+
+/** The pre-install shape: engine down, no CLI anywhere. */
+const ENGINE_DOWN_OUTPUT = LIVE_VM_OUTPUT
+  .replace(/\{"version[^\n]*/, "NO_HEALTHZ")
+  .replace("postgresai/dblab-server:4.1.3 Up 2 hours", "NO_CONTAINER")
+  .replace("/home/agent/bin/dblab", "NO_CLI")
+  .replace("\n127.0.0.1:2345", "");
 
 function fakeDeps(stdout: string, scripts?: string[]): EnvExecDeps {
   return {
@@ -126,32 +134,33 @@ describe("runEnvPreflight", () => {
 
   afterEach(() => rmSync(dir, { recursive: true, force: true }));
 
-  test("live VM shape: exit 1, engine BLOCKED, template READY, one connection", async () => {
+  test("LIVE VM shape (engine container up): exit 0, READY, one connection", async () => {
     const scripts: string[] = [];
     const c = capture();
     const code = await runEnvPreflight(
       { vm: "samo-we-field-record" }, { json: false },
       vmStore, fakeDeps(LIVE_VM_OUTPUT, scripts), c.out, c.err,
     );
-    expect(code).toBe(1);
+    expect(code).toBe(0);
     expect(scripts).toHaveLength(1); // ONE batched script = one connection
-    expect(c.o).toContain("dblab engine: BLOCKED");
+    expect(c.o).toContain("dblab engine: READY");
     expect(c.o).toContain("template fallback: READY");
-    expect(c.o).toContain("INSTALLED SHAPE ONLY");
+    // The container model is reported, and the retired unit is not probed.
+    expect(c.o).toContain("postgresai/dblab-server:4.1.3");
+    expect(scripts[0]).not.toContain("dblab.service");
+    expect(scripts[0]).toContain("healthz");
   });
 
-  test("running engine: exit 0 and READY (json shape)", async () => {
-    const running = LIVE_VM_OUTPUT
-      .replace("inactive", "active")
-      .replace("NO_CLI", "/usr/local/bin/dblab")
-      .replace("127.0.0.1:5432\n<<<SAMOHOST_AUDIT:zfs", "127.0.0.1:2345\n<<<SAMOHOST_AUDIT:zfs");
+  test("engine down (pre-install shape): exit 1, BLOCKED with runbook pointer (json)", async () => {
     const c = capture();
     const code = await runEnvPreflight(
       { vm: "samo-we-field-record" }, { json: true },
-      vmStore, fakeDeps(running), c.out, c.err,
+      vmStore, fakeDeps(ENGINE_DOWN_OUTPUT), c.out, c.err,
     );
-    expect(code).toBe(0);
-    expect(JSON.parse(c.o).engine).toBe("READY");
+    expect(code).toBe(1);
+    const rep = JSON.parse(c.o);
+    expect(rep.engine).toBe("BLOCKED");
+    expect(rep.reasons.join("\n")).toContain("docs/dblab-install-runbook.md");
   });
 
   test("unknown vm fails cleanly", async () => {

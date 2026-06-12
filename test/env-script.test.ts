@@ -71,14 +71,23 @@ describe("buildEnvCreateScript", () => {
     );
   });
 
-  test("dblab backend is GATED on a running engine (installed shape is not enough)", () => {
+  test("dblab backend is GATED on the LIVE engine API, not the retired unit (issue #7)", () => {
     const s = buildEnvCreateScript(app(), target({ dbBackend: "dblab" }));
     expect(s).toContain("<<<SAMOHOST_PHASE:db-preflight:start>>>");
-    expect(s).toContain("systemctl is-active --quiet dblab.service");
+    // Runtime-verified 2026-06-12: the engine runs as the dblab_server docker
+    // container; the legacy dblab.service unit's ExecStart binary does not
+    // exist. The gate is the engine's own healthz endpoint.
+    expect(s).toContain("curl -fsS --max-time 5 http://127.0.0.1:2345/healthz");
+    expect(s).not.toContain("systemctl is-active --quiet dblab.service");
+    // CLI resolution: PATH first, then ~/bin/dblab (where the runbook installs
+    // it; not on PATH in non-login shells) — bound to one var used everywhere.
     expect(s).toContain("command -v dblab");
+    expect(s).toContain('$HOME/bin/dblab');
+    expect(s).toContain("SAMOHOST_DBLAB_BIN");
     expect(s).toContain("samohost env preflight"); // pointer to the diagnosis cmd
+    expect(s).toContain("docs/dblab-install-runbook.md"); // pointer to the install
     // The gate precedes any clone attempt.
-    expect(s.indexOf("db-preflight:start")).toBeLessThan(s.indexOf("dblab clone create"));
+    expect(s.indexOf("db-preflight:start")).toBeLessThan(s.indexOf("clone create"));
     // Non-dblab backends have no engine gate.
     for (const db of ["template", "none"] as const) {
       expect(buildEnvCreateScript(app(), target({ dbBackend: db }))).not.toContain("db-preflight");
@@ -87,7 +96,8 @@ describe("buildEnvCreateScript", () => {
 
   test("dblab backend: clone create + on-host password, no samohost-side secrets", () => {
     const s = buildEnvCreateScript(app(), target({ dbBackend: "dblab" }));
-    expect(s).toContain("dblab clone create --id");
+    // Every dblab CLI call goes through the resolved binary, never bare `dblab`.
+    expect(s).toContain('"$SAMOHOST_DBLAB_BIN" clone create --id');
     expect(s).toContain("openssl rand -hex 16"); // generated ON HOST
     expect(s).toContain("<<<SAMOHOST_PHASE:db:start>>>");
     // The script must never echo the env file or the password.
@@ -147,9 +157,14 @@ describe("buildEnvDestroyScript", () => {
     expect(s).not.toContain("set -euo");
   });
 
-  test("dblab destroy deletes the clone", () => {
+  test("dblab destroy deletes the clone via the resolved CLI (issue #7)", () => {
     const s = buildEnvDestroyScript(app(), target({ dbBackend: "dblab" }));
-    expect(s).toContain("dblab clone destroy");
+    expect(s).toContain('"$SAMOHOST_DBLAB_BIN" clone destroy');
+    // Same two-path CLI resolution as create (PATH, then ~/bin/dblab).
+    expect(s).toContain("command -v dblab");
+    expect(s).toContain("$HOME/bin/dblab");
+    // Idempotent: a missing CLI must not abort the rest of the teardown.
+    expect(s).toMatch(/clone destroy[^\n]*\|\| true/);
   });
 
   test("template destroy drops db and role via exact-path sudo", () => {
@@ -469,5 +484,214 @@ describe("issue #11 finding 8: destroy resets the failed unit; host-prep grants 
   test("host-prep documents the envDbVars template contract", () => {
     const s = buildHostPrepScript(app(), "agent");
     expect(s).toContain("envDbVars");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Issue #7 — dblab backend contract fixes (runtime-verified 2026-06-12 against
+// DBLab v4.1.3 live on samo-we-field-record)
+// ---------------------------------------------------------------------------
+
+/**
+ * REAL clone-status JSON captured from the live engine (dblab clone status,
+ * v4.1.3, 2026-06-12) — the port is a STRING nested at `.db.port`, NOT a
+ * top-level number. Stored verbatim (password field is empty in the real
+ * output) so the parsing tests run against the prod shape, not a hand-rolled
+ * mock.
+ */
+const CLONE_STATUS_FIXTURE = join(
+  import.meta.dir,
+  "fixtures",
+  "dblab-clone-status.json",
+);
+
+/** Run the generated samohost_clone_port fn against a stub dblab CLI that
+ * replays the captured prod JSON. `breakPython` forces the sed fallback. */
+function runClonePort(opts: { breakPython?: boolean; json?: string } = {}) {
+  const dir = mkdtempSync(join(tmpdir(), "samohost-cloneport-"));
+  try {
+    const jsonPath = join(dir, "status.json");
+    writeFileSync(
+      jsonPath,
+      opts.json ?? readFileSync(CLONE_STATUS_FIXTURE, "utf8"),
+    );
+    const stub = join(dir, "dblab-stub");
+    writeFileSync(stub, `#!/usr/bin/env bash\ncat '${jsonPath}'\n`, {
+      mode: 0o755,
+    });
+    const fn = extractFn(
+      buildEnvCreateScript(app(), target({ dbBackend: "dblab" })),
+      "samohost_clone_port",
+    );
+    const prog = [
+      "set -uo pipefail",
+      // Optionally hide python3 from the function to exercise the sed path.
+      ...(opts.breakPython
+        ? [
+            "command() {",
+            '  if [[ "${2:-}" == python3 ]]; then return 1; fi',
+            '  builtin command "$@"',
+            "}",
+          ]
+        : []),
+      `SAMOHOST_DBLAB_BIN='${stub}'`,
+      "SAMOHOST_CLONE_ID='smoke-shape-1'",
+      fn,
+      "samohost_clone_port",
+    ].join("\n");
+    return spawnSync("bash", ["-c", prog], { encoding: "utf8" });
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+describe("issue #7: clone port parsed from the NESTED .db.port string", () => {
+  test("script no longer greps a top-level \"port\" (the old sed matched the wrong/no field)", () => {
+    const s = buildEnvCreateScript(app(), target({ dbBackend: "dblab" }));
+    expect(s).not.toContain('"port"[^0-9]');
+    expect(s).toContain("samohost_clone_port() {");
+    // Extraction result is validated as numeric inside the db phase.
+    expect(s).toMatch(/SAMOHOST_DB_PORT.*=~ \^\[0-9\]\+\$/);
+    // No hard jq dependency (jq presence on hosts is not guaranteed).
+    expect(s).not.toMatch(/\bjq\b/);
+  });
+
+  test("executed (python3 path): real v4.1.3 status JSON → 6000", () => {
+    const r = runClonePort();
+    expect(r.status).toBe(0);
+    expect(r.stdout.trim()).toBe("6000");
+  });
+
+  test("executed (sed fallback, python3 absent): real v4.1.3 status JSON → 6000", () => {
+    const r = runClonePort({ breakPython: true });
+    expect(r.status).toBe(0);
+    expect(r.stdout.trim()).toBe("6000");
+  });
+
+  test("executed: compact (non-pretty) JSON parses identically", () => {
+    const compact = JSON.stringify(
+      JSON.parse(readFileSync(CLONE_STATUS_FIXTURE, "utf8")),
+    );
+    expect(runClonePort({ json: compact }).stdout.trim()).toBe("6000");
+    expect(
+      runClonePort({ json: compact, breakPython: true }).stdout.trim(),
+    ).toBe("6000");
+  });
+});
+
+/** Execute the generated samohost_rewire_db_hostport against a temp .env. */
+function runRewireHostport(
+  envContent: string,
+  vars: string[],
+  port: string,
+): RewireRun {
+  const dir = mkdtempSync(join(tmpdir(), "samohost-rewirehp-"));
+  try {
+    const envPath = join(dir, ".env");
+    writeFileSync(envPath, envContent, { mode: 0o600 });
+    const script = buildEnvCreateScript(
+      app({ envDbVars: vars }),
+      target({ dbBackend: "dblab" }),
+    );
+    const fn = extractFn(script, "samohost_rewire_db_hostport");
+    const prog = [
+      "set -uo pipefail",
+      `SAMOHOST_DB_PORT='${port}'`,
+      `SAMOHOST_ENV_DB_VARS=(${vars.map((v) => `'${v}'`).join(" ")})`,
+      fn,
+      `samohost_rewire_db_hostport '${envPath}'`,
+    ].join("\n");
+    const res = spawnSync("bash", ["-c", prog], { encoding: "utf8" });
+    return {
+      code: res.status ?? -1,
+      stdout: res.stdout ?? "",
+      stderr: res.stderr ?? "",
+      env: readFileSync(envPath, "utf8"),
+    };
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+describe("issue #7 (closing the PR #12 TODO): dblab envDbVars host:port mapping", () => {
+  test("dblab create script declares the mapped vars and rewires them on-host", () => {
+    const s = buildEnvCreateScript(
+      app({ envDbVars: ["DATABASE_URL", "APP_DATABASE_URL"] }),
+      target({ dbBackend: "dblab" }),
+    );
+    expect(s).toContain("SAMOHOST_ENV_DB_VARS=('DATABASE_URL' 'APP_DATABASE_URL')");
+    expect(s).toContain("samohost_rewire_db_hostport() {");
+    expect(s).toContain('samohost_rewire_db_hostport "$SAMOHOST_ENV_DIR/.env"');
+    // The old append-only DATABASE_URL shape is GONE: the clone is a physical
+    // copy carrying prod's roles, so the template's credentials stay and only
+    // host:port is repointed at the clone.
+    expect(s).not.toContain("SAMOHOST_DATABASE_URL");
+    expect(s).not.toMatch(/printf 'DATABASE_URL=/);
+    expect(bashSyntaxOk(s)).toBe(true);
+  });
+
+  test("dblab envDbVars defaults to DATABASE_URL when the app declares none", () => {
+    const s = buildEnvCreateScript(app(), target({ dbBackend: "dblab" }));
+    expect(s).toContain("SAMOHOST_ENV_DB_VARS=('DATABASE_URL')");
+  });
+
+  test("executed: rewrites ONLY host:port to 127.0.0.1:<clone-port>; creds/dbname/query kept", () => {
+    const r = runRewireHostport(
+      [
+        `DATABASE_URL=${PROD_ADMIN_URL}`,
+        `APP_DATABASE_URL=${PROD_APP_URL}`,
+        "NODE_ENV=production",
+        "",
+      ].join("\n"),
+      ["DATABASE_URL", "APP_DATABASE_URL"],
+      "6000",
+    );
+    expect(r.code).toBe(0);
+    // Same-roles philosophy as #12: the clone is a physical copy, prod roles
+    // and passwords exist in it — user/password/dbname/query carry over.
+    expect(r.env).toContain(
+      "DATABASE_URL=postgresql://postgres:s3kr3t-admin@127.0.0.1:6000/field_record",
+    );
+    expect(r.env).toContain(
+      "APP_DATABASE_URL=postgresql://app_user:app-pw-9@127.0.0.1:6000/field_record?sslmode=disable",
+    );
+    // Originals stripped, exactly one line per var, prod host:port gone.
+    expect(r.env.match(/^DATABASE_URL=/gm)).toHaveLength(1);
+    expect(r.env.match(/^APP_DATABASE_URL=/gm)).toHaveLength(1);
+    expect(r.env).not.toContain("@localhost:5432");
+    // Unmapped vars pass through untouched.
+    expect(r.env).toContain("NODE_ENV=production");
+    // Secret values are NEVER echoed.
+    expect(r.stdout + r.stderr).not.toContain("s3kr3t-admin");
+    expect(r.stdout + r.stderr).not.toContain("app-pw-9");
+  });
+
+  test("executed: URL without explicit port still gains the clone port", () => {
+    const r = runRewireHostport(
+      "DATABASE_URL=postgresql://u:pw@dbhost/prod_db?sslmode=disable\n",
+      ["DATABASE_URL"],
+      "6042",
+    );
+    expect(r.code).toBe(0);
+    expect(r.env).toContain(
+      "DATABASE_URL=postgresql://u:pw@127.0.0.1:6042/prod_db?sslmode=disable",
+    );
+  });
+
+  test("executed: a MISSING mapped var fails loudly (no silent prod inheritance)", () => {
+    const r = runRewireHostport(
+      `DATABASE_URL=${PROD_ADMIN_URL}\n`,
+      ["DATABASE_URL", "APP_DATABASE_URL"],
+      "6000",
+    );
+    expect(r.code).not.toBe(0);
+    expect(r.stderr).toContain("APP_DATABASE_URL");
+    expect(r.stderr).not.toContain("s3kr3t-admin");
+  });
+
+  test("executed: a non-URL value fails with a clear message naming the var", () => {
+    const r = runRewireHostport("DATABASE_URL=not-a-url\n", ["DATABASE_URL"], "6000");
+    expect(r.code).not.toBe(0);
+    expect(r.stderr).toContain("DATABASE_URL");
   });
 });
