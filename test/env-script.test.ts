@@ -196,6 +196,92 @@ describe("buildHostPrepScript", () => {
     // Exact-path grants only.
     expect(s).toContain("NOPASSWD: /usr/bin/systemctl reload caddy");
   });
+
+  // -------------------------------------------------------------------------
+  // Durable MAIN-env vhost (field-record-1#117 ITEM C — 7th drift class).
+  //
+  // The production vhost (field-record-1.samo.team → localhost:3000) existed
+  // only as a hand-applied VM-local Caddy edit. Any churn that rewrites
+  // /etc/caddy/Caddyfile de-references it together with every sites.d preview
+  // snippet (observed as Cloudflare 521 on *.samo.cat). host-prep must emit
+  // the main vhost as durable, provisioned state in /etc/caddy/sites.d/,
+  // consistent with how env-create writes per-env snippets.
+  // -------------------------------------------------------------------------
+  const MAIN_HOST = "field-record-1.samo.team";
+
+  test("writes the durable main-env vhost snippet into sites.d (#117 ITEM C)", () => {
+    const s = buildHostPrepScript(app({ mainHost: MAIN_HOST }), "agent");
+    expect(bashSyntaxOk(s)).toBe(true);
+    // Stable filename that sorts FIRST in sites.d (00- prefix).
+    expect(s).toContain("/etc/caddy/sites.d/00-main-field-record-1.caddy");
+    // Host-matched block proxying to the production port (from healthUrl).
+    expect(s).toContain("field-record-1.samo.team");
+    expect(s).toContain("reverse_proxy localhost:3000");
+    // The sites.d include is still applied, and the snippet write precedes
+    // the caddy reload so one host-prep run leaves the main vhost live.
+    expect(s).toContain("import sites.d/*.caddy");
+    expect(s.indexOf("00-main-field-record-1.caddy")).toBeLessThan(
+      s.indexOf("systemctl reload caddy"),
+    );
+  });
+
+  test("main-env vhost write is idempotent (deterministic overwrite, no append-drift)", () => {
+    const s = buildHostPrepScript(app({ mainHost: MAIN_HOST }), "agent");
+    // Re-render is byte-identical → re-running host-prep rewrites the same
+    // deterministic snippet in place.
+    expect(s).toBe(buildHostPrepScript(app({ mainHost: MAIN_HOST }), "agent"));
+    // The snippet write is a whole-file overwrite (>), never an append (>>).
+    const line = s
+      .split("\n")
+      .find((l) => l.includes("00-main-field-record-1.caddy"));
+    expect(line).toBeDefined();
+    expect(line).toContain("> /etc/caddy/sites.d/00-main-field-record-1.caddy");
+    expect(line).not.toContain(">>");
+  });
+
+  test("derives the main vhost port from healthUrl (explicit port and scheme default)", () => {
+    expect(
+      buildHostPrepScript(
+        app({ mainHost: MAIN_HOST, healthUrl: "http://localhost:8080/health" }),
+        "agent",
+      ),
+    ).toContain("reverse_proxy localhost:8080");
+    expect(
+      buildHostPrepScript(
+        app({ mainHost: MAIN_HOST, healthUrl: "http://localhost/health" }),
+        "agent",
+      ),
+    ).toContain("reverse_proxy localhost:80");
+    expect(
+      buildHostPrepScript(
+        app({ mainHost: MAIN_HOST, healthUrl: "https://localhost/health" }),
+        "agent",
+      ),
+    ).toContain("reverse_proxy localhost:443");
+  });
+
+  test("fails closed on an unparseable healthUrl when mainHost is set", () => {
+    // Same fail-closed posture as the invalid-preview-domain fix (#117 → 525):
+    // never render a vhost pointing at a guessed port.
+    expect(() =>
+      buildHostPrepScript(
+        app({ mainHost: MAIN_HOST, healthUrl: "not a url" }),
+        "agent",
+      ),
+    ).toThrow(/healthUrl/);
+  });
+
+  test("fails closed on an invalid mainHost (it is embedded in a root-run script)", () => {
+    expect(() =>
+      buildHostPrepScript(app({ mainHost: "bad host!" }), "agent"),
+    ).toThrow(/main.?host/i);
+  });
+
+  test("no mainHost → no main vhost snippet (back-compat), include still applied", () => {
+    const s = buildHostPrepScript(app(), "agent");
+    expect(s).not.toContain("00-main-");
+    expect(s).toContain("import sites.d/*.caddy");
+  });
 });
 
 // ---------------------------------------------------------------------------

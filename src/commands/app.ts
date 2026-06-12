@@ -39,6 +39,9 @@ export interface AppRegisterInput {
   buildCmd: string;
   serviceUnit: string;
   healthUrl: string;
+  /** Public production host for the durable main-env Caddy vhost
+   * (field-record-1#117 ITEM C). Absent → host-prep emits no main vhost. */
+  mainHost?: string;
   migrateCmd?: string;
   seedCmd?: string;
   envFile?: string;
