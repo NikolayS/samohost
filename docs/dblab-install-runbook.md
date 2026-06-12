@@ -116,11 +116,17 @@ All three corrections below are implemented in `src/env/script.ts` +
   binary never existed as a published artifact).
 - **envDbVars mapping**: the dblab envfile phase rewrites ONLY host:port of
   each mapped var to `127.0.0.1:<clone-port>`; the operator template's
-  user/password/dbname carry over because the clone is a physical copy
-  containing prod's roles (the `--username/--password` clone flags only add an
-  extra role). See SPEC-DELTA §4.
-- Still open (filed separately): `dblab clone create --branch <git-branch>`
-  (4.x native branching) for per-branch previews instead of bare `--id`.
+  user/password/dbname carry over. ⚠️ LOGICAL retrieval does NOT carry
+  cluster roles, and the restore drops grants/RLS policies whose roles are
+  missing (live-verified) — the db phase repairs this by replaying
+  roles/ownership/grants/policies from the prod catalogs into the clone and
+  gating on policy parity (`samohost_sync_clone_globals`). See SPEC-DELTA §4.
+- Still open (filed separately):
+  - engine-side root fix: `logicalRestore.queryPreprocessing` SQL that creates
+    the prod roles (with hashes) BEFORE restore, so grants/policies restore
+    natively and the samohost-side sync becomes a no-op;
+  - `dblab clone create --branch <git-branch>` (4.x native branching) for
+    per-branch previews instead of bare `--id`.
 
 ## Sizing guardrails (8 GB VM with prod + CI)
 

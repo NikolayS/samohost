@@ -179,16 +179,30 @@ Design now:
   `cloneAccessAddresses` + 6000–6099 port pool), with the clone port read from
   the NESTED `.db.port` STRING in `dblab clone status` JSON (v4.1.3 contract,
   fixture captured from the live engine; python3 parse with an anchored-sed
-  fallback — no jq dependency). **Why credentials carry over:** a DBLab clone
-  is a full Postgres instance holding a PHYSICAL COPY of prod — prod's roles,
-  their passwords, and the database name all exist inside the clone; the
-  `--username/--password` flags on `dblab clone create` merely add one extra
-  (samohost-internal, on-host-generated) role on top. Keeping the operator
-  template's user/password/dbname therefore preserves the prod URL contract
-  (e.g. "DATABASE_URL bypasses RLS, APP_DATABASE_URL is the policy-fitted app
-  role") exactly as the template backend's same-roles design does — verified
-  live: sign-in with production credentials succeeds against a preview wired
-  to a clone. The old append-only `DATABASE_URL=` shape is gone.
+  fallback — no jq dependency). **Why credentials carry over (and what makes
+  that true):** the SOLO engine's retrieval mode is LOGICAL — live-verified
+  2026-06-12 that a fresh clone holds prod's database (same name, same
+  tables) but NONE of prod's cluster roles, and that the restore silently
+  dropped ALL grants and ALL 14 RLS policies because the roles they reference
+  did not exist in the clone's cluster. So the db phase runs
+  `samohost_sync_clone_globals`: it regenerates, from the PROD catalogs, the
+  roles (attributes + password hashes via pg_authid, read through the
+  exact-path sudo psql grant — hashes move host-side only, never through
+  samohost), table ownership, table grants, and RLS policies (deparsed from
+  pg_policies), applies them to the clone via the script's own on-host clone
+  superuser (`clone create --username/--password` adds exactly that one extra
+  role), and GATES the phase on policy-count parity with prod. After the
+  sync, keeping the operator template's user/password/dbname preserves the
+  prod URL contract ("DATABASE_URL bypasses RLS, APP_DATABASE_URL is the
+  policy-fitted app role") exactly as the template backend's same-roles
+  design does — verified live: sign-in with production credentials succeeds
+  against a preview wired to a clone. On engines whose retrieval carries
+  globals (physical mode) the sync degrades to ignored duplicate-DDL and an
+  already-true parity check. Known limits (fine for this app, documented):
+  sequence/function grants and default privileges are not replayed. The
+  engine-side long-term fix (logicalRestore queryPreprocessing creating
+  roles BEFORE restore, so grants/policies restore natively) is filed as a
+  follow-up. The old append-only `DATABASE_URL=` shape is gone.
 
 **Deterministic template-DB creation (operator runbook).** `createdb -T <src>`
 requires ZERO other connections on `<src>`, and lazy connection pools make the

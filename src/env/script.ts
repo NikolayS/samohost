@@ -168,9 +168,10 @@ const CLONE_PORT_FN_LINES: string[] = [
  * Bash function: rewire each mapped DB env var (the PR #12 TODO, closed by
  * issue #7) inside the composed .env so its URL points at the DBLab clone.
  * Unlike the template backend (which rewrites the DB NAME), the clone is a
- * full Postgres instance on its own port holding a PHYSICAL COPY of prod —
- * prod's roles, passwords, and database name all exist inside it. So ONLY
- * host:port is rewritten (to 127.0.0.1:$SAMOHOST_DB_PORT, the engine's
+ * full Postgres instance on its own port holding prod's database under the
+ * SAME name — and the db phase's globals sync (above) guarantees prod's
+ * roles/password-hashes/grants/policies exist inside it. So ONLY host:port
+ * is rewritten (to 127.0.0.1:$SAMOHOST_DB_PORT, the engine's
  * cloneAccessAddresses + port pool); scheme/user/password/dbname/query carry
  * over from the operator template, preserving the prod URL contract
  * (e.g. "DATABASE_URL bypasses RLS, APP_DATABASE_URL is the app role").
@@ -197,6 +198,61 @@ const REWIRE_DB_HOSTPORT_FN_LINES: string[] = [
   '    mv "${envfile}.rewired" "$envfile"',
   '    chmod 600 "$envfile"',
   "  done",
+  "}",
+];
+
+/**
+ * Bash function: replay prod's cluster globals into the clone (issue #7,
+ * live-verified gap). The engine's LOGICAL retrieval mode (pg_dump/pg_restore
+ * of the database only) does NOT carry cluster globals: a fresh clone held
+ * prod's tables but none of its roles — and because grant/policy DDL inside
+ * the dump references those roles, the restore silently dropped ALL grants
+ * and ALL RLS policies too. Rewiring envDbVars at a clone in that state hands
+ * the app a database its own credentials cannot use.
+ *
+ * So the db phase regenerates, from the PROD catalogs, and applies to the
+ * clone: (1) roles with attributes + password hashes (pg_authid via the
+ * exact-path sudo psql grant — hashes move host-side only, both psql ends
+ * silenced because error text can quote failing DDL), (2) table ownership,
+ * (3) table grants, (4) RLS policies (deparsed from pg_policies). Then it
+ * GATES on parity: the clone must reach prod's policy count, or the phase
+ * fails. On engines whose retrieval does carry globals (physical mode) the
+ * replay degrades to duplicate-DDL errors (ignored) and parity already holds.
+ * (Closing brace at column 0 — tests extract this function.)
+ */
+const SYNC_CLONE_GLOBALS_FN_LINES: string[] = [
+  "samohost_sync_clone_globals() {",
+  "  local prod_db prod_policies clone_policies",
+  "  # The production database the operator template points at (path component",
+  "  # of the first mapped var) — the same database name exists in the clone.",
+  '  prod_db="$(grep -E "^${SAMOHOST_ENV_DB_VARS[0]}=" "$SAMOHOST_ENV_TEMPLATE" | tail -n 1 \\',
+  "    | sed -E 's|^[^=]*=\"?[A-Za-z0-9+]+://[^/]*/||; s|[?\"].*$||')\"",
+  '  if [[ -z "$prod_db" ]]; then',
+  '    echo "samohost: cannot derive the production database name from ${SAMOHOST_ENV_DB_VARS[0]} in the env template" >&2',
+  "    return 1",
+  "  fi",
+  "  # 1. Roles: attributes + password hashes (superuser-only pg_authid read).",
+  '  sudo -u postgres /usr/bin/psql -At -d "$prod_db" -c "SELECT \'CREATE ROLE \'||quote_ident(rolname)||CASE WHEN rolsuper THEN \' SUPERUSER\' ELSE \'\' END||CASE WHEN rolcreatedb THEN \' CREATEDB\' ELSE \'\' END||CASE WHEN rolcreaterole THEN \' CREATEROLE\' ELSE \'\' END||CASE WHEN rolbypassrls THEN \' BYPASSRLS\' ELSE \'\' END||CASE WHEN rolcanlogin THEN \' LOGIN\' ELSE \'\' END||COALESCE(\' PASSWORD \'||quote_literal(rolpassword),\'\')||\';\' FROM pg_authid WHERE rolname NOT LIKE \'pg\\_%\' AND rolname <> \'postgres\'" \\',
+  '    | PGPASSWORD="$SAMOHOST_DB_PASSWORD" psql -h 127.0.0.1 -p "$SAMOHOST_DB_PORT" -U samohost_env -d postgres -f - >/dev/null 2>&1 || true',
+  "  # 2. Table ownership (prod's owner role; owner-bypass RLS semantics match).",
+  '  sudo -u postgres /usr/bin/psql -At -d "$prod_db" -c "SELECT \'ALTER TABLE \'||quote_ident(schemaname)||\'.\'||quote_ident(tablename)||\' OWNER TO \'||quote_ident(tableowner)||\';\' FROM pg_tables WHERE schemaname NOT IN (\'pg_catalog\',\'information_schema\')" \\',
+  '    | PGPASSWORD="$SAMOHOST_DB_PASSWORD" psql -h 127.0.0.1 -p "$SAMOHOST_DB_PORT" -U samohost_env -d "$prod_db" -f - >/dev/null 2>&1 || true',
+  "  # 3. Table grants.",
+  '  sudo -u postgres /usr/bin/psql -At -d "$prod_db" -c "SELECT \'GRANT \'||privilege_type||\' ON \'||quote_ident(table_schema)||\'.\'||quote_ident(table_name)||\' TO \'||quote_ident(grantee)||\';\' FROM information_schema.table_privileges WHERE grantee NOT IN (\'postgres\',\'PUBLIC\') AND table_schema NOT IN (\'pg_catalog\',\'information_schema\')" \\',
+  '    | PGPASSWORD="$SAMOHOST_DB_PASSWORD" psql -h 127.0.0.1 -p "$SAMOHOST_DB_PORT" -U samohost_env -d "$prod_db" -f - >/dev/null 2>&1 || true',
+  "  # 4. RLS policies (deparsed; restore dropped them with the roles missing).",
+  '  sudo -u postgres /usr/bin/psql -At -d "$prod_db" -c "SELECT \'CREATE POLICY \'||quote_ident(policyname)||\' ON \'||quote_ident(schemaname)||\'.\'||quote_ident(tablename)||\' AS \'||permissive||\' FOR \'||cmd||\' TO \'||(SELECT string_agg(CASE WHEN r=\'public\' THEN \'PUBLIC\' ELSE quote_ident(r) END, \', \') FROM unnest(roles) AS r)||COALESCE(\' USING (\'||qual||\')\',\'\')||COALESCE(\' WITH CHECK (\'||with_check||\')\',\'\')||\';\' FROM pg_policies" \\',
+  '    | PGPASSWORD="$SAMOHOST_DB_PASSWORD" psql -h 127.0.0.1 -p "$SAMOHOST_DB_PORT" -U samohost_env -d "$prod_db" -f - >/dev/null 2>&1 || true',
+  "  # 5. Parity gate: an env whose clone cannot honor the app's RLS contract",
+  "  #    is never composed.",
+  '  prod_policies="$(sudo -u postgres /usr/bin/psql -At -d "$prod_db" -c \'SELECT count(*) FROM pg_policies\')"',
+  '  clone_policies="$(PGPASSWORD="$SAMOHOST_DB_PASSWORD" \\',
+  '    psql -h 127.0.0.1 -p "$SAMOHOST_DB_PORT" -U samohost_env -d "$prod_db" -At -c \'SELECT count(*) FROM pg_policies\' 2>/dev/null)"',
+  '  if [[ "$clone_policies" =~ ^[0-9]+$ ]] && [[ "$clone_policies" -ge "$prod_policies" ]]; then',
+  "    return 0",
+  "  fi",
+  '  echo "samohost: clone globals sync failed parity check (prod policies=${prod_policies:-?}, clone=${clone_policies:-?}) — the clone would not honor the app\'s RLS/credentials contract" >&2',
+  "  return 1",
   "}",
 ];
 
@@ -337,31 +393,37 @@ export function buildEnvCreateScript(
         ],
       ),
       `SAMOHOST_CLONE_ID=${sq(dbName)}`,
-      "# Per-clone credentials are generated ON THE HOST and never echoed.",
-      "# (They create an ADDITIONAL role on the clone; the app keeps using the",
-      "# template's prod credentials, which exist in the physical copy.)",
+      "# Per-clone admin credentials are generated ON THE HOST and never echoed.",
+      "# (clone create's --username/--password add ONE extra superuser-ish role",
+      "# on the clone — the script's own handle for the globals sync below; the",
+      "# app keeps using the template's prod credentials, which the sync makes",
+      "# valid inside the clone.)",
       'SAMOHOST_DB_PASSWORD="$(openssl rand -hex 16)"',
+      "# Env vars whose URLs are repointed at the clone (AppRecord.envDbVars).",
+      `SAMOHOST_ENV_DB_VARS=(${envDbVars.map(sq).join(" ")})`,
+      "",
       ...CLONE_PORT_FN_LINES,
+      "",
+      ...SYNC_CLONE_GLOBALS_FN_LINES,
+      "",
+      ...REWIRE_DB_HOSTPORT_FN_LINES,
+      "",
       ...phaseBlock(
         "db",
-        "DBLab thin clone + nested .db.port extraction (v4.1.3 contract, issue #7)",
+        "DBLab thin clone + .db.port extraction + prod globals sync (issue #7)",
         [
           'if "$SAMOHOST_DBLAB_BIN" clone create --id "$SAMOHOST_CLONE_ID" \\',
           '     --username samohost_env --password "$SAMOHOST_DB_PASSWORD" \\',
           "     >/dev/null \\",
           '   && SAMOHOST_DB_PORT="$(samohost_clone_port)" \\',
-          '   && [[ "$SAMOHOST_DB_PORT" =~ ^[0-9]+$ ]]; ',
+          '   && [[ "$SAMOHOST_DB_PORT" =~ ^[0-9]+$ ]] \\',
+          "   && samohost_sync_clone_globals",
         ],
         [
-          '  echo "samohost: dblab clone create/status failed, or no numeric port at .db.port in the clone status JSON" >&2',
+          '  echo "samohost: dblab clone create/status failed, no numeric port at .db.port in the clone status JSON, or the prod globals sync failed parity" >&2',
           "  exit 1",
         ],
       ),
-      "# Env vars whose URLs are repointed at the clone (AppRecord.envDbVars).",
-      `SAMOHOST_ENV_DB_VARS=(${envDbVars.map(sq).join(" ")})`,
-      "",
-      ...REWIRE_DB_HOSTPORT_FN_LINES,
-      "",
     );
   } else if (t.dbBackend === "template") {
     const dbName = t.dbName ?? t.name.replace(/-/g, "_");
