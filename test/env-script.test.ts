@@ -767,3 +767,444 @@ describe("issue #7: clone globals sync (logical retrieval drops cluster roles/gr
     }
   });
 });
+
+// ---------------------------------------------------------------------------
+// PR #22 independent review findings — the role/policy replay is the #11-class
+// safety mechanism, so its gates must fail CLOSED and its role copy must be
+// scoped to the app's roles with cluster superpowers stripped.
+// ---------------------------------------------------------------------------
+
+/** Like extractFn but returns null when the function is not (yet) generated. */
+function extractFnOptional(script: string, name: string): string | null {
+  const re = new RegExp(`(${name}\\(\\) \\{[\\s\\S]*?\\n\\})`);
+  const m = script.match(re);
+  return m === null ? null : m[1]!;
+}
+
+/**
+ * REAL pg_authid row shape, dry-run-verified against prod (samo-we-field-record,
+ * 2026-06-12): `psql -At -c "SELECT rolname, rolcanlogin, rolpassword FROM
+ * pg_authid ..."` emits `rolname|t|SCRAM-SHA-256$4096:<salt>$<stored>:<server>`
+ * (NULL password -> empty third field). Names mirror prod's actual split:
+ * app roles (field_record = envDbVars[0]/table owner, app_user = RLS subject)
+ * vs ops roles (ci_user, ci_app_user, dblab_dump — BYPASSRLS/CI roles the app
+ * never uses). Hashes are FAKE (shape-true base64), never prod values.
+ */
+const AUTHID_ROWS_FIXTURE = join(
+  import.meta.dir,
+  "fixtures",
+  "dblab-pg-authid-rows.txt",
+);
+const FAKE_SCRAM_FIELD_RECORD =
+  "SCRAM-SHA-256$4096:RnJTYWx0$RnJTdG9yZWRLZXk=:RnJTZXJ2ZXJLZXk=";
+const FAKE_SCRAM_APP_USER =
+  "SCRAM-SHA-256$4096:QXBwU2FsdA==$QXBwU3RvcmVkS2V5:QXBwU2VydmVyS2V5";
+const FAKE_SCRAM_DBLAB_DUMP =
+  "SCRAM-SHA-256$4096:RGJsYWJTYWx0$RGJsYWJTdG9yZWQ=:RGJsYWJTZXJ2ZXI=";
+
+/** Prod-shaped operator template (same var/URL shapes as /opt/field-record/
+ * envs.template.env; role components verified on-host 2026-06-12). */
+const SYNC_TEMPLATE_DEFAULT = [
+  "DATABASE_URL=postgresql://field_record:admin-pw-X@localhost:5432/field_record",
+  "APP_DATABASE_URL=postgresql://app_user:app-pw-9@localhost:5432/field_record?sslmode=disable",
+  "NODE_ENV=production",
+  "",
+].join("\n");
+
+/**
+ * What prod psql emits TODAY for the legacy DDL-building pg_authid query
+ * (CASE rolsuper/rolcreatedb/rolcreaterole/rolbypassrls/rolcanlogin order,
+ * shape verified live in the original PR #22 work). Lets the harness stay
+ * prod-shape-faithful for whichever query generation the script embeds.
+ */
+const AUTHID_DDL_LEGACY = [
+  `CREATE ROLE field_record SUPERUSER CREATEDB CREATEROLE BYPASSRLS LOGIN PASSWORD '${FAKE_SCRAM_FIELD_RECORD}';`,
+  `CREATE ROLE app_user LOGIN PASSWORD '${FAKE_SCRAM_APP_USER}';`,
+  "CREATE ROLE ci_user BYPASSRLS LOGIN PASSWORD 'SCRAM-SHA-256$4096:Q2lTYWx0$Q2lTdG9yZWRLZXk=:Q2lTZXJ2ZXJLZXk=';",
+  "CREATE ROLE ci_app_user LOGIN PASSWORD 'SCRAM-SHA-256$4096:Q2lBcHBTYWx0$Q2lBcHBTdG9yZWQ=:Q2lBcHBTZXJ2ZXI=';",
+  `CREATE ROLE dblab_dump BYPASSRLS LOGIN PASSWORD '${FAKE_SCRAM_DBLAB_DUMP}';`,
+  "CREATE ROLE analytics_group;",
+  "",
+].join("\n");
+
+/**
+ * Stub `sudo` (prod-side psql): keyed on recognizable SQL fragments, each
+ * branch replays what PROD psql returns for that query (fragments + output
+ * shapes dry-run against the live prod db, read-only, 2026-06-12).
+ */
+const SUDO_STUB = [
+  "sudo() {",
+  '  local sql="${!#}"',
+  '  if [[ "$sql" == *"count(*)"* ]]; then',
+  '    if [[ "$sql" == *"pg_policies"* ]]; then cat "$FIX/prod_policies"',
+  '    elif [[ "$sql" == *"table_privileges"* ]]; then cat "$FIX/prod_grants"',
+  '    elif [[ "$sql" == *"pg_tables"* ]]; then cat "$FIX/prod_ownership"',
+  "    fi",
+  '    [[ -s "$FIX/prod_counts_fail" ]] && return 1',
+  "    return 0",
+  "  fi",
+  '  if [[ "$sql" == *"pg_authid"* ]]; then',
+  '    if [[ "$sql" == *"CREATE ROLE"* ]]; then cat "$FIX/prod_authid_ddl"',
+  '    else cat "$FIX/prod_authid_rows"; fi',
+  "    return 0",
+  "  fi",
+  '  if [[ "$sql" == *"CREATE POLICY"* ]]; then cat "$FIX/prod_policy_ddl"; return 0; fi',
+  '  if [[ "$sql" == *"unnest(roles)"* ]]; then cat "$FIX/prod_scoped_roles"; return 0; fi',
+  '  if [[ "$sql" == *"OWNER TO"* ]]; then cat "$FIX/prod_owner_ddl"; return 0; fi',
+  '  if [[ "$sql" == *"GRANT "* ]]; then cat "$FIX/prod_grant_ddl"; return 0; fi',
+  "  return 0",
+  "}",
+].join("\n");
+
+/**
+ * Stub `psql` (clone-side): `-f -` applies append their stdin batch to
+ * applied.sql (the harness's side channel) and fail when the batch contains
+ * $CLONE_APPLY_FAIL_ON (simulating a real in-clone DDL failure); `-c` count
+ * reads replay the clone fixtures.
+ */
+const PSQL_STUB = [
+  "psql() {",
+  '  local sql="" isfile=0 prev="" a batch',
+  '  for a in "$@"; do',
+  '    if [[ "$prev" == "-c" ]]; then sql="$a"; fi',
+  '    if [[ "$a" == "-f" ]]; then isfile=1; fi',
+  '    prev="$a"',
+  "  done",
+  '  if [[ "$isfile" == 1 ]]; then',
+  '    batch="$(cat)"',
+  '    printf \'%s\\n\' "$batch" >> "$FIX/applied.sql"',
+  '    if [[ -n "$CLONE_APPLY_FAIL_ON" && "$batch" == *"$CLONE_APPLY_FAIL_ON"* ]]; then return 1; fi',
+  "    return 0",
+  "  fi",
+  '  if [[ "$sql" == *"pg_policies"* ]]; then cat "$FIX/clone_policies"',
+  '  elif [[ "$sql" == *"table_privileges"* ]]; then cat "$FIX/clone_grants"',
+  '  elif [[ "$sql" == *"pg_tables"* ]]; then cat "$FIX/clone_ownership"',
+  "  fi",
+  "  return 0",
+  "}",
+].join("\n");
+
+interface SyncGlobalsOpts {
+  template?: string;
+  prodAuthidRows?: string;
+  prodScopedRoles?: string;
+  prodPolicies?: string;
+  prodGrants?: string;
+  prodOwnership?: string;
+  prodCountsFail?: boolean;
+  clonePolicies?: string;
+  cloneGrants?: string;
+  cloneOwnership?: string;
+  cloneApplyFailOn?: string;
+}
+
+interface SyncGlobalsRun {
+  code: number;
+  stdout: string;
+  stderr: string;
+  /** Every DDL batch the clone-side psql received (harness side channel). */
+  applied: string;
+}
+
+/** Execute the generated globals-sync path against prod-shaped fixtures. */
+function runSyncGlobals(opts: SyncGlobalsOpts = {}): SyncGlobalsRun {
+  const dir = mkdtempSync(join(tmpdir(), "samohost-syncglobals-"));
+  try {
+    const fix = (name: string, content: string) =>
+      writeFileSync(join(dir, name), content);
+    fix("template.env", opts.template ?? SYNC_TEMPLATE_DEFAULT);
+    fix(
+      "prod_authid_rows",
+      opts.prodAuthidRows ?? readFileSync(AUTHID_ROWS_FIXTURE, "utf8"),
+    );
+    fix("prod_authid_ddl", AUTHID_DDL_LEGACY);
+    // Live union-query result (policies roles + grantees + owners) on prod:
+    // app_user, field_record, public.
+    fix("prod_scoped_roles", opts.prodScopedRoles ?? "app_user\nfield_record\npublic\n");
+    fix("prod_policies", opts.prodPolicies ?? "14");
+    fix("prod_grants", opts.prodGrants ?? "315");
+    fix("prod_ownership", opts.prodOwnership ?? "29");
+    fix("prod_counts_fail", opts.prodCountsFail ? "1" : "");
+    fix("clone_policies", opts.clonePolicies ?? "14");
+    fix("clone_grants", opts.cloneGrants ?? "315");
+    fix("clone_ownership", opts.cloneOwnership ?? "29");
+    fix("prod_owner_ddl", "ALTER TABLE public.app_users OWNER TO field_record;\n");
+    fix("prod_grant_ddl", "GRANT SELECT ON public.app_users TO app_user;\n");
+    fix(
+      "prod_policy_ddl",
+      "CREATE POLICY p ON public.app_users AS PERMISSIVE FOR SELECT TO app_user USING (true);\n",
+    );
+    fix("applied.sql", "");
+    const script = buildEnvCreateScript(
+      app({ envDbVars: ["DATABASE_URL", "APP_DATABASE_URL"] }),
+      target({ dbBackend: "dblab" }),
+    );
+    const fns = [
+      "samohost_app_url_roles",
+      "samohost_emit_scoped_role_sql",
+      "samohost_parity_check",
+      "samohost_sync_clone_globals",
+    ]
+      .map((n) => extractFnOptional(script, n))
+      .filter((f): f is string => f !== null);
+    const prog = [
+      "set -uo pipefail",
+      `FIX='${dir}'`,
+      `CLONE_APPLY_FAIL_ON='${opts.cloneApplyFailOn ?? ""}'`,
+      `SAMOHOST_ENV_TEMPLATE='${join(dir, "template.env")}'`,
+      "SAMOHOST_ENV_DB_VARS=('DATABASE_URL' 'APP_DATABASE_URL')",
+      "SAMOHOST_DB_PASSWORD='harness-stub-pw'",
+      "SAMOHOST_DB_PORT='6000'",
+      SUDO_STUB,
+      PSQL_STUB,
+      ...fns,
+      "samohost_sync_clone_globals",
+    ].join("\n");
+    const res = spawnSync("bash", ["-c", prog], { encoding: "utf8" });
+    return {
+      code: res.status ?? -1,
+      stdout: res.stdout ?? "",
+      stderr: res.stderr ?? "",
+      applied: readFileSync(join(dir, "applied.sql"), "utf8"),
+    };
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+describe("PR #22 review finding 1 (MAJOR): parity gate fails CLOSED", () => {
+  test("executed: EMPTY prod policy count must FAIL the phase, not pass it", () => {
+    // The exact fail-open bug: an empty prod count made `clone -ge ""` evaluate
+    // as `-ge 0` and serve a clone with missing RLS (the #11 bypass class).
+    const r = runSyncGlobals({ prodPolicies: "", clonePolicies: "0" });
+    expect(r.code).not.toBe(0);
+    expect(r.stderr.toLowerCase()).toContain("parity");
+  });
+
+  test("executed: a FAILING prod count capture (non-zero exit, empty output) must FAIL", () => {
+    const r = runSyncGlobals({ prodPolicies: "", prodCountsFail: true });
+    expect(r.code).not.toBe(0);
+  });
+
+  test("executed: a non-numeric prod policy count must FAIL the phase", () => {
+    const r = runSyncGlobals({
+      prodPolicies: "ERROR:  permission denied",
+      clonePolicies: "0",
+    });
+    expect(r.code).not.toBe(0);
+    // The unvalidated capture must never be echoed back verbatim either way;
+    // the gate message reports the gate, not raw query output.
+    expect(r.stdout).toBe("");
+  });
+
+  test("executed: an empty CLONE count stays a failure (closed side stays closed)", () => {
+    const r = runSyncGlobals({ clonePolicies: "" });
+    expect(r.code).not.toBe(0);
+  });
+
+  test("executed: prod>0 with clone=0 fails; healthy parity passes", () => {
+    expect(runSyncGlobals({ clonePolicies: "0" }).code).not.toBe(0);
+    expect(runSyncGlobals().code).toBe(0);
+  });
+
+  test("script text: a parity helper validates BOTH prod and clone counts numerically", () => {
+    const s = buildEnvCreateScript(app(), target({ dbBackend: "dblab" }));
+    const fn = extractFn(s, "samohost_parity_check");
+    // Two independent numeric validations: prod side AND clone side.
+    expect(fn.match(/=~ \^\[0-9\]\+\$/g)?.length ?? 0).toBeGreaterThanOrEqual(2);
+    // The clone-side count read keeps stderr suppressed (error text from a
+    // psql failure can quote SQL); only the captured count is used.
+    expect(fn).toContain("2>/dev/null");
+  });
+});
+
+describe("PR #22 review finding 2 (MAJOR): role replay scoped to app roles, superpowers stripped", () => {
+  test("executed: ONLY app-referenced roles are replayed — ops/superuser roles ABSENT", () => {
+    const r = runSyncGlobals();
+    expect(r.code).toBe(0);
+    // The app's roles (envDbVars URL roles + grant/policy grantees + owner).
+    expect(r.applied).toContain('"app_user"');
+    expect(r.applied).toContain('"field_record"');
+    // Prod's unrelated ops roles must never reach the preview clone.
+    expect(r.applied).not.toContain("ci_user");
+    expect(r.applied).not.toContain("ci_app_user");
+    expect(r.applied).not.toContain("dblab_dump");
+    expect(r.applied).not.toContain("analytics_group");
+  });
+
+  test("executed: replayed roles are stripped of every cluster superpower", () => {
+    const r = runSyncGlobals();
+    expect(r.applied).toMatch(
+      /ALTER ROLE "field_record" NOSUPERUSER NOBYPASSRLS NOCREATEROLE NOCREATEDB NOREPLICATION LOGIN PASSWORD/,
+    );
+    expect(r.applied).toMatch(
+      /ALTER ROLE "app_user" NOSUPERUSER NOBYPASSRLS NOCREATEROLE NOCREATEDB NOREPLICATION LOGIN PASSWORD/,
+    );
+    // \b…\b does not match the NO- forms, so any bare grant of a superpower fails here.
+    expect(r.applied).not.toMatch(/(?<!NO)\bSUPERUSER\b/);
+    expect(r.applied).not.toMatch(/(?<!NO)\bBYPASSRLS\b/);
+    expect(r.applied).not.toMatch(/(?<!NO)\bCREATEROLE\b/);
+    expect(r.applied).not.toMatch(/(?<!NO)\bCREATEDB\b/);
+    expect(r.applied).not.toMatch(/(?<!NO)\bREPLICATION\b/);
+  });
+
+  test("executed: password hashes carry over for the scoped roles (sign-in works), never on stdout/stderr", () => {
+    const r = runSyncGlobals();
+    expect(r.applied).toContain(FAKE_SCRAM_FIELD_RECORD);
+    expect(r.applied).toContain(FAKE_SCRAM_APP_USER);
+    expect(r.applied).not.toContain(FAKE_SCRAM_DBLAB_DUMP);
+    expect(r.stdout + r.stderr).not.toContain("SCRAM-SHA-256");
+  });
+
+  test("executed helper: samohost_emit_scoped_role_sql emits only scoped roles from prod-shaped pg_authid rows", () => {
+    const s = buildEnvCreateScript(app(), target({ dbBackend: "dblab" }));
+    const fn = extractFn(s, "samohost_emit_scoped_role_sql");
+    const dir = mkdtempSync(join(tmpdir(), "samohost-emitrole-"));
+    try {
+      const scoped = join(dir, "scoped");
+      writeFileSync(scoped, "app_user\nanalytics_group\n");
+      const prog = [fn, `samohost_emit_scoped_role_sql '${scoped}'`].join("\n");
+      const r = spawnSync("bash", ["-c", prog], {
+        input: readFileSync(AUTHID_ROWS_FIXTURE, "utf8"),
+        encoding: "utf8",
+      });
+      expect(r.status).toBe(0);
+      expect(r.stdout).toContain('CREATE ROLE "app_user";');
+      expect(r.stdout).toContain(
+        `ALTER ROLE "app_user" NOSUPERUSER NOBYPASSRLS NOCREATEROLE NOCREATEDB NOREPLICATION LOGIN PASSWORD '${FAKE_SCRAM_APP_USER}';`,
+      );
+      // NOLOGIN group role without a hash: no PASSWORD clause, NOLOGIN kept.
+      expect(r.stdout).toContain(
+        'ALTER ROLE "analytics_group" NOSUPERUSER NOBYPASSRLS NOCREATEROLE NOCREATEDB NOREPLICATION NOLOGIN;',
+      );
+      // Unscoped rows (incl. superuser ops roles) are dropped entirely.
+      expect(r.stdout).not.toContain("field_record");
+      expect(r.stdout).not.toContain("dblab_dump");
+      expect(r.stderr).not.toContain("SCRAM-SHA-256");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("executed helper: a hash with quoting metacharacters is skipped, not interpolated, not echoed", () => {
+    const s = buildEnvCreateScript(app(), target({ dbBackend: "dblab" }));
+    const fn = extractFn(s, "samohost_emit_scoped_role_sql");
+    const dir = mkdtempSync(join(tmpdir(), "samohost-emitrole-"));
+    try {
+      const scoped = join(dir, "scoped");
+      writeFileSync(scoped, "weird_role\n");
+      const prog = [fn, `samohost_emit_scoped_role_sql '${scoped}'`].join("\n");
+      const r = spawnSync("bash", ["-c", prog], {
+        input: "weird_role|t|SCRAM-SHA-256$4096:a'b$c:d\n",
+        encoding: "utf8",
+      });
+      expect(r.status).toBe(0);
+      expect(r.stdout).not.toContain("PASSWORD");
+      expect(r.stdout).not.toContain("a'b");
+      expect(r.stderr).not.toContain("a'b");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("executed helper: samohost_app_url_roles extracts the role component of each mapped var, leaking no values", () => {
+    const s = buildEnvCreateScript(
+      app({ envDbVars: ["DATABASE_URL", "APP_DATABASE_URL"] }),
+      target({ dbBackend: "dblab" }),
+    );
+    const fn = extractFn(s, "samohost_app_url_roles");
+    const dir = mkdtempSync(join(tmpdir(), "samohost-urlroles-"));
+    try {
+      const tpl = join(dir, "template.env");
+      writeFileSync(tpl, SYNC_TEMPLATE_DEFAULT);
+      const prog = [
+        "set -uo pipefail",
+        `SAMOHOST_ENV_TEMPLATE='${tpl}'`,
+        "SAMOHOST_ENV_DB_VARS=('DATABASE_URL' 'APP_DATABASE_URL')",
+        fn,
+        "samohost_app_url_roles",
+      ].join("\n");
+      const r = spawnSync("bash", ["-c", prog], { encoding: "utf8" });
+      expect(r.status).toBe(0);
+      const lines = r.stdout.trim().split("\n").sort();
+      expect(lines).toEqual(["app_user", "field_record"]);
+      expect(r.stdout + r.stderr).not.toContain("admin-pw-X");
+      expect(r.stdout + r.stderr).not.toContain("app-pw-9");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("script text: the unscoped pg_authid attribute passthrough is GONE", () => {
+    const s = buildEnvCreateScript(app(), target({ dbBackend: "dblab" }));
+    const fn = extractFn(s, "samohost_sync_clone_globals");
+    // The old query copied prod's rolsuper/rolbypassrls/rolcreaterole bits
+    // verbatim into the clone for EVERY non-builtin role.
+    expect(fn).not.toContain("WHEN rolsuper");
+    expect(fn).not.toContain("WHEN rolbypassrls");
+    expect(s).toContain("NOSUPERUSER");
+    expect(s).toContain("NOBYPASSRLS");
+  });
+});
+
+describe("PR #22 review finding 3 (MINOR): partial grant/ownership replay must be visible", () => {
+  test("executed: a FAILING ownership apply fails the phase (counted via exit codes, output suppressed)", () => {
+    const r = runSyncGlobals({ cloneApplyFailOn: "OWNER TO" });
+    expect(r.code).not.toBe(0);
+    // Failures are COUNTED, never echoed: psql error text can quote DDL.
+    expect(r.stdout + r.stderr).not.toContain("SCRAM-SHA-256");
+    expect(r.stdout + r.stderr).not.toContain("OWNER TO public.app_users");
+  });
+
+  test("executed: a FAILING grants apply fails the phase", () => {
+    const r = runSyncGlobals({ cloneApplyFailOn: "GRANT SELECT" });
+    expect(r.code).not.toBe(0);
+  });
+
+  test("executed: clone grant count below prod fails parity", () => {
+    const r = runSyncGlobals({ cloneGrants: "0" });
+    expect(r.code).not.toBe(0);
+    expect(r.stderr.toLowerCase()).toContain("grant");
+  });
+
+  test("script text: ownership/grant applies run under ON_ERROR_STOP with streams suppressed", () => {
+    const s = buildEnvCreateScript(app(), target({ dbBackend: "dblab" }));
+    const fn = extractFn(s, "samohost_sync_clone_globals");
+    expect(fn).toContain("ON_ERROR_STOP");
+    for (const line of fn.split("\n")) {
+      if (line.includes("ON_ERROR_STOP")) {
+        expect(line).toContain(">/dev/null 2>&1");
+        expect(line).not.toContain("|| true");
+      }
+    }
+  });
+});
+
+describe("PR #22 review finding 4 (MINOR): prod_db derivation is validated", () => {
+  test("executed: a mapped var with NO database path component fails the phase, names the var, leaks nothing", () => {
+    const r = runSyncGlobals({
+      template: [
+        "DATABASE_URL=postgresql://field_record:admin-pw-X@localhost:5432",
+        "APP_DATABASE_URL=postgresql://app_user:app-pw-9@localhost:5432/field_record",
+        "",
+      ].join("\n"),
+    });
+    expect(r.code).not.toBe(0);
+    expect(r.stderr).toContain("DATABASE_URL");
+    // A mis-parse can capture the WHOLE line (credentials included) — the
+    // failure message must never echo the derived value.
+    expect(r.stdout + r.stderr).not.toContain("admin-pw-X");
+  });
+
+  test("executed: a garbage (non-URL) first mapped var fails the phase", () => {
+    const r = runSyncGlobals({
+      template: "DATABASE_URL=not-a-url\nAPP_DATABASE_URL=also-not\n",
+    });
+    expect(r.code).not.toBe(0);
+  });
+
+  test("executed: a MISSING first mapped var fails the phase", () => {
+    const r = runSyncGlobals({ template: "NODE_ENV=production\n" });
+    expect(r.code).not.toBe(0);
+  });
+});
