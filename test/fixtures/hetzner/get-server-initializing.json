@@ -1,0 +1,18 @@
+{
+  "server": {
+    "id": 4711,
+    "name": "samo-test-vm",
+    "status": "initializing",
+    "public_net": {
+      "ipv4": { "id": 90, "ip": "192.0.2.10", "blocked": false },
+      "ipv6": { "id": 91, "ip": "2001:db8::/64", "blocked": false }
+    },
+    "server_type": { "id": 22, "name": "cx22" },
+    "datacenter": { "id": 2, "name": "nbg1-dc3", "location": { "id": 2, "name": "nbg1" } },
+    "image": { "id": 114690387, "name": "ubuntu-24.04" },
+    "labels": { "managed-by": "samohost", "samohost-id": "00000000-0000-4000-8000-000000000001" },
+    "volumes": [],
+    "protection": { "delete": false, "rebuild": false },
+    "locked": false
+  }
+}

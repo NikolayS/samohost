@@ -1,0 +1,46 @@
+{
+  "server": {
+    "id": 4711,
+    "name": "samo-test-vm",
+    "status": "initializing",
+    "created": "2026-06-11T12:00:00+00:00",
+    "public_net": {
+      "ipv4": { "id": 90, "ip": "192.0.2.10", "blocked": false, "dns_ptr": "static.10.2.0.192.clients.your-server.de" },
+      "ipv6": { "id": 91, "ip": "2001:db8::/64", "blocked": false, "dns_ptr": [] },
+      "floating_ips": []
+    },
+    "server_type": { "id": 22, "name": "cx22", "cores": 2, "memory": 4.0, "disk": 40 },
+    "datacenter": { "id": 2, "name": "nbg1-dc3", "location": { "id": 2, "name": "nbg1", "country": "DE" } },
+    "image": { "id": 114690387, "name": "ubuntu-24.04", "os_flavor": "ubuntu", "os_version": "24.04" },
+    "labels": { "managed-by": "samohost", "samohost-id": "00000000-0000-4000-8000-000000000001" },
+    "volumes": [],
+    "protection": { "delete": false, "rebuild": false },
+    "rescue_enabled": false,
+    "locked": false,
+    "backup_window": null,
+    "outgoing_traffic": null,
+    "ingoing_traffic": null,
+    "included_traffic": 21990232555520
+  },
+  "action": {
+    "id": 13,
+    "command": "create_server",
+    "status": "running",
+    "progress": 0,
+    "started": "2026-06-11T12:00:00+00:00",
+    "finished": null,
+    "resources": [{ "id": 4711, "type": "server" }],
+    "error": null
+  },
+  "next_actions": [
+    {
+      "id": 14,
+      "command": "start_server",
+      "status": "running",
+      "progress": 0,
+      "resources": [{ "id": 4711, "type": "server" }],
+      "error": null
+    }
+  ],
+  "root_password": "FIXTUREonlyRootPw2mqzKxe7"
+}
