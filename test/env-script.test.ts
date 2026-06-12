@@ -837,6 +837,9 @@ const AUTHID_DDL_LEGACY = [
  * Stub `sudo` (prod-side psql): keyed on recognizable SQL fragments, each
  * branch replays what PROD psql returns for that query (fragments + output
  * shapes dry-run against the live prod db, read-only, 2026-06-12).
+ *
+ * The schema-grants branch (ON SCHEMA) is dispatched before the generic
+ * table-grants branch (GRANT) so the two don't collide.
  */
 const SUDO_STUB = [
   "sudo() {",
@@ -857,6 +860,9 @@ const SUDO_STUB = [
   '  if [[ "$sql" == *"CREATE POLICY"* ]]; then cat "$FIX/prod_policy_ddl"; return 0; fi',
   '  if [[ "$sql" == *"unnest(roles)"* ]]; then cat "$FIX/prod_scoped_roles"; return 0; fi',
   '  if [[ "$sql" == *"OWNER TO"* ]]; then cat "$FIX/prod_owner_ddl"; return 0; fi',
+  // Schema grants branch must come BEFORE the generic table grants branch
+  // because both contain "GRANT" — the schema-grant query uses "ON SCHEMA".
+  '  if [[ "$sql" == *"ON SCHEMA"* ]]; then cat "$FIX/prod_schema_grant_ddl"; return 0; fi',
   '  if [[ "$sql" == *"GRANT "* ]]; then cat "$FIX/prod_grant_ddl"; return 0; fi',
   "  return 0",
   "}",
@@ -902,6 +908,8 @@ interface SyncGlobalsOpts {
   cloneGrants?: string;
   cloneOwnership?: string;
   cloneApplyFailOn?: string;
+  /** DDL the prod-side sudo stub returns for schema-grant queries (ON SCHEMA). */
+  prodSchemaGrantDdl?: string;
 }
 
 interface SyncGlobalsRun {
@@ -936,6 +944,14 @@ function runSyncGlobals(opts: SyncGlobalsOpts = {}): SyncGlobalsRun {
     fix("clone_ownership", opts.cloneOwnership ?? "29");
     fix("prod_owner_ddl", "ALTER TABLE public.app_users OWNER TO field_record;\n");
     fix("prod_grant_ddl", "GRANT SELECT ON public.app_users TO app_user;\n");
+    // Prod-verified: field_record is the DB owner so it gets CREATE on public
+    // via pg_database_owner=UC — replayed explicitly because the clone's DB
+    // owner is postgres. Dry-run shape: GRANT CREATE ON SCHEMA public TO ...;
+    fix(
+      "prod_schema_grant_ddl",
+      opts.prodSchemaGrantDdl ??
+        "GRANT USAGE ON SCHEMA public TO field_record;\nGRANT CREATE ON SCHEMA public TO field_record;\nGRANT USAGE ON SCHEMA public TO app_user;\n",
+    );
     fix(
       "prod_policy_ddl",
       "CREATE POLICY p ON public.app_users AS PERMISSIVE FOR SELECT TO app_user USING (true);\n",
@@ -1212,5 +1228,58 @@ describe("PR #22 review finding 4 (MINOR): prod_db derivation is validated", () 
   test("executed: a MISSING first mapped var fails the phase", () => {
     const r = runSyncGlobals({ template: "NODE_ENV=production\n" });
     expect(r.code).not.toBe(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Schema-grant replay (live-validation finding, 2026-06-12): the globals sync
+// was missing schema-level GRANT USAGE/CREATE ON SCHEMA statements. When prod's
+// database owner role (e.g. field_record) is NOT the clone's DB owner (postgres
+// is), the role loses CREATE on the public schema — causing migration failures
+// with "permission denied for schema public" at app startup.
+// ---------------------------------------------------------------------------
+describe("schema-grant replay (live-validation finding 2026-06-12)", () => {
+  test("executed: schema grants from prod are applied to the clone", () => {
+    const r = runSyncGlobals();
+    expect(r.code).toBe(0);
+    // field_record must receive GRANT CREATE ON SCHEMA public (prod-sourced).
+    expect(r.applied).toContain("GRANT CREATE ON SCHEMA public TO field_record");
+    expect(r.applied).toContain("GRANT USAGE ON SCHEMA public TO field_record");
+    expect(r.applied).toContain("GRANT USAGE ON SCHEMA public TO app_user");
+  });
+
+  test("executed: schema-grant apply failure is counted and fails the phase", () => {
+    const r = runSyncGlobals({ cloneApplyFailOn: "GRANT CREATE ON SCHEMA" });
+    expect(r.code).not.toBe(0);
+  });
+
+  test("executed: ops roles NOT granted schema access (scoping respected)", () => {
+    // Even if the sudo stub returned grants for ops roles, the query must
+    // be scoped — ops roles absent from the scoped set must not appear.
+    const r = runSyncGlobals({
+      prodSchemaGrantDdl:
+        "GRANT USAGE ON SCHEMA public TO field_record;\nGRANT USAGE ON SCHEMA public TO ci_user;\n",
+    });
+    // ci_user is an ops role not in envDbVars URL roles or grant/policy grantees.
+    // The generated SQL query must filter by the scoped set.
+    // For this test: if the script emits the ci_user grant, it fails.
+    // (If the query is correctly scoped in SQL, ci_user won't appear in output.)
+    expect(r.applied).not.toContain("ci_user");
+  });
+
+  test("script text: schema-grant step is present in samohost_sync_clone_globals", () => {
+    const s = buildEnvCreateScript(app(), target({ dbBackend: "dblab" }));
+    const fn = extractFn(s, "samohost_sync_clone_globals");
+    // The schema-grant replay step must query schema privileges and emit grants.
+    expect(fn).toContain("ON SCHEMA");
+    expect(fn).toContain("GRANT");
+    // Must be applied to the clone under ON_ERROR_STOP (idempotent, but real
+    // failures — e.g. role doesn't exist yet — are errors).
+    const lines = fn.split("\n");
+    const schemaGrantLine = lines.find(
+      (l) => l.includes("ON SCHEMA") && l.includes("PGPASSWORD") && l.includes("psql"),
+    );
+    expect(schemaGrantLine).toBeDefined();
+    expect(schemaGrantLine).toContain(">/dev/null 2>&1");
   });
 });
