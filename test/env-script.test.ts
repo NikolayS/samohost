@@ -186,13 +186,18 @@ describe("buildHostPrepScript", () => {
     expect(bashSyntaxOk(buildHostPrepScript(app(), "agent"))).toBe(true);
   });
 
-  test("documents template unit, caddy include, sudoers grants, wildcard DNS", () => {
+  test("documents template unit, caddy include, sudoers grants, per-preview DNS posture", () => {
     const s = buildHostPrepScript(app(), "agent");
     expect(s).toContain("/etc/systemd/system/field-record@.service");
     expect(s).toContain("import sites.d/*.caddy");
     expect(s).toContain("/etc/sudoers.d/samohost-env-field-record-1");
     expect(s).toContain("visudo -cf");
-    expect(s).toContain("wildcard A record");
+    // DNS comment must describe the correct posture: per-preview UNPROXIED A
+    // record (not the old misleading wildcard claim).
+    expect(s).toContain("UNPROXIED");
+    expect(s).toContain("per-preview");
+    // Old misleading claim must be gone.
+    expect(s).not.toContain("no per-env DNS API calls are needed");
     // Exact-path grants only.
     expect(s).toContain("NOPASSWD: /usr/bin/systemctl reload caddy");
   });
