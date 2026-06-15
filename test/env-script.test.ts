@@ -282,6 +282,43 @@ describe("buildHostPrepScript", () => {
     expect(s).not.toContain("00-main-");
     expect(s).toContain("import sites.d/*.caddy");
   });
+
+  // -------------------------------------------------------------------------
+  // Issue #38 — open ufw 443 in host-prep; correct preview DNS comment
+  // -------------------------------------------------------------------------
+
+  test("opens ufw 443/tcp so the origin answers HTTPS (avoids 522)", () => {
+    // host-prep is run with root; /usr/sbin/ufw is the canonical path on
+    // Ubuntu 22.04/24.04 and ufw allow is naturally idempotent.
+    const s = buildHostPrepScript(app(), "agent");
+    expect(s).toContain("/usr/sbin/ufw allow 443/tcp");
+  });
+
+  test("DNS comment describes per-preview UNPROXIED A record + ufw 443 (not misleading wildcard claim)", () => {
+    const s = buildHostPrepScript(app(), "agent");
+    // New wording must reference the correct posture (unproxied, per-preview).
+    expect(s).toContain("UNPROXIED");
+    expect(s).toContain("per-preview");
+    // Must mention that ufw 443 is required for HTTP-01 / HTTPS to work.
+    expect(s).toMatch(/ufw.*443|443.*ufw/i);
+    // Old misleading claim — "no per-env DNS API calls are needed" — must be gone.
+    expect(s).not.toContain("no per-env DNS API calls are needed");
+  });
+
+  test("regression: vhost blocks emitted by buildEnvCreateScript carry NO tls directive", () => {
+    for (const db of ["dblab", "template", "none"] as const) {
+      const s = buildEnvCreateScript(app(), target({ dbBackend: db }));
+      // Caddy vhost blocks must remain bare (ACME mode); tls internal would
+      // force a self-signed cert → browser warning on direct-to-origin previews.
+      expect(s).not.toMatch(/^\s*tls\s/m);
+    }
+  });
+
+  test("regression: vhost blocks emitted by buildEnvCreateScript are valid bash", () => {
+    for (const db of ["dblab", "template", "none"] as const) {
+      expect(bashSyntaxOk(buildEnvCreateScript(app(), target({ dbBackend: db })))).toBe(true);
+    }
+  });
 });
 
 // ---------------------------------------------------------------------------
