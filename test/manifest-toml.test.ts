@@ -219,7 +219,11 @@ describe("parseSamohostToml — wrong field types", () => {
 
 describe("parseSamohostToml — unknown key rejection", () => {
   test("unknown top-level key → error naming the key", () => {
-    const toml = FIXTURE_TEXT + '\nhelathUrl = "http://typo"\n';
+    // Insert the typo before the [provision] section so it is a top-level key
+    const toml = FIXTURE_TEXT.replace(
+      "[provision]",
+      'helathUrl = "http://typo"\n\n[provision]',
+    );
     const result = parseSamohostToml(toml);
     expect(result.ok).toBe(false);
     if (result.ok) throw new Error("expected ok=false");
@@ -227,7 +231,11 @@ describe("parseSamohostToml — unknown key rejection", () => {
   });
 
   test("unknown [provision] key → error naming the key", () => {
-    const toml = FIXTURE_TEXT + "\n[provision]\nunknownKey = \"value\"\n";
+    // Append an unknown key inside the [provision] section
+    const toml = FIXTURE_TEXT.replace(
+      "[provision.labels]",
+      'unknownKey = "value"\n\n[provision.labels]',
+    );
     const result = parseSamohostToml(toml);
     expect(result.ok).toBe(false);
     if (result.ok) throw new Error("expected ok=false");
