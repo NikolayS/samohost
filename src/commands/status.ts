@@ -92,10 +92,10 @@ function formatAudit(results: AuditResult[]): string {
 }
 
 /** Output that signals "the probe ran but was not allowed", not "control off". */
-const PERMISSION_RE =
+export const PERMISSION_RE =
   /permission denied|you need to be root|must be root|not permitted|operation not permitted|enough privilege/i;
 
-function evaluate(
+export function evaluate(
   check: AuditCheck,
   observed: string | undefined,
   sshStderr: string,

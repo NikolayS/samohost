@@ -19,7 +19,7 @@ import {
   test,
   mock,
 } from "bun:test";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { parseArgs } from "../src/cli.ts";
@@ -28,8 +28,6 @@ import {
   parseLivenessOutput,
   parseSuspiciousOutput,
   parsePgLocalhostOutput,
-  type DoctorStatus,
-  type DoctorResult,
 } from "../src/commands/doctor.ts";
 import { hardeningModule } from "../src/cloudinit/hardening.ts";
 import { StateStore } from "../src/state/store.ts";
@@ -101,20 +99,27 @@ const CORE_HOST_PASS_BODIES: Record<string, string> = {
   "apparmor-enforced": "12 profiles are in enforce mode.",
 };
 
-// Pass bodies for doctor-specific checks (non-app-scoped).
+// Pass bodies for doctor-specific checks — IDs must exactly match buildDoctorChecks() output.
 const DOCTOR_PASS_BODIES: Record<string, string> = {
   // new core-host checks
   "permitrootlogin": "permitrootlogin no",
   "passwordauth": "passwordauthentication no",
   "allowusers": "allowusers agent",
   "unattended-upgrades-active": "active",
+  // only-intended-ports: empty output = no unexpected listeners = pass
+  "only-intended-ports": "",
+  // app-scoped core-host (placeholder commands — will be skip when no app)
+  "env-file-perms": "600 agent",
+  "git-remote-no-token": "origin\thttps://github.com/Tanya301/field-record-1 (fetch)",
   // liveness
   "ss-listeners": "LISTEN 0 128 0.0.0.0:2223 0.0.0.0:*\nLISTEN 0 511 0.0.0.0:80 0.0.0.0:*\nLISTEN 0 511 0.0.0.0:443 0.0.0.0:*",
   "fail2ban-jail": "Status for the jail: sshd\n|- Filter\n|  `- Currently failed: 0\n`- Actions\n   `- Total banned: 1",
-  // suspicious
-  "failed-auth": "5",
-  "sudo-failures": "0",
-  "fail2ban-bans": "Status for the jail: sshd\n|- Filter\n|  `- Currently failed: 0\n`- Actions\n   `- Total banned: 3",
+  // app-scoped liveness (skip when no app)
+  "service-crash-loop": "Started field-record.service.",
+  // suspicious (never fails; raw journal text — parser counts locally)
+  "failed-auth-burst": "Accepted publickey for agent",
+  "sudo-failures": "Accepted publickey for agent",
+  "fail2ban-ban-spike": "Status for the jail: sshd\n|- Filter\n|  `- Currently failed: 0\n`- Actions\n   `- Total banned: 3",
   // app-db
   "rls-nonsuperuser": "f",
   "pg-localhost": "LISTEN 0 128 127.0.0.1:5432 0.0.0.0:*",
@@ -127,42 +132,42 @@ const ALL_PASS_BODIES: Record<string, string> = {
 };
 
 /**
- * Build canned delimited output for a given set of check IDs → bodies mapping.
- * Mirrors the pattern in status.test.ts.
- */
-function delimitedOutput(idToBody: (id: string) => string, ids: string[]): string {
-  return ids
-    .map((id) => `<<<SAMOHOST_AUDIT:${id}}>>>\n${idToBody(id)}`)
-    .join("\n");
-}
-
-/**
  * Build delimited output that satisfies ALL doctor checks.
- * Uses the merged pass bodies for both core-host and doctor-specific checks.
+ * Delimiter: <<<SAMOHOST_AUDIT:<id>>> (from AUDIT_DELIM_PREFIX + id + AUDIT_DELIM_SUFFIX).
  */
 function allPassDelimited(overrides: Record<string, string> = {}): string {
   const bodies = { ...ALL_PASS_BODIES, ...overrides };
-  // We need to produce output that parseAuditOutput can parse.
-  // The AUDIT_DELIM format is <<<SAMOHOST_AUDIT:<id>>>
-  // Build ids from the known pass bodies
-  const ids = Object.keys(bodies);
-  return ids
-    .map((id) => `<<<SAMOHOST_AUDIT:${id}>>\n${bodies[id]}`)
+  return Object.entries(bodies)
+    .map(([id, body]) => `<<<SAMOHOST_AUDIT:${id}>>>\n${body}`)
     .join("\n");
 }
 
 /**
- * Build valid delimited output where the body function is called per-id.
- * The doctor test infrastructure needs to include ALL probe ids that runDoctor
- * will look for. We build a runner that returns all sections for both the
- * hardening checks + doctor checks.
+ * Build valid delimited output. The runner intercepts the actual generated script,
+ * extracts probe IDs from the embedded echo statements (JSON-quoted delimiters),
+ * and returns a response with each check section satisfied.
  */
 function makePassRunner(overrides: Record<string, string> = {}): RemoteRunner {
   const bodies = { ...ALL_PASS_BODIES, ...overrides };
-  return (_vm, _script) => {
-    // Build output with all expected section delimiters
-    const sections = Object.entries(bodies)
-      .map(([id, body]) => `<<<SAMOHOST_AUDIT:${id}}>>>\n${body}`)
+  return (_vm, script) => {
+    // Extract IDs from the script: buildAuditScript emits echo "<<<SAMOHOST_AUDIT:<id>>>"
+    // We match them from the JSON-quoted form in the echo statements.
+    const ids: string[] = [];
+    const echoRe = /echo\s+"<<<SAMOHOST_AUDIT:([^>]+)>>>"/g;
+    let m: RegExpExecArray | null;
+    while ((m = echoRe.exec(script)) !== null) {
+      ids.push(m[1]!);
+    }
+    // Fallback: also accept the non-JSON-quoted form.
+    if (ids.length === 0) {
+      const re2 = /<<<SAMOHOST_AUDIT:([^>]+)>>>/g;
+      while ((m = re2.exec(script)) !== null) {
+        ids.push(m[1]!);
+      }
+    }
+    // Build output: serve pass bodies for script IDs, fallback to "".
+    const sections = ids
+      .map((id) => `<<<SAMOHOST_AUDIT:${id}>>>\n${bodies[id] ?? ""}`)
       .join("\n");
     return Promise.resolve({ code: 0, stdout: sections, stderr: "" });
   };
@@ -463,7 +468,7 @@ describe("7. Auto-detect app-db scoping", () => {
         stderr: "",
       });
     const c = capture();
-    const code = await runDoctor(
+    await runDoctor(
       { target: "test-vm", infra: false },
       { json: true },
       store,
