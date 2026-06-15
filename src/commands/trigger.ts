@@ -14,8 +14,19 @@
  *   - health-200 gate (#45)
  *   - rollback and bookkeeping
  *
- * The trigger only adds the "should we deploy?" iteration layer.
- * It does NOT import or call `checkCiGreen` directly.
+ * The trigger adds the "should we deploy?" iteration layer and pre-checks CI
+ * state via checkCiGreen so that a pending/red/none CI result is classified as
+ * a transient SKIP (not a deploy failure). Only on CI "success" does the
+ * trigger call deps.deploy (runAppDeploy, which still re-gates on its own).
+ *
+ * Ordered short-circuits (no CI call made for these):
+ *   same-SHA   → up-to-date
+ *   known-bad  → known-bad
+ *   dry-run    → would-deploy  (offline-safe; no CI call)
+ *   CI pending → skipped (reason: ci-pending)
+ *   CI none    → skipped (reason: ci-none)
+ *   CI failure → skipped (reason: ci-red)
+ *   CI success → call deploy; non-zero exit → failed (genuine deploy failure)
  */
 
 import { AppStore } from "../state/apps.ts";
@@ -26,6 +37,7 @@ import {
   type AppDeployInput,
   type RefResolver,
 } from "./app.ts";
+import { checkCiGreen } from "../app/cigate.ts";
 import type { DeployOutcome } from "../app/parse.ts";
 
 // ---------------------------------------------------------------------------
@@ -86,6 +98,16 @@ export interface TriggerDeps {
   resolveRef: RefResolver;
   /** CURRIED runAppDeploy — AppDeployDeps already bound inside. */
   deploy: TriggerDeploy;
+  /**
+   * Injected fetch used by checkCiGreen. Prod wires globalThis.fetch; tests
+   * inject a fixture that returns workflow_runs JSON without hitting the network.
+   */
+  fetch: typeof globalThis.fetch;
+  /**
+   * Optional env override for token lookup inside checkCiGreen (tests inject
+   * `{}` or `{ GH_TOKEN: "..." }`; prod uses process.env by default).
+   */
+  env?: Record<string, string | undefined>;
   /** Clock for cycleAt timestamps. */
   now: () => Date;
 }
@@ -97,30 +119,34 @@ export interface TriggerDeps {
 /**
  * Perform ONE idempotent poll cycle.
  *
- * Algorithm (per SPEC-DELTA §7):
+ * Algorithm (per SPEC-DELTA §7 + #52 CI-skip classification):
  *
  * 1. Enumerate all apps from appStore joined to vmStore:
  *    - Skip apps whose VM is missing or whose lifecycleState is not in
  *      {ready, adopted}.
  *    - Apply --vm / --app narrowing when provided.
  * 2. For each candidate: resolve the tracked-branch SHA via resolveRef.
- * 3. Compare resolved SHA to app.deployedSha:
- *    - equal          → action up-to-date; no deploy.
- *    - == failedSha   → action known-bad; no deploy (early skip before the
- *                        guard in runAppDeploy would also catch it, but we
- *                        avoid the pointless SSH/CI round-trip).
- *    - different      → call deps.deploy with the resolved SHA explicitly.
- * 4. --dry-run: report would-deploy / up-to-date / known-bad / skipped without
- *    actually calling runAppDeploy.
- * 5. Per-app isolation: catch any throw per-app; record action=error; continue.
- * 6. Exit 0 if all actions are {deployed, up-to-date, known-bad, skipped,
+ * 3. Ordered short-circuits (no CI call for these):
+ *    - equal to deployedSha → action up-to-date; no CI call, no deploy.
+ *    - equal to failedSha   → action known-bad; no CI call, no deploy (avoids
+ *                              the pointless SSH/CI round-trip).
+ *    - --dry-run            → action would-deploy; no CI call, no deploy
+ *                              (offline-safe).
+ * 4. Check CI via checkCiGreen(repo, sha, {fetch, env}):
+ *    - "pending"  → action skipped, reason "ci-pending"; DO NOT call deploy.
+ *    - "none"     → action skipped, reason "ci-none";    DO NOT call deploy.
+ *    - "failure"  → action skipped, reason "ci-red";     DO NOT call deploy.
+ *    - "success"  → proceed to call deps.deploy.
+ * 5. Call deps.deploy. Non-zero exit → action failed (genuine deploy failure).
+ * 6. Per-app isolation: catch any throw per-app; record action=error; continue.
+ * 7. Exit 0 if all actions are {deployed, up-to-date, known-bad, skipped,
  *    would-deploy}; exit 1 if any action is {failed, error}.
  *
  * Bucket mapping for report counters:
  *   deployed            → report.deployed
  *   up-to-date          → report.skipped
  *   known-bad           → report.skipped
- *   skipped             → report.skipped
+ *   skipped             → report.skipped  (includes all ci-* reasons)
  *   would-deploy        → report.skipped
  *   failed | error      → report.failed
  */
@@ -206,7 +232,8 @@ export async function runTriggerRun(
         continue;
       }
 
-      // --dry-run: report would-deploy without calling runAppDeploy
+      // --dry-run: report would-deploy without calling CI or runAppDeploy.
+      // Dry-run must be offline-safe — no network calls.
       if (input.dryRun) {
         results.push({
           app: app.name,
@@ -217,9 +244,51 @@ export async function runTriggerRun(
         continue;
       }
 
-      // Deploy — always pass the resolved SHA explicitly so runAppDeploy never
-      // resolves twice. CI gate is NOT skipped; enforcement is delegated to
-      // runAppDeploy.
+      // Check CI state. pending/none/failure are transient — classify as skipped
+      // so the systemd timer cycle exits 0 (not a deploy failure). Only on
+      // "success" do we proceed to call deploy.
+      const ciStatus = await checkCiGreen(app.repo, resolvedSha, {
+        fetch: deps.fetch,
+        env: deps.env,
+      });
+
+      if (ciStatus === "pending") {
+        results.push({
+          app: app.name,
+          vm: vmName,
+          action: "skipped",
+          sha: resolvedSha,
+          reason: "ci-pending",
+        });
+        continue;
+      }
+
+      if (ciStatus === "none") {
+        results.push({
+          app: app.name,
+          vm: vmName,
+          action: "skipped",
+          sha: resolvedSha,
+          reason: "ci-none",
+        });
+        continue;
+      }
+
+      if (ciStatus === "failure") {
+        results.push({
+          app: app.name,
+          vm: vmName,
+          action: "skipped",
+          sha: resolvedSha,
+          reason: "ci-red",
+        });
+        continue;
+      }
+
+      // ciStatus === "success" — proceed to deploy.
+      // Always pass the resolved SHA explicitly so runAppDeploy never resolves
+      // twice. runAppDeploy still re-runs its own CI gate + known-bad + health
+      // gates — it remains the deploy authority.
       const deployInput: AppDeployInput = {
         vm: vmName,
         app: app.name,
@@ -321,6 +390,9 @@ export async function runTriggerRun(
  *   - resolveRef: from defaultAppDeployDeps() (same `gh api` resolver)
  *   - deploy: closure that binds defaultAppDeployDeps() once and calls
  *             runAppDeploy — AppDeployDeps are bound inside, NOT exposed.
+ *   - fetch: globalThis.fetch (real network; token read from GH_TOKEN/GITHUB_TOKEN
+ *            at call time inside checkCiGreen — never stored here)
+ *   - env: undefined (checkCiGreen falls back to process.env)
  *   - now: () => new Date()
  */
 export function defaultTriggerDeps(): TriggerDeps {
@@ -334,6 +406,10 @@ export function defaultTriggerDeps(): TriggerDeps {
     // Curried: AppDeployDeps already captured in closure.
     deploy: (input, opts, vmStore, appStore, out, err) =>
       runAppDeploy(input, opts, vmStore, appStore, appDeployDeps, out, err),
+
+    // Real network fetch; checkCiGreen reads GH_TOKEN/GITHUB_TOKEN from
+    // process.env at call time (env: undefined → default).
+    fetch: globalThis.fetch,
 
     now: () => new Date(),
   };
