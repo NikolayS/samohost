@@ -37,6 +37,7 @@ import {
   runAppDeploy,
   runAppStatus,
   runAppClearFailed,
+  runAppBootstrap,
   defaultAppDeployDeps,
   defaultAppStore,
   type AppRegisterInput,
@@ -44,6 +45,7 @@ import {
   type AppDeployInput,
   type AppStatusInput,
   type AppClearFailedInput,
+  type AppBootstrapInput,
 } from "./commands/app.ts";
 import {
   runEnvPlan,
@@ -99,6 +101,7 @@ Usage:
       [--skip-ci-gate] [--force] [--json]
   samohost app status <vm> <app> [--json]
   samohost app clear-failed <vm> <app> [--json]
+  samohost app bootstrap <vm> <app> --app-user <user> [options]
   samohost env plan <vm> <app> (--branch <b> [--destroy] | --host-prep) [options]
   samohost env create <vm> <app> --branch <b> [--db dblab|template|none] [--json]
   samohost env list <vm> [--app <name>] [--json]
@@ -211,6 +214,18 @@ app clear-failed (offline; clears the known-bad-SHA guard record):
   longer refused — use after a rollback caused by a tooling defect (e.g.
   a misconfigured RLS probe), when the commit itself was healthy
 
+app bootstrap options (PR-A1 — ONE-TIME OS bootstrap; printed for operator
+  review; NOT auto-executed by samohost; run as root):
+  <vm>                       VM name or id (required)
+  <app>                      app name or id (required)
+  --app-user <user>          OS user created to run the app (required)
+  --app-base <path>          base directory (default: /opt/<app-name>)
+  --node-major <N>           Node.js major via NodeSource (default: 22)
+  --pg-major <N>             PostgreSQL major via PGDG (default: 18)
+  --exec-start <cmd>         ExecStart for MAIN unit
+                             (default: /usr/bin/node dist/server.js)
+  --tls <acme|local>         Caddy TLS mode (default: acme; local => local_certs)
+
 env options (per-branch preview environments — SOLO plan, one shared VM):
   --branch <branch>          git branch the env tracks (required except --host-prep)
   --db <dblab|template|none> per-env database backend (default: dblab)
@@ -312,6 +327,11 @@ export interface ParsedAppClearFailed {
   json: boolean;
 }
 
+export interface ParsedAppBootstrap {
+  kind: "app-bootstrap";
+  input: AppBootstrapInput;
+}
+
 export interface ParsedEnvPlan {
   kind: "env-plan";
   input: EnvPlanInput;
@@ -362,6 +382,7 @@ export type ParsedCommand =
   | ParsedAppDeploy
   | ParsedAppStatus
   | ParsedAppClearFailed
+  | ParsedAppBootstrap
   | ParsedEnvPlan
   | ParsedEnvCreate
   | ParsedEnvList
@@ -839,7 +860,7 @@ function parseLogs(args: string[]): ParsedLogs {
   };
 }
 
-type AppSub = "register" | "plan" | "deploy" | "status" | "clear-failed";
+type AppSub = "register" | "plan" | "deploy" | "status" | "clear-failed" | "bootstrap";
 
 const APP_SUBS: readonly AppSub[] = [
   "register",
@@ -847,6 +868,7 @@ const APP_SUBS: readonly AppSub[] = [
   "deploy",
   "status",
   "clear-failed",
+  "bootstrap",
 ];
 
 function parseApp(args: string[]): ParsedCommand {
@@ -871,6 +893,8 @@ function parseApp(args: string[]): ParsedCommand {
       return parseAppStatus(rest);
     case "clear-failed":
       return parseAppClearFailed(rest);
+    case "bootstrap":
+      return parseAppBootstrap(rest);
   }
 }
 
@@ -1071,6 +1095,56 @@ function parseAppStatus(args: string[]): ParsedAppStatus {
   if (vm === undefined) throw new UsageError("app status requires <vm> <app>");
   if (app === undefined) throw new UsageError("app status requires <vm> <app>");
   return { kind: "app-status", input: { vm, app }, json };
+}
+
+function parseAppBootstrap(args: string[]): ParsedAppBootstrap {
+  let appUser: string | undefined;
+  let appBase: string | undefined;
+  let nodeMajor: number | undefined;
+  let pgMajor: number | undefined;
+  let execStart: string | undefined;
+  let tlsMode: "acme" | "local" | undefined;
+
+  const { vm, app } = takeVmApp(args, (a, i) => {
+    if (a === "--app-user") { appUser = takeValue(args, i, a); return i + 1; }
+    if (a === "--app-base") { appBase = takeValue(args, i, a); return i + 1; }
+    if (a === "--node-major") {
+      nodeMajor = parseIntFlag(takeValue(args, i, a), a);
+      return i + 1;
+    }
+    if (a === "--pg-major") {
+      pgMajor = parseIntFlag(takeValue(args, i, a), a);
+      return i + 1;
+    }
+    if (a === "--exec-start") { execStart = takeValue(args, i, a); return i + 1; }
+    if (a === "--tls") {
+      const v = takeValue(args, i, a);
+      if (v !== "acme" && v !== "local") {
+        throw new UsageError(`invalid --tls: ${v} (acme|local)`);
+      }
+      tlsMode = v;
+      return i + 1;
+    }
+    // Legacy --print is a no-op (bootstrap always prints to stdout)
+    if (a === "--print") { return i; }
+    return undefined;
+  });
+
+  if (vm === undefined) throw new UsageError("app bootstrap requires <vm> <app>");
+  if (app === undefined) throw new UsageError("app bootstrap requires <vm> <app>");
+  if (appUser === undefined) throw new UsageError("app bootstrap requires --app-user <user>");
+
+  const input: AppBootstrapInput = {
+    vm,
+    app,
+    appUser,
+    ...(appBase !== undefined ? { appBase } : {}),
+    ...(nodeMajor !== undefined ? { nodeMajor } : {}),
+    ...(pgMajor !== undefined ? { pgMajor } : {}),
+    ...(execStart !== undefined ? { execStart } : {}),
+    ...(tlsMode !== undefined ? { tlsMode } : {}),
+  };
+  return { kind: "app-bootstrap", input };
 }
 
 // ---------------------------------------------------------------------------
@@ -1387,6 +1461,14 @@ export async function main(
       return runAppClearFailed(
         cmd.input,
         { json: cmd.json },
+        new StateStore(),
+        defaultAppStore(),
+        out,
+        err,
+      );
+    case "app-bootstrap":
+      return runAppBootstrap(
+        cmd.input,
         new StateStore(),
         defaultAppStore(),
         out,
