@@ -299,6 +299,19 @@ describe("buildHostPrepScript", () => {
     expect(s).toContain("/usr/sbin/ufw allow 443/tcp");
   });
 
+  test("ufw 443 is opened in host-prep only — NOT granted in the per-env NOPASSWD sudoers, and never called by the env scripts (privilege surface)", () => {
+    const hp = buildHostPrepScript(app(), "agent");
+    // 443 is opened once, here, by the root operator running host-prep.
+    expect(hp).toContain("/usr/sbin/ufw allow 443/tcp");
+    // It must NOT be added to the per-(vm,app) sudoers block: the env scripts
+    // run later as the non-root sshUser and have no reason to touch ufw, so a
+    // ufw NOPASSWD grant would needlessly widen that user's privileges.
+    expect(hp).not.toMatch(/NOPASSWD:.*ufw/);
+    // And the env create/destroy scripts never invoke ufw at all.
+    expect(buildEnvCreateScript(app(), target())).not.toContain("ufw");
+    expect(buildEnvDestroyScript(app(), target())).not.toContain("ufw");
+  });
+
   test("DNS comment describes per-preview UNPROXIED A record + ufw 443 (not misleading wildcard claim)", () => {
     const s = buildHostPrepScript(app(), "agent");
     // New wording must reference the correct posture (unproxied, per-preview).
