@@ -1,5 +1,5 @@
 /**
- * Pure OS-level host bootstrap script builder (PR-A1).
+ * Pure OS-level host bootstrap script builder (PR-A1 + PR-A2).
  *
  * `buildHostBootstrapScript` turns an {@link AppRecord} + {@link HostBootstrapOptions}
  * into a single self-contained bash program printed for an operator with root to
@@ -8,7 +8,7 @@
  * AppRecord — NO field-record hardcoding.
  *
  * ---------------------------------------------------------------------------
- * SCOPE (PR-A1 — OS prep only):
+ * SCOPE (PR-A1 — OS prep):
  *
  *  1. Runtime installs: Node (via NodeSource), PostgreSQL (via PGDG with
  *     apt-cache fallback and PG_FALLBACK log line), Caddy (official apt repo),
@@ -37,12 +37,32 @@
  *     mkdir sites.d, `caddy validate` before reload. TLS mode: acme (default)
  *     or local (=> `local_certs` global).
  *
- *  8. Self-check PASS/FAIL table for the OS-level items: node, pg, caddy,
- *     sudo grant count, service unit enabled. Exits non-zero on FAIL.
+ * ---------------------------------------------------------------------------
+ * SCOPE (PR-A2 — DB bootstrap, base env file, token-safe repo clone):
+ *
+ *  d. DB superuser bootstrap + createdb: enable postgresql, wait-for-ready
+ *     loop, set/rotate the `postgres` superuser password generated ON-HOST
+ *     with `openssl rand -hex 24` (fed to psql via STDIN with dollar-quoting;
+ *     NEVER in argv). Idempotent reuse from existing env file. Then idempotent
+ *     `createdb <dbName>` guarded by pg_database SELECT.
+ *     CRITICAL: dbName is REQUIRED and EXPLICIT — never derived from app.name.
+ *
+ *  e. Base env file seeding (600, appUser-owned): DATABASE_URL (superuser),
+ *     APP_DATABASE_URL placeholder (app role + 'app_password' — rotated by
+ *     deploy.sh on first deploy), NODE_ENV, PORT (from healthUrl), HOST,
+ *     COOKIE_SECRET (on-host openssl rand), SEED_OWNER_LOGIN/PASSWORD.
+ *     PG_BACKEND is intentionally NOT written here (lives in unit Environment=).
+ *     Idempotent: reuses existing pw/secret/DEPLOYED_SHA values.
+ *
+ *  f. FULL token-safe repo clone: token from STDIN or pre-placed 600 `.gh-token`
+ *     file (NEVER in argv or remote URL). credential.helper reads the token
+ *     file BY PATH at runtime. Full clone (no --depth). Clone into app.appDir;
+ *     git-safe.conf for dubious-ownership. Idempotent: leaves existing checkout.
+ *
+ *  §11. Extended self-check table: postgres ready, db present,
+ *       staging.env 600, app clone present.
  *
  * ---------------------------------------------------------------------------
- * NOT IN SCOPE (PR-A2): DB bootstrap, base env file, repo clone.
- *
  * The builder is PURE: no I/O, no network, fully deterministic.
  * ---------------------------------------------------------------------------
  *
@@ -57,10 +77,10 @@ import type { AppRecord } from "../types.ts";
 // ---------------------------------------------------------------------------
 
 /**
- * Options for the host bootstrap script (PR-A1 OS prep).
+ * Options for the host bootstrap script (PR-A1 OS prep + PR-A2 DB/env/clone).
  *
- * All fields are optional except `appUser` (the OS user created on the host
- * to run the app service). Defaults are applied by the caller before passing.
+ * `appUser` and `dbName` are REQUIRED. All other fields are optional with
+ * documented defaults.
  */
 export interface HostBootstrapOptions {
   /**
@@ -69,31 +89,59 @@ export interface HostBootstrapOptions {
    * user is a privilege-escalation risk.
    */
   appUser: string;
+
+  /**
+   * PR-A2 REQUIRED — the database name to create on the host.
+   *
+   * MUST be passed explicitly. Do NOT derive from app.name.
+   * The critic flagged: 'field-record-1'.replace(/-/g,'_') = 'field_record_1'
+   * but the live box's DB is 'field_record'. The production DB name is opaque
+   * to samohost and must always be supplied by the operator.
+   */
+  dbName: string;
+
   /**
    * Base directory for the app on the host (e.g. /opt/field-record).
    * Default: `/opt/<app.name>`.
    */
   appBase?: string;
+
   /**
    * Node.js major version to install via NodeSource. Default 22.
    */
   nodeMajor?: number;
+
   /**
    * PostgreSQL major version to install via PGDG. Default 18. The script
    * includes the PG_FALLBACK apt-cache logic to print the chosen version
    * when the exact major is unavailable (port of stack-prep.sh §2).
    */
   pgMajor?: number;
+
   /**
    * ExecStart for the MAIN systemd unit. Default "/usr/bin/node dist/server.js".
    */
   execStart?: string;
+
   /**
    * TLS mode for the Caddy base config. "acme" (default) uses Caddy's ACME
    * HTTP-01/TLS-ALPN; "local" adds a `local_certs` global directive (useful
    * for LAN setups where ACME cannot reach port 80). Port of stack-prep.sh §9.
    */
   tlsMode?: "acme" | "local";
+
+  /**
+   * PR-A2 — The app (non-superuser, RLS) database role name written into the
+   * APP_DATABASE_URL placeholder. Default "app_user". The placeholder password
+   * is the literal 'app_password' — deploy.sh rotates it on first deploy.
+   */
+  appDbRole?: string;
+
+  /**
+   * PR-A2 — The login name written into SEED_OWNER_LOGIN in the env file.
+   * Default "owner".
+   */
+  seedOwnerLogin?: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -108,6 +156,26 @@ export interface HostBootstrapOptions {
  */
 function sq(s: string): string {
   return `'${s.replace(/'/g, `'\\''`)}'`;
+}
+
+/**
+ * Derive the main-env listen port from app.healthUrl.
+ * Replicates env/script.ts:mainEnvPort() — replicated here to avoid a
+ * cross-module import that would create a cycle (bootstrap.ts uses no other
+ * env/ types). Fails closed on unparseable URL.
+ */
+function bootstrapPort(app: AppRecord): number {
+  let u: URL;
+  try {
+    u = new URL(app.healthUrl);
+  } catch {
+    throw new Error(
+      `buildHostBootstrapScript: cannot derive PORT for app '${app.name}': ` +
+        `unparseable healthUrl ${JSON.stringify(app.healthUrl)}`,
+    );
+  }
+  if (u.port !== "") return Number(u.port);
+  return u.protocol === "https:" ? 443 : 80;
 }
 
 // ---------------------------------------------------------------------------
@@ -126,6 +194,7 @@ export function buildHostBootstrapScript(
   opts: HostBootstrapOptions,
 ): string {
   const appUser = opts.appUser;
+  const dbName = opts.dbName; // REQUIRED — never derived from app.name
   const nodeMajor = opts.nodeMajor ?? 22;
   const pgMajor = opts.pgMajor ?? 18;
   const execStart = opts.execStart ?? "/usr/bin/node dist/server.js";
@@ -135,6 +204,13 @@ export function buildHostBootstrapScript(
   const unit = app.serviceUnit;
   const envFile = app.envFile ?? `${appBase}/staging.env`;
   const sudoersFile = `/etc/sudoers.d/${app.name}-agent`;
+  const tokenFile = `${appBase}/.gh-token`;
+  const gitSafeConf = `${appBase}/git-safe.conf`;
+  const repoUrl = `https://github.com/${app.repo}.git`;
+  const appPort = bootstrapPort(app);
+  const appDbRole = opts.appDbRole ?? "app_user";
+  const seedOwnerLogin = opts.seedOwnerLogin ?? "owner";
+  const rlsUrlVar = app.rlsUrlVar ?? "APP_DATABASE_URL";
 
   const lines: string[] = [];
   const push = (...l: string[]): void => {
@@ -144,12 +220,43 @@ export function buildHostBootstrapScript(
   // ---- header ---------------------------------------------------------------
   push(
     "#!/usr/bin/env bash",
-    `# samohost host-bootstrap for app ${sq(app.name)} — OS prep (PR-A1).`,
+    `# samohost host-bootstrap for app ${sq(app.name)} — OS prep + DB + env + clone (PR-A1/A2).`,
     "# Generated; review before applying. NOT auto-executed by samohost.",
     "# PR-A1 scope: runtimes, OS user, /opt layout, sudoers, MAIN unit,",
-    "#   sshd AllowUsers, Caddy base config, self-check table.",
-    "# PR-A2 scope (NOT here): DB bootstrap, env file, repo clone.",
+    "#   sshd AllowUsers, Caddy base config.",
+    "# PR-A2 scope: DB bootstrap, base env file, token-safe repo clone, extended self-check.",
+    "# Token handling: read from STDIN (piped) or pre-placed 600 file at",
+    `#   ${tokenFile}. NEVER in argv, NEVER in remote URL.`,
     "set -euo pipefail",
+    "",
+  );
+
+  // ---- section 0: read GitHub token from STDIN or pre-placed file -----------
+  push(
+    `# ---------------------------------------------------------------------------`,
+    `# §0. GitHub token: read from STDIN (if piped) or ${sq(tokenFile)} (pre-placed).`,
+    `#     Token arrives into the script via stdin pipe on first run, or via a`,
+    `#     pre-placed 600 file. NEVER echoed, logged, or placed in argv.`,
+    `# ---------------------------------------------------------------------------`,
+    "",
+    `TOKEN_FILE=${sq(tokenFile)}`,
+    `mkdir -p ${sq(appBase)}`,
+    `if [[ ! -t 0 ]] && [[ ! -s "$TOKEN_FILE" ]]; then`,
+    `  # STDIN is a pipe/redirect and no token file yet: read one line as the token.`,
+    `  _tok=""`,
+    `  IFS= read -r _tok || true`,
+    `  if [[ -n "$_tok" ]]; then`,
+    `    ( umask 077; printf '%s' "$_tok" > "$TOKEN_FILE" )`,
+    `    unset _tok`,
+    `    echo "GitHub token captured from STDIN -> $TOKEN_FILE (600). [value not logged]"`,
+    `  fi`,
+    `fi`,
+    `if [[ -s "$TOKEN_FILE" ]]; then`,
+    `  chmod 600 "$TOKEN_FILE"`,
+    `  echo "GitHub token present at $TOKEN_FILE."`,
+    `else`,
+    `  echo "WARNING: no GitHub token (STDIN empty and $TOKEN_FILE absent). Clone step will be SKIPPED."`,
+    `fi`,
     "",
   );
 
@@ -380,10 +487,188 @@ export function buildHostBootstrapScript(
     "",
   );
 
-  // ---- section 10: self-check PASS/FAIL table --------------------------------
+  // ---- section 10 (PR-A2-d): PostgreSQL DB bootstrap ------------------------
   push(
     `# ---------------------------------------------------------------------------`,
-    `# §10. Self-check PASS/FAIL table (OS-level items only; exits 1 on FAIL).`,
+    `# §10. DB bootstrap (PR-A2-d): enable postgresql, wait-for-ready,`,
+    `#      set/rotate postgres superuser password (on-host openssl rand, STDIN-fed`,
+    `#      to psql with dollar-quoting — NEVER in argv/environment), createdb.`,
+    `#`,
+    `#      CRITICAL: dbName is ${sq(dbName)} — passed explicitly, NEVER derived`,
+    `#      from app.name (which could produce a different string via transforms).`,
+    `# ---------------------------------------------------------------------------`,
+    "",
+    `ENV_FILE=${sq(envFile)}`,
+    "",
+    `# Enable and start postgresql. Try the meta-unit first; fall back to the`,
+    `# versioned cluster unit if needed.`,
+    `/usr/bin/systemctl enable --now postgresql 2>/dev/null || true`,
+    `if ! sudo -u postgres psql -p 5432 -qAtc 'select 1' >/dev/null 2>&1; then`,
+    `  pg_ctlcluster "$(pg_lsclusters -h | awk '{print $1}' | head -1)" main start 2>/dev/null || true`,
+    `fi`,
+    `# Wait up to 30 s for the cluster to accept connections.`,
+    `for _ in $(seq 1 30); do`,
+    `  sudo -u postgres psql -p 5432 -qAtc 'select 1' >/dev/null 2>&1 && break`,
+    `  sleep 1`,
+    `done`,
+    `sudo -u postgres psql -p 5432 -qAtc 'select 1' >/dev/null 2>&1 \\`,
+    `  || { echo "ERROR: PostgreSQL cluster did not come up on 127.0.0.1:5432" >&2; exit 1; }`,
+    `echo "postgres: cluster ready on 127.0.0.1:5432"`,
+    "",
+    `# Superuser password: generate ONCE; persist into the env file only.`,
+    `# If the env file already carries a DATABASE_URL, reuse that password`,
+    `# (idempotent — safe to re-run after the box is already configured).`,
+    `if [[ -f "$ENV_FILE" ]] && grep -q '^DATABASE_URL=' "$ENV_FILE"; then`,
+    `  PG_SUPER_PW="$(grep '^DATABASE_URL=' "$ENV_FILE" | sed -E 's#.*//postgres:([^@]*)@.*#\\1#')"`,
+    `  echo "postgres: reusing existing superuser password from $ENV_FILE"`,
+    `else`,
+    `  PG_SUPER_PW="$(openssl rand -hex 24)"`,
+    `  echo "postgres: generated new superuser password (value only in $ENV_FILE)"`,
+    `fi`,
+    `# Set/rotate the postgres role password to match (idempotent).`,
+    `# The whole SQL — INCLUDING the quoted literal — is fed via STDIN so the`,
+    `# cleartext password never lands in argv / the process table.`,
+    `# Dollar-quoting neutralizes any quote chars in the random hex value.`,
+    // Dollar-quoting: \$pgpw\$...\$pgpw\$ — fed via STDIN so cleartext never lands in argv.
+    // \$pgpw\$ in the generated bash script: backslash-escaped so bash treats $ as literal.
+    // Use string concatenation + explicit escapes to prevent TS template-literal expansion.
+    "printf 'ALTER ROLE postgres PASSWORD %s;\\n'" +
+      " \"\\$pgpw\\$${PG_SUPER_PW}\\$pgpw\\$\" \\",
+    `  | sudo -u postgres psql -p 5432 -q >/dev/null`,
+    `echo "postgres: superuser password set (value not logged)"`,
+    "",
+    `# createdb ${dbName} (idempotent: guarded by pg_database check)`,
+    `if ! sudo -u postgres psql -p 5432 -qAtc \\`,
+    `    "SELECT 1 FROM pg_database WHERE datname='${dbName}'" | grep -q 1; then`,
+    `  sudo -u postgres createdb -p 5432 ${sq(dbName)}`,
+    `  echo "postgres: created database ${dbName}"`,
+    `else`,
+    `  echo "postgres: database ${dbName} already exists"`,
+    `fi`,
+    "",
+  );
+
+  // ---- section 11 (PR-A2-e): base env file seeding -------------------------
+  push(
+    `# ---------------------------------------------------------------------------`,
+    `# §11. Base env file seeding (PR-A2-e): ${envFile}`,
+    `#      600, ${appUser}-owned. DATABASE_URL = superuser (migrations/seed only).`,
+    `#      ${rlsUrlVar} = ${appDbRole}:app_password placeholder`,
+    `#        (deploy.sh rotates the password on the first deploy).`,
+    `#      PG_BACKEND is intentionally NOT set here — it lives in the unit's`,
+    `#      Environment= directive (stack-prep.sh invariant).`,
+    `#      Idempotent: reuses existing secrets across re-runs.`,
+    `# ---------------------------------------------------------------------------`,
+    "",
+    `# Seed password: generate once; reuse if already present.`,
+    `if [[ -f "$ENV_FILE" ]] && grep -q '^SEED_OWNER_PASSWORD=' "$ENV_FILE"; then`,
+    `  SEED_PW="$(grep '^SEED_OWNER_PASSWORD=' "$ENV_FILE" | head -1 | cut -d= -f2-)"`,
+    `else`,
+    `  SEED_PW="$(openssl rand -hex 8)"`,
+    `fi`,
+    "",
+    `# Cookie secret: generate once; reuse if already present.`,
+    `if [[ -f "$ENV_FILE" ]] && grep -q '^COOKIE_SECRET=' "$ENV_FILE"; then`,
+    `  COOKIE_SECRET="$(grep '^COOKIE_SECRET=' "$ENV_FILE" | head -1 | cut -d= -f2-)"`,
+    `else`,
+    `  COOKIE_SECRET="$(openssl rand -hex 32)"`,
+    `fi`,
+    "",
+    `# Preserve an already-rotated ${rlsUrlVar} across re-runs.`,
+    `# The placeholder (${appDbRole}:app_password) is only valid before the first deploy.`,
+    `APP_DB_LINE="${rlsUrlVar}=postgresql://${appDbRole}:app_password@127.0.0.1:5432/${dbName}"`,
+    `if [[ -f "$ENV_FILE" ]] && grep -q '^${rlsUrlVar}=postgresql://${appDbRole}:' "$ENV_FILE" \\`,
+    `   && ! grep -q '^${rlsUrlVar}=postgresql://${appDbRole}:app_password@' "$ENV_FILE"; then`,
+    `  APP_DB_LINE="$(grep '^${rlsUrlVar}=' "$ENV_FILE" | head -1)"`,
+    `  echo "$ENV_FILE: preserving already-rotated ${rlsUrlVar}"`,
+    `fi`,
+    "",
+    `# Preserve deploy bookkeeping vars (DEPLOYED_SHA, DEPLOY_FAILED_SHA) if present.`,
+    `PRESERVE=""`,
+    `for _k in DEPLOYED_SHA DEPLOY_FAILED_SHA; do`,
+    '  if [[ -f "$ENV_FILE" ]] && grep -q "^${_k}=" "$ENV_FILE"; then',
+    '    PRESERVE+="$(grep "^${_k}=" "$ENV_FILE" | head -1)"$\'\\n\'',
+    `  fi`,
+    `done`,
+    "",
+    `umask 077`,
+    `cat > "$ENV_FILE" <<ENVEOF`,
+    `# ${app.name} env file — generated by samohost host-bootstrap. chmod 600, ${appUser}-owned.`,
+    `# NEVER commit. DATABASE_URL is the superuser (migrations/seed only).`,
+    `# ${rlsUrlVar} placeholder is rotated by deploy.sh on the first deploy.`,
+    `# PG_BACKEND is intentionally NOT set here — it is set in ${unit}.service Environment=.`,
+    `DATABASE_URL=postgresql://postgres:\${PG_SUPER_PW}@127.0.0.1:5432/${dbName}`,
+    `\${APP_DB_LINE}`,
+    `NODE_ENV=production`,
+    `PORT=${appPort}`,
+    `HOST=0.0.0.0`,
+    `COOKIE_SECRET=\${COOKIE_SECRET}`,
+    `SEED_OWNER_LOGIN=${seedOwnerLogin}`,
+    `SEED_OWNER_PASSWORD=\${SEED_PW}`,
+    `ENVEOF`,
+    `[[ -n "\${PRESERVE}" ]] && printf '%s' "\${PRESERVE}" >> "$ENV_FILE"`,
+    `chown ${sq(appUser)}:${sq(appUser)} "$ENV_FILE"`,
+    `chmod 600 "$ENV_FILE"`,
+    `echo "$ENV_FILE: written (600, ${appUser}). [secret values not logged]"`,
+    "",
+  );
+
+  // ---- section 12 (PR-A2-f): full token-safe repo clone --------------------
+  push(
+    `# ---------------------------------------------------------------------------`,
+    `# §12. Full token-safe repo clone (PR-A2-f).`,
+    `#      FULL clone (no --depth — deploys checkout SHAs).`,
+    `#      Token is NEVER in argv or the remote URL. The credential helper reads`,
+    `#      the token file BY PATH at runtime via 'cat $TOKEN_FILE'.`,
+    `#      git-safe.conf sidesteps GIT_DIR dubious-ownership warnings.`,
+    `#      Idempotent: leaves an existing checkout in place.`,
+    `# ---------------------------------------------------------------------------`,
+    "",
+    `GIT_SAFE_CONF=${sq(gitSafeConf)}`,
+    `APP_DIR=${sq(appDir)}`,
+    `REPO_URL=${sq(repoUrl)}`,
+    "",
+    `# Write git-safe.conf so the app user can operate in the checkout`,
+    `# without GIT_DIR dubious-ownership errors (directory owned by agent/root).`,
+    `cat > "$GIT_SAFE_CONF" <<SAFEOF`,
+    `[safe]`,
+    `    directory = ${appDir}`,
+    `SAFEOF`,
+    `chown ${sq(appUser)}:${sq(appUser)} "$GIT_SAFE_CONF"`,
+    `chmod 644 "$GIT_SAFE_CONF"`,
+    "",
+    `if [[ -d "$APP_DIR/.git" ]]; then`,
+    `  echo "clone: $APP_DIR already a git checkout — leaving in place."`,
+    `elif [[ -s "$TOKEN_FILE" ]]; then`,
+    `  echo "clone: full clone of ${app.repo} -> $APP_DIR (token via runtime credential helper)"`,
+    `  chown ${sq(appUser)}:${sq(appUser)} "$TOKEN_FILE"`,
+    `  chmod 600 "$TOKEN_FILE"`,
+    `  # The inline credential helper reads the token file BY PATH at runtime.`,
+    `  # The token value NEVER appears in argv, the remote URL, or git config.`,
+    // Fix (samorev #32): the credential helper value MUST be single-quoted so that
+    // $(cat $TOKEN_FILE) is only evaluated LAZILY when git invokes the helper —
+    // not at bash-invocation time (which would expand the token value into git's
+    // argv, visible in /proc/<pid>/cmdline). The double-quoted form is the BUG.
+    // Single-quoting matches the persist line a few lines below and the proven
+    // field-record-1 stack-prep.sh pattern.
+    `  sudo -u ${sq(appUser)} GIT_CONFIG_GLOBAL="$GIT_SAFE_CONF" git -c 'credential.helper=!f() { echo username=x-access-token; echo "password=$(cat $TOKEN_FILE)"; }; f' clone "$REPO_URL" "$APP_DIR"`,
+    `  sudo -u ${sq(appUser)} GIT_CONFIG_GLOBAL="$GIT_SAFE_CONF" git -C "$APP_DIR" remote set-url origin "$REPO_URL"`,
+    `  echo "clone: complete; origin set to public URL (token only via runtime helper)"`,
+    `  # Persist the credential helper in the app user's global gitconfig so LATER`,
+    `  # fetches (deploy, env-create clones) authenticate without re-reading stdin.`,
+    `  sudo -u ${sq(appUser)} git config --global \\`,
+    `    credential."https://github.com".helper \\`,
+    `    '!f() { echo username=x-access-token; echo "password=$(cat ${tokenFile})"; }; f'`,
+    `else`,
+    `  echo "clone: SKIPPED (no token). Place a 600 token at $TOKEN_FILE and re-run."`,
+    `fi`,
+    "",
+  );
+
+  // ---- section 13: extended self-check PASS/FAIL table (A1 + A2 rows) ------
+  push(
+    `# ---------------------------------------------------------------------------`,
+    `# §13. Self-check PASS/FAIL table (OS-level + A2 items; exits 1 on FAIL).`,
     `# ---------------------------------------------------------------------------`,
     "",
     `echo ""`,
@@ -422,12 +707,35 @@ export function buildHostBootstrapScript(
     `/usr/bin/systemctl is-enabled ${sq(unit)} >/dev/null 2>&1 && unit_ok=1 || true`,
     `chk "unit ${unit} enabled" "$unit_ok"`,
     "",
+    `# postgres ready (PR-A2)`,
+    `pg_ok=0`,
+    `sudo -u postgres psql -p 5432 -qAtc 'select 1' >/dev/null 2>&1 && pg_ok=1 || true`,
+    `chk "postgres ready on 5432" "$pg_ok"`,
+    "",
+    `# database present (PR-A2)`,
+    `db_ok=0`,
+    `sudo -u postgres psql -p 5432 -qAtc "SELECT 1 FROM pg_database WHERE datname='${dbName}'" \\`,
+    `  2>/dev/null | grep -q 1 && db_ok=1 || true`,
+    `chk "db ${dbName} present" "$db_ok"`,
+    "",
+    `# staging.env present and 600 (PR-A2)`,
+    `env_ok=0`,
+    `if [[ -f "$ENV_FILE" ]] && [[ "$(stat -c '%a' "$ENV_FILE" 2>/dev/null || echo 0)" == "600" ]]; then`,
+    `  env_ok=1`,
+    `fi`,
+    `chk "staging.env 600 at $ENV_FILE" "$env_ok"`,
+    "",
+    `# app clone present (PR-A2)`,
+    `clone_ok=0`,
+    `if [[ -d "$APP_DIR/.git" ]]; then clone_ok=1; fi`,
+    `chk "app clone at $APP_DIR/.git" "$clone_ok"`,
+    "",
     `echo "==="`,
     `if [[ "$FAILED" -gt 0 ]]; then`,
     `  echo "FAIL: $FAILED check(s) failed. Resolve above before proceeding." >&2`,
     `  exit 1`,
     `fi`,
-    `echo "All checks PASS — host OS bootstrap complete for ${app.name}."`,
+    `echo "All checks PASS — host bootstrap complete for ${app.name} (db: ${dbName})."`,
     "",
   );
 
