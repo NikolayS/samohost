@@ -447,16 +447,110 @@ export function envsRoot(app: AppRecord): string {
 }
 
 /**
+ * Build the env CREATE script for a STATIC site (issue #36). Clones the branch
+ * into the env dir then writes a Caddy file_server vhost (bare block, ACME
+ * HTTPS). Skips install/build/db/envfile/unit phases entirely: there is no
+ * service to start, no DB, no env file. Health probe uses a Host-header curl
+ * against local Caddy (nothing listens on the allocated port for static sites).
+ */
+function buildStaticEnvCreateScript(
+  app: AppRecord,
+  t: EnvScriptTarget,
+): string {
+  const root = envsRoot(app);
+  const lines: string[] = [
+    "#!/usr/bin/env bash",
+    "# samohost env-create script (generated; static-site path; pushed over ssh stdin to `bash -s`).",
+    "set -euo pipefail",
+    "",
+    `SAMOHOST_ENV_NAME=${sq(t.name)}`,
+    `SAMOHOST_BRANCH=${sq(t.branch)}`,
+    // NOTE: a port is still allocated from the pool (commands/env.ts machinery)
+    // but a static env does NOT use it for a service. The allocation keeps the
+    // port pool consistent (no gaps) and is harmless.
+    `SAMOHOST_PORT=${sq(String(t.port))}`,
+    `SAMOHOST_VHOST=${sq(t.vhost)}`,
+    `SAMOHOST_ENVS_ROOT=${sq(root)}`,
+    `SAMOHOST_ENV_DIR=${sq(`${root}/${t.name}`)}`,
+    `SAMOHOST_REPO=${sq(app.repo)}`,
+    `SAMOHOST_APP_DIR=${sq(app.appDir)}`,
+    `SAMOHOST_CADDY_SNIPPET=${sq(`/etc/caddy/sites.d/${t.name}.caddy`)}`,
+    "",
+  ];
+
+  // ----- clone (reuse CLONE_FN_LINES unchanged) ----------------------------
+  lines.push(...CLONE_FN_LINES, "");
+  lines.push(
+    ...phaseBlock("clone", "branch checkout into the env dir", [
+      'mkdir -p "$SAMOHOST_ENVS_ROOT"',
+      "if samohost_clone_env_dir; ",
+    ]),
+  );
+
+  lines.push('cd "$SAMOHOST_ENV_DIR"', "");
+
+  // ----- vhost: Caddy file_server (bare block = ACME HTTPS) ----------------
+  lines.push(
+    ...phaseBlock(
+      "vhost",
+      "Caddy file_server vhost snippet + reload (sites.d include applied in host-prep)",
+      [
+        "if printf '%s {\\n\\troot * %s\\n\\ttry_files {path} /index.html\\n\\tfile_server\\n\\tencode gzip\\n}\\n' \\",
+        '     "$SAMOHOST_VHOST" "$SAMOHOST_ENV_DIR" \\',
+        '   | sudo /usr/bin/tee "$SAMOHOST_CADDY_SNIPPET" >/dev/null \\',
+        "   && sudo /usr/bin/systemctl reload caddy; ",
+      ],
+    ),
+  );
+
+  // ----- health: prove Caddy SERVES index.html via Host-header curl ---------
+  // Nothing listens on $SAMOHOST_PORT for a static env, so we cannot poll
+  // localhost:$PORT. Instead, curl Caddy's local HTTPS listener with the
+  // vhost's Host header. -k allows the in-flight self-signed cert (ACME may
+  // not yet have issued the real cert at first-create time).
+  lines.push(
+    `# --- health: prove Caddy serves the static vhost (Host-header curl) ---`,
+    marker("health", "start"),
+    "health_ok=0",
+    `for attempt in $(seq 1 ${HEALTH_RETRIES}); do`,
+    `  code=$(curl -s -k -o /dev/null -w "%{http_code}" --max-time 10 -H "Host: $SAMOHOST_VHOST" https://127.0.0.1/ || echo 000)`,
+    '  if [[ "$code" == "200" ]]; then health_ok=1; break; fi',
+    `  sleep ${HEALTH_SLEEP_SEC}`,
+    "done",
+    'if [[ "$health_ok" == "1" ]]; then',
+    `  ${marker("health", "ok")}`,
+    "else",
+    `  ${marker("health", "fail")}`,
+    '  echo "static env health check failed — caddy may not yet be serving the vhost; destroy to clean up" >&2',
+    "  exit 1",
+    "fi",
+    "",
+    'echo "env ready: https://${SAMOHOST_VHOST} (static file_server)"',
+    "",
+  );
+
+  return lines.join("\n");
+}
+
+/**
  * Build the env CREATE script: fresh shallow clone of the branch, install +
  * build, per-env database (dblab clone / template createdb / none), env file
  * composed on-host, systemd template instance start, Caddy vhost write +
  * reload, localhost health probe. Failure exits non-zero; partial state is
  * cleaned by the destroy script (idempotent), not by rollback here.
+ *
+ * When `app.kind === "static"` the static path is used (no install/build/db/
+ * envfile/unit phases; Caddy file_server vhost; Host-header health probe).
  */
 export function buildEnvCreateScript(
   app: AppRecord,
   t: EnvScriptTarget,
 ): string {
+  // issue #36: branch on kind for static sites.
+  if (app.kind === "static") {
+    return buildStaticEnvCreateScript(app, t);
+  }
+
   const root = envsRoot(app);
   const lines: string[] = [
     "#!/usr/bin/env bash",
@@ -668,11 +762,17 @@ export function buildEnvCreateScript(
 /**
  * Build the env DESTROY script. Idempotent by design (every step tolerates
  * "already gone") so it doubles as the cleanup path for a failed create.
+ *
+ * When `app.kind === "static"` the unit-stop and db-drop phases are omitted
+ * (there is no service and no DB for a static env). envOutcome in env/parse.ts
+ * is lenient — it only fails on a `fail` marker and tolerates missing phases —
+ * so omitting unit-stop/db-drop is safe.
  */
 export function buildEnvDestroyScript(
   app: AppRecord,
   t: EnvScriptTarget,
 ): string {
+  const isStatic = app.kind === "static";
   const root = envsRoot(app);
   const lines: string[] = [
     "#!/usr/bin/env bash",
@@ -681,51 +781,73 @@ export function buildEnvDestroyScript(
     "",
     `SAMOHOST_ENV_NAME=${sq(t.name)}`,
     `SAMOHOST_ENV_DIR=${sq(`${root}/${t.name}`)}`,
-    `SAMOHOST_UNIT_INSTANCE=${sq(`${app.serviceUnit}@${t.name}.service`)}`,
     `SAMOHOST_CADDY_SNIPPET=${sq(`/etc/caddy/sites.d/${t.name}.caddy`)}`,
+  ];
+
+  if (!isStatic) {
+    // Node path: stop the systemd template instance.
+    lines.push(
+      `SAMOHOST_UNIT_INSTANCE=${sq(`${app.serviceUnit}@${t.name}.service`)}`,
+    );
+  }
+
+  lines.push(
     "",
-    `# --- unit-stop ---`,
-    marker("unit-stop", "start"),
-    'sudo /usr/bin/systemctl disable --now "$SAMOHOST_UNIT_INSTANCE" 2>/dev/null || true',
-    "# Clear any residual 'failed' unit state (issue #11 finding 8; cosmetic).",
-    'sudo /usr/bin/systemctl reset-failed "$SAMOHOST_UNIT_INSTANCE" 2>/dev/null || true',
-    marker("unit-stop", "ok"),
-    "",
+  );
+
+  if (!isStatic) {
+    // Node path: emit unit-stop phase.
+    lines.push(
+      `# --- unit-stop ---`,
+      marker("unit-stop", "start"),
+      'sudo /usr/bin/systemctl disable --now "$SAMOHOST_UNIT_INSTANCE" 2>/dev/null || true',
+      "# Clear any residual 'failed' unit state (issue #11 finding 8; cosmetic).",
+      'sudo /usr/bin/systemctl reset-failed "$SAMOHOST_UNIT_INSTANCE" 2>/dev/null || true',
+      marker("unit-stop", "ok"),
+      "",
+    );
+  }
+
+  lines.push(
     `# --- vhost-remove ---`,
     marker("vhost-remove", "start"),
     'sudo /usr/bin/rm -f "$SAMOHOST_CADDY_SNIPPET"',
     "sudo /usr/bin/systemctl reload caddy || true",
     marker("vhost-remove", "ok"),
     "",
-  ];
+  );
 
-  if (t.dbBackend === "dblab") {
-    const dbName = t.dbName ?? t.name;
-    lines.push(
-      `SAMOHOST_CLONE_ID=${sq(dbName)}`,
-      ...DBLAB_BIN_RESOLVE_LINES,
-      `# --- db-drop: delete the DBLab clone (issue #7: resolved CLI; a missing`,
-      `# CLI must not abort teardown — idle clones auto-expire on the engine) ---`,
-      marker("db-drop", "start"),
-      'if [[ -n "$SAMOHOST_DBLAB_BIN" ]]; then',
-      '  "$SAMOHOST_DBLAB_BIN" clone destroy "$SAMOHOST_CLONE_ID" 2>/dev/null || true',
-      "else",
-      '  echo "samohost: dblab CLI not found (PATH or ~/bin/dblab) — clone left for the engine to expire" >&2',
-      "fi",
-      marker("db-drop", "ok"),
-      "",
-    );
-  } else if (t.dbBackend === "template") {
-    const dbName = t.dbName ?? t.name.replace(/-/g, "_");
-    lines.push(
-      `SAMOHOST_DB_NAME=${sq(dbName)}`,
-      `# --- db-drop: drop the per-env database and role ---`,
-      marker("db-drop", "start"),
-      'sudo -u postgres /usr/bin/dropdb --if-exists "$SAMOHOST_DB_NAME"',
-      'printf \'DROP ROLE IF EXISTS "%s";\\n\' "$SAMOHOST_DB_NAME" | sudo -u postgres /usr/bin/psql --quiet --file=- >/dev/null || true',
-      marker("db-drop", "ok"),
-      "",
-    );
+  // Static envs have no DB — skip db-drop entirely (envOutcome is lenient;
+  // missing phases are tolerated; only a `fail` marker fails the outcome).
+  if (!isStatic) {
+    if (t.dbBackend === "dblab") {
+      const dbName = t.dbName ?? t.name;
+      lines.push(
+        `SAMOHOST_CLONE_ID=${sq(dbName)}`,
+        ...DBLAB_BIN_RESOLVE_LINES,
+        `# --- db-drop: delete the DBLab clone (issue #7: resolved CLI; a missing`,
+        `# CLI must not abort teardown — idle clones auto-expire on the engine) ---`,
+        marker("db-drop", "start"),
+        'if [[ -n "$SAMOHOST_DBLAB_BIN" ]]; then',
+        '  "$SAMOHOST_DBLAB_BIN" clone destroy "$SAMOHOST_CLONE_ID" 2>/dev/null || true',
+        "else",
+        '  echo "samohost: dblab CLI not found (PATH or ~/bin/dblab) — clone left for the engine to expire" >&2',
+        "fi",
+        marker("db-drop", "ok"),
+        "",
+      );
+    } else if (t.dbBackend === "template") {
+      const dbName = t.dbName ?? t.name.replace(/-/g, "_");
+      lines.push(
+        `SAMOHOST_DB_NAME=${sq(dbName)}`,
+        `# --- db-drop: drop the per-env database and role ---`,
+        marker("db-drop", "start"),
+        'sudo -u postgres /usr/bin/dropdb --if-exists "$SAMOHOST_DB_NAME"',
+        'printf \'DROP ROLE IF EXISTS "%s";\\n\' "$SAMOHOST_DB_NAME" | sudo -u postgres /usr/bin/psql --quiet --file=- >/dev/null || true',
+        marker("db-drop", "ok"),
+        "",
+      );
+    }
   }
 
   lines.push(
@@ -782,18 +904,22 @@ function mainEnvPort(app: AppRecord): number {
 
 /**
  * Render the ONE-TIME host preparation an operator with root must review and
- * apply before `env create` can run on a (vm, app): the systemd template unit,
- * the Caddy sites.d include, the durable main-env vhost (when
- * {@link AppRecord.mainHost} is set), the env template file, and the
- * exact-path sudoers grants the env scripts rely on. This script is NOT meant
- * to be piped to bash by samohost — it is printed for human review
- * (`samohost env plan --host-prep`).
+ * apply before `env create` can run on a (vm, app): the Caddy sites.d include,
+ * the durable main-env vhost (when {@link AppRecord.mainHost} is set), the
+ * exact-path sudoers grants the env scripts rely on, and the ufw 443 rule.
+ *
+ * When `app.kind === "static"` (issue #36): the systemd template unit, the
+ * env-template-file step, and the DB sudoers grants are OMITTED (a static env
+ * has no service, no DB, no env file). The Caddy/ufw/DNS steps are kept
+ * unchanged — static HTTPS still needs them.
+ *
+ * This script is NOT meant to be piped to bash by samohost — it is printed
+ * for human review (`samohost env plan --host-prep`).
  */
 export function buildHostPrepScript(app: AppRecord, sshUser: string): string {
+  const isStatic = app.kind === "static";
   const root = envsRoot(app);
   const unit = app.serviceUnit;
-  const envDbVars = app.envDbVars ?? [...DEFAULT_ENV_DB_VARS];
-  const defaultTemplateDb = `${app.name.replace(/-/g, "_")}_template`;
 
   // Durable MAIN-env vhost (field-record-1#117 ITEM C, 7th drift class): the
   // production vhost must be provisioned state in sites.d, not a hand-applied
@@ -824,43 +950,82 @@ export function buildHostPrepScript(app: AppRecord, sshUser: string): string {
     );
   }
 
+  // --- step 1: env template (node only) + step 2: systemd unit (node only) --
+  const nodeOnlyLines: string[] = [];
+  if (!isStatic) {
+    const envDbVars = app.envDbVars ?? [...DEFAULT_ENV_DB_VARS];
+    const defaultTemplateDb = `${app.name.replace(/-/g, "_")}_template`;
+    nodeOnlyLines.push(
+      `# 1. Env template file: base env vars (secrets) for every preview env.`,
+      `#    Copy from the production env file (MINUS PORT) and adjust; chmod 600.`,
+      `#    samohost env-create copies it on-host, appends PORT, and rewrites the`,
+      `#    DATABASE NAME of each var in the app's envDbVars to the per-env db`,
+      `#    (issue #11): this app's envDbVars = ${envDbVars.join(", ")}.`,
+      `#    Each of those vars MUST be present in the template, pointing at the`,
+      `#    production-shaped URL (scheme://user:pass@host[:port]/dbname[?params]).`,
+      `#    Expected template database for --db template: ${defaultTemplateDb}`,
+      `#    (override per env with --template-db).`,
+      `install -m 600 -o ${sshUser} -g ${sshUser} /dev/null ${root}.template.env`,
+      `echo 'EDIT ${root}.template.env: populate base env vars for previews' >&2`,
+      "",
+      `# 2. systemd template unit: one instance per env (%i = env name).`,
+      `cat > /etc/systemd/system/${unit}@.service <<'UNIT'`,
+      "[Unit]",
+      `Description=${app.name} preview env %i`,
+      "After=network.target",
+      "",
+      "[Service]",
+      `User=${sshUser}`,
+      `WorkingDirectory=${root}/%i`,
+      `EnvironmentFile=${root}/%i/.env`,
+      "ExecStart=/usr/bin/npm start",
+      "Restart=on-failure",
+      "",
+      "[Install]",
+      "WantedBy=multi-user.target",
+      "UNIT",
+      "systemctl daemon-reload",
+      "",
+    );
+  }
+
+  // --- step 4 sudoers: node has systemd+postgres grants; static has caddy only -
+  const sudoersLines: string[] = [
+    `# ${isStatic ? "3" : "4"}. Exact-path sudoers grants (Defaults use_pty is in effect; the env`,
+    `#    scripts always call these full paths — issue #99 lesson).`,
+    `cat > /etc/sudoers.d/samohost-env-${app.name} <<SUDOERS`,
+  ];
+  if (!isStatic) {
+    sudoersLines.push(
+      `${sshUser} ALL=(root) NOPASSWD: /usr/bin/systemctl enable --now ${unit}@*.service`,
+      `${sshUser} ALL=(root) NOPASSWD: /usr/bin/systemctl disable --now ${unit}@*.service`,
+      `${sshUser} ALL=(root) NOPASSWD: /usr/bin/systemctl reset-failed ${unit}@*.service`,
+    );
+  }
+  sudoersLines.push(
+    `${sshUser} ALL=(root) NOPASSWD: /usr/bin/systemctl reload caddy`,
+    `${sshUser} ALL=(root) NOPASSWD: /usr/bin/tee /etc/caddy/sites.d/*.caddy`,
+    `${sshUser} ALL=(root) NOPASSWD: /usr/bin/rm -f /etc/caddy/sites.d/*.caddy`,
+  );
+  if (!isStatic) {
+    sudoersLines.push(
+      `${sshUser} ALL=(postgres) NOPASSWD: /usr/bin/createdb, /usr/bin/dropdb, /usr/bin/psql`,
+    );
+  }
+  sudoersLines.push(
+    "SUDOERS",
+    `chmod 440 /etc/sudoers.d/samohost-env-${app.name}`,
+    "visudo -cf /etc/sudoers.d/samohost-env-" + app.name,
+  );
+
   return [
     "#!/usr/bin/env bash",
     `# samohost host-prep for app '${app.name}' — ONE-TIME, run by an operator with root.`,
     "# Review before applying. Nothing here is executed by samohost itself.",
     "set -euo pipefail",
     "",
-    `# 1. Env template file: base env vars (secrets) for every preview env.`,
-    `#    Copy from the production env file (MINUS PORT) and adjust; chmod 600.`,
-    `#    samohost env-create copies it on-host, appends PORT, and rewrites the`,
-    `#    DATABASE NAME of each var in the app's envDbVars to the per-env db`,
-    `#    (issue #11): this app's envDbVars = ${envDbVars.join(", ")}.`,
-    `#    Each of those vars MUST be present in the template, pointing at the`,
-    `#    production-shaped URL (scheme://user:pass@host[:port]/dbname[?params]).`,
-    `#    Expected template database for --db template: ${defaultTemplateDb}`,
-    `#    (override per env with --template-db).`,
-    `install -m 600 -o ${sshUser} -g ${sshUser} /dev/null ${root}.template.env`,
-    `echo 'EDIT ${root}.template.env: populate base env vars for previews' >&2`,
-    "",
-    `# 2. systemd template unit: one instance per env (%i = env name).`,
-    `cat > /etc/systemd/system/${unit}@.service <<'UNIT'`,
-    "[Unit]",
-    `Description=${app.name} preview env %i`,
-    "After=network.target",
-    "",
-    "[Service]",
-    `User=${sshUser}`,
-    `WorkingDirectory=${root}/%i`,
-    `EnvironmentFile=${root}/%i/.env`,
-    "ExecStart=/usr/bin/npm start",
-    "Restart=on-failure",
-    "",
-    "[Install]",
-    "WantedBy=multi-user.target",
-    "UNIT",
-    "systemctl daemon-reload",
-    "",
-    `# 3. Caddy: include per-env vhost snippets + the durable MAIN-env vhost`,
+    ...nodeOnlyLines,
+    `# ${isStatic ? "1" : "3"}. Caddy: include per-env vhost snippets + the durable MAIN-env vhost`,
     `#    (field-record-1#117 ITEM C, 7th drift class).`,
     "mkdir -p /etc/caddy/sites.d",
     `grep -q 'import sites.d/\\*.caddy' /etc/caddy/Caddyfile \\`,
@@ -868,21 +1033,9 @@ export function buildHostPrepScript(app: AppRecord, sshUser: string): string {
     ...mainVhostLines,
     "systemctl reload caddy",
     "",
-    `# 4. Exact-path sudoers grants (Defaults use_pty is in effect; the env`,
-    `#    scripts always call these full paths — issue #99 lesson).`,
-    `cat > /etc/sudoers.d/samohost-env-${app.name} <<SUDOERS`,
-    `${sshUser} ALL=(root) NOPASSWD: /usr/bin/systemctl enable --now ${unit}@*.service`,
-    `${sshUser} ALL=(root) NOPASSWD: /usr/bin/systemctl disable --now ${unit}@*.service`,
-    `${sshUser} ALL=(root) NOPASSWD: /usr/bin/systemctl reset-failed ${unit}@*.service`,
-    `${sshUser} ALL=(root) NOPASSWD: /usr/bin/systemctl reload caddy`,
-    `${sshUser} ALL=(root) NOPASSWD: /usr/bin/tee /etc/caddy/sites.d/*.caddy`,
-    `${sshUser} ALL=(root) NOPASSWD: /usr/bin/rm -f /etc/caddy/sites.d/*.caddy`,
-    `${sshUser} ALL=(postgres) NOPASSWD: /usr/bin/createdb, /usr/bin/dropdb, /usr/bin/psql`,
-    "SUDOERS",
-    `chmod 440 /etc/sudoers.d/samohost-env-${app.name}`,
-    "visudo -cf /etc/sudoers.d/samohost-env-" + app.name,
+    ...sudoersLines,
     "",
-    `# 5. Firewall: allow 443/tcp so the origin answers HTTPS.`,
+    `# ${isStatic ? "4" : "5"}. Firewall: allow 443/tcp so the origin answers HTTPS.`,
     `#    Without this the browser (or Cloudflare edge) gets a TCP-refused`,
     `#    connection → Cloudflare 522. /usr/sbin/ufw is the canonical path on`,
     `#    Ubuntu 22.04/24.04; ufw allow is naturally idempotent.`,
@@ -893,7 +1046,7 @@ export function buildHostPrepScript(app: AppRecord, sshUser: string): string {
     `#    grant would needlessly widen the env user's privilege surface.`,
     `/usr/sbin/ufw allow 443/tcp`,
     "",
-    `# 6. DNS (one-time, per-preview): samohost's DNS step (Gap #2) creates an`,
+    `# ${isStatic ? "5" : "6"}. DNS (one-time, per-preview): samohost's DNS step (Gap #2) creates an`,
     `#    UNPROXIED A record for each per-preview hostname → this VM's IP.`,
     `#    Being UNPROXIED lets Caddy complete the ACME HTTP-01 challenge`,
     `#    directly and obtain a real Let's Encrypt cert (no browser warning).`,

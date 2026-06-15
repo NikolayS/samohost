@@ -159,6 +159,14 @@ export interface AppAssertions {
 export interface AppSpec {
   /** App name, unique per VM (e.g. "field-record"). */
   name: string;
+  /**
+   * Serve kind: `"node"` (default, absent = node) runs a Node.js process via a
+   * systemd template instance and reverse-proxies it; `"static"` serves a
+   * pre-built asset bundle (Vite/SPA output) directly via Caddy `file_server`
+   * with no Node.js service, no DB, no env file. Optional: all existing AppRecords
+   * without this field are treated as `"node"`.
+   */
+  kind?: "node" | "static";
   /** GitHub repo in `owner/name` form (e.g. "Tanya301/field-record-1"). */
   repo: string;
   /** Git branch to track. Default "main". */

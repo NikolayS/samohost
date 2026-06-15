@@ -59,6 +59,11 @@ export interface AppRegisterInput {
   rlsNonSuperuser: boolean;
   /** Env var holding the NON-superuser URL for the RLS probe (issue #2). */
   rlsUrlVar?: string;
+  /**
+   * Serve kind (issue #36): `"node"` (default when absent) or `"static"`.
+   * Absent = node; all existing AppRecords are valid.
+   */
+  kind?: "node" | "static";
 }
 
 /**
@@ -164,6 +169,7 @@ export function runAppRegister(
     buildCmd: input.buildCmd,
     healthUrl: input.healthUrl,
     serviceUnit: input.serviceUnit,
+    ...(input.kind !== undefined ? { kind: input.kind } : {}),
     ...(input.mainHost !== undefined ? { mainHost: input.mainHost } : {}),
     ...(input.migrateCmd !== undefined ? { migrateCmd: input.migrateCmd } : {}),
     ...(input.seedCmd !== undefined ? { seedCmd: input.seedCmd } : {}),
@@ -264,6 +270,7 @@ export function runAppRegisterFromToml(
     serviceUnit: app.serviceUnit,
     healthUrl: app.healthUrl,
     rlsNonSuperuser: app.rlsNonSuperuser === true,
+    ...(app.kind !== undefined ? { kind: app.kind } : {}),
     ...(app.migrateCmd !== undefined ? { migrateCmd: app.migrateCmd } : {}),
     ...(app.seedCmd !== undefined ? { seedCmd: app.seedCmd } : {}),
     ...(app.envFile !== undefined ? { envFile: app.envFile } : {}),

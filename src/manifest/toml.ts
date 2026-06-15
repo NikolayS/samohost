@@ -47,6 +47,11 @@ export interface AppManifest {
   envDbVars?: string[];
   /** Maps to assertions.rlsNonSuperuser when true. */
   rlsNonSuperuser?: boolean;
+  /**
+   * Serve kind: `"node"` (default) or `"static"`. Maps to {@link AppSpec.kind}.
+   * Optional: absent means node.
+   */
+  kind?: "node" | "static";
 }
 
 /**
@@ -91,6 +96,8 @@ const APP_KEYS = new Set<string>([
   "rlsUrlVar",
   "envDbVars",
   "rlsNonSuperuser",
+  // Issue #36: serve kind ("node" | "static")
+  "kind",
   // `provision` is the only allowed sub-table at top level
   "provision",
 ]);
@@ -281,6 +288,21 @@ export function parseSamohostToml(text: string): ParseTomlResult {
   const envDbVars = optionalStringArray(raw, "envDbVars", errors);
   const rlsNonSuperuser = optionalBoolean(raw, "rlsNonSuperuser", errors);
 
+  // issue #36: optional enum field (must be "node" | "static" when present)
+  let kind: "node" | "static" | undefined;
+  {
+    const rawKind = raw["kind"];
+    if (rawKind !== undefined) {
+      if (typeof rawKind !== "string") {
+        errors.push(`field kind must be a string (got ${typeof rawKind})`);
+      } else if (rawKind !== "node" && rawKind !== "static") {
+        errors.push(`field kind must be "node" or "static" (got "${rawKind}")`);
+      } else {
+        kind = rawKind;
+      }
+    }
+  }
+
   // ---- 5. Validate [provision] table (optional) ----------------------------
   let provision: ProvisionManifest | undefined;
   const rawProvision = raw["provision"];
@@ -345,6 +367,7 @@ export function parseSamohostToml(text: string): ParseTomlResult {
     ...(rlsUrlVar !== undefined ? { rlsUrlVar } : {}),
     ...(envDbVars !== undefined ? { envDbVars } : {}),
     ...(rlsNonSuperuser !== undefined ? { rlsNonSuperuser } : {}),
+    ...(kind !== undefined ? { kind } : {}),
   };
 
   return {
