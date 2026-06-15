@@ -24,7 +24,6 @@ import {
   runTriggerRun,
   type TriggerRunInput,
   type TriggerDeps,
-  type TriggerAppResult,
   type TriggerRunReport,
 } from "../src/commands/trigger.ts";
 import { AppStore } from "../src/state/apps.ts";
@@ -37,7 +36,6 @@ import type { AppDeployInput } from "../src/commands/app.ts";
 // ---------------------------------------------------------------------------
 
 const SHA_A = "aaa1111aaa2222aaa3333aaa4444aaa555566666";
-const SHA_B = "bbb1111bbb2222bbb3333bbb4444bbb555566666";
 const SHA_OLD = "000000000000000000000000000000000000000a";
 const SHA_FAILED = "ffffffffffffffffffffffffffffffffffffffff";
 
@@ -73,7 +71,6 @@ function makeApp(o: Partial<AppRecord> = {}): AppRecord {
     buildCmd: "npm run build",
     serviceUnit: "field-record",
     healthUrl: "http://localhost:3000/api/version",
-    rlsNonSuperuser: false,
     ...o,
   };
 }
@@ -425,7 +422,6 @@ describe("parseArgs trigger", () => {
   });
 
   test("9c — unknown trigger subcommand throws UsageError", () => {
-    const { UsageError } = require("../src/cli.ts");
     expect(() => parseArgs(["trigger", "wat"])).toThrow(/unknown trigger subcommand/);
   });
 
