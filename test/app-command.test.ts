@@ -499,3 +499,133 @@ describe("app commands", () => {
     expect(rec?.lastDeployAt).toBe("2026-06-11T12:00:00.000Z"); // attempt stamped
   });
 });
+
+// ---------------------------------------------------------------------------
+// Issue #36 — --kind flag for app register
+// ---------------------------------------------------------------------------
+
+describe("parseArgs app register --kind", () => {
+  function baseRegisterArgs(extra: string[] = []): string[] {
+    return [
+      "app", "register", "samo-we-field-record",
+      "--name", "gc1",
+      "--repo", "samo-agent/gc1",
+      "--service-unit", "gc1",
+      "--health-url", "http://localhost:3000/health",
+      ...extra,
+    ];
+  }
+
+  test("--kind static persists kind:'static' on the AppRecord", () => {
+    const cmd = parseArgs(baseRegisterArgs(["--kind", "static"]));
+    if (cmd.kind !== "app-register") throw new Error("expected app-register");
+    expect(cmd.input.kind).toBe("static");
+  });
+
+  test("--kind node persists kind:'node' on the AppRecord", () => {
+    const cmd = parseArgs(baseRegisterArgs(["--kind", "node"]));
+    if (cmd.kind !== "app-register") throw new Error("expected app-register");
+    expect(cmd.input.kind).toBe("node");
+  });
+
+  test("no --kind flag leaves kind undefined (defaults to node in the impl)", () => {
+    const cmd = parseArgs(baseRegisterArgs());
+    if (cmd.kind !== "app-register") throw new Error("expected app-register");
+    expect(cmd.input.kind).toBeUndefined();
+  });
+
+  test("--kind bogus throws a UsageError", () => {
+    expect(() => parseArgs(baseRegisterArgs(["--kind", "bogus"]))).toThrow(/--kind/);
+  });
+});
+
+describe("app register --kind integration (temp store)", () => {
+  let dir: string;
+  let vmStore: StateStore;
+  let appStore: AppStore;
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), "samohost-kind-"));
+    vmStore = new StateStore(join(dir, "state.json"));
+    appStore = new AppStore(join(dir, "apps.json"));
+    vmStore.upsert(
+      {
+        id: "vm-1111",
+        provider: "hetzner",
+        providerId: "1",
+        name: "samo-we-field-record",
+        ip: "1.2.3.4",
+        sshKeyPath: "/k",
+        sshPort: 2223,
+        sshUser: "agent",
+        hostKeyFingerprint: "SHA256:" + "A".repeat(43),
+        region: "fsn1",
+        type: "cx22",
+        modules: [],
+        lifecycleState: "adopted",
+        createdAt: "2026-01-01T00:00:00.000Z",
+        updatedAt: "2026-01-01T00:00:00.000Z",
+      } as import("../src/types.ts").VmRecord,
+    );
+  });
+
+  afterEach(() => rmSync(dir, { recursive: true, force: true }));
+
+  test("--kind static persists kind:'static' on the saved AppRecord", () => {
+    const c = capture();
+    const code = runAppRegister(
+      {
+        vm: "samo-we-field-record",
+        name: "gc1",
+        repo: "samo-agent/gc1",
+        branch: "main",
+        appDir: "/opt/gc1/app",
+        buildCmd: "npm run build",
+        serviceUnit: "gc1",
+        healthUrl: "http://localhost:3000/health",
+        rlsNonSuperuser: false,
+        kind: "static",
+      },
+      { json: false },
+      vmStore,
+      appStore,
+      c.out,
+      c.err,
+    );
+    expect(code).toBe(0);
+    const rec = appStore.get("vm-1111", "gc1");
+    expect(rec?.kind).toBe("static");
+  });
+
+  test("--from-toml with kind in the toml persists it on the AppRecord", () => {
+    const { join: pathJoin } = require("node:path");
+    const { writeFileSync } = require("node:fs");
+    const tomlPath = pathJoin(dir, "test.toml");
+    writeFileSync(
+      tomlPath,
+      [
+        'name = "gc1"',
+        'repo = "samo-agent/gc1"',
+        'branch = "main"',
+        'appDir = "/opt/gc1/dist"',
+        'buildCmd = "npm run build"',
+        'healthUrl = "http://localhost:3000/health"',
+        'serviceUnit = "gc1"',
+        'kind = "static"',
+      ].join("\n"),
+    );
+    const { runAppRegisterFromToml } = require("../src/commands/app.ts");
+    const c = capture();
+    const code = runAppRegisterFromToml(
+      { vm: "samo-we-field-record", tomlPath },
+      { json: false },
+      vmStore,
+      appStore,
+      c.out,
+      c.err,
+    );
+    expect(code).toBe(0);
+    const rec = appStore.get("vm-1111", "gc1");
+    expect(rec?.kind).toBe("static");
+  });
+});

@@ -959,6 +959,7 @@ function parseAppRegister(
   const envDbVars: string[] = [];
   let rlsNonSuperuser = false;
   let rlsUrlVar: string | undefined;
+  let kind: "node" | "static" | undefined;
   let json = false;
 
   for (let i = 0; i < args.length; i++) {
@@ -1004,6 +1005,18 @@ function parseAppRegister(
       }
       case "--assert-rls": rlsNonSuperuser = true; break;
       case "--rls-url-var": rlsUrlVar = takeValue(args, i, a); i++; break;
+      case "--kind": {
+        // issue #36: serve kind ("node" | "static")
+        const v = takeValue(args, i, a);
+        if (v !== "node" && v !== "static") {
+          throw new UsageError(
+            `invalid --kind: ${v} (expected "node" or "static")`,
+          );
+        }
+        kind = v;
+        i++;
+        break;
+      }
       case "--json": json = true; break;
       default:
         if (a.startsWith("-")) throw new UsageError(`unknown flag: ${a}`);
@@ -1053,6 +1066,7 @@ function parseAppRegister(
     serviceUnit,
     healthUrl,
     rlsNonSuperuser,
+    ...(kind !== undefined ? { kind } : {}),
     ...(mainHost !== undefined ? { mainHost } : {}),
     ...(migrateCmd !== undefined ? { migrateCmd } : {}),
     ...(seedCmd !== undefined ? { seedCmd } : {}),

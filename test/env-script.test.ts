@@ -1429,3 +1429,186 @@ describe("schema-grant replay (live-validation finding 2026-06-12)", () => {
     expect(nearby).toContain(">/dev/null 2>&1");
   });
 });
+
+// ---------------------------------------------------------------------------
+// Issue #36 — static-site preview backend (Caddy file_server)
+// ---------------------------------------------------------------------------
+
+describe("static env-create path (kind='static')", () => {
+  // buildEnvCreateScript with kind:'static' must emit a file_server vhost.
+  // It must NOT emit npm ci, npm start, systemd unit, or DB/envfile phases.
+  // It must NOT emit reverse_proxy localhost: (nothing listens there).
+
+  test("static create script is valid bash", () => {
+    const s = buildEnvCreateScript(app({ kind: "static" }), target({ dbBackend: "none" }));
+    expect(bashSyntaxOk(s)).toBe(true);
+  });
+
+  test("static create script contains file_server and try_files", () => {
+    const s = buildEnvCreateScript(app({ kind: "static" }), target({ dbBackend: "none" }));
+    expect(s).toContain("file_server");
+    expect(s).toContain("try_files {path} /index.html");
+  });
+
+  test("static create script does NOT contain npm ci, npm start, or reverse_proxy localhost:", () => {
+    const s = buildEnvCreateScript(app({ kind: "static" }), target({ dbBackend: "none" }));
+    expect(s).not.toContain("npm ci");
+    expect(s).not.toContain("npm start");
+    expect(s).not.toContain("reverse_proxy localhost:");
+  });
+
+  test("static create script contains the clone phase (reuses CLONE_FN_LINES)", () => {
+    const s = buildEnvCreateScript(app({ kind: "static" }), target({ dbBackend: "none" }));
+    expect(s).toContain("<<<SAMOHOST_PHASE:clone:start>>>");
+    expect(s).toContain("samohost_clone_env_dir() {");
+  });
+
+  test("static create script does NOT emit install/build/db/envfile/unit phases", () => {
+    const s = buildEnvCreateScript(app({ kind: "static" }), target({ dbBackend: "none" }));
+    for (const phase of ["install", "build", "db", "envfile", "unit"]) {
+      expect(s).not.toContain(`<<<SAMOHOST_PHASE:${phase}:start>>>`);
+    }
+  });
+
+  test("static create script health probe uses Host-header curl against local Caddy (not localhost:PORT)", () => {
+    const s = buildEnvCreateScript(app({ kind: "static" }), target({ dbBackend: "none" }));
+    // Must use the HTTPS + Host header approach.
+    expect(s).toContain('-H "Host: $SAMOHOST_VHOST"');
+    expect(s).toContain("https://127.0.0.1/");
+    // Must NOT poll the app port (nothing listens there for static sites).
+    expect(s).not.toContain("http://localhost:${SAMOHOST_PORT}/");
+  });
+
+  test("static create script health probe checks for 200 in the retry loop", () => {
+    const s = buildEnvCreateScript(app({ kind: "static" }), target({ dbBackend: "none" }));
+    // Same retry loop shape as the node path.
+    expect(s).toContain(`<<<SAMOHOST_PHASE:health:start>>>`);
+    expect(s).toContain('"200"');
+  });
+
+  test("static create script emits the vhost phase with tee + caddy reload", () => {
+    const s = buildEnvCreateScript(app({ kind: "static" }), target({ dbBackend: "none" }));
+    expect(s).toContain("<<<SAMOHOST_PHASE:vhost:start>>>");
+    expect(s).toContain("sudo /usr/bin/tee");
+    expect(s).toContain("sudo /usr/bin/systemctl reload caddy");
+  });
+
+  test("static vhost block has no tls directive (bare = ACME mode)", () => {
+    const s = buildEnvCreateScript(app({ kind: "static" }), target({ dbBackend: "none" }));
+    expect(s).not.toMatch(/^\s*tls\s/m);
+  });
+
+  test("static create script contains encode gzip", () => {
+    const s = buildEnvCreateScript(app({ kind: "static" }), target({ dbBackend: "none" }));
+    expect(s).toContain("encode gzip");
+  });
+
+  test("node path still works when kind is absent", () => {
+    const s = buildEnvCreateScript(app(), target());
+    expect(s).toContain("npm ci");
+    expect(s).toContain("reverse_proxy localhost:");
+    expect(s).not.toContain("file_server");
+    expect(bashSyntaxOk(s)).toBe(true);
+  });
+
+  test("node path still works when kind is explicitly 'node'", () => {
+    const s = buildEnvCreateScript(app({ kind: "node" }), target());
+    expect(s).toContain("npm ci");
+    expect(s).toContain("reverse_proxy localhost:");
+    expect(s).not.toContain("file_server");
+    expect(bashSyntaxOk(s)).toBe(true);
+  });
+});
+
+describe("static env-destroy path (kind='static')", () => {
+  test("static destroy is valid bash", () => {
+    const s = buildEnvDestroyScript(app({ kind: "static" }), target({ dbBackend: "none" }));
+    expect(bashSyntaxOk(s)).toBe(true);
+  });
+
+  test("static destroy does NOT emit unit-stop start marker", () => {
+    const s = buildEnvDestroyScript(app({ kind: "static" }), target({ dbBackend: "none" }));
+    expect(s).not.toContain("<<<SAMOHOST_PHASE:unit-stop:start>>>");
+  });
+
+  test("static destroy does NOT emit db-drop", () => {
+    const s = buildEnvDestroyScript(app({ kind: "static" }), target({ dbBackend: "none" }));
+    expect(s).not.toContain("<<<SAMOHOST_PHASE:db-drop");
+    expect(s).not.toContain("db-drop");
+  });
+
+  test("static destroy DOES emit vhost-remove", () => {
+    const s = buildEnvDestroyScript(app({ kind: "static" }), target({ dbBackend: "none" }));
+    expect(s).toContain("<<<SAMOHOST_PHASE:vhost-remove:start>>>");
+    expect(s).toContain('sudo /usr/bin/rm -f "$SAMOHOST_CADDY_SNIPPET"');
+    expect(s).toContain("sudo /usr/bin/systemctl reload caddy");
+  });
+
+  test("static destroy DOES emit dir-remove", () => {
+    const s = buildEnvDestroyScript(app({ kind: "static" }), target({ dbBackend: "none" }));
+    expect(s).toContain("<<<SAMOHOST_PHASE:dir-remove:start>>>");
+    expect(s).toContain('rm -rf "$SAMOHOST_ENV_DIR"');
+  });
+});
+
+describe("static host-prep path (kind='static')", () => {
+  test("static host-prep is valid bash", () => {
+    expect(bashSyntaxOk(buildHostPrepScript(app({ kind: "static" }), "agent"))).toBe(true);
+  });
+
+  test("static host-prep contains caddy reload grant", () => {
+    const s = buildHostPrepScript(app({ kind: "static" }), "agent");
+    expect(s).toContain("NOPASSWD: /usr/bin/systemctl reload caddy");
+  });
+
+  test("static host-prep contains tee and rm grants for caddy snippets", () => {
+    const s = buildHostPrepScript(app({ kind: "static" }), "agent");
+    expect(s).toContain("NOPASSWD: /usr/bin/tee /etc/caddy/sites.d/*.caddy");
+    expect(s).toContain("NOPASSWD: /usr/bin/rm -f /etc/caddy/sites.d/*.caddy");
+  });
+
+  test("static host-prep does NOT contain systemctl enable/disable/reset-failed unit@ grants", () => {
+    const s = buildHostPrepScript(app({ kind: "static" }), "agent");
+    // Systemd template instance grants are NOT needed for static sites.
+    expect(s).not.toContain(`systemctl enable --now ${app({ kind: "static" }).serviceUnit}@`);
+    expect(s).not.toContain(`systemctl disable --now ${app({ kind: "static" }).serviceUnit}@`);
+    expect(s).not.toContain(`systemctl reset-failed ${app({ kind: "static" }).serviceUnit}@`);
+  });
+
+  test("static host-prep does NOT contain createdb/dropdb/psql postgres grant", () => {
+    const s = buildHostPrepScript(app({ kind: "static" }), "agent");
+    expect(s).not.toContain("(postgres) NOPASSWD: /usr/bin/createdb");
+    expect(s).not.toContain("/usr/bin/dropdb");
+    // postgres-user psql grant not needed for static
+    expect(s).not.toContain("(postgres) NOPASSWD:");
+  });
+
+  test("static host-prep does NOT contain the systemd @.service template unit", () => {
+    const s = buildHostPrepScript(app({ kind: "static" }), "agent");
+    // No systemd template unit for static sites.
+    expect(s).not.toContain(`/etc/systemd/system/${app({ kind: "static" }).serviceUnit}@.service`);
+  });
+
+  test("static host-prep includes the caddy sites.d include", () => {
+    const s = buildHostPrepScript(app({ kind: "static" }), "agent");
+    expect(s).toContain("import sites.d/*.caddy");
+    expect(s).toContain("mkdir -p /etc/caddy/sites.d");
+  });
+
+  test("static host-prep includes the ufw 443/tcp line", () => {
+    const s = buildHostPrepScript(app({ kind: "static" }), "agent");
+    expect(s).toContain("/usr/sbin/ufw allow 443/tcp");
+  });
+
+  test("static host-prep includes the DNS comment with UNPROXIED", () => {
+    const s = buildHostPrepScript(app({ kind: "static" }), "agent");
+    expect(s).toContain("UNPROXIED");
+  });
+
+  test("node host-prep is unchanged (still has systemd unit and postgres grants)", () => {
+    const s = buildHostPrepScript(app(), "agent");
+    expect(s).toContain("/etc/systemd/system/field-record@.service");
+    expect(s).toContain("(postgres) NOPASSWD: /usr/bin/createdb");
+    expect(bashSyntaxOk(s)).toBe(true);
+  });
+});

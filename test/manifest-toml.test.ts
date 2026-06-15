@@ -484,3 +484,57 @@ describe("round-trip: --from-toml produces same AppSpec as equivalent flags", ()
     }
   });
 });
+
+// ---------------------------------------------------------------------------
+// Issue #36 — kind field in .samohost.toml
+// ---------------------------------------------------------------------------
+
+describe("parseSamohostToml — kind field", () => {
+  function minimal(extra = ""): string {
+    return [
+      'name = "my-app"',
+      'repo = "owner/my-app"',
+      'branch = "main"',
+      'appDir = "/opt/my-app/app"',
+      'buildCmd = "npm run build"',
+      'healthUrl = "http://localhost:3000/health"',
+      'serviceUnit = "my-app"',
+      extra,
+    ]
+      .filter(Boolean)
+      .join("\n");
+  }
+
+  test('kind = "static" parses ok and is present in the app manifest', () => {
+    const result = parseSamohostToml(minimal('kind = "static"'));
+    if (!result.ok) throw new Error("expected ok=true; errors: " + result.errors.join(", "));
+    expect(result.app.kind).toBe("static");
+  });
+
+  test('kind = "node" parses ok and is present in the app manifest', () => {
+    const result = parseSamohostToml(minimal('kind = "node"'));
+    if (!result.ok) throw new Error("expected ok=true; errors: " + result.errors.join(", "));
+    expect(result.app.kind).toBe("node");
+  });
+
+  test("absent kind parses ok and kind is undefined", () => {
+    const result = parseSamohostToml(minimal());
+    if (!result.ok) throw new Error("expected ok=true; errors: " + result.errors.join(", "));
+    expect(result.app.kind).toBeUndefined();
+  });
+
+  test('kind = "bogus" is rejected with a clear error', () => {
+    const result = parseSamohostToml(minimal('kind = "bogus"'));
+    expect(result.ok).toBe(false);
+    if (result.ok) throw new Error("expected ok=false");
+    expect(result.errors.some((e) => e.includes("kind"))).toBe(true);
+    expect(result.errors.some((e) => e.includes('"node"') || e.includes('"static"'))).toBe(true);
+  });
+
+  test('kind = 123 (wrong type) is rejected', () => {
+    const result = parseSamohostToml(minimal("kind = 123"));
+    expect(result.ok).toBe(false);
+    if (result.ok) throw new Error("expected ok=false");
+    expect(result.errors.some((e) => e.includes("kind"))).toBe(true);
+  });
+});
