@@ -214,17 +214,25 @@ app clear-failed (offline; clears the known-bad-SHA guard record):
   longer refused — use after a rollback caused by a tooling defect (e.g.
   a misconfigured RLS probe), when the commit itself was healthy
 
-app bootstrap options (PR-A1 — ONE-TIME OS bootstrap; printed for operator
-  review; NOT auto-executed by samohost; run as root):
+app bootstrap options (PR-A1+A2 — ONE-TIME OS bootstrap + DB + env + clone;
+  printed for operator review; NOT auto-executed by samohost; run as root):
   <vm>                       VM name or id (required)
   <app>                      app name or id (required)
   --app-user <user>          OS user created to run the app (required)
+  --db-name <name>           Database to create — REQUIRED, EXPLICIT.
+                             Never derived from app name (e.g. field_record,
+                             NOT field-record or field_record_1). Must match
+                             the actual database on the host.
   --app-base <path>          base directory (default: /opt/<app-name>)
   --node-major <N>           Node.js major via NodeSource (default: 22)
   --pg-major <N>             PostgreSQL major via PGDG (default: 18)
   --exec-start <cmd>         ExecStart for MAIN unit
                              (default: /usr/bin/node dist/server.js)
   --tls <acme|local>         Caddy TLS mode (default: acme; local => local_certs)
+  --app-db-role <role>       non-superuser DB role for the RLS URL placeholder
+                             (default: app_user; deploy.sh rotates the password)
+  --seed-owner-login <name>  value for SEED_OWNER_LOGIN in the env file
+                             (default: owner)
 
 env options (per-branch preview environments — SOLO plan, one shared VM):
   --branch <branch>          git branch the env tracks (required except --host-prep)
@@ -1099,14 +1107,19 @@ function parseAppStatus(args: string[]): ParsedAppStatus {
 
 function parseAppBootstrap(args: string[]): ParsedAppBootstrap {
   let appUser: string | undefined;
+  let dbName: string | undefined;
   let appBase: string | undefined;
   let nodeMajor: number | undefined;
   let pgMajor: number | undefined;
   let execStart: string | undefined;
   let tlsMode: "acme" | "local" | undefined;
+  let appDbRole: string | undefined;
+  let seedOwnerLogin: string | undefined;
 
   const { vm, app } = takeVmApp(args, (a, i) => {
     if (a === "--app-user") { appUser = takeValue(args, i, a); return i + 1; }
+    // PR-A2 REQUIRED: DB name is always explicit — never derived from app.name.
+    if (a === "--db-name") { dbName = takeValue(args, i, a); return i + 1; }
     if (a === "--app-base") { appBase = takeValue(args, i, a); return i + 1; }
     if (a === "--node-major") {
       nodeMajor = parseIntFlag(takeValue(args, i, a), a);
@@ -1125,6 +1138,9 @@ function parseAppBootstrap(args: string[]): ParsedAppBootstrap {
       tlsMode = v;
       return i + 1;
     }
+    // PR-A2 optional DB/env options
+    if (a === "--app-db-role") { appDbRole = takeValue(args, i, a); return i + 1; }
+    if (a === "--seed-owner-login") { seedOwnerLogin = takeValue(args, i, a); return i + 1; }
     // Legacy --print is a no-op (bootstrap always prints to stdout)
     if (a === "--print") { return i; }
     return undefined;
@@ -1133,16 +1149,20 @@ function parseAppBootstrap(args: string[]): ParsedAppBootstrap {
   if (vm === undefined) throw new UsageError("app bootstrap requires <vm> <app>");
   if (app === undefined) throw new UsageError("app bootstrap requires <vm> <app>");
   if (appUser === undefined) throw new UsageError("app bootstrap requires --app-user <user>");
+  if (dbName === undefined) throw new UsageError("app bootstrap requires --db-name <name> (REQUIRED: must be explicit; not derived from app name)");
 
   const input: AppBootstrapInput = {
     vm,
     app,
     appUser,
+    dbName,
     ...(appBase !== undefined ? { appBase } : {}),
     ...(nodeMajor !== undefined ? { nodeMajor } : {}),
     ...(pgMajor !== undefined ? { pgMajor } : {}),
     ...(execStart !== undefined ? { execStart } : {}),
     ...(tlsMode !== undefined ? { tlsMode } : {}),
+    ...(appDbRole !== undefined ? { appDbRole } : {}),
+    ...(seedOwnerLogin !== undefined ? { seedOwnerLogin } : {}),
   };
   return { kind: "app-bootstrap", input };
 }

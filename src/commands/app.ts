@@ -96,11 +96,21 @@ export interface AppBootstrapInput {
   vm: string;
   app: string;
   appUser: string;
+  /**
+   * PR-A2 REQUIRED — the database name to create on the host.
+   * MUST be passed explicitly; never derived from app.name.
+   * See HostBootstrapOptions.dbName.
+   */
+  dbName: string;
   appBase?: string;
   nodeMajor?: number;
   pgMajor?: number;
   execStart?: string;
   tlsMode?: "acme" | "local";
+  /** PR-A2 optional — non-superuser DB role for the RLS URL placeholder. Default "app_user". */
+  appDbRole?: string;
+  /** PR-A2 optional — value written into SEED_OWNER_LOGIN. Default "owner". */
+  seedOwnerLogin?: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -317,10 +327,10 @@ export function runAppClearFailed(
  * and prints it to stdout. The operator reviews and applies it with root;
  * samohost NEVER auto-executes this script.
  *
- * Scope: runtimes (Node/PG/Caddy), app OS user, /opt layout, sudoers,
- * MAIN systemd unit, sshd AllowUsers drop-in, Caddy base config,
- * self-check table. See PR-A1 spec. DB bootstrap / env file / repo clone
- * are PR-A2 (not here).
+ * Scope (PR-A1): runtimes (Node/PG/Caddy), app OS user, /opt layout, sudoers,
+ * MAIN systemd unit, sshd AllowUsers drop-in, Caddy base config.
+ * Scope (PR-A2): DB bootstrap + createdb (dbName REQUIRED, explicit),
+ * base env file seeding, full token-safe repo clone, extended self-check table.
  */
 export function runAppBootstrap(
   input: AppBootstrapInput,
@@ -342,11 +352,14 @@ export function runAppBootstrap(
 
   const opts: HostBootstrapOptions = {
     appUser: input.appUser,
+    dbName: input.dbName,
     ...(input.appBase !== undefined ? { appBase: input.appBase } : {}),
     ...(input.nodeMajor !== undefined ? { nodeMajor: input.nodeMajor } : {}),
     ...(input.pgMajor !== undefined ? { pgMajor: input.pgMajor } : {}),
     ...(input.execStart !== undefined ? { execStart: input.execStart } : {}),
     ...(input.tlsMode !== undefined ? { tlsMode: input.tlsMode } : {}),
+    ...(input.appDbRole !== undefined ? { appDbRole: input.appDbRole } : {}),
+    ...(input.seedOwnerLogin !== undefined ? { seedOwnerLogin: input.seedOwnerLogin } : {}),
   };
 
   out(buildHostBootstrapScript(app, opts));
