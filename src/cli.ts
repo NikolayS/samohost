@@ -76,6 +76,7 @@ import {
   defaultProvisionDeps,
 } from "./commands/provision.ts";
 import { runDestroy, defaultConfirm, type DestroyInput } from "./commands/destroy.ts";
+import { runDoctor } from "./commands/doctor.ts";
 import { HetznerProvider } from "./providers/hetzner.ts";
 import { StateStore } from "./state/store.ts";
 import type { EnvDbBackend } from "./types.ts";
@@ -94,6 +95,7 @@ Usage:
       --host-key-fingerprint 'SHA256:...' [options]
   samohost list [--json]
   samohost status <vm-name-or-id> [--audit] [--json]
+  samohost doctor <vm-name-or-id> [--infra] [--json]
   samohost ssh <vm-name-or-id> [-- <command...>]
   samohost logs <vm-name-or-id> [--unit <name>] [--lines <n>] [--follow]
   samohost app register <vm> --name <n> --repo <owner/name> \\
@@ -167,6 +169,10 @@ list options:
 
 status options:
   --audit                    run live hardening probes over pinned SSH
+
+doctor options (READ-ONLY security/hardening check — never remediates):
+  --infra                    infra-only mode: skip app-db checks (no app context)
+  --json                     emit a JSON envelope {record, infraMode, checks[]}
 
 ssh (interactive session — or run a one-off command — over the pinned host
 key; same machinery as status --audit: per-VM known_hosts, strict checking,
@@ -386,6 +392,12 @@ export interface ParsedDnsStatus {
   json: boolean;
 }
 
+export interface ParsedDoctor {
+  kind: "doctor";
+  input: { target: string; infra: boolean };
+  json: boolean;
+}
+
 export type ParsedCommand =
   | ParsedPreview
   | ParsedProvision
@@ -408,6 +420,7 @@ export type ParsedCommand =
   | ParsedEnvDestroy
   | ParsedEnvPreflight
   | ParsedDnsStatus
+  | ParsedDoctor
   | { kind: "help" }
   | { kind: "version" };
 
@@ -452,6 +465,9 @@ export function parseArgs(
   }
   if (first === "status") {
     return parseStatus(argv.slice(1));
+  }
+  if (first === "doctor") {
+    return parseDoctor(argv.slice(1));
   }
   if (first === "ssh") {
     return parseSsh(argv.slice(1));
@@ -820,6 +836,35 @@ function parseStatus(args: string[]): ParsedStatus {
     throw new UsageError("status requires a VM name or id");
   }
   return { kind: "status", input: { target, audit }, json };
+}
+
+function parseDoctor(args: string[]): ParsedDoctor {
+  let target: string | undefined;
+  let infra = false;
+  let json = false;
+
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i]!;
+    switch (a) {
+      case "--infra":
+        infra = true;
+        break;
+      case "--json":
+        json = true;
+        break;
+      default:
+        if (a.startsWith("-")) throw new UsageError(`unknown flag: ${a}`);
+        if (target !== undefined) {
+          throw new UsageError(`unexpected extra argument: ${a}`);
+        }
+        target = a;
+    }
+  }
+
+  if (target === undefined) {
+    throw new UsageError("doctor requires a VM name or id");
+  }
+  return { kind: "doctor", input: { target, infra }, json };
 }
 
 function parseSsh(args: string[]): ParsedSsh {
@@ -1618,6 +1663,15 @@ export async function main(
         cmd.input,
         { json: cmd.json },
         defaultDnsStatusDeps(),
+        out,
+        err,
+      );
+    case "doctor":
+      return runDoctor(
+        cmd.input,
+        { json: cmd.json },
+        new StateStore(),
+        defaultAppStore(),
         out,
         err,
       );
