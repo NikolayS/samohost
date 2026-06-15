@@ -14,6 +14,7 @@
  * clock) are all injected so the whole flow is unit-tested offline.
  */
 
+import { readFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { checkCiGreen, type CiStatus } from "../app/cigate.ts";
 import { parseDeployOutcome, type DeployOutcome } from "../app/parse.ts";
@@ -31,6 +32,7 @@ import {
   type SpawnResult,
 } from "../ssh/runner.ts";
 import type { AppRecord, AppSpec, VmRecord } from "../types.ts";
+import { parseSamohostToml } from "../manifest/toml.ts";
 
 // ---------------------------------------------------------------------------
 // Parsed inputs (produced by the CLI parser)
@@ -57,6 +59,21 @@ export interface AppRegisterInput {
   rlsNonSuperuser: boolean;
   /** Env var holding the NON-superuser URL for the RLS probe (issue #2). */
   rlsUrlVar?: string;
+}
+
+/**
+ * Input for `app register --from-toml`: the `<vm>` positional arg plus the
+ * path to a `.samohost.toml` manifest. The VM is NOT part of the manifest
+ * (it is repo-portable; the target VM is supplied at register time).
+ *
+ * NOTE: the `[provision]` section of the TOML (serverType/location/labels) is
+ * parsed and validated but NOT consumed here. It is intended for a future
+ * `provision --from-toml` command.
+ * TODO(PR-E): wire provision --from-toml to consume the [provision] table.
+ */
+export interface AppRegisterFromTomlInput {
+  vm: string;
+  tomlPath: string;
 }
 
 export interface AppPlanInput {
@@ -187,6 +204,75 @@ export function runAppRegister(
     );
   }
   return 0;
+}
+
+// ---------------------------------------------------------------------------
+// register --from-toml
+// ---------------------------------------------------------------------------
+
+/**
+ * Read a `.samohost.toml` manifest from `input.tomlPath`, parse + validate it,
+ * then delegate to {@link runAppRegister} to write the AppRecord.
+ *
+ * Fail-closed: if the file cannot be read or the manifest is invalid, prints
+ * all errors to stderr and returns 1 without persisting anything.
+ *
+ * The `[provision]` table in the manifest is parsed and validated but NOT
+ * consumed here (it targets a future `provision --from-toml` command).
+ *
+ * @see AppRegisterFromTomlInput
+ */
+export function runAppRegisterFromToml(
+  input: AppRegisterFromTomlInput,
+  opts: { json: boolean },
+  vmStore: StateStore,
+  appStore: AppStore,
+  out: (s: string) => void,
+  err: (s: string) => void,
+): number {
+  // ---- read file -----------------------------------------------------------
+  let text: string;
+  try {
+    text = readFileSync(input.tomlPath, "utf8");
+  } catch (e) {
+    err(
+      `error: cannot read manifest file ${input.tomlPath}: ` +
+        `${e instanceof Error ? e.message : String(e)}`,
+    );
+    return 1;
+  }
+
+  // ---- parse + validate ---------------------------------------------------
+  const result = parseSamohostToml(text);
+  if (!result.ok) {
+    err(`error: manifest validation failed (${result.errors.length} error(s)):`);
+    for (const msg of result.errors) {
+      err(`  - ${msg}`);
+    }
+    return 1;
+  }
+
+  // ---- build AppRegisterInput from manifest --------------------------------
+  const { app } = result;
+  const registerInput: AppRegisterInput = {
+    vm: input.vm,
+    name: app.name,
+    repo: app.repo,
+    branch: app.branch,
+    appDir: app.appDir,
+    buildCmd: app.buildCmd,
+    serviceUnit: app.serviceUnit,
+    healthUrl: app.healthUrl,
+    rlsNonSuperuser: app.rlsNonSuperuser === true,
+    ...(app.migrateCmd !== undefined ? { migrateCmd: app.migrateCmd } : {}),
+    ...(app.seedCmd !== undefined ? { seedCmd: app.seedCmd } : {}),
+    ...(app.envFile !== undefined ? { envFile: app.envFile } : {}),
+    ...(app.mainHost !== undefined ? { mainHost: app.mainHost } : {}),
+    ...(app.rlsUrlVar !== undefined ? { rlsUrlVar: app.rlsUrlVar } : {}),
+    ...(app.envDbVars !== undefined ? { envDbVars: app.envDbVars } : {}),
+  };
+
+  return runAppRegister(registerInput, opts, vmStore, appStore, out, err);
 }
 
 // ---------------------------------------------------------------------------

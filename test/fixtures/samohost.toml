@@ -1,0 +1,25 @@
+# .samohost.toml — fixture for field-record-1 app (test data only; no secrets)
+
+name        = "field-record"
+repo        = "Tanya301/field-record-1"
+branch      = "main"
+appDir      = "/opt/field-record/app"
+buildCmd    = "npm run build"
+healthUrl   = "http://localhost:3000/api/version"
+serviceUnit = "field-record"
+
+migrateCmd  = "npm run migrate"
+seedCmd     = "npm run db:seed"
+envFile     = "/opt/field-record/staging.env"
+mainHost    = "field-record-1.samo.team"
+rlsUrlVar   = "APP_DATABASE_URL"
+envDbVars   = ["DATABASE_URL", "APP_DATABASE_URL"]
+rlsNonSuperuser = true
+
+[provision]
+serverType = "cx22"
+location   = "fsn1"
+
+[provision.labels]
+env  = "prod"
+team = "platform"

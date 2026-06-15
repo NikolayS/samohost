@@ -33,6 +33,7 @@ import {
 } from "./commands/logs.ts";
 import {
   runAppRegister,
+  runAppRegisterFromToml,
   runAppPlan,
   runAppDeploy,
   runAppStatus,
@@ -41,6 +42,7 @@ import {
   defaultAppDeployDeps,
   defaultAppStore,
   type AppRegisterInput,
+  type AppRegisterFromTomlInput,
   type AppPlanInput,
   type AppDeployInput,
   type AppStatusInput,
@@ -313,6 +315,12 @@ export interface ParsedAppRegister {
   json: boolean;
 }
 
+export interface ParsedAppRegisterFromToml {
+  kind: "app-register-from-toml";
+  input: AppRegisterFromTomlInput;
+  json: boolean;
+}
+
 export interface ParsedAppPlan {
   kind: "app-plan";
   input: AppPlanInput;
@@ -388,6 +396,7 @@ export type ParsedCommand =
   | ParsedSsh
   | ParsedLogs
   | ParsedAppRegister
+  | ParsedAppRegisterFromToml
   | ParsedAppPlan
   | ParsedAppDeploy
   | ParsedAppStatus
@@ -931,8 +940,11 @@ function takeValue(args: string[], i: number, flag: string): string {
   return v;
 }
 
-function parseAppRegister(args: string[]): ParsedAppRegister {
+function parseAppRegister(
+  args: string[],
+): ParsedAppRegister | ParsedAppRegisterFromToml {
   let vm: string | undefined;
+  let fromToml: string | undefined;
   let name: string | undefined;
   let repo: string | undefined;
   let branch = "main";
@@ -952,6 +964,7 @@ function parseAppRegister(args: string[]): ParsedAppRegister {
   for (let i = 0; i < args.length; i++) {
     const a = args[i]!;
     switch (a) {
+      case "--from-toml": fromToml = takeValue(args, i, a); i++; break;
       case "--name": name = takeValue(args, i, a); i++; break;
       case "--repo": repo = takeValue(args, i, a); i++; break;
       case "--branch": branch = takeValue(args, i, a); i++; break;
@@ -1000,6 +1013,21 @@ function parseAppRegister(args: string[]): ParsedAppRegister {
   }
 
   if (vm === undefined) throw new UsageError("app register requires a <vm> argument");
+
+  // ---- --from-toml path: flags are not required (manifest supplies them) ---
+  // When --from-toml is given, ignore any flag-based fields that were NOT also
+  // provided — the manifest is the source of truth. If both --from-toml and
+  // required flags are provided, --from-toml takes precedence and flags are
+  // ignored (documented behaviour; use one or the other, not both).
+  if (fromToml !== undefined) {
+    return {
+      kind: "app-register-from-toml",
+      input: { vm, tomlPath: fromToml },
+      json,
+    };
+  }
+
+  // ---- flag path (existing behaviour, unchanged) ---------------------------
   if (name === undefined) throw new UsageError("--name is required");
   if (repo === undefined) throw new UsageError("--repo is required");
   if (!/^[^/\s]+\/[^/\s]+$/.test(repo)) {
@@ -1460,6 +1488,15 @@ export async function main(
       );
     case "app-register":
       return runAppRegister(
+        cmd.input,
+        { json: cmd.json },
+        new StateStore(),
+        defaultAppStore(),
+        out,
+        err,
+      );
+    case "app-register-from-toml":
+      return runAppRegisterFromToml(
         cmd.input,
         { json: cmd.json },
         new StateStore(),
