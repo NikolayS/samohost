@@ -11,7 +11,7 @@ import { describe, expect, test } from "bun:test";
 import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { ProvisionSpec, VmRecord } from "../src/types.ts";
+import type { ProvisionSpec } from "../src/types.ts";
 import { StateStore } from "../src/state/store.ts";
 import {
   MANAGED_BY_LABEL,
@@ -47,13 +47,11 @@ function makeEnv() {
   const fake = new FakeProvider();
   fake.statusSequence = ["initializing", "running"];
 
-  let keyscanCalled = false;
   const deps: ProvisionDeps = {
     provider: fake,
     store,
     spawn: async (file, _args) => {
       if (file === "ssh-keyscan") {
-        keyscanCalled = true;
         return { code: 0, stdout: SCAN_OUTPUT, stderr: "" };
       }
       if (file === "ssh") {

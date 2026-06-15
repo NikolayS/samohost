@@ -125,6 +125,8 @@ provision options (Hetzner only in v0.1 — AWS deferred; needs HCLOUD_TOKEN in 
   --trusted-ip <ip>          never-banned IP for fail2ban (repeatable)
   --timeout <seconds>        booting→ready gate bound (default: 600;
                              timeout leaves the VM recorded as 'degraded')
+  --label <key=value>        custom provider label (repeatable); managed labels
+                             (managed-by, samohost-id) always win on collision
   --json                     print the final VmRecord as JSON
 
 destroy options (typed VM-name confirmation unless --yes):
@@ -580,6 +582,8 @@ function parseProvision(args: string[]): ParsedProvision {
   let json = false;
   const modules: string[] = [];
   const trustedIps: string[] = [];
+  const labels: Record<string, string> = {};
+  let hasLabels = false;
 
   for (let i = 0; i < args.length; i++) {
     const a = args[i]!;
@@ -595,6 +599,19 @@ function parseProvision(args: string[]): ParsedProvision {
       case "--admin-user": adminUser = takeValue(args, i, a); i++; break;
       case "--timeout": timeoutSec = parseIntFlag(takeValue(args, i, a), a); i++; break;
       case "--json": json = true; break;
+      case "--label": {
+        const raw = takeValue(args, i, a);
+        const eq = raw.indexOf("=");
+        if (eq === -1) {
+          throw new UsageError(
+            `--label value must be in key=value form, got: "${raw}"`,
+          );
+        }
+        labels[raw.slice(0, eq)] = raw.slice(eq + 1);
+        hasLabels = true;
+        i++;
+        break;
+      }
       default:
         throw new UsageError(`unknown flag: ${a}`);
     }
@@ -626,6 +643,7 @@ function parseProvision(args: string[]): ParsedProvision {
     modules,
     trustedIps,
     timeoutSec,
+    ...(hasLabels ? { labels } : {}),
   };
   return { kind: "provision", spec, sshKey, json };
 }

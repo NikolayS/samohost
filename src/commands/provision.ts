@@ -56,6 +56,60 @@ import { expandTilde } from "./adopt.ts";
 export const PROVISION_IMAGE = "ubuntu-24.04";
 
 /**
+ * Hetzner label key pattern (name part, no prefix):
+ *   single char:  `[a-zA-Z0-9]`
+ *   multi-char:   `[a-zA-Z0-9]([a-zA-Z0-9._-]*[a-zA-Z0-9])?`
+ *
+ * Both key and value share the same charset; value additionally permits
+ * an empty string (Hetzner docs allow value="").
+ */
+const LABEL_KEY_RE = /^[a-zA-Z0-9]([a-zA-Z0-9._-]*[a-zA-Z0-9])?$|^[a-zA-Z0-9]$/;
+const LABEL_CHAR_RE = /^[a-zA-Z0-9._-]*$/;
+const LABEL_MAX_LEN = 63;
+
+/**
+ * Validate `spec.labels` against Hetzner constraints. Returns an array of
+ * human-readable error strings (empty == valid). Called in the validation
+ * phase: nothing is persisted or sent to the provider on any error.
+ */
+export function validateCustomLabels(
+  labels: Record<string, string> | undefined,
+): string[] {
+  if (labels === undefined) return [];
+  const errors: string[] = [];
+  for (const [key, value] of Object.entries(labels)) {
+    if (key.length === 0) {
+      errors.push(`label key must not be empty`);
+      continue;
+    }
+    if (key.length > LABEL_MAX_LEN) {
+      errors.push(
+        `label key "${key.slice(0, 20)}…" exceeds ${LABEL_MAX_LEN} characters (${key.length})`,
+      );
+      continue;
+    }
+    if (!LABEL_KEY_RE.test(key)) {
+      errors.push(
+        `label key "${key}" is invalid: must match [a-zA-Z0-9._-], start and end ` +
+          `with alphanumeric`,
+      );
+    }
+    if (value.length > LABEL_MAX_LEN) {
+      errors.push(
+        `label value for key "${key}" exceeds ${LABEL_MAX_LEN} characters (${value.length})`,
+      );
+      continue;
+    }
+    if (value.length > 0 && !LABEL_CHAR_RE.test(value)) {
+      errors.push(
+        `label value "${value}" for key "${key}" is invalid: must match [a-zA-Z0-9._-]`,
+      );
+    }
+  }
+  return errors;
+}
+
+/**
  * The pinned-SSH readiness probe. `boot-finished` proves cloud-init finished
  * its run; the samohost sentinel (the baseline's FINAL runcmd) proves OUR
  * hardening runcmds all executed. Non-blocking by design: it is polled with
@@ -150,6 +204,7 @@ export async function runProvision(
   const validationErrors = [
     ...moduleErrors,
     ...[hardeningModule, ...modules].flatMap((m) => m.validate(spec)),
+    ...validateCustomLabels(spec.labels),
   ];
   if (validationErrors.length > 0) {
     for (const e of validationErrors) err(`error: ${e}`);
@@ -194,16 +249,21 @@ export async function runProvision(
 
   let providerId: string;
   try {
+    // Merge custom labels first so managed labels overwrite any key collision.
+    // This is the security invariant: a user must not be able to supply a label
+    // that masks the managed-by or samohost-id tags used for orphan discovery.
+    const mergedLabels: Record<string, string> = {
+      ...(spec.labels ?? {}),
+      [MANAGED_BY_LABEL]: MANAGED_BY_VALUE,
+      [SAMOHOST_ID_LABEL]: record.id,
+    };
     const info = await deps.provider.create({
       name: spec.name,
       serverType: spec.type,
       image: PROVISION_IMAGE,
       location: spec.region,
       userData,
-      labels: {
-        [MANAGED_BY_LABEL]: MANAGED_BY_VALUE,
-        [SAMOHOST_ID_LABEL]: record.id,
-      },
+      labels: mergedLabels,
     });
     providerId = info.providerId;
     // ---- booting: provider id + ip persisted the moment the API accepts ----
