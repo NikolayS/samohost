@@ -56,6 +56,21 @@ export interface ProvisionSpec {
   trustedIps: string[];
   /** Bound for booting→ready polling, in seconds. Default 600. */
   timeoutSec: number;
+  /**
+   * Optional custom labels to attach to the provider resource at create time.
+   * Merged with the managed labels (`managed-by=samohost`, `samohost-id=<uuid>`);
+   * the managed labels WIN on key collision so a user cannot mislabel a
+   * samohost-managed VM to evade inventory/cleanup.
+   *
+   * Keys and values must conform to Hetzner label constraints:
+   *   - key: 1–63 chars, pattern `[a-zA-Z0-9]([a-zA-Z0-9._-]*[a-zA-Z0-9])?`
+   *     (single-char keys are simply `[a-zA-Z0-9]`)
+   *   - value: 0–63 chars, same charset as key (empty value is allowed)
+   *
+   * Populated from `--label key=value` CLI flags or the `[provision]` TOML
+   * section (PR-D). Absent when no custom labels are requested.
+   */
+  labels?: Record<string, string>;
 }
 
 /** A single file to be written by cloud-init's `write_files`. */
