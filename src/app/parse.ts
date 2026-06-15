@@ -21,12 +21,15 @@ export interface PhaseEvent {
 
 /**
  * Terminal outcome of a deploy run, derived from the phase event stream:
- *  - `deployed`        : reached a terminal phase with no failure and no rollback.
+ *  - `deployed`        : reached `health:ok` (the authoritative "app is actually
+ *                        serving" signal) with no subsequent failure and no rollback.
  *  - `rolled-back`     : a phase failed and `rollback:ok` was seen.
  *  - `rollback-failed` : a phase failed and `rollback:fail` was seen.
  *  - `incomplete`      : a phase failed with no rollback marker, OR the stream
  *                        ended mid-phase (a `start` with no matching `ok`/`fail`
- *                        and no rollback) — i.e. the connection dropped.
+ *                        and no rollback) — i.e. the connection dropped. Also
+ *                        returned when `health:ok` was never observed (e.g. the
+ *                        connection died before the health phase ran).
  */
 export type DeployOutcome =
   | "deployed"
@@ -77,6 +80,7 @@ export function parsePhaseStream(raw: string): PhaseEvent[] {
 export function deployOutcome(events: PhaseEvent[]): DeployOutcome {
   let pendingStart: PhaseName | undefined;
   let sawFailure = false;
+  let sawHealthOk = false;
 
   for (const ev of events) {
     if (ev.phase === "rollback") {
@@ -88,6 +92,7 @@ export function deployOutcome(events: PhaseEvent[]): DeployOutcome {
       pendingStart = ev.phase;
     } else if (ev.status === "ok") {
       if (pendingStart === ev.phase) pendingStart = undefined;
+      if (ev.phase === "health") sawHealthOk = true;
     } else if (ev.status === "fail") {
       sawFailure = true;
       pendingStart = undefined;
@@ -98,6 +103,10 @@ export function deployOutcome(events: PhaseEvent[]): DeployOutcome {
   if (sawFailure) return "incomplete";
   // A start with no matching terminal status ⇒ stream cut off mid-phase.
   if (pendingStart !== undefined) return "incomplete";
+  // No health:ok observed ⇒ we cannot confirm the app is actually serving.
+  // This covers: empty stream, connection dropped before health phase ran,
+  // or any truncated stream that never reached the health check.
+  if (!sawHealthOk) return "incomplete";
   return "deployed";
 }
 

@@ -482,6 +482,23 @@ describe("app commands", () => {
     expect(JSON.parse(c.o).sha).toBe(SHA);
   });
 
+  test("empty stream → outcome incomplete, deployedSha NOT set", async () => {
+    register();
+    const c = capture();
+    const code = await runAppDeploy(
+      { vm: "samo-we-field-record", app: "field-record", sha: SHA, skipCiGate: true },
+      { json: true }, vmStore, appStore,
+      deployDeps(""),
+      c.out, c.err,
+    );
+    expect(code).toBe(1);
+    expect(JSON.parse(c.o).outcome).toBe("incomplete");
+    const rec = appStore.get("vm-1111", "field-record");
+    expect(rec?.deployedSha).toBeUndefined();
+    expect(rec?.failedSha).toBeUndefined();
+    expect(rec?.lastDeployAt).toBe("2026-06-11T12:00:00.000Z");
+  });
+
   test("incomplete stream leaves deployedSha/failedSha unchanged", async () => {
     register();
     const c = capture();
