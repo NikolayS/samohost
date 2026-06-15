@@ -56,7 +56,43 @@ samohost env destroy web field-record --branch feat/x
 
 # Preview DNS preflight (read-only)
 samohost dns status example.com --expect-ip 10.0.0.5 --cf-zone example.com
+
+# Auto-deploy (samo-level) — replaces per-client on-box deploy timers
+samohost trigger run                              # poll all registered apps; deploy where SHA changed
+samohost trigger run --vm web --app field-record  # narrow to one app
+samohost trigger run --dry-run --json             # report what would deploy, no SSH
 ```
+
+### Auto-deploy (samo-level)
+
+`samohost trigger run` is the ONE samo-level mechanism that replaces
+per-client on-box deploy timers. It performs one idempotent poll cycle:
+
+1. Enumerates all registered apps (optionally narrowed by `--vm`/`--app`).
+2. Skips apps on VMs not in `{ready, adopted}` lifecycle state.
+3. For each candidate, resolves the tracked-branch HEAD SHA via the GitHub API.
+4. Compares the resolved SHA to `app.deployedSha`:
+   - **equal** → no-op (`up-to-date`).
+   - **equals `app.failedSha`** → skip early (`known-bad`), avoiding a pointless
+     SSH/CI round-trip; `runAppDeploy` would also catch it.
+   - **different** → delegates to `runAppDeploy` with the resolved SHA passed
+     explicitly (so `runAppDeploy` never resolves twice).
+5. `runAppDeploy` enforces the CI-green gate, health-200 gate, known-bad
+   guard, and rollback — the trigger adds only the iteration/scheduler layer.
+6. One app's failure or error does not abort the cycle (per-app isolation).
+
+Intended to run from a samohost-managed control-plane systemd timer, e.g.:
+
+```ini
+# /etc/systemd/system/samohost-trigger.timer
+[Timer]
+OnCalendar=*:0/5       # every 5 minutes
+[Install]
+WantedBy=timers.target
+```
+
+Exit 0 when every candidate ended in `{deployed, up-to-date, known-bad,
+skipped, would-deploy}`; exit 1 when any deploy returned non-zero or threw.
 
 ### SPEC v0.1 coverage
 

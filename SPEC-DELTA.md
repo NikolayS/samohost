@@ -363,3 +363,95 @@ manual, deliberate act. On provider API failure the record stays
 `destroying` (truthful + retryable); `notFound` counts as already-gone.
 Crash reclaim: destroy is legal from `creating`/`booting` so a provision
 that died mid-flight is never orphaned.
+
+### 7. `trigger` — samo-level auto-deploy poller
+
+#### The per-client timer problem
+
+Before this feature, every client project shipped its own on-box deploy
+timer (a systemd timer or cron job running `samohost app deploy` on the VM
+itself). This had two failure modes:
+
+1. **Operator explosion** — adding a new client or a new app required
+   logging in to the project VM and manually installing a new timer unit.
+2. **Credential sprawl** — each on-box timer needed `gh` auth to resolve
+   SHAs and hit the CI gate, so GitHub tokens lived on every project VM
+   instead of on the control plane where they belong.
+
+#### The poller design
+
+`samohost trigger run [--vm <name>] [--app <name>] [--dry-run] [--json]`
+performs ONE idempotent poll cycle from the samo control plane:
+
+1. Enumerate all registered `AppRecord`s joined to `VmRecord`s from the
+   local state stores.
+2. Filter: skip apps on VMs not in `{ready, adopted}` lifecycle state;
+   apply `--vm`/`--app` narrowing when provided.
+3. For each candidate, resolve the tracked-branch HEAD SHA via `resolveRef`
+   (same `gh api repos/<owner>/<name>/commits/<ref>` call the `app deploy`
+   path uses — injected for testability).
+4. Compare resolved SHA to `app.deployedSha`:
+   - **equal** → `up-to-date`; no deploy.
+   - **equals `app.failedSha`** → `known-bad`; no deploy (early skip avoids
+     a pointless SSH/CI round-trip; `runAppDeploy` would also catch it).
+   - **different** → call the injected `TriggerDeploy` (the curried form of
+     `runAppDeploy`) with the resolved SHA passed **explicitly** so
+     `runAppDeploy` never calls `resolveRef` a second time.
+5. `--dry-run` reports `would-deploy` / `up-to-date` / `known-bad` /
+   `skipped` without calling `runAppDeploy` or touching any VM.
+6. Per-app isolation: a thrown error or non-zero deploy for one app is
+   recorded and reported (`action=error|failed`) but the cycle continues
+   to the next app. No single app can abort the batch.
+
+Exit codes:
+- `0` — all candidates ended in `{deployed, up-to-date, known-bad, skipped,
+  would-deploy}` AND no unexpected errors.
+- `1` — any app's deploy returned non-zero or threw.
+
+#### Why poller over webhook
+
+Webhooks from GitHub require an inbound HTTPS endpoint with a secret, which
+adds infra and surface area. A control-plane cron/timer is simpler:
+idempotent, self-healing after downtime, and trivially tested offline. The
+CI gate inside `runAppDeploy` means a red SHA is refused regardless of poll
+frequency — over-polling is safe.
+
+#### Why reuse `runAppDeploy` instead of reimplementing
+
+`runAppDeploy` already enforces all deploy-time gates in one place:
+
+- Known-bad-SHA guard (wedge prevention from false rollbacks)
+- CI-green gate (`gh` check-runs, `checkCiGreen`)
+- Health-200 gate (live HTTP probe after restart — added in #45)
+- Rollback and bookkeeping
+
+The trigger adds ONLY the "should we deploy?" iteration layer. This keeps
+the gate logic in a single, well-tested function and ensures that the
+samo-level poller and the manual `samohost app deploy` path share the
+exact same enforcement. Changes to gates only need to be made in one place.
+
+#### Dependency injection design
+
+`TriggerDeps` has three fields:
+
+```ts
+export interface TriggerDeps {
+  resolveRef: RefResolver;   // resolve repo+branch → SHA (no deploy)
+  deploy: TriggerDeploy;     // CURRIED runAppDeploy (AppDeployDeps already bound)
+  now: () => Date;
+}
+```
+
+`deploy` is the CURRIED form — `AppDeployDeps` (SSH runner, fetch, clock)
+are bound at the prod callsite inside `defaultTriggerDeps()`. The trigger
+itself never sees `AppDeployDeps` and has no `fetch` field (no CI gate, no
+SSH runner). Unit tests inject a fake `TriggerDeploy` that records calls
+and returns a configurable exit code, keeping tests fully offline.
+
+#### Generalizes to future clients
+
+With per-client timers, adding a new game-changer or client project required
+manual on-box setup. With `trigger run`, registering a new `AppRecord` (one
+offline write to `~/.samohost/apps.json`) is sufficient — the next poll
+cycle picks it up automatically. The poller scales horizontally across any
+number of registered apps with zero per-app configuration.

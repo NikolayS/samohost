@@ -50,6 +50,11 @@ import {
   type AppBootstrapInput,
 } from "./commands/app.ts";
 import {
+  runTriggerRun,
+  defaultTriggerDeps,
+  type TriggerRunInput,
+} from "./commands/trigger.ts";
+import {
   runEnvPlan,
   runEnvCreate,
   runEnvList,
@@ -112,6 +117,7 @@ Usage:
   samohost env destroy <vm> <app> --branch <b> [--json]
   samohost env preflight <vm> [--json]
   samohost dns status <domain> [--expect-ip <ip>] [--cf-zone <z>] [--json]
+  samohost trigger run [--vm <name>] [--app <name>] [--dry-run] [--json]
   samohost --help
   samohost --version
 
@@ -265,6 +271,20 @@ dns status options (READ-ONLY: public NS/A lookups + token PRESENCE check):
   --cf-zone <zone>           zone the local Cloudflare token/config covers
                              (repeatable; default: ${DEFAULT_CLOUDFLARE_ZONES.join(", ")})
   --json                     emit the JSON report
+
+trigger run options (samo-level auto-deploy poller — replaces per-client on-box timers):
+  --vm <name>                narrow to apps on this VM only (name or id; optional)
+  --app <name>               narrow to this app only (optional)
+  --dry-run                  report what WOULD happen without deploying
+  --json                     emit a JSON TriggerRunReport
+
+  Intended to be called from a samohost-managed control-plane systemd timer.
+  One idempotent poll cycle: for each candidate app whose tracked-branch SHA
+  differs from its last-deployed SHA, delegates to \`samohost app deploy\` logic
+  (CI-green gate, health-200 gate, known-bad guard, rollback — all enforced by
+  runAppDeploy; the trigger adds only the iteration/scheduler layer).
+  Exit 0 when every candidate ended in {deployed, up-to-date, known-bad,
+  skipped, would-deploy}; exit 1 when any deploy returned non-zero or threw.
 `;
 
 export interface ParsedPreview {
@@ -398,6 +418,12 @@ export interface ParsedDoctor {
   json: boolean;
 }
 
+export interface ParsedTriggerRun {
+  kind: "trigger-run";
+  input: TriggerRunInput;
+  json: boolean;
+}
+
 export type ParsedCommand =
   | ParsedPreview
   | ParsedProvision
@@ -421,6 +447,7 @@ export type ParsedCommand =
   | ParsedEnvPreflight
   | ParsedDnsStatus
   | ParsedDoctor
+  | ParsedTriggerRun
   | { kind: "help" }
   | { kind: "version" };
 
@@ -483,6 +510,9 @@ export function parseArgs(
   }
   if (first === "dns") {
     return parseDns(argv.slice(1));
+  }
+  if (first === "trigger") {
+    return parseTrigger(argv.slice(1));
   }
 
   // A bare --help/--version may also appear after an (absent) command.
@@ -1472,6 +1502,57 @@ function readPubkeyFile(path: string): string {
   }
 }
 
+// ---------------------------------------------------------------------------
+// trigger subcommands
+// ---------------------------------------------------------------------------
+
+function parseTrigger(args: string[]): ParsedTriggerRun {
+  const sub = args[0];
+  if (sub === undefined) {
+    throw new UsageError("trigger requires a subcommand: run");
+  }
+  if (sub !== "run") {
+    throw new UsageError(`unknown trigger subcommand: ${sub}`);
+  }
+  return parseTriggerRun(args.slice(1));
+}
+
+function parseTriggerRun(args: string[]): ParsedTriggerRun {
+  let vm: string | undefined;
+  let app: string | undefined;
+  let dryRun = false;
+  let json = false;
+
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i]!;
+    switch (a) {
+      case "--vm":
+        vm = takeValue(args, i, a);
+        i++;
+        break;
+      case "--app":
+        app = takeValue(args, i, a);
+        i++;
+        break;
+      case "--dry-run":
+        dryRun = true;
+        break;
+      case "--json":
+        json = true;
+        break;
+      default:
+        throw new UsageError(`unknown flag: ${a}`);
+    }
+  }
+
+  const input: TriggerRunInput = {
+    dryRun,
+    ...(vm !== undefined ? { vm } : {}),
+    ...(app !== undefined ? { app } : {}),
+  };
+  return { kind: "trigger-run", input, json };
+}
+
 /** Entry point. Returns the process exit code. */
 export async function main(
   argv: string[],
@@ -1672,6 +1753,16 @@ export async function main(
         { json: cmd.json },
         new StateStore(),
         defaultAppStore(),
+        out,
+        err,
+      );
+    case "trigger-run":
+      return runTriggerRun(
+        cmd.input,
+        { json: cmd.json },
+        new StateStore(),
+        defaultAppStore(),
+        defaultTriggerDeps(),
         out,
         err,
       );
