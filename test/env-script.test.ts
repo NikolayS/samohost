@@ -1472,11 +1472,28 @@ describe("static env-create path (kind='static')", () => {
 
   test("static create script health probe uses Host-header curl against local Caddy (not localhost:PORT)", () => {
     const s = buildEnvCreateScript(app({ kind: "static" }), target({ dbBackend: "none" }));
-    // Must use the HTTPS + Host header approach.
-    expect(s).toContain('-H "Host: $SAMOHOST_VHOST"');
-    expect(s).toContain("https://127.0.0.1/");
     // Must NOT poll the app port (nothing listens there for static sites).
     expect(s).not.toContain("http://localhost:${SAMOHOST_PORT}/");
+    // Must use the HTTPS approach (retain pre-existing assertion for curl structure).
+    expect(s).toContain("https://");
+  });
+
+  // Issue #46: static health probe must use --resolve so curl sends the correct
+  // TLS SNI (the vhost name), not 127.0.0.1 (for which Caddy has no cert).
+  // Proven live: `-H "Host: $SAMOHOST_VHOST" https://127.0.0.1/` triggers a
+  // handshake failure (SNI=127.0.0.1 → no cert → 000) even though Caddy serves
+  // a real 200 externally. `--resolve` sets BOTH the TCP destination AND the
+  // TLS SNI to the vhost, so Caddy selects the right cert and the health probe
+  // reflects the actual state of the site.
+  test("static health probe uses --resolve so SNI matches the vhost (issue #46)", () => {
+    const s = buildEnvCreateScript(app({ kind: "static" }), target({ dbBackend: "none" }));
+    // New form: --resolve "$SAMOHOST_VHOST:443:127.0.0.1" "https://$SAMOHOST_VHOST/"
+    expect(s).toContain('--resolve "$SAMOHOST_VHOST:443:127.0.0.1"');
+    expect(s).toContain('"https://$SAMOHOST_VHOST/"');
+    // Old form must be gone: it sent SNI=127.0.0.1 → handshake fail → 000.
+    expect(s).not.toContain('-H "Host: $SAMOHOST_VHOST" https://127.0.0.1/');
+    // Script must still be valid bash.
+    expect(bashSyntaxOk(s)).toBe(true);
   });
 
   test("static create script health probe checks for 200 in the retry loop", () => {
