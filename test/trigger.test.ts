@@ -13,6 +13,13 @@
  *  - Per-app isolation: one app's failure/throw must not abort the cycle.
  *  - Exit 0 when all candidates are {deployed, up-to-date, known-bad, skipped}.
  *  - Exit 1 when any app's deploy returned non-zero or threw.
+ *
+ * New in #52: trigger calls checkCiGreen (via injected fetch) BEFORE deciding
+ * to call deps.deploy. pending/none/red CI → action=skipped (transient, exit 0).
+ * Only on CI "success" does trigger call deps.deploy. Genuine deploy-execution
+ * failures (deploy returned non-zero) remain action=failed (exit 1). Same-SHA
+ * and known-bad short-circuit BEFORE the CI call (no unnecessary fetch).
+ * Dry-run is also offline-safe (no CI call, no deploy).
  */
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
@@ -107,6 +114,30 @@ function makeFakeDeploy(exitCode = 0): {
 }
 
 // ---------------------------------------------------------------------------
+// Fake fetch factory: returns a workflow_runs response with the given CI state.
+// Records whether it was called and how many times.
+// ---------------------------------------------------------------------------
+
+/**
+ * Build a fake fetch that returns the given workflow_runs payload.
+ * Mimics the same pattern used in test/app-cigate.test.ts.
+ */
+function makeFakeFetch(
+  runs: Array<{ status?: string; conclusion?: string | null }>,
+  opts: { ok?: boolean } = {},
+): { fetch: typeof globalThis.fetch; callCount: () => number } {
+  let count = 0;
+  const fakeFetch = (async (_url: unknown, _init?: unknown) => {
+    count++;
+    return {
+      ok: opts.ok ?? true,
+      json: async () => ({ workflow_runs: runs }),
+    } as Response;
+  }) as unknown as typeof globalThis.fetch;
+  return { fetch: fakeFetch, callCount: () => count };
+}
+
+// ---------------------------------------------------------------------------
 // Shared setup
 // ---------------------------------------------------------------------------
 
@@ -124,17 +155,364 @@ describe("trigger run", () => {
   afterEach(() => rmSync(dir, { recursive: true, force: true }));
 
   // -------------------------------------------------------------------------
-  // Test 1: new SHA → deploy called once with resolved SHA; action deployed;
-  //         report.deployed === 1
+  // NEW Test 1 (brief #52 case 1): new SHA, CI success →
+  //   deploy called once, action=deployed, exit 0
   // -------------------------------------------------------------------------
+  test("new-1 — new SHA, CI success: deploy called once; action=deployed; exit 0", async () => {
+    vmStore.upsert(makeVm());
+    appStore.upsert(makeApp({ deployedSha: SHA_OLD }));
+
+    const { deploy, calls } = makeFakeDeploy(0);
+    const { fetch: fakeFetch, callCount } = makeFakeFetch([
+      { status: "completed", conclusion: "success" },
+    ]);
+
+    const deps: TriggerDeps = {
+      resolveRef: (_repo, _branch) => Promise.resolve(SHA_A),
+      deploy,
+      fetch: fakeFetch,
+      env: { GH_TOKEN: "ghp_test" },
+      now: () => new Date("2026-06-15T10:00:00.000Z"),
+    };
+
+    const c = capture();
+    const code = await runTriggerRun({ dryRun: false }, { json: true }, vmStore, appStore, deps, c.out, c.err);
+
+    const report: TriggerRunReport = JSON.parse(c.o);
+
+    // CI must have been checked
+    expect(callCount()).toBeGreaterThanOrEqual(1);
+    // deploy must have been called exactly once
+    expect(calls.length).toBe(1);
+    // resolved SHA must be passed explicitly
+    expect(calls[0]!.input.sha).toBe(SHA_A);
+    expect(calls[0]!.input.app).toBe("field-record");
+    expect(calls[0]!.input.vm).toBe("samo-we-field-record");
+
+    expect(report.results[0]!.action).toBe("deployed");
+    expect(report.deployed).toBe(1);
+    expect(report.failed).toBe(0);
+    expect(code).toBe(0);
+  });
+
+  // -------------------------------------------------------------------------
+  // NEW Test 2 (brief #52 case 2): new SHA, CI pending →
+  //   deploy NOT called, action=skipped, reason=ci-pending, exit 0
+  // -------------------------------------------------------------------------
+  test("new-2 — new SHA, CI pending: deploy NOT called; action=skipped; reason=ci-pending; exit 0", async () => {
+    vmStore.upsert(makeVm());
+    appStore.upsert(makeApp({ deployedSha: SHA_OLD }));
+
+    const { deploy, calls } = makeFakeDeploy(0);
+    const { fetch: fakeFetch, callCount } = makeFakeFetch([
+      { status: "in_progress", conclusion: null },
+    ]);
+
+    const deps: TriggerDeps = {
+      resolveRef: () => Promise.resolve(SHA_A),
+      deploy,
+      fetch: fakeFetch,
+      env: {},
+      now: () => new Date(),
+    };
+
+    const c = capture();
+    const code = await runTriggerRun({ dryRun: false }, { json: true }, vmStore, appStore, deps, c.out, c.err);
+
+    const report: TriggerRunReport = JSON.parse(c.o);
+
+    expect(callCount()).toBeGreaterThanOrEqual(1);
+    expect(calls.length).toBe(0);
+
+    const result = report.results[0]!;
+    expect(result.action).toBe("skipped");
+    expect(result.reason).toBe("ci-pending");
+    expect(report.failed).toBe(0);
+    expect(report.skipped).toBe(1);
+    expect(code).toBe(0);
+  });
+
+  // -------------------------------------------------------------------------
+  // NEW Test 3 (brief #52 case 3): new SHA, CI failure →
+  //   deploy NOT called, action=skipped, reason=ci-red, exit 0
+  // -------------------------------------------------------------------------
+  test("new-3 — new SHA, CI failure: deploy NOT called; action=skipped; reason=ci-red; exit 0", async () => {
+    vmStore.upsert(makeVm());
+    appStore.upsert(makeApp({ deployedSha: SHA_OLD }));
+
+    const { deploy, calls } = makeFakeDeploy(0);
+    const { fetch: fakeFetch, callCount } = makeFakeFetch([
+      { status: "completed", conclusion: "failure" },
+    ]);
+
+    const deps: TriggerDeps = {
+      resolveRef: () => Promise.resolve(SHA_A),
+      deploy,
+      fetch: fakeFetch,
+      env: {},
+      now: () => new Date(),
+    };
+
+    const c = capture();
+    const code = await runTriggerRun({ dryRun: false }, { json: true }, vmStore, appStore, deps, c.out, c.err);
+
+    const report: TriggerRunReport = JSON.parse(c.o);
+
+    expect(callCount()).toBeGreaterThanOrEqual(1);
+    expect(calls.length).toBe(0);
+
+    const result = report.results[0]!;
+    expect(result.action).toBe("skipped");
+    expect(result.reason).toBe("ci-red");
+    expect(report.failed).toBe(0);
+    expect(report.skipped).toBe(1);
+    expect(code).toBe(0);
+  });
+
+  // -------------------------------------------------------------------------
+  // NEW Test 4 (brief #52 case 4): new SHA, CI none (empty runs) →
+  //   deploy NOT called, action=skipped, reason=ci-none, exit 0
+  // -------------------------------------------------------------------------
+  test("new-4 — new SHA, CI none: deploy NOT called; action=skipped; reason=ci-none; exit 0", async () => {
+    vmStore.upsert(makeVm());
+    appStore.upsert(makeApp({ deployedSha: SHA_OLD }));
+
+    const { deploy, calls } = makeFakeDeploy(0);
+    const { fetch: fakeFetch, callCount } = makeFakeFetch([]); // empty runs → "none"
+
+    const deps: TriggerDeps = {
+      resolveRef: () => Promise.resolve(SHA_A),
+      deploy,
+      fetch: fakeFetch,
+      env: {},
+      now: () => new Date(),
+    };
+
+    const c = capture();
+    const code = await runTriggerRun({ dryRun: false }, { json: true }, vmStore, appStore, deps, c.out, c.err);
+
+    const report: TriggerRunReport = JSON.parse(c.o);
+
+    expect(callCount()).toBeGreaterThanOrEqual(1);
+    expect(calls.length).toBe(0);
+
+    const result = report.results[0]!;
+    expect(result.action).toBe("skipped");
+    expect(result.reason).toBe("ci-none");
+    expect(report.failed).toBe(0);
+    expect(report.skipped).toBe(1);
+    expect(code).toBe(0);
+  });
+
+  // -------------------------------------------------------------------------
+  // NEW Test 5 (brief #52 case 5): new SHA, CI success, but deploy returns
+  //   non-zero (genuine deploy failure) →
+  //   action=failed, report.failed===1, exit 1
+  // -------------------------------------------------------------------------
+  test("new-5 — new SHA, CI success, deploy fails: action=failed; failed===1; exit 1", async () => {
+    vmStore.upsert(makeVm());
+    appStore.upsert(makeApp({ deployedSha: SHA_OLD }));
+
+    // CI says green, but deploy execution fails
+    const { deploy, calls } = makeFakeDeploy(1);
+    const { fetch: fakeFetch, callCount } = makeFakeFetch([
+      { status: "completed", conclusion: "success" },
+    ]);
+
+    const deps: TriggerDeps = {
+      resolveRef: () => Promise.resolve(SHA_A),
+      deploy,
+      fetch: fakeFetch,
+      env: {},
+      now: () => new Date(),
+    };
+
+    const c = capture();
+    const code = await runTriggerRun({ dryRun: false }, { json: true }, vmStore, appStore, deps, c.out, c.err);
+
+    const report: TriggerRunReport = JSON.parse(c.o);
+
+    // CI was checked
+    expect(callCount()).toBeGreaterThanOrEqual(1);
+    // deploy was called (CI was green)
+    expect(calls.length).toBe(1);
+
+    const result = report.results[0]!;
+    expect(result.action).toBe("failed");
+    expect(report.failed).toBe(1);
+    expect(report.deployed).toBe(0);
+    expect(code).toBe(1);
+  });
+
+  // -------------------------------------------------------------------------
+  // NEW Test 6 (brief #52 case 6): same-SHA → up-to-date, NO CI call
+  //   (fetch must NOT be invoked for this app)
+  // -------------------------------------------------------------------------
+  test("new-6 — same-SHA: action=up-to-date; NO CI call (fetch not invoked)", async () => {
+    vmStore.upsert(makeVm());
+    appStore.upsert(makeApp({ deployedSha: SHA_A }));
+
+    const { deploy, calls } = makeFakeDeploy(0);
+    const { fetch: fakeFetch, callCount } = makeFakeFetch([
+      { status: "completed", conclusion: "success" },
+    ]);
+
+    const deps: TriggerDeps = {
+      resolveRef: () => Promise.resolve(SHA_A),
+      deploy,
+      fetch: fakeFetch,
+      env: {},
+      now: () => new Date(),
+    };
+
+    const c = capture();
+    const code = await runTriggerRun({ dryRun: false }, { json: true }, vmStore, appStore, deps, c.out, c.err);
+
+    const report: TriggerRunReport = JSON.parse(c.o);
+
+    // No CI call — up-to-date short-circuits before CI check
+    expect(callCount()).toBe(0);
+    expect(calls.length).toBe(0);
+    expect(report.results[0]!.action).toBe("up-to-date");
+    expect(code).toBe(0);
+  });
+
+  // -------------------------------------------------------------------------
+  // NEW Test 7 (brief #52 case 7): known-bad SHA → known-bad, NO CI call
+  // -------------------------------------------------------------------------
+  test("new-7 — known-bad SHA: action=known-bad; NO CI call (fetch not invoked)", async () => {
+    vmStore.upsert(makeVm());
+    appStore.upsert(makeApp({ failedSha: SHA_FAILED }));
+
+    const { deploy, calls } = makeFakeDeploy(0);
+    const { fetch: fakeFetch, callCount } = makeFakeFetch([
+      { status: "completed", conclusion: "success" },
+    ]);
+
+    const deps: TriggerDeps = {
+      resolveRef: () => Promise.resolve(SHA_FAILED),
+      deploy,
+      fetch: fakeFetch,
+      env: {},
+      now: () => new Date(),
+    };
+
+    const c = capture();
+    const code = await runTriggerRun({ dryRun: false }, { json: true }, vmStore, appStore, deps, c.out, c.err);
+
+    const report: TriggerRunReport = JSON.parse(c.o);
+
+    // No CI call — known-bad short-circuits before CI check
+    expect(callCount()).toBe(0);
+    expect(calls.length).toBe(0);
+    expect(report.results[0]!.action).toBe("known-bad");
+    expect(code).toBe(0);
+  });
+
+  // -------------------------------------------------------------------------
+  // NEW Test 8 (brief #52 case 8): --dry-run, new SHA →
+  //   would-deploy, NO deploy, NO CI call (offline-safe)
+  // -------------------------------------------------------------------------
+  test("new-8 — dry-run, new SHA: action=would-deploy; NO deploy; NO CI call", async () => {
+    vmStore.upsert(makeVm());
+    appStore.upsert(makeApp({ deployedSha: SHA_OLD }));
+
+    const { deploy, calls } = makeFakeDeploy(0);
+    const { fetch: fakeFetch, callCount } = makeFakeFetch([
+      { status: "completed", conclusion: "success" },
+    ]);
+
+    const deps: TriggerDeps = {
+      resolveRef: () => Promise.resolve(SHA_A),
+      deploy,
+      fetch: fakeFetch,
+      env: {},
+      now: () => new Date(),
+    };
+
+    const c = capture();
+    const code = await runTriggerRun({ dryRun: true }, { json: true }, vmStore, appStore, deps, c.out, c.err);
+
+    const report: TriggerRunReport = JSON.parse(c.o);
+
+    // dry-run must not call CI or deploy
+    expect(callCount()).toBe(0);
+    expect(calls.length).toBe(0);
+
+    const result = report.results[0]!;
+    expect(result.action).toBe("would-deploy");
+    expect(result.sha).toBe(SHA_A);
+    expect(code).toBe(0);
+  });
+
+  // -------------------------------------------------------------------------
+  // NEW Test 9 (brief #52 case 9): per-app isolation preserved —
+  //   two apps, first's deploy throws → second still processed; exit 1
+  //   (Note: both apps get CI=success so deploy IS called for both)
+  // -------------------------------------------------------------------------
+  test("new-9 — isolation: first deploy throws; second still processed; exit 1", async () => {
+    vmStore.upsert(makeVm());
+    appStore.upsert(makeApp({ name: "app-one", id: "app-one-id", deployedSha: SHA_OLD }));
+    appStore.upsert(makeApp({ name: "app-two", id: "app-two-id", deployedSha: SHA_OLD }));
+
+    const { fetch: fakeFetch } = makeFakeFetch([
+      { status: "completed", conclusion: "success" },
+    ]);
+
+    let callCount = 0;
+    const deploy: TriggerDeps["deploy"] = async (input, _opts, _vmStore, _appStore, _out, _err) => {
+      callCount++;
+      if (input.app === "app-one") throw new Error("network failure");
+      return 0;
+    };
+
+    const deps: TriggerDeps = {
+      resolveRef: () => Promise.resolve(SHA_A),
+      deploy,
+      fetch: fakeFetch,
+      env: {},
+      now: () => new Date(),
+    };
+
+    const c = capture();
+    const code = await runTriggerRun({ dryRun: false }, { json: true }, vmStore, appStore, deps, c.out, c.err);
+
+    const report: TriggerRunReport = JSON.parse(c.o);
+    expect(report.results.length).toBe(2);
+
+    const appOneResult = report.results.find((r) => r.app === "app-one")!;
+    const appTwoResult = report.results.find((r) => r.app === "app-two")!;
+
+    expect(appOneResult).toBeDefined();
+    expect(appTwoResult).toBeDefined();
+    expect(appOneResult.action).toBe("error");
+    // second app was still processed (CI checked + deploy attempted)
+    expect(["deployed", "failed", "up-to-date"].includes(appTwoResult.action)).toBe(true);
+
+    // cycle exit must be 1 because of the error
+    expect(code).toBe(1);
+  });
+
+  // -------------------------------------------------------------------------
+  // Existing tests — kept for regression (reframed where needed for #52)
+  // -------------------------------------------------------------------------
+
+  // Test 1 (original): basic deploy path — CI success → deploy called once.
+  // Now uses fetch injection because trigger calls checkCiGreen.
   test("1 — new SHA: deploy called once with resolved SHA; action=deployed; deployed===1", async () => {
     vmStore.upsert(makeVm());
     appStore.upsert(makeApp({ deployedSha: SHA_OLD }));
 
     const { deploy, calls } = makeFakeDeploy(0);
+    const { fetch: fakeFetch } = makeFakeFetch([
+      { status: "completed", conclusion: "success" },
+    ]);
+
     const deps: TriggerDeps = {
       resolveRef: (_repo, _branch) => Promise.resolve(SHA_A),
       deploy,
+      fetch: fakeFetch,
+      env: {},
       now: () => new Date("2026-06-15T10:00:00.000Z"),
     };
 
@@ -156,17 +534,19 @@ describe("trigger run", () => {
     expect(code).toBe(0);
   });
 
-  // -------------------------------------------------------------------------
-  // Test 2: resolved SHA === app.deployedSha → deploy NOT called; action up-to-date
-  // -------------------------------------------------------------------------
+  // Test 2 (original): up-to-date — no CI call, no deploy.
   test("2 — up-to-date: deploy NOT called; action=up-to-date", async () => {
     vmStore.upsert(makeVm());
     appStore.upsert(makeApp({ deployedSha: SHA_A }));
 
     const { deploy, calls } = makeFakeDeploy(0);
+    const { fetch: fakeFetch } = makeFakeFetch([]);
+
     const deps: TriggerDeps = {
       resolveRef: () => Promise.resolve(SHA_A),
       deploy,
+      fetch: fakeFetch,
+      env: {},
       now: () => new Date(),
     };
 
@@ -177,18 +557,19 @@ describe("trigger run", () => {
     expect(code).toBe(0);
   });
 
-  // -------------------------------------------------------------------------
-  // Test 3: resolved SHA === app.failedSha → deploy NOT called; action=known-bad
-  //         single-app cycle with only known-bad → exit 0, failed===0, skipped===1
-  // -------------------------------------------------------------------------
+  // Test 3 (original): known-bad — no CI call, no deploy; exit 0, skipped===1.
   test("3 — known-bad: deploy NOT called; exit 0; skipped===1; failed===0", async () => {
     vmStore.upsert(makeVm());
     appStore.upsert(makeApp({ failedSha: SHA_FAILED }));
 
     const { deploy, calls } = makeFakeDeploy(0);
+    const { fetch: fakeFetch } = makeFakeFetch([]);
+
     const deps: TriggerDeps = {
       resolveRef: () => Promise.resolve(SHA_FAILED),
       deploy,
+      fetch: fakeFetch,
+      env: {},
       now: () => new Date(),
     };
 
@@ -205,18 +586,19 @@ describe("trigger run", () => {
     expect(result.action).toBe("known-bad");
   });
 
-  // -------------------------------------------------------------------------
-  // Test 4: VM lifecycleState 'destroyed' → app skipped; deploy NOT called;
-  //         action=skipped, reason mentions state
-  // -------------------------------------------------------------------------
+  // Test 4 (original): destroyed VM → skipped.
   test("4 — destroyed VM: app skipped; deploy NOT called; action=skipped, reason mentions state", async () => {
     vmStore.upsert(makeVm({ lifecycleState: "destroyed" }));
     appStore.upsert(makeApp());
 
     const { deploy, calls } = makeFakeDeploy(0);
+    const { fetch: fakeFetch } = makeFakeFetch([]);
+
     const deps: TriggerDeps = {
       resolveRef: () => Promise.resolve(SHA_A),
       deploy,
+      fetch: fakeFetch,
+      env: {},
       now: () => new Date(),
     };
 
@@ -232,18 +614,19 @@ describe("trigger run", () => {
     expect(result.reason).toMatch(/destroyed/);
   });
 
-  // -------------------------------------------------------------------------
-  // Test 5: --dry-run with a new SHA → deploy NOT called; action=would-deploy
-  //         with the sha
-  // -------------------------------------------------------------------------
+  // Test 5 (original): dry-run → would-deploy, no deploy, no CI call.
   test("5 — dry-run: deploy NOT called; action=would-deploy with sha", async () => {
     vmStore.upsert(makeVm());
     appStore.upsert(makeApp({ deployedSha: SHA_OLD }));
 
     const { deploy, calls } = makeFakeDeploy(0);
+    const { fetch: fakeFetch } = makeFakeFetch([]);
+
     const deps: TriggerDeps = {
       resolveRef: () => Promise.resolve(SHA_A),
       deploy,
+      fetch: fakeFetch,
+      env: {},
       now: () => new Date(),
     };
 
@@ -259,14 +642,16 @@ describe("trigger run", () => {
     expect(result.sha).toBe(SHA_A);
   });
 
-  // -------------------------------------------------------------------------
-  // Test 6: per-app isolation: two apps, first's deploy throws → second still
-  //         processed; cycle exit 1; both appear in results (first=error, second ok)
-  // -------------------------------------------------------------------------
+  // Test 6 (original): per-app isolation — first deploy throws, second processed.
+  // Now uses fetch injection.
   test("6 — isolation: first deploy throws, second is still processed; exit 1", async () => {
     vmStore.upsert(makeVm());
     appStore.upsert(makeApp({ name: "app-one", id: "app-one-id", deployedSha: SHA_OLD }));
     appStore.upsert(makeApp({ name: "app-two", id: "app-two-id", deployedSha: SHA_OLD }));
+
+    const { fetch: fakeFetch } = makeFakeFetch([
+      { status: "completed", conclusion: "success" },
+    ]);
 
     let callCount = 0;
     const deploy: TriggerDeps["deploy"] = async (input, _opts, _vmStore, _appStore, _out, _err) => {
@@ -278,6 +663,8 @@ describe("trigger run", () => {
     const deps: TriggerDeps = {
       resolveRef: () => Promise.resolve(SHA_A),
       deploy,
+      fetch: fakeFetch,
+      env: {},
       now: () => new Date(),
     };
 
@@ -301,26 +688,32 @@ describe("trigger run", () => {
     expect(code).toBe(1);
   });
 
-  // -------------------------------------------------------------------------
-  // Test 6b: non-throw exit-1 deploy (simulates CI refused / rolled-back) →
-  //          action=failed; report.failed===1; cycle exit 1
-  // -------------------------------------------------------------------------
-  test("6b — non-throw exit-1 deploy: action=failed; failed===1; exit 1", async () => {
+  // Test 6b (original, reframed for #52): non-throw exit-1 deploy (genuine deploy
+  // EXECUTION failure after CI was already confirmed green) → action=failed;
+  // report.failed===1; cycle exit 1.
+  // This is NOT a CI-block scenario — CI passed; runAppDeploy itself returned non-zero.
+  test("6b — genuine deploy failure (non-throw exit-1, CI success): action=failed; failed===1; exit 1", async () => {
     vmStore.upsert(makeVm());
     appStore.upsert(makeApp({ deployedSha: SHA_OLD }));
 
-    // fake deploy returns 1 (e.g. CI gate refused or deploy rolled back)
+    // CI says green, but deploy execution returns non-zero
     const { deploy, calls } = makeFakeDeploy(1);
+    const { fetch: fakeFetch } = makeFakeFetch([
+      { status: "completed", conclusion: "success" },
+    ]);
+
     const deps: TriggerDeps = {
       resolveRef: () => Promise.resolve(SHA_A),
       deploy,
+      fetch: fakeFetch,
+      env: {},
       now: () => new Date(),
     };
 
     const c = capture();
     const code = await runTriggerRun({ dryRun: false }, { json: true }, vmStore, appStore, deps, c.out, c.err);
 
-    // deploy was called
+    // deploy was called (CI was green)
     expect(calls.length).toBe(1);
 
     const report: TriggerRunReport = JSON.parse(c.o);
@@ -334,10 +727,8 @@ describe("trigger run", () => {
     expect(code).toBe(1);
   });
 
-  // -------------------------------------------------------------------------
-  // Test 7: multi-app cycle: one up-to-date + one deployed → exit 0,
-  //         deployed===1, skipped>=1
-  // -------------------------------------------------------------------------
+  // Test 7 (original): multi-app cycle: up-to-date + deployed → exit 0.
+  // Uses fetch injection.
   test("7 — multi-app cycle: up-to-date + deployed → exit 0; deployed===1; skipped>=1", async () => {
     vmStore.upsert(makeVm());
     // app-alpha: already up-to-date (same SHA)
@@ -345,10 +736,16 @@ describe("trigger run", () => {
     // app-beta: has old SHA → will be deployed
     appStore.upsert(makeApp({ name: "app-beta", id: "app-beta-id", deployedSha: SHA_OLD }));
 
+    const { fetch: fakeFetch } = makeFakeFetch([
+      { status: "completed", conclusion: "success" },
+    ]);
+
     let resolveCallCount = 0;
     const deps: TriggerDeps = {
       resolveRef: () => { resolveCallCount++; return Promise.resolve(SHA_A); },
       deploy: makeFakeDeploy(0).deploy,
+      fetch: fakeFetch,
+      env: {},
       now: () => new Date(),
     };
 
@@ -362,18 +759,23 @@ describe("trigger run", () => {
     expect(report.results.length).toBe(2);
   });
 
-  // -------------------------------------------------------------------------
-  // Test 8: --vm / --app narrowing selects only the matching app
-  // -------------------------------------------------------------------------
+  // Test 8 (original): --vm / --app narrowing.
+  // Uses fetch injection.
   test("8 — --vm/--app narrowing: only matching app processed", async () => {
     vmStore.upsert(makeVm());
     appStore.upsert(makeApp({ name: "app-one", id: "app-one-id", deployedSha: SHA_OLD }));
     appStore.upsert(makeApp({ name: "app-two", id: "app-two-id", deployedSha: SHA_OLD }));
 
     const { deploy, calls } = makeFakeDeploy(0);
+    const { fetch: fakeFetch } = makeFakeFetch([
+      { status: "completed", conclusion: "success" },
+    ]);
+
     const deps: TriggerDeps = {
       resolveRef: () => Promise.resolve(SHA_A),
       deploy,
+      fetch: fakeFetch,
+      env: {},
       now: () => new Date(),
     };
 
@@ -431,22 +833,18 @@ describe("parseArgs trigger", () => {
 });
 
 // ---------------------------------------------------------------------------
-// Structural assertion: trigger does NOT call checkCiGreen directly.
-// (The CI gate lives in runAppDeploy — the trigger is just a scheduler.)
-// We verify this by ensuring no real `fetch` is ever passed into the trigger
-// (only the fake deploy fn is injected). If the trigger imported checkCiGreen
-// and called it, we would see that in coverage or require additional injection.
-// This test documents the contract by checking that a trigger run with a fake
-// deploy that returns 0 never requires a fetch implementation.
+// Structural assertion: TriggerDeps NOW has fetch + env fields (added in #52).
+// The trigger uses them to call checkCiGreen before deciding to deploy.
 // ---------------------------------------------------------------------------
-test("structural — trigger accepts no fetch dep (CI gate is in runAppDeploy, not trigger)", () => {
-  // TriggerDeps has no `fetch` field — this is enforced by TypeScript.
-  // At runtime, verify that a complete TriggerDeps can be constructed without fetch:
+test("structural — TriggerDeps has fetch and env fields (added in #52)", () => {
+  // Verify that a complete TriggerDeps requires fetch:
   const deps: TriggerDeps = {
     resolveRef: () => Promise.resolve("abc123"),
     deploy: async () => 0,
+    fetch: globalThis.fetch,
+    env: { GH_TOKEN: "test" },
     now: () => new Date(),
   };
-  // No `fetch` property on deps
-  expect("fetch" in deps).toBe(false);
+  expect("fetch" in deps).toBe(true);
+  expect("env" in deps).toBe(true);
 });
