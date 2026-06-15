@@ -96,12 +96,53 @@ describe("deployOutcome", () => {
     expect(deployOutcome(events)).toBe("incomplete");
   });
 
-  test("pure garbage → 'deployed' (no failures, no pending starts)", () => {
-    // Edge: empty event list means nothing failed and nothing is mid-flight.
-    // parseDeployOutcome on raw garbage yields no events.
+  test("empty/garbage stream → 'incomplete' (no health:ok = no false success)", () => {
+    // An empty event list means we never saw health:ok — we cannot claim the
+    // app is actually serving. Connection dropped before any markers emitted.
     const { events, outcome } = parseDeployOutcome("just some build noise\n");
     expect(events).toEqual([]);
-    expect(outcome).toBe("deployed");
+    expect(outcome).toBe("incomplete");
+  });
+
+  test("stream truncated after restart:ok with no health phase → 'incomplete'", () => {
+    // fetch ok, checkout ok, install ok, build ok, restart ok — but health
+    // never ran (connection dropped). The app may or may not be serving.
+    const events = parsePhaseStream(
+      [
+        m("fetch", "start"), m("fetch", "ok"),
+        m("checkout", "start"), m("checkout", "ok"),
+        m("install", "start"), m("install", "ok"),
+        m("build", "start"), m("build", "ok"),
+        m("restart", "start"), m("restart", "ok"),
+      ].join("\n"),
+    );
+    expect(deployOutcome(events)).toBe("incomplete");
+  });
+
+  test("health:ok present, then seed:start + seed:ok → 'deployed'", () => {
+    const events = parsePhaseStream(
+      [
+        m("fetch", "start"), m("fetch", "ok"),
+        m("build", "start"), m("build", "ok"),
+        m("restart", "start"), m("restart", "ok"),
+        m("health", "start"), m("health", "ok"),
+        m("seed", "start"), m("seed", "ok"),
+      ].join("\n"),
+    );
+    expect(deployOutcome(events)).toBe("deployed");
+  });
+
+  test("health:ok present, then seed:start + seed:fail → 'incomplete'", () => {
+    // App is live but seed failed — the deploy is not complete.
+    const events = parsePhaseStream(
+      [
+        m("build", "start"), m("build", "ok"),
+        m("restart", "start"), m("restart", "ok"),
+        m("health", "start"), m("health", "ok"),
+        m("seed", "start"), m("seed", "fail"),
+      ].join("\n"),
+    );
+    expect(deployOutcome(events)).toBe("incomplete");
   });
 
   test("garbage interleaved with a real rollback is still detected", () => {
