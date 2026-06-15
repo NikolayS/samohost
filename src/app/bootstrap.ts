@@ -645,9 +645,13 @@ export function buildHostBootstrapScript(
     `  chmod 600 "$TOKEN_FILE"`,
     `  # The inline credential helper reads the token file BY PATH at runtime.`,
     `  # The token value NEVER appears in argv, the remote URL, or git config.`,
-    // Full clone on ONE line: token-file path (not value) read at runtime by 'cat $TOKEN_FILE'.
-    // git clone is kept on a single line so tests can grep for 'git clone' + verify no --depth.
-    `  sudo -u ${sq(appUser)} GIT_CONFIG_GLOBAL="$GIT_SAFE_CONF" git -c "credential.helper=!f() { echo username=x-access-token; echo \\"password=$(cat $TOKEN_FILE)\\"; }; f" clone "$REPO_URL" "$APP_DIR"`,
+    // Fix (samorev #32): the credential helper value MUST be single-quoted so that
+    // $(cat $TOKEN_FILE) is only evaluated LAZILY when git invokes the helper —
+    // not at bash-invocation time (which would expand the token value into git's
+    // argv, visible in /proc/<pid>/cmdline). The double-quoted form is the BUG.
+    // Single-quoting matches the persist line a few lines below and the proven
+    // field-record-1 stack-prep.sh pattern.
+    `  sudo -u ${sq(appUser)} GIT_CONFIG_GLOBAL="$GIT_SAFE_CONF" git -c 'credential.helper=!f() { echo username=x-access-token; echo "password=$(cat $TOKEN_FILE)"; }; f' clone "$REPO_URL" "$APP_DIR"`,
     `  sudo -u ${sq(appUser)} GIT_CONFIG_GLOBAL="$GIT_SAFE_CONF" git -C "$APP_DIR" remote set-url origin "$REPO_URL"`,
     `  echo "clone: complete; origin set to public URL (token only via runtime helper)"`,
     `  # Persist the credential helper in the app user's global gitconfig so LATER`,
