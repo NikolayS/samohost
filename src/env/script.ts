@@ -503,17 +503,25 @@ function buildStaticEnvCreateScript(
     ),
   );
 
-  // ----- health: prove Caddy SERVES index.html via Host-header curl ---------
+  // ----- health: prove Caddy SERVES index.html via --resolve curl -----------
   // Nothing listens on $SAMOHOST_PORT for a static env, so we cannot poll
-  // localhost:$PORT. Instead, curl Caddy's local HTTPS listener with the
-  // vhost's Host header. -k allows the in-flight self-signed cert (ACME may
-  // not yet have issued the real cert at first-create time).
+  // localhost:$PORT. Instead, curl Caddy's local HTTPS listener using
+  // --resolve so that BOTH the TCP connection (127.0.0.1) AND the TLS SNI
+  // are set to the vhost name. This is critical: the old form
+  //   -H "Host: $SAMOHOST_VHOST" https://127.0.0.1/
+  // sent SNI=127.0.0.1, for which Caddy has no cert → TLS handshake failure
+  // → 000 → false health-fail even when the site serves a real 200 externally.
+  // --resolve "$SAMOHOST_VHOST:443:127.0.0.1" makes curl connect to 127.0.0.1
+  // while presenting the vhost as both the SNI and the Host header, so Caddy
+  // selects the right cert/site and the probe reflects actual site health.
+  // -k allows the in-flight self-signed cert (ACME may not yet have issued
+  // the real cert at first-create time).
   lines.push(
-    `# --- health: prove Caddy serves the static vhost (Host-header curl) ---`,
+    `# --- health: prove Caddy serves the static vhost (--resolve curl, SNI=vhost) ---`,
     marker("health", "start"),
     "health_ok=0",
     `for attempt in $(seq 1 ${HEALTH_RETRIES}); do`,
-    `  code=$(curl -s -k -o /dev/null -w "%{http_code}" --max-time 10 -H "Host: $SAMOHOST_VHOST" https://127.0.0.1/ || echo 000)`,
+    `  code=$(curl -s -k -o /dev/null -w "%{http_code}" --max-time 10 --resolve "$SAMOHOST_VHOST:443:127.0.0.1" "https://$SAMOHOST_VHOST/" || echo 000)`,
     '  if [[ "$code" == "200" ]]; then health_ok=1; break; fi',
     `  sleep ${HEALTH_SLEEP_SEC}`,
     "done",
