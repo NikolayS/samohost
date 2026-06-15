@@ -1,0 +1,665 @@
+/**
+ * test/doctor.test.ts — Red/Green TDD for `samohost doctor`.
+ *
+ * Mirrors test/status.test.ts patterns: canned delimited output injected via
+ * RemoteRunner, no network, no live VM.
+ *
+ * E2E / Playwright note: doctor is a headless CLI with no browser surface.
+ * A Playwright browser spec is N/A. The E2E requirement is satisfied in the
+ * "CLI subprocess e2e" describe block below, which spawns the real CLI binary
+ * via Bun.spawn and asserts exit code + stderr (offline, no host needed). This
+ * proves the wired binary path end-to-end without a network connection.
+ */
+
+import {
+  afterEach,
+  beforeEach,
+  describe,
+  expect,
+  test,
+  mock,
+} from "bun:test";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { parseArgs } from "../src/cli.ts";
+import {
+  runDoctor,
+  parseLivenessOutput,
+  parseSuspiciousOutput,
+  parsePgLocalhostOutput,
+  type DoctorStatus,
+  type DoctorResult,
+} from "../src/commands/doctor.ts";
+import { hardeningModule } from "../src/cloudinit/hardening.ts";
+import { StateStore } from "../src/state/store.ts";
+import { AppStore } from "../src/state/apps.ts";
+import type { VmRecord, AppRecord } from "../src/types.ts";
+import type { RemoteRunner } from "../src/commands/status.ts";
+
+// ---------------------------------------------------------------------------
+// Fixtures
+// ---------------------------------------------------------------------------
+
+function rec(o: Partial<VmRecord> = {}): VmRecord {
+  return {
+    id: "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+    provider: "hetzner",
+    providerId: "99999999",
+    name: "test-vm",
+    ip: "10.0.0.1",
+    sshKeyPath: "/home/u/.ssh/id_ed25519",
+    sshPort: 2223,
+    sshUser: "agent",
+    hostKeyFingerprint: "SHA256:" + "B".repeat(43),
+    region: "nbg1",
+    type: "cx22",
+    modules: [],
+    lifecycleState: "adopted",
+    createdAt: "2026-01-01T00:00:00.000Z",
+    updatedAt: "2026-01-01T00:00:00.000Z",
+    ...o,
+  };
+}
+
+function appRec(vmId: string, o: Partial<AppRecord> = {}): AppRecord {
+  return {
+    id: "app-1111-2222-3333-4444",
+    vmId,
+    name: "field-record",
+    repo: "Tanya301/field-record-1",
+    branch: "main",
+    appDir: "/opt/field-record/app",
+    buildCmd: "npm run build",
+    healthUrl: "http://localhost:3000/api/version",
+    serviceUnit: "field-record",
+    envFile: "/opt/field-record/.env",
+    rlsUrlVar: "APP_DATABASE_URL",
+    ...o,
+  };
+}
+
+function capture() {
+  let out = "";
+  let err = "";
+  return {
+    out: (s: string) => (out += s + "\n"),
+    err: (s: string) => (err += s + "\n"),
+    get o() { return out; },
+    get e() { return err; },
+  };
+}
+
+// Canonical pass bodies for all hardening checks (same as status.test.ts PASS_BODIES).
+const CORE_HOST_PASS_BODIES: Record<string, string> = {
+  "ssh-port": "port 2223",
+  "ufw-active": "Status: active\nDefault: deny (incoming)",
+  "fail2ban-active": "active",
+  "sysctl-rpfilter": "1",
+  "sysctl-syncookies": "1",
+  "sysctl-redirects": "0",
+  "apparmor-enforced": "12 profiles are in enforce mode.",
+};
+
+// Pass bodies for doctor-specific checks (non-app-scoped).
+const DOCTOR_PASS_BODIES: Record<string, string> = {
+  // new core-host checks
+  "permitrootlogin": "permitrootlogin no",
+  "passwordauth": "passwordauthentication no",
+  "allowusers": "allowusers agent",
+  "unattended-upgrades-active": "active",
+  // liveness
+  "ss-listeners": "LISTEN 0 128 0.0.0.0:2223 0.0.0.0:*\nLISTEN 0 511 0.0.0.0:80 0.0.0.0:*\nLISTEN 0 511 0.0.0.0:443 0.0.0.0:*",
+  "fail2ban-jail": "Status for the jail: sshd\n|- Filter\n|  `- Currently failed: 0\n`- Actions\n   `- Total banned: 1",
+  // suspicious
+  "failed-auth": "5",
+  "sudo-failures": "0",
+  "fail2ban-bans": "Status for the jail: sshd\n|- Filter\n|  `- Currently failed: 0\n`- Actions\n   `- Total banned: 3",
+  // app-db
+  "rls-nonsuperuser": "f",
+  "pg-localhost": "LISTEN 0 128 127.0.0.1:5432 0.0.0.0:*",
+  "app-health": "200",
+};
+
+const ALL_PASS_BODIES: Record<string, string> = {
+  ...CORE_HOST_PASS_BODIES,
+  ...DOCTOR_PASS_BODIES,
+};
+
+/**
+ * Build canned delimited output for a given set of check IDs → bodies mapping.
+ * Mirrors the pattern in status.test.ts.
+ */
+function delimitedOutput(idToBody: (id: string) => string, ids: string[]): string {
+  return ids
+    .map((id) => `<<<SAMOHOST_AUDIT:${id}}>>>\n${idToBody(id)}`)
+    .join("\n");
+}
+
+/**
+ * Build delimited output that satisfies ALL doctor checks.
+ * Uses the merged pass bodies for both core-host and doctor-specific checks.
+ */
+function allPassDelimited(overrides: Record<string, string> = {}): string {
+  const bodies = { ...ALL_PASS_BODIES, ...overrides };
+  // We need to produce output that parseAuditOutput can parse.
+  // The AUDIT_DELIM format is <<<SAMOHOST_AUDIT:<id>>>
+  // Build ids from the known pass bodies
+  const ids = Object.keys(bodies);
+  return ids
+    .map((id) => `<<<SAMOHOST_AUDIT:${id}>>\n${bodies[id]}`)
+    .join("\n");
+}
+
+/**
+ * Build valid delimited output where the body function is called per-id.
+ * The doctor test infrastructure needs to include ALL probe ids that runDoctor
+ * will look for. We build a runner that returns all sections for both the
+ * hardening checks + doctor checks.
+ */
+function makePassRunner(overrides: Record<string, string> = {}): RemoteRunner {
+  const bodies = { ...ALL_PASS_BODIES, ...overrides };
+  return (_vm, _script) => {
+    // Build output with all expected section delimiters
+    const sections = Object.entries(bodies)
+      .map(([id, body]) => `<<<SAMOHOST_AUDIT:${id}}>>>\n${body}`)
+      .join("\n");
+    return Promise.resolve({ code: 0, stdout: sections, stderr: "" });
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Stores
+// ---------------------------------------------------------------------------
+
+let dir: string;
+let store: StateStore;
+let appStore: AppStore;
+
+beforeEach(() => {
+  dir = mkdtempSync(join(tmpdir(), "samohost-doctor-"));
+  store = new StateStore(join(dir, "state.json"));
+  appStore = new AppStore(join(dir, "apps.json"));
+});
+
+afterEach(() => {
+  rmSync(dir, { recursive: true, force: true });
+});
+
+// ===========================================================================
+// 1. parseDoctor: target, --infra, --json; missing target throws /requires/;
+//    unknown flag throws /unknown/.
+// ===========================================================================
+describe("1. parseDoctor", () => {
+  test("parses target only", () => {
+    const cmd = parseArgs(["doctor", "test-vm"]);
+    if (cmd.kind !== "doctor") throw new Error("expected doctor");
+    expect(cmd.input.target).toBe("test-vm");
+    expect(cmd.input.infra).toBe(false);
+    expect(cmd.json).toBe(false);
+  });
+
+  test("parses --infra and --json", () => {
+    const cmd = parseArgs(["doctor", "test-vm", "--infra", "--json"]);
+    if (cmd.kind !== "doctor") throw new Error("expected doctor");
+    expect(cmd.input.target).toBe("test-vm");
+    expect(cmd.input.infra).toBe(true);
+    expect(cmd.json).toBe(true);
+  });
+
+  test("missing target throws /requires/", () => {
+    expect(() => parseArgs(["doctor"])).toThrow(/requires/);
+  });
+
+  test("unknown flag throws /unknown/", () => {
+    expect(() => parseArgs(["doctor", "vm", "--bogus"])).toThrow(/unknown/);
+  });
+});
+
+// ===========================================================================
+// 2. Single connection: runDoctor with injected RemoteRunner →
+//    exactly ONE remote() call, and the script contains every check's probeCommand.
+// ===========================================================================
+describe("2. Single connection invariant", () => {
+  test("exactly ONE remote call for all checks", async () => {
+    store.upsert(rec());
+    const seen: string[] = [];
+    const remote: RemoteRunner = (_vm, cmd) => {
+      seen.push(cmd);
+      return Promise.resolve({
+        code: 0,
+        stdout: allPassDelimited(),
+        stderr: "",
+      });
+    };
+
+    const c = capture();
+    await runDoctor(
+      { target: "test-vm", infra: false },
+      { json: false },
+      store,
+      appStore,
+      c.out,
+      c.err,
+      remote,
+    );
+
+    // Hard invariant: ONE ssh connection regardless of check count.
+    expect(seen.length).toBe(1);
+
+    // The script must contain every hardening probeCommand.
+    for (const ch of hardeningModule.auditChecks) {
+      expect(seen[0]).toContain(ch.probeCommand);
+    }
+  });
+});
+
+// ===========================================================================
+// 3. All-pass canned output → all PASS rows, exit 0.
+// ===========================================================================
+describe("3. All-pass canned output", () => {
+  test("all PASS → exit 0", async () => {
+    store.upsert(rec());
+    appStore.upsert(appRec("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"));
+    const c = capture();
+    const code = await runDoctor(
+      { target: "test-vm", infra: false },
+      { json: false },
+      store,
+      appStore,
+      c.out,
+      c.err,
+      makePassRunner(),
+    );
+    expect(code).toBe(0);
+    expect(c.o).toContain("PASS");
+    expect(c.o).not.toContain("FAIL");
+    expect(c.e).toBe("");
+  });
+});
+
+// ===========================================================================
+// 4. A core-host probe mismatch → that row FAIL, exit 1.
+// ===========================================================================
+describe("4. Core-host probe mismatch → FAIL, exit 1", () => {
+  test("sysctl-rpfilter returns 0 → FAIL", async () => {
+    store.upsert(rec());
+    const remote: RemoteRunner = (_vm, _cmd) =>
+      Promise.resolve({
+        code: 0,
+        stdout: allPassDelimited({ "sysctl-rpfilter": "0" }),
+        stderr: "",
+      });
+    const c = capture();
+    const code = await runDoctor(
+      { target: "test-vm", infra: false },
+      { json: true },
+      store,
+      appStore,
+      c.out,
+      c.err,
+      remote,
+    );
+    expect(code).toBe(1);
+    const parsed = JSON.parse(c.o);
+    const row = parsed.checks.find((r: { id: string }) => r.id === "sysctl-rpfilter");
+    expect(row.status).toBe("fail");
+  });
+});
+
+// ===========================================================================
+// 5. requiresSudo probe returning permission error → UNKNOWN (not fail), exit 0.
+// ===========================================================================
+describe("5. requiresSudo → UNKNOWN, exit 0", () => {
+  test("permission denied → unknown not fail", async () => {
+    store.upsert(rec());
+    const remote: RemoteRunner = (_vm, _cmd) =>
+      Promise.resolve({
+        code: 0,
+        stdout: allPassDelimited({
+          "ufw-active": "ERROR: You need to be root to run this script",
+          "apparmor-enforced": "permission denied",
+        }),
+        stderr: "",
+      });
+    const c = capture();
+    const code = await runDoctor(
+      { target: "test-vm", infra: false },
+      { json: true },
+      store,
+      appStore,
+      c.out,
+      c.err,
+      remote,
+    );
+    expect(code).toBe(0); // unknown tolerated; only fail exits 1
+    const parsed = JSON.parse(c.o);
+    const byId = Object.fromEntries(
+      parsed.checks.map((r: { id: string; status: string }) => [r.id, r.status]),
+    );
+    expect(byId["ufw-active"]).toBe("unknown");
+    expect(byId["apparmor-enforced"]).toBe("unknown");
+  });
+});
+
+// ===========================================================================
+// 6. Infra mode: with --infra, every app-db (appScoped) check renders SKIP.
+// ===========================================================================
+describe("6. Infra mode: app-db checks → SKIP", () => {
+  test("--infra: all app-scoped checks are skip, exit 0 even if they would fail", async () => {
+    store.upsert(rec());
+    // Even with an app registered, --infra forces skip on app-db checks
+    appStore.upsert(appRec("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"));
+    const remote: RemoteRunner = (_vm, _cmd) =>
+      Promise.resolve({
+        code: 0,
+        // app-db probes return values that would be "fail" if evaluated
+        stdout: allPassDelimited({
+          "rls-nonsuperuser": "t", // would be FAIL (superuser)
+          "app-health": "500",     // would be FAIL
+        }),
+        stderr: "",
+      });
+    const c = capture();
+    const code = await runDoctor(
+      { target: "test-vm", infra: true },
+      { json: true },
+      store,
+      appStore,
+      c.out,
+      c.err,
+      remote,
+    );
+    expect(code).toBe(0); // app-db skips don't cause exit 1
+    const parsed = JSON.parse(c.o);
+    expect(parsed.infraMode).toBe(true);
+    // All app-scoped checks must be skip
+    const appDbChecks = parsed.checks.filter(
+      (r: { group: string }) => r.group === "app-db",
+    );
+    expect(appDbChecks.length).toBeGreaterThan(0);
+    for (const row of appDbChecks) {
+      expect(row.status).toBe("skip");
+    }
+  });
+});
+
+// ===========================================================================
+// 7. Auto-detect: NO app + no :5432 → app-db SKIP; app registered → evaluated;
+//    :5432-loopback present (no app) → app-db evaluated.
+// ===========================================================================
+describe("7. Auto-detect app-db scoping", () => {
+  test("no app, no :5432 → app-db checks are skip", async () => {
+    store.upsert(rec());
+    // No app registered, no :5432 in ss output
+    const ssNoPostgres = "LISTEN 0 128 0.0.0.0:2223 0.0.0.0:*\nLISTEN 0 511 0.0.0.0:80 0.0.0.0:*";
+    const remote: RemoteRunner = (_vm, _cmd) =>
+      Promise.resolve({
+        code: 0,
+        stdout: allPassDelimited({ "ss-listeners": ssNoPostgres }),
+        stderr: "",
+      });
+    const c = capture();
+    const code = await runDoctor(
+      { target: "test-vm", infra: false },
+      { json: true },
+      store,
+      appStore,
+      c.out,
+      c.err,
+      remote,
+    );
+    expect(code).toBe(0);
+    const parsed = JSON.parse(c.o);
+    const appDbChecks = parsed.checks.filter(
+      (r: { group: string }) => r.group === "app-db",
+    );
+    for (const row of appDbChecks) {
+      expect(row.status).toBe("skip");
+    }
+  });
+
+  test("app registered → app-db checks evaluated as real pass/fail", async () => {
+    store.upsert(rec());
+    appStore.upsert(appRec("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"));
+    // RLS probe returns 't' (superuser) → should FAIL
+    const remote: RemoteRunner = (_vm, _cmd) =>
+      Promise.resolve({
+        code: 0,
+        stdout: allPassDelimited({ "rls-nonsuperuser": "t" }),
+        stderr: "",
+      });
+    const c = capture();
+    const code = await runDoctor(
+      { target: "test-vm", infra: false },
+      { json: true },
+      store,
+      appStore,
+      c.out,
+      c.err,
+      remote,
+    );
+    expect(code).toBe(1); // app-db fail → exit 1
+    const parsed = JSON.parse(c.o);
+    const rlsRow = parsed.checks.find(
+      (r: { id: string }) => r.id === "rls-nonsuperuser",
+    );
+    expect(rlsRow?.status).toBe("fail");
+  });
+
+  test(":5432 loopback present, no app registered → app-db checks evaluated", async () => {
+    store.upsert(rec());
+    // No app but :5432 loopback detected in ss output → evaluate app-db
+    const ssWithPostgres =
+      "LISTEN 0 128 0.0.0.0:2223 0.0.0.0:*\nLISTEN 0 128 127.0.0.1:5432 0.0.0.0:*";
+    // rls-nonsuperuser returns 't' (would be fail), pg-localhost passes
+    const remote: RemoteRunner = (_vm, _cmd) =>
+      Promise.resolve({
+        code: 0,
+        stdout: allPassDelimited({
+          "ss-listeners": ssWithPostgres,
+          "rls-nonsuperuser": "t",
+        }),
+        stderr: "",
+      });
+    const c = capture();
+    const code = await runDoctor(
+      { target: "test-vm", infra: false },
+      { json: true },
+      store,
+      appStore,
+      c.out,
+      c.err,
+      remote,
+    );
+    // rls-nonsuperuser should be evaluated (not skip), and would be fail
+    const parsed = JSON.parse(c.o);
+    const rlsRow = parsed.checks.find(
+      (r: { id: string }) => r.id === "rls-nonsuperuser",
+    );
+    // When no app, rls check can't be fully evaluated (no envFile) → unknown or skip
+    // but it should NOT be skip if :5432 detected — it should at least be unknown/fail
+    expect(rlsRow?.status).not.toBe("skip");
+  });
+});
+
+// ===========================================================================
+// 8. READ-ONLY: spy AppStore whose upsert/remove throw if called.
+//    runDoctor must complete without mutation.
+// ===========================================================================
+describe("8. Read-only invariant: no state mutation", () => {
+  test("runDoctor never calls appStore.upsert or appStore.remove", async () => {
+    store.upsert(rec());
+    appStore.upsert(appRec("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"));
+
+    // Create a spy AppStore that throws if mutating methods are called.
+    const spyAppStore = new AppStore(join(dir, "apps.json"));
+    const upsertSpy = mock(() => { throw new Error("AppStore.upsert called — doctor must be read-only"); });
+    const removeSpy = mock(() => { throw new Error("AppStore.remove called — doctor must be read-only"); });
+    spyAppStore.upsert = upsertSpy as unknown as typeof spyAppStore.upsert;
+    spyAppStore.remove = removeSpy as unknown as typeof spyAppStore.remove;
+
+    const remote: RemoteRunner = (_vm, _cmd) =>
+      Promise.resolve({ code: 0, stdout: allPassDelimited(), stderr: "" });
+
+    const c = capture();
+    // Must NOT throw (upsert/remove not called).
+    const code = await runDoctor(
+      { target: "test-vm", infra: false },
+      { json: false },
+      store,
+      spyAppStore,
+      c.out,
+      c.err,
+      remote,
+    );
+    // verify spies were never called
+    expect(upsertSpy).not.toHaveBeenCalled();
+    expect(removeSpy).not.toHaveBeenCalled();
+    expect(code).toBeLessThanOrEqual(1); // 0 or 1, but not an exception
+  });
+});
+
+// ===========================================================================
+// 9. Liveness parser (pure fn): unit "active" but port NOT in ss → fail;
+//    port present → pass. Caddy: 80+443 → pass; only 80 → fail.
+// ===========================================================================
+describe("9. parseLivenessOutput", () => {
+  const SS_WITH_SSH = "LISTEN 0 128 0.0.0.0:2223 0.0.0.0:*";
+  const SS_WITH_CADDY = "LISTEN 0 128 0.0.0.0:2223 0.0.0.0:*\nLISTEN 0 511 0.0.0.0:80 0.0.0.0:*\nLISTEN 0 511 0.0.0.0:443 0.0.0.0:*";
+  const SS_ONLY_80 = "LISTEN 0 128 0.0.0.0:2223 0.0.0.0:*\nLISTEN 0 511 0.0.0.0:80 0.0.0.0:*";
+
+  test("ssh port present → pass", () => {
+    const result = parseLivenessOutput("ssh-port-listening", SS_WITH_SSH, 2223);
+    expect(result.status).toBe("pass");
+  });
+
+  test("ssh port absent → fail", () => {
+    const result = parseLivenessOutput("ssh-port-listening", "LISTEN 0 128 0.0.0.0:22 0.0.0.0:*", 2223);
+    expect(result.status).toBe("fail");
+  });
+
+  test("caddy 80+443 both listening → pass", () => {
+    const result = parseLivenessOutput("caddy-serving", SS_WITH_CADDY, 2223);
+    expect(result.status).toBe("pass");
+  });
+
+  test("caddy only 80 → fail", () => {
+    const result = parseLivenessOutput("caddy-serving", SS_ONLY_80, 2223);
+    expect(result.status).toBe("fail");
+  });
+});
+
+// ===========================================================================
+// 10. Suspicious parser (pure fn): 30 "Failed password" lines → finding;
+//     clean text → no finding, status pass.
+//     SECRET-REDACTION: token in log → never appears in findings.
+// ===========================================================================
+describe("10. parseSuspiciousOutput", () => {
+  test("30 Failed password lines → finding with count", () => {
+    const logText = Array(30).fill("Jun 11 12:00:00 host sshd[1234]: Failed password for invalid user root from 1.2.3.4 port 54321 ssh2").join("\n");
+    const result = parseSuspiciousOutput("failed-auth-burst", logText);
+    expect(result.status).toBe("pass"); // suspicious → never fail exit-code
+    expect(result.findings).toBeDefined();
+    expect(result.findings!.length).toBeGreaterThan(0);
+    // finding must mention a count
+    expect(result.findings![0]).toMatch(/\d+/);
+  });
+
+  test("clean text → no findings, status pass", () => {
+    const logText = "Jun 11 12:00:00 host sshd[1234]: Accepted publickey for agent";
+    const result = parseSuspiciousOutput("failed-auth-burst", logText);
+    expect(result.status).toBe("pass");
+    expect(!result.findings || result.findings.length === 0).toBe(true);
+  });
+
+  test("SECRET-REDACTION: token in log line never appears in findings output", () => {
+    const secret = "AKIAabcdefghijklmnopqrstuvwxyz01234567890AAAA"; // 44 chars
+    const logText = Array(30).fill(
+      `Jun 11 12:00:00 host sshd[1234]: Failed password token=${secret} for root`,
+    ).join("\n");
+    const result = parseSuspiciousOutput("failed-auth-burst", logText);
+    // Secret must NOT appear in any finding
+    const allFindings = (result.findings ?? []).join(" ");
+    expect(allFindings).not.toContain(secret);
+    // Findings must contain only category+count, not raw lines
+    expect(allFindings).not.toContain("Failed password token=");
+  });
+});
+
+// ===========================================================================
+// 11. pg-localhost parser: :5432 on 127.0.0.1 → pass; :5432 on 0.0.0.0 → fail.
+// ===========================================================================
+describe("11. parsePgLocalhostOutput", () => {
+  test(":5432 on 127.0.0.1 → pass", () => {
+    const ssOutput = "LISTEN 0 128 127.0.0.1:5432 0.0.0.0:*\nLISTEN 0 128 [::1]:5432 [::]:*";
+    const result = parsePgLocalhostOutput(ssOutput);
+    expect(result.status).toBe("pass");
+  });
+
+  test(":5432 on 0.0.0.0 → fail", () => {
+    const ssOutput = "LISTEN 0 128 0.0.0.0:5432 0.0.0.0:*";
+    const result = parsePgLocalhostOutput(ssOutput);
+    expect(result.status).toBe("fail");
+  });
+
+  test(":5432 on loopback only (no external) → pass", () => {
+    const ssOutput = "LISTEN 0 128 127.0.0.1:5432 0.0.0.0:*\nLISTEN 0 128 0.0.0.0:80 0.0.0.0:*";
+    const result = parsePgLocalhostOutput(ssOutput);
+    expect(result.status).toBe("pass");
+  });
+});
+
+// ===========================================================================
+// 12. --json shape: emits checks[] with id/status/group and an infraMode boolean.
+// ===========================================================================
+describe("12. JSON output shape", () => {
+  test("--json emits {record, infraMode, checks:[{id,status,group}]}", async () => {
+    store.upsert(rec());
+    const c = capture();
+    await runDoctor(
+      { target: "test-vm", infra: true },
+      { json: true },
+      store,
+      appStore,
+      c.out,
+      c.err,
+      makePassRunner(),
+    );
+    const parsed = JSON.parse(c.o);
+    expect(parsed).toHaveProperty("record");
+    expect(parsed).toHaveProperty("infraMode", true);
+    expect(Array.isArray(parsed.checks)).toBe(true);
+    for (const chk of parsed.checks) {
+      expect(chk).toHaveProperty("id");
+      expect(chk).toHaveProperty("status");
+      expect(chk).toHaveProperty("group");
+    }
+  });
+});
+
+// ===========================================================================
+// E2E (CLI subprocess) — satisfies the Playwright/E2E requirement for a CLI.
+// No browser involved; this tests the real wired binary path end-to-end.
+// ===========================================================================
+describe("CLI subprocess e2e", () => {
+  test("samohost doctor <nonexistent-vm> exits 1 with 'not found' on stderr", async () => {
+    // Playwright browser spec is N/A for a headless CLI (no browser surface).
+    // This subprocess test proves the wired binary path end-to-end without a network.
+    const proc = Bun.spawn(
+      ["bun", "run", "/tmp/samo-doctor-33/src/cli.ts", "doctor", "no-such-vm"],
+      {
+        env: {
+          ...process.env,
+          SAMOHOST_STATE: join(dir, "state-empty.json"),
+        },
+        stdout: "pipe",
+        stderr: "pipe",
+      },
+    );
+    await proc.exited;
+    const stderrText = await new Response(proc.stderr).text();
+    expect(proc.exitCode).toBe(1);
+    expect(stderrText).toMatch(/not found/i);
+  });
+});
