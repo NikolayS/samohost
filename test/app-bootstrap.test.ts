@@ -789,6 +789,20 @@ describe("buildHostBootstrapScript (A2) — token-safe repo clone", () => {
     const script = buildHostBootstrapScript(fieldRecord(), frOpts());
     expect(script).toMatch(/git config --global|git config.*global/);
   });
+
+  test("clone credential helper must NOT expand token into argv (samorev #32)", () => {
+    // INVARIANT: the token value must never appear in git's argv (visible in
+    // /proc/<pid>/cmdline). The broken form uses a double-quoted -c argument:
+    //   git -c "credential.helper=...$(cat $TOKEN_FILE)..."
+    // which causes bash to expand $(cat $TOKEN_FILE) AT INVOCATION TIME and place
+    // the token VALUE into git's argv. The correct form uses single-quotes so that
+    // $(cat ...) is only evaluated LAZILY when git invokes the credential helper.
+    const script = buildHostBootstrapScript(fieldRecord(), frOpts());
+    // Must NOT contain double-quoted -c "credential.helper=... (broken form)
+    expect(script).not.toMatch(/git -c "credential\.helper/);
+    // Must contain the deferred single-quoted form: -c 'credential.helper=
+    expect(script).toMatch(/git -c 'credential\.helper/);
+  });
 });
 
 // ---------------------------------------------------------------------------
