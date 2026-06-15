@@ -911,3 +911,133 @@ describe("buildHostBootstrapScript (A2) — A1 ownership boundary preserved", ()
     expect(script).not.toMatch(/%i\b/);
   });
 });
+
+// ---------------------------------------------------------------------------
+// (PG-PAM fix) Pre-create postgres system user before apt install
+//
+// ROOT CAUSE: postgresql-common's postinst calls `adduser --system ... postgres`
+// which internally invokes `chfn` to set GECOS info. On a PAM-password-expired
+// (hardened) box, chfn fails:
+//   "Authentication token is no longer valid; new one required" (exit 82)
+// leaving PG unconfigured → the whole bootstrap aborts (rc 100).
+//
+// FIX: Pre-create the `postgres` system user+group with `useradd` (no chfn,
+// no PAM auth) BEFORE the apt install. The postinst guards its adduser call
+// with `if ! getent passwd postgres`, so a pre-existing user makes it skip
+// the dangerous adduser+chfn path entirely.
+//
+// This mirrors the insight already applied to the APP user in §4 (useradd, NOT
+// adduser — see §4 comment in bootstrap.ts and stack-prep.sh ~line 187).
+// The guard must live INSIDE the PG install block (i.e., only when PG is not
+// yet installed) and BEFORE the apt-get install postgresql-* line.
+//
+// Found on a freshly-hardened smoke VM: field-record-1#117
+// (host-bootstrap PG/PAM-chfn fix).
+// ---------------------------------------------------------------------------
+
+describe("buildHostBootstrapScript (PG-PAM fix) — postgres user pre-created before apt install", () => {
+  test("generated script contains useradd for postgres user (not adduser)", () => {
+    // The guard must use useradd (no chfn/PAM) not adduser (which calls chfn).
+    const script = buildHostBootstrapScript(fieldRecord(), defaultOpts());
+    expect(script).toContain("useradd");
+    // Must specifically reference 'postgres' user in a useradd invocation
+    expect(script).toMatch(/useradd[^\n]*postgres/);
+    // Must NOT use adduser for the postgres user (adduser's chfn dies on hardened box)
+    const lines = script.split("\n");
+    for (const line of lines) {
+      if (!line.trimStart().startsWith("#") && /adduser/.test(line)) {
+        // adduser must not appear in any non-comment code line referencing postgres
+        expect(/adduser[^\n]*postgres/.test(line)).toBe(false);
+      }
+    }
+  });
+
+  test("postgres useradd guard is idempotent: wrapped in `id postgres` check", () => {
+    // Must be `if ! id postgres >/dev/null 2>&1` (or equivalent) so it is a no-op
+    // when the user already exists (re-runnable bootstrap).
+    const script = buildHostBootstrapScript(fieldRecord(), defaultOpts());
+    expect(script).toMatch(/id\s+postgres/);
+    // The check must be a negative guard (skip if already exists)
+    expect(script).toMatch(/!\s*id\s+postgres/);
+  });
+
+  test("postgres useradd guard appears BEFORE the postgresql apt-get install line (ordering)", () => {
+    // The whole point: we must pre-create the user BEFORE the postinst runs.
+    // Order: useradd-postgres guard index < apt-get install postgresql index.
+    const script = buildHostBootstrapScript(fieldRecord(), defaultOpts());
+    const lines = script.split("\n");
+
+    // Find the index of the useradd postgres guard line
+    const useradd_pg_idx = lines.findIndex(
+      (l) => !l.trimStart().startsWith("#") && /useradd[^\n]*postgres/.test(l),
+    );
+    expect(useradd_pg_idx).toBeGreaterThan(-1);
+
+    // Find the index of the apt-get install postgresql line
+    const apt_pg_idx = lines.findIndex(
+      (l) =>
+        !l.trimStart().startsWith("#") &&
+        /apt-get install[^\n]*postgresql/.test(l),
+    );
+    expect(apt_pg_idx).toBeGreaterThan(-1);
+
+    // The useradd guard must come BEFORE the install
+    expect(useradd_pg_idx).toBeLessThan(apt_pg_idx);
+  });
+
+  test("postgres useradd uses --system flag (system account, not regular user)", () => {
+    const script = buildHostBootstrapScript(fieldRecord(), defaultOpts());
+    // Must be a system account (matches what postgresql-common expects)
+    expect(script).toMatch(/useradd[^\n]*--system[^\n]*postgres|useradd[^\n]*postgres[^\n]*--system/);
+  });
+
+  test("postgres pre-create guard scoped to PG install block (not emitted when PG already present)", () => {
+    // The guard must live inside the `if command -v psql ... else` block —
+    // it should only run when PG is not yet installed.
+    // We verify this by checking the guard appears AFTER the psql-present check
+    // (i.e., it is inside the else branch, not at the top level of the script).
+    const script = buildHostBootstrapScript(fieldRecord(), defaultOpts());
+    const lines = script.split("\n");
+
+    const psql_check_idx = lines.findIndex((l) => /command -v psql/.test(l));
+    const useradd_pg_idx = lines.findIndex(
+      (l) => !l.trimStart().startsWith("#") && /useradd[^\n]*postgres/.test(l),
+    );
+    // The useradd guard must come AFTER the `command -v psql` idempotency check
+    expect(psql_check_idx).toBeGreaterThan(-1);
+    expect(useradd_pg_idx).toBeGreaterThan(psql_check_idx);
+  });
+
+  test("bash -n still passes after PG-PAM fix is applied (script remains syntax-clean)", () => {
+    const script = buildHostBootstrapScript(fieldRecord(), defaultOpts());
+    expect(bashSyntaxOk(script)).toBe(true);
+  });
+
+  test("bash -n still passes for demo-app fixture after PG-PAM fix (no regression)", () => {
+    const script = buildHostBootstrapScript(demoApp(), demoOpts());
+    expect(bashSyntaxOk(script)).toBe(true);
+  });
+
+  test("PG-PAM fix does NOT hardcode field-record: guard present in demo-app fixture too", () => {
+    // The guard must appear in any generated script regardless of app, since the
+    // PAM hazard is OS-level (not app-specific).
+    const script = buildHostBootstrapScript(demoApp(), demoOpts());
+    expect(script).toMatch(/useradd[^\n]*postgres/);
+    expect(script).toMatch(/!\s*id\s+postgres/);
+  });
+
+  test("PG-PAM fix does NOT weaken adduser guard for the APP user (§4 still uses useradd)", () => {
+    // §4 pre-existing behavior: app OS user is also created with useradd (not adduser).
+    // After the fix, that invariant must remain intact.
+    const script = buildHostBootstrapScript(fieldRecord(), defaultOpts({ appUser: "agent" }));
+    // The app user (agent) creation line must use useradd
+    expect(script).toMatch(/useradd[^\n]*agent|useradd[^\n]*--create-home/);
+    // adduser must not appear for the app user either
+    const lines = script.split("\n");
+    for (const line of lines) {
+      if (!line.trimStart().startsWith("#") && /adduser[^\n]*agent/.test(line)) {
+        fail(`adduser used for app user in line: ${line}`);
+      }
+    }
+  });
+});
