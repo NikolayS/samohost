@@ -293,6 +293,32 @@ export function buildHostBootstrapScript(
     `if command -v psql >/dev/null 2>&1; then`,
     `  echo "PostgreSQL already present — skipping PGDG install."`,
     "else",
+    // PG-PAM fix (field-record-1#117, host-bootstrap PG/PAM-chfn fix — found on smoke VM):
+    // postgresql-common's postinst calls `adduser --system ... postgres` which
+    // internally invokes `chfn` to set GECOS info. On a PAM-password-expired
+    // (hardened) box, chfn fails:
+    //   "Authentication token is no longer valid; new one required" (exit 82)
+    // leaving PG unconfigured → the whole bootstrap aborts (rc 100).
+    //
+    // The postinst guards its adduser call with:
+    //   if ! getent passwd postgres > /dev/null; then adduser ... fi
+    // So pre-creating the postgres system user+group with useradd (no adduser,
+    // no chfn, no PAM auth) causes the postinst to skip that dangerous path
+    // entirely.
+    //
+    // This mirrors the rationale already applied to the APP user in §4 (useradd,
+    // NOT adduser — adduser's chfn dies on the hardened box). Scoped to the PG
+    // install block (only runs when PG is not yet installed). Idempotent.
+    `  # PG-PAM fix (samohost#117): postgresql-common's postinst runs chfn on the`,
+    `  # 'postgres' system user. On a PAM-password-expired (hardened) box, chfn`,
+    `  # exits 82 ("Authentication token is no longer valid"), leaving PG unconfigured.`,
+    `  # Pre-create the postgres system user+group with useradd (no chfn, no PAM auth)`,
+    `  # so the postinst finds the user present and skips that path. Idempotent.`,
+    `  # Mirrors §4 (app OS user also uses useradd for the same reason).`,
+    `  if ! id postgres >/dev/null 2>&1; then`,
+    `    useradd --system --user-group --home-dir /var/lib/postgresql --shell /bin/bash postgres`,
+    `  fi`,
+    "",
     `  # Add PGDG apt repo.`,
     `  install -d /usr/share/postgresql-common/pgdg`,
     `  curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc \\`,

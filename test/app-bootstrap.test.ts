@@ -1036,7 +1036,7 @@ describe("buildHostBootstrapScript (PG-PAM fix) — postgres user pre-created be
     const lines = script.split("\n");
     for (const line of lines) {
       if (!line.trimStart().startsWith("#") && /adduser[^\n]*agent/.test(line)) {
-        fail(`adduser used for app user in line: ${line}`);
+        throw new Error(`adduser used for app user in line: ${line}`);
       }
     }
   });
