@@ -50,6 +50,8 @@ import type {
   EnvRecord,
   VmRecord,
 } from "../types.ts";
+import { CloudflareDns, type DnsProviderPort } from "../dns/cloudflare.ts";
+import { ensurePreviewDns, removePreviewDns } from "../dns/ensure.ts";
 
 /** Default preview domain for the SOLO plan (issue #117). */
 export const DEFAULT_PREVIEW_DOMAIN = "samo.cat";
@@ -303,7 +305,24 @@ export interface EnvExecDeps {
   remote: RemoteScriptRunner;
   now: () => Date;
   uuid: () => string;
+  /**
+   * Optional DNS provider factory for per-VM preview DNS (issue #37).
+   *
+   * The field is OPTIONAL (`?:`) so that the 628 existing test fixtures that
+   * build `{ remote, now, uuid }` continue to compile and run unchanged.
+   * When absent (or the factory returns `undefined`), DNS operations are
+   * skipped and a single warning is emitted via `err`.
+   *
+   * Returns a DnsProviderPort or undefined when no credentials are available.
+   */
+  dns?: () => DnsProviderPort | undefined;
 }
+
+/** Warning emitted when no DNS provider is configured. */
+const DNS_DEGRADE_WARNING =
+  "samohost: CLOUDFLARE_SAMOCAT and/or SAMOHOST_SAMOCAT_ZONE_ID not set — " +
+  "skipping per-preview DNS (relying on a wildcard A record); previews on a " +
+  "VM not covered by the wildcard will not resolve";
 
 export interface EnvCreateReport {
   env: string;
@@ -347,6 +366,22 @@ export async function runEnvCreate(
   if ("error" in target) {
     err(`error: ${target.error}`);
     return 1;
+  }
+
+  // Ensure the per-preview DNS A record BEFORE pushing the create script so
+  // the first ACME HTTP-01 challenge from Caddy can resolve to this VM's IP.
+  const dnsProvider = deps.dns?.();
+  if (dnsProvider !== undefined) {
+    try {
+      await ensurePreviewDns(dnsProvider, target.vhost, r.vm.ip);
+    } catch (e) {
+      err(
+        `samohost: warning: DNS ensure failed for ${target.vhost} — ` +
+          `${e instanceof Error ? e.message : String(e)}; continuing create`,
+      );
+    }
+  } else {
+    err(DNS_DEGRADE_WARNING);
   }
 
   const script = buildEnvCreateScript(r.app, target);
@@ -451,6 +486,23 @@ export async function runEnvDestroy(
     return 1;
   }
 
+  // Remove the per-preview DNS A record after a successful destroy.
+  // On DNS failure, warn and continue — the local record is still removed and
+  // the stale DNS entry is harmless (unproxied, no origin to hit).
+  const dnsProvider = deps.dns?.();
+  if (dnsProvider !== undefined) {
+    try {
+      await removePreviewDns(dnsProvider, env.vhost);
+    } catch (e) {
+      err(
+        `samohost: warning: DNS remove failed for ${env.vhost} — ` +
+          `${e instanceof Error ? e.message : String(e)}; record still removed locally`,
+      );
+    }
+  } else {
+    err(DNS_DEGRADE_WARNING);
+  }
+
   envStore.remove(r.vm.id, r.app.name, input.branch);
   if (opts.json) {
     out(JSON.stringify({ env: env.name, vm: r.vm.name, outcome }, null, 2));
@@ -549,6 +601,24 @@ export function defaultEnvExecDeps(): EnvExecDeps {
     remote: defaultRemoteScriptRunner(),
     now: () => new Date(),
     uuid: () => crypto.randomUUID(),
+    // Per-preview DNS factory (issue #37).
+    //
+    // CLOUDFLARE_SAMOCAT is intentionally a SEPARATE env var from
+    // CLOUDFLARE_API_TOKEN used by `dns status`. That token is a
+    // broad read/write API token; CLOUDFLARE_SAMOCAT is a zone-scoped
+    // write token for samo.cat ONLY. They must remain separate — a
+    // zone-scoped token often lacks the zones:list scope that
+    // CLOUDFLARE_API_TOKEN needs, and granting samo.cat write access
+    // to the global token would be over-privileged.
+    dns: () => {
+      const token = process.env["CLOUDFLARE_SAMOCAT"];
+      const zoneId = process.env["SAMOHOST_SAMOCAT_ZONE_ID"];
+      if (!token || !zoneId) {
+        // Caller checks for undefined and emits the degrade warning.
+        return undefined;
+      }
+      return new CloudflareDns({ token, zoneId });
+    },
   };
 }
 
