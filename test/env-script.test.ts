@@ -186,13 +186,18 @@ describe("buildHostPrepScript", () => {
     expect(bashSyntaxOk(buildHostPrepScript(app(), "agent"))).toBe(true);
   });
 
-  test("documents template unit, caddy include, sudoers grants, wildcard DNS", () => {
+  test("documents template unit, caddy include, sudoers grants, per-preview DNS posture", () => {
     const s = buildHostPrepScript(app(), "agent");
     expect(s).toContain("/etc/systemd/system/field-record@.service");
     expect(s).toContain("import sites.d/*.caddy");
     expect(s).toContain("/etc/sudoers.d/samohost-env-field-record-1");
     expect(s).toContain("visudo -cf");
-    expect(s).toContain("wildcard A record");
+    // DNS comment must describe the correct posture: per-preview UNPROXIED A
+    // record (not the old misleading wildcard claim).
+    expect(s).toContain("UNPROXIED");
+    expect(s).toContain("per-preview");
+    // Old misleading claim must be gone.
+    expect(s).not.toContain("no per-env DNS API calls are needed");
     // Exact-path grants only.
     expect(s).toContain("NOPASSWD: /usr/bin/systemctl reload caddy");
   });
@@ -281,6 +286,56 @@ describe("buildHostPrepScript", () => {
     const s = buildHostPrepScript(app(), "agent");
     expect(s).not.toContain("00-main-");
     expect(s).toContain("import sites.d/*.caddy");
+  });
+
+  // -------------------------------------------------------------------------
+  // Issue #38 — open ufw 443 in host-prep; correct preview DNS comment
+  // -------------------------------------------------------------------------
+
+  test("opens ufw 443/tcp so the origin answers HTTPS (avoids 522)", () => {
+    // host-prep is run with root; /usr/sbin/ufw is the canonical path on
+    // Ubuntu 22.04/24.04 and ufw allow is naturally idempotent.
+    const s = buildHostPrepScript(app(), "agent");
+    expect(s).toContain("/usr/sbin/ufw allow 443/tcp");
+  });
+
+  test("ufw 443 is opened in host-prep only — NOT granted in the per-env NOPASSWD sudoers, and never called by the env scripts (privilege surface)", () => {
+    const hp = buildHostPrepScript(app(), "agent");
+    // 443 is opened once, here, by the root operator running host-prep.
+    expect(hp).toContain("/usr/sbin/ufw allow 443/tcp");
+    // It must NOT be added to the per-(vm,app) sudoers block: the env scripts
+    // run later as the non-root sshUser and have no reason to touch ufw, so a
+    // ufw NOPASSWD grant would needlessly widen that user's privileges.
+    expect(hp).not.toMatch(/NOPASSWD:.*ufw/);
+    // And the env create/destroy scripts never invoke ufw at all.
+    expect(buildEnvCreateScript(app(), target())).not.toContain("ufw");
+    expect(buildEnvDestroyScript(app(), target())).not.toContain("ufw");
+  });
+
+  test("DNS comment describes per-preview UNPROXIED A record + ufw 443 (not misleading wildcard claim)", () => {
+    const s = buildHostPrepScript(app(), "agent");
+    // New wording must reference the correct posture (unproxied, per-preview).
+    expect(s).toContain("UNPROXIED");
+    expect(s).toContain("per-preview");
+    // Must mention that ufw 443 is required for HTTP-01 / HTTPS to work.
+    expect(s).toMatch(/ufw.*443|443.*ufw/i);
+    // Old misleading claim — "no per-env DNS API calls are needed" — must be gone.
+    expect(s).not.toContain("no per-env DNS API calls are needed");
+  });
+
+  test("regression: vhost blocks emitted by buildEnvCreateScript carry NO tls directive", () => {
+    for (const db of ["dblab", "template", "none"] as const) {
+      const s = buildEnvCreateScript(app(), target({ dbBackend: db }));
+      // Caddy vhost blocks must remain bare (ACME mode); tls internal would
+      // force a self-signed cert → browser warning on direct-to-origin previews.
+      expect(s).not.toMatch(/^\s*tls\s/m);
+    }
+  });
+
+  test("regression: vhost blocks emitted by buildEnvCreateScript are valid bash", () => {
+    for (const db of ["dblab", "template", "none"] as const) {
+      expect(bashSyntaxOk(buildEnvCreateScript(app(), target({ dbBackend: db })))).toBe(true);
+    }
   });
 });
 
