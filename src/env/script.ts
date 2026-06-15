@@ -1033,6 +1033,11 @@ export function buildHostPrepScript(app: AppRecord, sshUser: string): string {
     ...mainVhostLines,
     "systemctl reload caddy",
     "",
+    // The env-create script runs later as the non-root env user, so the envs
+    // root must already exist and be writable by that user regardless of how
+    // /opt/<app> was provisioned (e.g. root-owned when not via app bootstrap).
+    `install -d -m 755 -o ${sshUser} -g ${sshUser} ${sq(root)}`,
+    "",
     ...sudoersLines,
     "",
     `# ${isStatic ? "4" : "5"}. Firewall: allow 443/tcp so the origin answers HTTPS.`,

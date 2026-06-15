@@ -1612,3 +1612,41 @@ describe("static host-prep path (kind='static')", () => {
     expect(bashSyntaxOk(s)).toBe(true);
   });
 });
+
+// ---------------------------------------------------------------------------
+// Issue #43 — host-prep must create + own the envs root dir
+//
+// buildEnvCreateScript's clone phase does `mkdir -p "$SAMOHOST_ENVS_ROOT"` as
+// the NON-ROOT env user. When /opt/<app> is root-owned (any client not
+// onboarded via `samohost app bootstrap`), mkdir fails with Permission denied.
+// buildHostPrepScript is the root-run one-time prep: it must guarantee the
+// envs root exists AND is owned by the env user before env create ever runs.
+// ---------------------------------------------------------------------------
+
+describe("issue #43: host-prep creates + owns the envs root dir", () => {
+  // For the test app: appDir = '/opt/field-record/app' → envsRoot = '/opt/field-record/envs'
+  // sq('/opt/field-record/envs') = "'/opt/field-record/envs'"
+
+  test("node app host-prep emits idempotent install -d for the envs root (node path)", () => {
+    const s = buildHostPrepScript(app(), "agent");
+    // install -d -m 755 -o <sshUser> -g <sshUser> <sq(envsRoot)>
+    expect(s).toContain(
+      "install -d -m 755 -o agent -g agent '/opt/field-record/envs'",
+    );
+  });
+
+  test("static app host-prep emits idempotent install -d for the envs root (static path)", () => {
+    const s = buildHostPrepScript(app({ kind: "static" }), "samo");
+    expect(s).toContain(
+      "install -d -m 755 -o samo -g samo '/opt/field-record/envs'",
+    );
+  });
+
+  test("node host-prep bash syntax still valid after the addition", () => {
+    expect(bashSyntaxOk(buildHostPrepScript(app(), "agent"))).toBe(true);
+  });
+
+  test("static host-prep bash syntax still valid after the addition", () => {
+    expect(bashSyntaxOk(buildHostPrepScript(app({ kind: "static" }), "samo"))).toBe(true);
+  });
+});
