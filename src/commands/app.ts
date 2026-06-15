@@ -2,11 +2,13 @@
  * `samohost app` command family (SPEC-DELTA §3 "app module").
  *
  * Subcommands:
- *   register  — write an AppRecord (offline; no network, no SSH).
- *   plan      — print the deploy script for a SHA (offline; like `preview`).
- *   deploy    — resolve SHA, run the CI gate, push the deploy script over ONE
- *               SSH connection, parse phase markers, update AppRecord state.
- *   status    — print an app record + its deploy bookkeeping (offline).
+ *   register   — write an AppRecord (offline; no network, no SSH).
+ *   plan       — print the deploy script for a SHA (offline; like `preview`).
+ *   deploy     — resolve SHA, run the CI gate, push the deploy script over ONE
+ *                SSH connection, parse phase markers, update AppRecord state.
+ *   status     — print an app record + its deploy bookkeeping (offline).
+ *   bootstrap  — print the ONE-TIME OS bootstrap script (PR-A1: runtimes,
+ *                OS user, /opt layout, sudoers, MAIN unit, sshd, Caddy).
  *
  * The deploy path's effects (resolve-sha fetch, CI-gate fetch, SSH spawn,
  * clock) are all injected so the whole flow is unit-tested offline.
@@ -16,6 +18,10 @@ import { spawnSync } from "node:child_process";
 import { checkCiGreen, type CiStatus } from "../app/cigate.ts";
 import { parseDeployOutcome, type DeployOutcome } from "../app/parse.ts";
 import { buildDeployScript } from "../app/script.ts";
+import {
+  buildHostBootstrapScript,
+  type HostBootstrapOptions,
+} from "../app/bootstrap.ts";
 import { AppStore } from "../state/apps.ts";
 import { StateStore } from "../state/store.ts";
 import {
@@ -80,6 +86,21 @@ export interface AppStatusInput {
 export interface AppClearFailedInput {
   vm: string;
   app: string;
+}
+
+/**
+ * Inputs for `app bootstrap` (PR-A1 OS prep). All HostBootstrapOptions fields
+ * plus the VM/app identifiers. `appUser` is required; other opts have defaults.
+ */
+export interface AppBootstrapInput {
+  vm: string;
+  app: string;
+  appUser: string;
+  appBase?: string;
+  nodeMajor?: number;
+  pgMajor?: number;
+  execStart?: string;
+  tlsMode?: "acme" | "local";
 }
 
 // ---------------------------------------------------------------------------
@@ -281,6 +302,54 @@ export function runAppClearFailed(
         `the known-bad-SHA guard will no longer refuse deploys of this commit`,
     );
   }
+  return 0;
+}
+
+// ---------------------------------------------------------------------------
+// bootstrap (PR-A1)
+// ---------------------------------------------------------------------------
+
+/**
+ * Print the ONE-TIME OS bootstrap script for operator review and application.
+ *
+ * Resolves the AppRecord from state (same lookup pattern as `env plan
+ * --host-prep`), builds the bootstrap script via {@link buildHostBootstrapScript},
+ * and prints it to stdout. The operator reviews and applies it with root;
+ * samohost NEVER auto-executes this script.
+ *
+ * Scope: runtimes (Node/PG/Caddy), app OS user, /opt layout, sudoers,
+ * MAIN systemd unit, sshd AllowUsers drop-in, Caddy base config,
+ * self-check table. See PR-A1 spec. DB bootstrap / env file / repo clone
+ * are PR-A2 (not here).
+ */
+export function runAppBootstrap(
+  input: AppBootstrapInput,
+  vmStore: StateStore,
+  appStore: AppStore,
+  out: (s: string) => void,
+  err: (s: string) => void,
+): number {
+  const vm = findVm(vmStore, input.vm);
+  if (vm === undefined) {
+    err(`error: VM not found in state: ${input.vm}`);
+    return 1;
+  }
+  const app = appStore.get(vm.id, input.app);
+  if (app === undefined) {
+    err(`error: app not found on vm ${vm.name}: ${input.app}`);
+    return 1;
+  }
+
+  const opts: HostBootstrapOptions = {
+    appUser: input.appUser,
+    ...(input.appBase !== undefined ? { appBase: input.appBase } : {}),
+    ...(input.nodeMajor !== undefined ? { nodeMajor: input.nodeMajor } : {}),
+    ...(input.pgMajor !== undefined ? { pgMajor: input.pgMajor } : {}),
+    ...(input.execStart !== undefined ? { execStart: input.execStart } : {}),
+    ...(input.tlsMode !== undefined ? { tlsMode: input.tlsMode } : {}),
+  };
+
+  out(buildHostBootstrapScript(app, opts));
   return 0;
 }
 
