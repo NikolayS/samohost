@@ -2074,6 +2074,36 @@ describe("port-check phase — foreign-occupant detection", () => {
     expect(r.status).toBe(0);
   });
 
+  /** Bind a real TCP listener on the IPv6 loopback (::1) and return the port. */
+  function bindListenerV6(): Promise<{ server: net.Server; port: number }> {
+    return new Promise((resolve, reject) => {
+      const server = net.createServer();
+      _servers.push(server);
+      server.listen(0, "::1", () => {
+        const addr = server.address();
+        if (!addr || typeof addr === "string") return reject(new Error("bad addr"));
+        resolve({ server, port: addr.port });
+      });
+      server.on("error", reject);
+    });
+  }
+
+  // (a') IPv6-only squatter must also be caught (samorev #71 hardening): an
+  // IPv6-only listener shows as [::1]:PORT in `ss -ltnH`; the old IPv4-only
+  // regex was a false negative → unit would still hit EADDRINUSE on a dual-stack
+  // bind. ss on this host may not be present in every CI image, so skip cleanly
+  // if the address form isn't observable, but assert detection when it is.
+  test("(a') executed: function returns non-zero when an IPv6-only process holds the port", async () => {
+    let bound: { server: net.Server; port: number };
+    try {
+      bound = await bindListenerV6();
+    } catch {
+      return; // no IPv6 loopback in this environment — nothing to assert
+    }
+    const r = runPortCheck(bound.port, false);
+    expect(r.status).not.toBe(0);
+  });
+
   // (b) SCRIPT-CONTENT: port-check phase emitted BEFORE clone, fail path removes Caddy snippet
   test("(b) port-check phase marker appears BEFORE clone phase marker in node path", () => {
     const s = buildEnvCreateScript(app(), target());
