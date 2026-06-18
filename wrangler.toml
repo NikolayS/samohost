@@ -19,10 +19,12 @@ name            = "samohost-preview-banner"
 main            = "src/edge/worker.ts"
 compatibility_date = "2024-11-01"
 
-# Route: bind the Worker to all requests on *.samo.cat preview hostnames.
+# Route: bind the Worker to all *.samo.cat preview SUBDOMAINS.
+# The leading "*." (with the dot) restricts the route to subdomains and does
+# NOT match the apex samo.cat — apex would otherwise be matched by a bare "*".
 # Production hosts live on the samo.team zone and are NOT matched here.
 # The route + zone_name pair is all that wrangler needs to register the route
 # in the CF dashboard for the samo.cat zone.
 [[routes]]
-pattern   = "*samo.cat/*"
+pattern   = "*.samo.cat/*"
 zone_name = "samo.cat"

@@ -21,6 +21,9 @@
  */
 
 import { describe, test, expect } from "bun:test";
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+import { dirname, join } from "node:path";
 import { isPreviewHost } from "../src/edge/worker.ts";
 import { injectBanner } from "../src/edge/worker.ts";
 import { handleEdgeRequest } from "../src/edge/worker.ts";
@@ -289,5 +292,40 @@ describe("handleEdgeRequest — end-to-end", () => {
     const result = await handleEdgeRequest(req, res);
     expect(result.status).toBe(301);
     expect(result.headers.get("location")).toBe("https://field-record-demo.samo.cat/new-path");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// wrangler.toml route — CI-locked deploy manifest (prod isolation lives here)
+// ---------------------------------------------------------------------------
+//
+// The CF route is the FIRST line of prod isolation: it binds the Worker to the
+// samo.cat zone only, and "*.samo.cat/*" (with the dot) restricts it to
+// SUBDOMAINS so the apex `samo.cat` is not matched. A bare "*samo.cat/*" would
+// also match the apex. Production hosts live on the samo.team zone and can never
+// be matched. Lock these values so a regression in the deploy manifest fails CI.
+describe("wrangler.toml route — prod isolation manifest", () => {
+  const here = dirname(fileURLToPath(import.meta.url));
+  const wrangler = readFileSync(join(here, "..", "wrangler.toml"), "utf8");
+
+  test("route pattern is exactly *.samo.cat/* (subdomain-only, not apex)", () => {
+    const m = wrangler.match(/pattern\s*=\s*"([^"]+)"/);
+    expect(m).not.toBeNull();
+    expect(m![1]).toBe("*.samo.cat/*");
+  });
+
+  test("route is bound to the samo.cat zone (never samo.team / prod)", () => {
+    const m = wrangler.match(/zone_name\s*=\s*"([^"]+)"/);
+    expect(m).not.toBeNull();
+    expect(m![1]).toBe("samo.cat");
+    // The zone binding must never be the prod zone (samo.team is only ever
+    // mentioned in comments explaining isolation, never as a zone_name value).
+    expect(wrangler).not.toMatch(/zone_name\s*=\s*"[^"]*samo\.team[^"]*"/);
+  });
+
+  test("manifest carries no committed account id or token (names only)", () => {
+    // No bare account_id/api_token assignments — only env-var documentation.
+    expect(wrangler).not.toMatch(/^\s*account_id\s*=\s*"[0-9a-f]{16,}"/m);
+    expect(wrangler).not.toMatch(/CLOUDFLARE_API_TOKEN\s*=\s*"[A-Za-z0-9_-]{20,}"/);
   });
 });
