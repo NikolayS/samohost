@@ -318,9 +318,15 @@ export interface EnvExecDeps {
   dns?: () => DnsProviderPort | undefined;
 }
 
-/** Warning emitted when no DNS provider is configured. */
+/**
+ * Warning emitted when no DNS provider is configured.
+ *
+ * CLOUDFLARE_SAMOCAT is the only required env var (issue #54): samohost
+ * resolves the zone id itself via zones:list when SAMOHOST_SAMOCAT_ZONE_ID is
+ * unset, so omitting it is no longer an error — only the token is required.
+ */
 const DNS_DEGRADE_WARNING =
-  "samohost: CLOUDFLARE_SAMOCAT and/or SAMOHOST_SAMOCAT_ZONE_ID not set — " +
+  "samohost: CLOUDFLARE_SAMOCAT not set — " +
   "skipping per-preview DNS (relying on a wildcard A record); previews on a " +
   "VM not covered by the wildcard will not resolve";
 
@@ -488,7 +494,9 @@ export async function runEnvDestroy(
 
   // Remove the per-preview DNS A record after a successful destroy.
   // On DNS failure, warn and continue — the local record is still removed and
-  // the stale DNS entry is harmless (unproxied, no origin to hit).
+  // the stale proxied DNS entry is harmless once the origin no longer responds
+  // (CF will return a 521/522 for the vhost, which is an acceptable failure
+  // mode for a destroyed env).
   const dnsProvider = deps.dns?.();
   if (dnsProvider !== undefined) {
     try {
@@ -601,23 +609,35 @@ export function defaultEnvExecDeps(): EnvExecDeps {
     remote: defaultRemoteScriptRunner(),
     now: () => new Date(),
     uuid: () => crypto.randomUUID(),
-    // Per-preview DNS factory (issue #37).
+    // Per-preview DNS factory (issue #37, updated issue #54).
     //
     // CLOUDFLARE_SAMOCAT is intentionally a SEPARATE env var from
-    // CLOUDFLARE_API_TOKEN used by `dns status`. That token is a
-    // broad read/write API token; CLOUDFLARE_SAMOCAT is a zone-scoped
-    // write token for samo.cat ONLY. They must remain separate — a
-    // zone-scoped token often lacks the zones:list scope that
-    // CLOUDFLARE_API_TOKEN needs, and granting samo.cat write access
-    // to the global token would be over-privileged.
+    // CLOUDFLARE_API_TOKEN used by `dns status`. That token is a broad
+    // read/write API token; CLOUDFLARE_SAMOCAT is a zone-scoped write
+    // token for samo.cat ONLY. They must remain separate — granting
+    // samo.cat write access to the global read token would be over-privileged.
+    //
+    // SAMOHOST_SAMOCAT_ZONE_ID is now OPTIONAL (issue #54): CLOUDFLARE_SAMOCAT
+    // has zones:list scope, so samohost resolves the zone id itself when the
+    // env var is unset. CloudflareDns accepts `zoneName` and lazily resolves
+    // the zone id on the first write call (one extra GET /zones?name=samo.cat,
+    // result cached). SAMOHOST_SAMOCAT_ZONE_ID takes precedence when set
+    // (zero-change for existing deployments that pin the zone id explicitly).
+    //
+    // DEFAULT_PREVIEW_DOMAIN ("samo.cat") is the only zone we have a
+    // CLOUDFLARE_SAMOCAT token for, so it is the right fallback for zone
+    // discovery when the zone-id env var is absent.
     dns: () => {
       const token = process.env["CLOUDFLARE_SAMOCAT"];
-      const zoneId = process.env["SAMOHOST_SAMOCAT_ZONE_ID"];
-      if (!token || !zoneId) {
+      if (!token) {
         // Caller checks for undefined and emits the degrade warning.
         return undefined;
       }
-      return new CloudflareDns({ token, zoneId });
+      const zoneId = process.env["SAMOHOST_SAMOCAT_ZONE_ID"];
+      return new CloudflareDns({
+        token,
+        ...(zoneId ? { zoneId } : { zoneName: DEFAULT_PREVIEW_DOMAIN }),
+      });
     },
   };
 }

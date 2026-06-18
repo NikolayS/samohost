@@ -489,13 +489,20 @@ function buildStaticEnvCreateScript(
 
   lines.push('cd "$SAMOHOST_ENV_DIR"', "");
 
-  // ----- vhost: Caddy file_server (bare block = ACME HTTPS) ----------------
+  // ----- vhost: Caddy file_server (tls internal — CF Full-mode proxied origin)
+  // The record is PROXIED (orange cloud), so CF edge fronts the origin. Caddy
+  // uses `tls internal` (self-signed cert); CF Full mode accepts a self-signed
+  // origin cert. No browser ever sees the self-signed cert — CF terminates the
+  // real edge cert. ACME is NOT used: it cannot complete on a CF-locked :443
+  // (port firewalled to CF IPs only) and the host has no DNS-01 plugin.
+  // The health probe below uses `curl -k --resolve` which works against
+  // `tls internal` — unchanged.
   lines.push(
     ...phaseBlock(
       "vhost",
       "Caddy file_server vhost snippet + reload (sites.d include applied in host-prep)",
       [
-        "if printf '%s {\\n\\troot * %s\\n\\ttry_files {path} /index.html\\n\\tfile_server\\n\\tencode gzip\\n}\\n' \\",
+        "if printf '%s {\\n\\ttls internal\\n\\troot * %s\\n\\ttry_files {path} /index.html\\n\\tfile_server\\n\\tencode gzip\\n}\\n' \\",
         '     "$SAMOHOST_VHOST" "$SAMOHOST_ENV_DIR" \\',
         '   | sudo /usr/bin/tee "$SAMOHOST_CADDY_SNIPPET" >/dev/null \\',
         "   && sudo /usr/bin/systemctl reload caddy; ",
@@ -514,8 +521,7 @@ function buildStaticEnvCreateScript(
   // --resolve "$SAMOHOST_VHOST:443:127.0.0.1" makes curl connect to 127.0.0.1
   // while presenting the vhost as both the SNI and the Host header, so Caddy
   // selects the right cert/site and the probe reflects actual site health.
-  // -k allows the in-flight self-signed cert (ACME may not yet have issued
-  // the real cert at first-create time).
+  // -k skips the self-signed cert check (tls internal) — correct behaviour.
   lines.push(
     `# --- health: prove Caddy serves the static vhost (--resolve curl, SNI=vhost) ---`,
     marker("health", "start"),
@@ -729,12 +735,19 @@ export function buildEnvCreateScript(
   );
 
   // ----- vhost -----------------------------------------------------------------
+  // The record is PROXIED (orange cloud), so CF edge fronts the origin. Caddy
+  // uses `tls internal` (self-signed cert); CF Full mode accepts a self-signed
+  // origin cert. No browser ever sees the self-signed cert — CF terminates the
+  // real edge cert. Direct-to-origin is impossible on CF-locked VMs (firewall
+  // allows :443 from CF IPs only), so the `tls internal` self-signed cert is
+  // never exposed to clients. ACME is not used: it cannot complete behind a
+  // CF-locked :443 and the host has no DNS-01 plugin.
   lines.push(
     ...phaseBlock(
       "vhost",
       "Caddy vhost snippet + reload (sites.d include applied in host-prep)",
       [
-        "if printf '%s {\\n\\treverse_proxy localhost:%s\\n}\\n' \\",
+        "if printf '%s {\\n\\ttls internal\\n\\treverse_proxy localhost:%s\\n}\\n' \\",
         '     "$SAMOHOST_VHOST" "$SAMOHOST_PORT" \\',
         '   | sudo /usr/bin/tee "$SAMOHOST_CADDY_SNIPPET" >/dev/null \\',
         "   && sudo /usr/bin/systemctl reload caddy; ",
