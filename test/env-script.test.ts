@@ -283,6 +283,23 @@ describe("buildHostPrepScript", () => {
     ).toThrow(/main.?host/i);
   });
 
+  test("invalid mainHost error message uses a neutral placeholder, not a client-specific hostname (D2)", () => {
+    let msg = "";
+    try {
+      buildHostPrepScript(app({ mainHost: "bad host!" }), "agent");
+    } catch (e) {
+      msg = (e as Error).message;
+    }
+    // Error must have been thrown
+    expect(msg).not.toBe("");
+    // Generic platform code must NOT embed a client-specific domain as the example
+    // (app.name appears legitimately as 'field-record-1'; the contamination is the
+    // hardcoded "field-record-1.samo.team" example string — keyed by ".samo.team")
+    expect(msg).not.toContain("field-record-1.samo.team");
+    // Must carry a neutral placeholder example so the message is still helpful
+    expect(msg).toContain("app.example.com");
+  });
+
   test("no mainHost → no main vhost snippet (back-compat), include still applied", () => {
     const s = buildHostPrepScript(app(), "agent");
     expect(s).not.toContain("00-main-");
