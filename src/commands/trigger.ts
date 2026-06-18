@@ -39,10 +39,26 @@ import {
 } from "./app.ts";
 import { checkCiGreen } from "../app/cigate.ts";
 import type { DeployOutcome } from "../app/parse.ts";
+import {
+  runEnvGc,
+  defaultEnvExecDeps,
+  defaultEnvStore,
+} from "./env.ts";
+import type { EnvStore } from "../state/envs.ts";
 
 // ---------------------------------------------------------------------------
 // Public types
 // ---------------------------------------------------------------------------
+
+/**
+ * Per-VM GC summary folded into TriggerRunReport when --gc is active.
+ * Returned by the injected gc dep after running a GC pass on one VM.
+ */
+export interface GcSummary {
+  candidates: number;
+  reaped: number;
+  pruned: number;
+}
 
 export interface TriggerRunInput {
   /** Narrow to a single VM by name or id (optional). */
@@ -50,6 +66,15 @@ export interface TriggerRunInput {
   /** Narrow to a single app by name (optional). */
   app?: string;
   dryRun: boolean;
+  /**
+   * When true, run an env GC pass per live VM in scope after the deploy loop.
+   * DEFAULT: false (absent = no GC at all). GC only ever reaps branch-gone and
+   * orphan-vm envs (never ttl — no default age-based cleanup in the trigger).
+   * Under --dry-run the GC pass runs in dry-run too (reap:false).
+   * SAFETY: this must be OPT-IN. The trigger runs unattended; destructive
+   * operations must never happen unless explicitly requested.
+   */
+  gc?: boolean;
 }
 
 export interface TriggerAppResult {
@@ -75,6 +100,11 @@ export interface TriggerRunReport {
   deployed: number;
   skipped: number;
   failed: number;
+  /**
+   * Per-VM GC summary (vmId → counts). Only present when --gc was active and
+   * at least one live VM was in scope and the gc dep is wired.
+   */
+  gc?: Record<string, GcSummary>;
 }
 
 /**
@@ -110,6 +140,24 @@ export interface TriggerDeps {
   env?: Record<string, string | undefined>;
   /** Clock for cycleAt timestamps. */
   now: () => Date;
+  /**
+   * OPTIONAL: Curried GC function. When present and input.gc is true, called
+   * once per unique live VM in scope (after the deploy loop). Restricted to
+   * branch-gone + orphan-vm reasons (NOT ttl — no default age-based cleanup).
+   *
+   * Signature: (vmId, opts) => Promise<GcSummary>
+   *
+   * OPTIONAL so that all existing test fixtures that build {resolveRef, deploy,
+   * fetch, now} continue to compile and run unchanged. When absent, the GC pass
+   * is silently skipped even if input.gc is true.
+   */
+  gc?: (vmId: string, opts: { reap: boolean }) => Promise<GcSummary>;
+  /**
+   * OPTIONAL: EnvStore used to enumerate live-VM ids for the GC pass scope.
+   * When absent, GC scope is derived from candidate app vmIds (live VMs only).
+   * OPTIONAL to preserve backward compatibility with existing test fixtures.
+   */
+  envStore?: EnvStore;
 }
 
 // ---------------------------------------------------------------------------
@@ -330,6 +378,51 @@ export async function runTriggerRun(
     }
   }
 
+  // ---- GC pass (opt-in: only when input.gc is true and dep is wired) ------
+  // Runs AFTER the deploy loop so the deploy pass always completes unaffected.
+  // Restricted to branch-gone + orphan-vm reasons (no ttl in the trigger).
+  // Under --dry-run the GC pass runs in dry-run too (reap:false, never reaps).
+  // Deduplicated by vmId so each live VM is gc'd exactly once even with
+  // multiple apps.
+  let gcByVm: Record<string, GcSummary> | undefined;
+
+  if (input.gc === true && deps.gc !== undefined) {
+    // Collect unique live VM ids from the candidates we processed.
+    const seenVmIds = new Set<string>();
+    for (const app of candidates) {
+      const vmRecord = allVms.find((v) => v.id === app.vmId);
+      if (vmRecord === undefined) continue;
+      if (!LIVE_STATES.has(vmRecord.lifecycleState)) continue;
+      seenVmIds.add(vmRecord.id);
+    }
+
+    if (seenVmIds.size > 0) {
+      gcByVm = {};
+      // reap:true unless we are in a dry-run (trigger --dry-run propagates to gc)
+      const reap = !input.dryRun;
+
+      for (const vmId of seenVmIds) {
+        try {
+          const summary = await deps.gc(vmId, { reap });
+          gcByVm[vmId] = summary;
+
+          // Only print text output if something was reaped/pruned (quiet when nothing happened)
+          if (!opts.json && (summary.reaped > 0 || summary.pruned > 0)) {
+            out(
+              `  gc ${vmId}: candidates=${summary.candidates} reaped=${summary.reaped} pruned=${summary.pruned}`,
+            );
+          }
+        } catch (e) {
+          // GC failure for one VM must not abort the cycle
+          err(
+            `samohost: warning: gc pass failed for VM ${vmId}: ` +
+              (e instanceof Error ? e.message : String(e)),
+          );
+        }
+      }
+    }
+  }
+
   // ---- Build report -------------------------------------------------------
   let deployed = 0;
   let skipped = 0;
@@ -359,6 +452,7 @@ export async function runTriggerRun(
     deployed,
     skipped,
     failed,
+    ...(gcByVm !== undefined ? { gc: gcByVm } : {}),
   };
 
   if (opts.json) {
@@ -394,10 +488,15 @@ export async function runTriggerRun(
  *            at call time inside checkCiGreen — never stored here)
  *   - env: undefined (checkCiGreen falls back to process.env)
  *   - now: () => new Date()
+ *   - gc: closure that calls runEnvGc with defaultEnvExecDeps() + defaultEnvStore()
+ *         bound; restricted to branch-gone + orphan-vm (no ttl); only INVOKED
+ *         when input.gc is true — set but lazy.
+ *   - envStore: defaultEnvStore()
  */
 export function defaultTriggerDeps(): TriggerDeps {
   // Bind AppDeployDeps once for the lifetime of this trigger run.
   const appDeployDeps = defaultAppDeployDeps();
+  const envStore = defaultEnvStore();
 
   return {
     // Reuse the same resolver the deploy path uses (no new resolver code).
@@ -412,5 +511,58 @@ export function defaultTriggerDeps(): TriggerDeps {
     fetch: globalThis.fetch,
 
     now: () => new Date(),
+
+    // Curried GC function: EnvExecDeps + EnvStore already bound. Only invoked
+    // when input.gc is true. Restricted to branch-gone + orphan-vm (no ttl arg
+    // → ttl-based reaping disabled). AppStore and StateStore are passed in at
+    // call time from the trigger's own stores.
+    gc: async (vmId: string, opts: { reap: boolean }): Promise<GcSummary> => {
+      const envExecDeps = defaultEnvExecDeps();
+      // Null sink for gc text output: trigger accumulates summary counts only.
+      const noop = (_s: string) => {};
+
+      // We need vmStore and appStore — use new default stores for the gc call.
+      // This mirrors the pattern in cli.ts (new StateStore() / defaultAppStore()).
+      // Lazy import avoids a circular-at-load issue if this grows.
+      const { StateStore: VmStateStore } = await import("../state/store.ts");
+      const { AppStore: GcAppStore } = await import("../state/apps.ts");
+      const gcVmStore = new VmStateStore();
+      const gcAppStore = new GcAppStore();
+
+      const gcInput: import("./env.ts").EnvGcInput = {
+        vm: vmId,
+        reap: opts.reap,
+        // No ttl: trigger never does age-based reaping
+      };
+
+      // Run gc; capture counts from the JSON output (json:true suppresses text).
+      let outStr = "";
+      const captureOut = (s: string) => { outStr += s; };
+
+      await runEnvGc(
+        gcInput,
+        { json: true },
+        gcVmStore,
+        gcAppStore,
+        envStore,
+        envExecDeps,
+        captureOut,
+        noop,
+      );
+
+      // Parse the GcReport JSON to extract summary counts.
+      try {
+        const report = JSON.parse(outStr) as import("./env.ts").GcReport;
+        return {
+          candidates: report.candidates.length,
+          reaped: report.reaped.length,
+          pruned: report.pruned.length,
+        };
+      } catch {
+        return { candidates: 0, reaped: 0, pruned: 0 };
+      }
+    },
+
+    envStore,
   };
 }

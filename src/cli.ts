@@ -1601,6 +1601,7 @@ function parseTriggerRun(args: string[]): ParsedTriggerRun {
   let app: string | undefined;
   let dryRun = false;
   let json = false;
+  let gc: boolean | undefined;
 
   for (let i = 0; i < args.length; i++) {
     const a = args[i]!;
@@ -1619,6 +1620,9 @@ function parseTriggerRun(args: string[]): ParsedTriggerRun {
       case "--json":
         json = true;
         break;
+      case "--gc":
+        gc = true;
+        break;
       default:
         throw new UsageError(`unknown flag: ${a}`);
     }
@@ -1628,6 +1632,7 @@ function parseTriggerRun(args: string[]): ParsedTriggerRun {
     dryRun,
     ...(vm !== undefined ? { vm } : {}),
     ...(app !== undefined ? { app } : {}),
+    ...(gc !== undefined ? { gc } : {}),
   };
   return { kind: "trigger-run", input, json };
 }

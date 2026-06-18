@@ -32,6 +32,7 @@ import {
   type TriggerRunInput,
   type TriggerDeps,
   type TriggerRunReport,
+  type GcSummary,
 } from "../src/commands/trigger.ts";
 import { AppStore } from "../src/state/apps.ts";
 import { StateStore } from "../src/state/store.ts";
@@ -847,4 +848,279 @@ test("structural — TriggerDeps has fetch and env fields (added in #52)", () =>
   };
   expect("fetch" in deps).toBe(true);
   expect("env" in deps).toBe(true);
+});
+
+// ---------------------------------------------------------------------------
+// PR-2: GC wired into trigger run (--gc flag, opt-in, default OFF)
+// ---------------------------------------------------------------------------
+
+describe("trigger run --gc (PR-2)", () => {
+  let dir: string;
+  let vmStore: StateStore;
+  let appStore: AppStore;
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), "samohost-trigger-gc-"));
+    vmStore = new StateStore(join(dir, "state.json"));
+    appStore = new AppStore(join(dir, "apps.json"));
+  });
+
+  afterEach(() => rmSync(dir, { recursive: true, force: true }));
+
+  // -------------------------------------------------------------------------
+  // gc-1: WITHOUT --gc, the fake gc dependency is NEVER called (call count = 0)
+  // -------------------------------------------------------------------------
+  test("gc-1 — without --gc flag, gc dep is never called; report has no gc key", async () => {
+    vmStore.upsert(makeVm());
+    appStore.upsert(makeApp({ deployedSha: SHA_A })); // up-to-date → no deploy
+
+    let gcCallCount = 0;
+    const fakeGc = async (_vmId: string, _opts: { reap: boolean }): Promise<GcSummary> => {
+      gcCallCount++;
+      return { candidates: 0, reaped: 0, pruned: 0 };
+    };
+
+    const { fetch: fakeFetch } = makeFakeFetch([]);
+    const deps: TriggerDeps = {
+      resolveRef: () => Promise.resolve(SHA_A),
+      deploy: makeFakeDeploy(0).deploy,
+      fetch: fakeFetch,
+      env: {},
+      now: () => new Date(),
+      gc: fakeGc,
+    };
+
+    const c = capture();
+    // No --gc in input
+    const code = await runTriggerRun({ dryRun: false }, { json: true }, vmStore, appStore, deps, c.out, c.err);
+    expect(code).toBe(0);
+
+    // gc MUST NOT have been called
+    expect(gcCallCount).toBe(0);
+
+    // JSON report must NOT have a gc key
+    const report: TriggerRunReport = JSON.parse(c.o);
+    expect("gc" in report).toBe(false);
+  });
+
+  // -------------------------------------------------------------------------
+  // gc-2: WITH --gc, gc dep is called once per unique live VM; counts folded
+  //       into report.gc keyed by vmId
+  // -------------------------------------------------------------------------
+  test("gc-2 — with --gc, gc dep called once per live VM; counts in report.gc", async () => {
+    vmStore.upsert(makeVm({ id: "vm-1111", name: "samo-we-field-record" }));
+    appStore.upsert(makeApp({ deployedSha: SHA_A })); // up-to-date
+
+    const gcCalls: Array<{ vmId: string; opts: { reap: boolean } }> = [];
+    const fakeGc = async (vmId: string, opts: { reap: boolean }): Promise<GcSummary> => {
+      gcCalls.push({ vmId, opts });
+      return { candidates: 2, reaped: 1, pruned: 1 };
+    };
+
+    const { fetch: fakeFetch } = makeFakeFetch([]);
+    const deps: TriggerDeps = {
+      resolveRef: () => Promise.resolve(SHA_A),
+      deploy: makeFakeDeploy(0).deploy,
+      fetch: fakeFetch,
+      env: {},
+      now: () => new Date(),
+      gc: fakeGc,
+    };
+
+    const c = capture();
+    const code = await runTriggerRun({ dryRun: false, gc: true }, { json: true }, vmStore, appStore, deps, c.out, c.err);
+    expect(code).toBe(0);
+
+    // gc called exactly once (one unique live VM)
+    expect(gcCalls.length).toBe(1);
+    expect(gcCalls[0]!.vmId).toBe("vm-1111");
+    // must be called with reap:true (not dry-run)
+    expect(gcCalls[0]!.opts.reap).toBe(true);
+
+    // JSON report includes gc key keyed by vmId
+    const report: TriggerRunReport = JSON.parse(c.o);
+    expect("gc" in report).toBe(true);
+    expect(report.gc!["vm-1111"]).toBeDefined();
+    expect(report.gc!["vm-1111"]!.candidates).toBe(2);
+    expect(report.gc!["vm-1111"]!.reaped).toBe(1);
+    expect(report.gc!["vm-1111"]!.pruned).toBe(1);
+  });
+
+  // -------------------------------------------------------------------------
+  // gc-3: WITH --gc and TWO apps on the SAME VM, gc is called ONCE (deduplicated)
+  // -------------------------------------------------------------------------
+  test("gc-3 — two apps on same VM: gc called exactly once (deduped by vmId)", async () => {
+    vmStore.upsert(makeVm({ id: "vm-1111", name: "samo-we-field-record" }));
+    appStore.upsert(makeApp({ name: "app-one", id: "app-one-id", deployedSha: SHA_A }));
+    appStore.upsert(makeApp({ name: "app-two", id: "app-two-id", deployedSha: SHA_A }));
+
+    let gcCallCount = 0;
+    const fakeGc = async (_vmId: string, _opts: { reap: boolean }): Promise<GcSummary> => {
+      gcCallCount++;
+      return { candidates: 0, reaped: 0, pruned: 0 };
+    };
+
+    const { fetch: fakeFetch } = makeFakeFetch([]);
+    const deps: TriggerDeps = {
+      resolveRef: () => Promise.resolve(SHA_A),
+      deploy: makeFakeDeploy(0).deploy,
+      fetch: fakeFetch,
+      env: {},
+      now: () => new Date(),
+      gc: fakeGc,
+    };
+
+    const c = capture();
+    await runTriggerRun({ dryRun: false, gc: true }, { json: true }, vmStore, appStore, deps, c.out, c.err);
+
+    // gc called once despite two apps (same vmId)
+    expect(gcCallCount).toBe(1);
+  });
+
+  // -------------------------------------------------------------------------
+  // gc-4: WITH --gc --dry-run, gc dep is called with reap:false (DRY-RUN);
+  //       counts still appear in report.gc; nothing is actually reaped
+  // -------------------------------------------------------------------------
+  test("gc-4 — with --gc --dry-run, gc dep called with reap:false (dry-run mode)", async () => {
+    vmStore.upsert(makeVm());
+    appStore.upsert(makeApp({ deployedSha: SHA_A }));
+
+    const gcCalls: Array<{ vmId: string; opts: { reap: boolean } }> = [];
+    const fakeGc = async (vmId: string, opts: { reap: boolean }): Promise<GcSummary> => {
+      gcCalls.push({ vmId, opts });
+      // dry-run gc: reports candidates but reaped=0 pruned=0
+      return { candidates: 3, reaped: 0, pruned: 0 };
+    };
+
+    const { fetch: fakeFetch } = makeFakeFetch([]);
+    const deps: TriggerDeps = {
+      resolveRef: () => Promise.resolve(SHA_A),
+      deploy: makeFakeDeploy(0).deploy,
+      fetch: fakeFetch,
+      env: {},
+      now: () => new Date(),
+      gc: fakeGc,
+    };
+
+    const c = capture();
+    const code = await runTriggerRun({ dryRun: true, gc: true }, { json: true }, vmStore, appStore, deps, c.out, c.err);
+    expect(code).toBe(0);
+
+    // gc was called with reap:false (dry-run propagated)
+    expect(gcCalls.length).toBe(1);
+    expect(gcCalls[0]!.opts.reap).toBe(false);
+
+    // report still has gc key with counts
+    const report: TriggerRunReport = JSON.parse(c.o);
+    expect("gc" in report).toBe(true);
+    expect(report.gc!["vm-1111"]!.candidates).toBe(3);
+    expect(report.gc!["vm-1111"]!.reaped).toBe(0);
+  });
+
+  // -------------------------------------------------------------------------
+  // gc-5: --gc --json output must include a `gc` key (CI-verifiable acceptance)
+  // -------------------------------------------------------------------------
+  test("gc-5 — --gc --json output includes gc key (CI-verifiable, no live remote)", async () => {
+    vmStore.upsert(makeVm());
+    appStore.upsert(makeApp({ deployedSha: SHA_A }));
+
+    const fakeGc = async (_vmId: string, _opts: { reap: boolean }): Promise<GcSummary> => {
+      return { candidates: 1, reaped: 1, pruned: 0 };
+    };
+
+    const { fetch: fakeFetch } = makeFakeFetch([]);
+    const deps: TriggerDeps = {
+      resolveRef: () => Promise.resolve(SHA_A),
+      deploy: makeFakeDeploy(0).deploy,
+      fetch: fakeFetch,
+      env: {},
+      now: () => new Date(),
+      gc: fakeGc,
+    };
+
+    const c = capture();
+    await runTriggerRun({ dryRun: false, gc: true }, { json: true }, vmStore, appStore, deps, c.out, c.err);
+
+    const parsed = JSON.parse(c.o);
+    expect("gc" in parsed).toBe(true);
+    // gc is keyed by vmId
+    const gcKeys = Object.keys(parsed.gc);
+    expect(gcKeys.length).toBeGreaterThanOrEqual(1);
+    const vmGc = parsed.gc[gcKeys[0]!];
+    expect(typeof vmGc.candidates).toBe("number");
+    expect(typeof vmGc.reaped).toBe("number");
+    expect(typeof vmGc.pruned).toBe("number");
+  });
+
+  // -------------------------------------------------------------------------
+  // gc-6: parse --gc flag sets gc:true on TriggerRunInput
+  // -------------------------------------------------------------------------
+  test("gc-6 — parseArgs: trigger run --gc sets gc:true; absent = gc:undefined/false", () => {
+    const withGc = parseArgs(["trigger", "run", "--gc"]);
+    if (withGc.kind !== "trigger-run") throw new Error(`expected trigger-run, got ${withGc.kind}`);
+    expect(withGc.input.gc).toBe(true);
+
+    const withoutGc = parseArgs(["trigger", "run"]);
+    if (withoutGc.kind !== "trigger-run") throw new Error(`expected trigger-run, got ${withoutGc.kind}`);
+    // --gc absent: gc should be falsy (undefined or false)
+    expect(withoutGc.input.gc ?? false).toBe(false);
+  });
+
+  // -------------------------------------------------------------------------
+  // gc-7: --gc without gc dep injected → gc is silently skipped (no crash);
+  //       report has no gc key (graceful degradation when dep not wired)
+  // -------------------------------------------------------------------------
+  test("gc-7 — --gc with no gc dep injected: no crash; report omits gc key", async () => {
+    vmStore.upsert(makeVm());
+    appStore.upsert(makeApp({ deployedSha: SHA_A }));
+
+    const { fetch: fakeFetch } = makeFakeFetch([]);
+    // No gc dep
+    const deps: TriggerDeps = {
+      resolveRef: () => Promise.resolve(SHA_A),
+      deploy: makeFakeDeploy(0).deploy,
+      fetch: fakeFetch,
+      env: {},
+      now: () => new Date(),
+    };
+
+    const c = capture();
+    const code = await runTriggerRun({ dryRun: false, gc: true }, { json: true }, vmStore, appStore, deps, c.out, c.err);
+    expect(code).toBe(0);
+
+    // No crash; report doesn't have gc key (dep not wired)
+    const report: TriggerRunReport = JSON.parse(c.o);
+    expect("gc" in report).toBe(false);
+  });
+
+  // -------------------------------------------------------------------------
+  // gc-8: non-live VM (destroyed) is excluded from gc target set
+  // -------------------------------------------------------------------------
+  test("gc-8 — destroyed VM is excluded from gc pass; gc dep not called for dead VMs", async () => {
+    // Only a destroyed VM — no live VMs → gc dep should not be called at all
+    vmStore.upsert(makeVm({ lifecycleState: "destroyed" }));
+    appStore.upsert(makeApp());
+
+    let gcCallCount = 0;
+    const fakeGc = async (_vmId: string, _opts: { reap: boolean }): Promise<GcSummary> => {
+      gcCallCount++;
+      return { candidates: 0, reaped: 0, pruned: 0 };
+    };
+
+    const { fetch: fakeFetch } = makeFakeFetch([]);
+    const deps: TriggerDeps = {
+      resolveRef: () => Promise.resolve(SHA_A),
+      deploy: makeFakeDeploy(0).deploy,
+      fetch: fakeFetch,
+      env: {},
+      now: () => new Date(),
+      gc: fakeGc,
+    };
+
+    const c = capture();
+    await runTriggerRun({ dryRun: false, gc: true }, { json: true }, vmStore, appStore, deps, c.out, c.err);
+
+    // Destroyed VM should not trigger gc
+    expect(gcCallCount).toBe(0);
+  });
 });
