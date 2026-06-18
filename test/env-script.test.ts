@@ -1860,6 +1860,73 @@ describe("preview-flag: static env create writes config.js with preview:true", (
   });
 });
 
+// ---------------------------------------------------------------------------
+// PR #62 — static vhost must serve /config.js with no-cache so CF edge does
+// not cache it (preview banner never shows when CF returns a stale config.js
+// with preview:false from its 4h edge cache). Prod already serves config.js
+// with Cache-Control: no-cache, no-store, must-revalidate; the preview static
+// vhost must mirror that posture.
+// ---------------------------------------------------------------------------
+
+describe("static vhost: /config.js served with no-cache Cache-Control header", () => {
+  function staticApp(o: Partial<AppRecord> = {}): AppRecord {
+    return app({
+      kind: "static",
+      buildCmd: "true",
+      serviceUnit: "gc1",
+      repo: "samo-agent/game-changers",
+      appDir: "/opt/gc1/app",
+      ...o,
+    });
+  }
+
+  const NOCACHE_HEADER = 'header /config.js Cache-Control "no-cache, no-store, must-revalidate"';
+
+  test("static create script vhost block contains the config.js Cache-Control no-cache directive", () => {
+    const s = buildEnvCreateScript(staticApp(), target({ dbBackend: "none" }));
+    expect(s).toContain(NOCACHE_HEADER);
+  });
+
+  test("the no-cache directive is inside the site block (between root * and file_server)", () => {
+    const s = buildEnvCreateScript(staticApp(), target({ dbBackend: "none" }));
+    const rootIdx = s.indexOf("root *");
+    const fileServerIdx = s.indexOf("file_server");
+    const headerIdx = s.indexOf(NOCACHE_HEADER);
+    // Directive must appear in the script.
+    expect(headerIdx).toBeGreaterThan(-1);
+    // Directive must appear after 'root *' and before 'file_server' (placement
+    // inside the site block, per the brief's position guidance).
+    expect(headerIdx).toBeGreaterThan(rootIdx);
+    expect(headerIdx).toBeLessThan(fileServerIdx);
+  });
+
+  test("static vhost block still contains tls internal, root *, file_server, try_files (non-regression)", () => {
+    const s = buildEnvCreateScript(staticApp(), target({ dbBackend: "none" }));
+    expect(s).toContain("tls internal");
+    expect(s).toContain("root *");
+    expect(s).toContain("file_server");
+    expect(s).toContain("try_files {path} /index.html");
+  });
+
+  test("static create bash syntax is still valid after adding the no-cache header (bash -n)", () => {
+    const s = buildEnvCreateScript(staticApp(), target({ dbBackend: "none" }));
+    expect(bashSyntaxOk(s)).toBe(true);
+  });
+
+  test("static create is still deterministic (byte-identical across two calls)", () => {
+    expect(buildEnvCreateScript(staticApp(), target({ dbBackend: "none" }))).toBe(
+      buildEnvCreateScript(staticApp(), target({ dbBackend: "none" })),
+    );
+  });
+
+  test("node-app vhost (reverse_proxy) does NOT contain the config.js Cache-Control header directive", () => {
+    // The node-app vhost is a bare reverse_proxy block: it has no config.js
+    // (there is no file being served) so the header directive must not appear.
+    const s = buildEnvCreateScript(app(), target());
+    expect(s).not.toContain(NOCACHE_HEADER);
+  });
+});
+
 describe("preview-flag: prod deploy path stays clean (SAMO_ENV=preview must NOT appear)", () => {
   // The deploy path is the ONLY path that writes to production; env create is
   // preview-only by construction. This test guards against accidental drift.
