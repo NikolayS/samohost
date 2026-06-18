@@ -106,8 +106,8 @@ Usage:
   samohost doctor <vm-name-or-id> [--infra] [--json]
   samohost ssh <vm-name-or-id> [-- <command...>]
   samohost logs <vm-name-or-id> [--unit <name>] [--lines <n>] [--follow]
-  samohost app register <vm> --name <n> --repo <owner/name> \\
-      --service-unit <u> --health-url <url> [options]
+  samohost app register <vm> (--name <n> --repo <owner/name> \\
+      --service-unit <u> --health-url <url> [options] | --from-toml <path>)
   samohost app plan <vm> <app> --sha <sha>
   samohost app deploy <vm> <app> [--sha <sha> | --ref <ref>] \\
       [--skip-ci-gate] [--force] [--json]
@@ -202,20 +202,27 @@ non-interactive sudo path /usr/bin/journalctl):
 
 app register options (write an AppRecord; offline, no network):
   <vm>                       VM name or id the app deploys on (required)
-  --name <name>              app name, unique per VM (required)
-  --repo <owner/name>        GitHub repo (required)
-  --service-unit <unit>      systemd unit restarted on deploy (required)
-  --health-url <url>         post-deploy health URL (required)
+  --from-toml <path>         read all app fields from a repo-side .samohost.toml
+                             manifest instead of flags (the manifest is then the
+                             source of truth; flags are ignored). Schema +
+                             example: README "App manifest" section.
+  --name <name>              app name, unique per VM (required unless --from-toml)
+  --repo <owner/name>        GitHub repo (required unless --from-toml)
+  --service-unit <unit>      systemd unit restarted on deploy (required unless --from-toml)
+  --health-url <url>         post-deploy health URL (required unless --from-toml)
   --branch <branch>          tracked branch (default: main)
   --app-dir <path>           remote checkout dir (default: /opt/<name>/app)
   --build-cmd <cmd>          build command (default: npm run build)
   --migrate-cmd <cmd>        optional migration command
   --seed-cmd <cmd>           optional idempotent seed command
-  --env-file <path>          remote env file path (NEVER read/written by samohost)
+  --main-host <domain>       public production host for the durable main-env Caddy
+                             vhost (dotted lowercase DNS, e.g. app.samo.team)
+  --kind <node|static>       serve kind (default: node; static = file_server vhost,
+                             no service/db/build install)
+  --env-file <path>          remote env file; sourced (read-only) by the deploy
+                             script before install — NEVER read/written by samohost
   --env-db-var <NAME>        env var whose DB URL must point at the per-env db in
                              preview envs (repeatable; default: DATABASE_URL)
-  --env-file <path>          remote env file; sourced (read-only) by the deploy
-                             script before install — NEVER written by samohost
   --assert-rls               require app to connect as a non-superuser (RLS gate)
   --rls-url-var <NAME>       env var holding the NON-superuser URL the RLS probe
                              uses (default: RLS_DATABASE_URL || DATABASE_URL)
