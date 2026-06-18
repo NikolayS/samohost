@@ -692,6 +692,7 @@ export function defaultTriggerDeps(): TriggerDeps {
         app: string;
         branch: string;
         headSha: string;
+        prNumber: number;
       }) => {
         const prVmStore = new PrVmStore();
         const prAppStore = new PrAppStore();
@@ -728,13 +729,15 @@ export function defaultTriggerDeps(): TriggerDeps {
           // Parse failure → treat as failed
         }
 
-        // Re-read the persisted record and stamp lastDeployedSha.
+        // Re-read the persisted record and stamp lastDeployedSha + prNumber.
+        // prNumber marks this env as PR-managed so the closed-PR reaper knows it
+        // is safe to reap (manually-created/demo envs lack prNumber and are kept).
         // We need the vm id — resolve it from the store.
         const vmRec = prVmStore.list().find((v) => v.name === args.vm);
         if (vmRec !== undefined && vhost !== "") {
           const rec = prEnvStore.get(vmRec.id, args.app, args.branch);
           if (rec !== undefined) {
-            prEnvStore.upsert({ ...rec, lastDeployedSha: args.headSha });
+            prEnvStore.upsert({ ...rec, lastDeployedSha: args.headSha, prNumber: args.prNumber });
           }
         }
 

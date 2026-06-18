@@ -90,19 +90,24 @@ export interface PrPreviewDeps {
 
   /**
    * Create or redeploy the preview env for (vm, app, branch) at the current
-   * branch tip, recording lastDeployedSha=headSha on the EnvRecord.
+   * branch tip, recording lastDeployedSha=headSha and prNumber on the EnvRecord.
    *
    * IMPORTANT: the prod impl wraps runEnvCreate (db default "template",
    * DEFAULT_PREVIEW_DOMAIN) and reads the persisted EnvRecord back from envStore
-   * to record lastDeployedSha — so the unit-test fake MUST ALSO upsert an
-   * EnvRecord into the SAME injected envStore (matching prod write shape) for
-   * the SHA-compare in subsequent cycles to behave identically.
+   * to record lastDeployedSha and prNumber — so the unit-test fake MUST ALSO
+   * upsert an EnvRecord into the SAME injected envStore (matching prod write
+   * shape, including prNumber) for the SHA-compare and reap-guard in subsequent
+   * cycles to behave identically.
    */
   ensurePreview: (args: {
     vm: string;
     app: string;
     branch: string;
     headSha: string;
+    /** PR number that owns this preview env. Stamped onto the EnvRecord so the
+     * closed-PR reaper can distinguish PR-managed envs from manually-created /
+     * demo previews (which have prNumber===undefined and MUST NOT be reaped). */
+    prNumber: number;
   }) => Promise<EnsurePreviewResult>;
 
   /**
@@ -206,6 +211,7 @@ export async function runPrPreviewPass(
           app: app.name,
           branch,
           headSha: pr.headSha,
+          prNumber: pr.number,
         });
 
         const url = r.outcome === "ok" ? `https://${r.vhost}` : undefined;
@@ -248,6 +254,11 @@ export async function runPrPreviewPass(
   const allEnvs = deps.envStore.listFor(vm.id, app.name);
   for (const env of allEnvs) {
     if (openSet.has(env.branch)) continue; // branch is open — keep
+
+    // PR-provenance guard: ONLY reap envs that were created by this pass.
+    // Manually-created and demo previews (prNumber===undefined) are NEVER
+    // touched by the closed-PR reaper — they are not owned by any PR.
+    if (env.prNumber === undefined) continue;
 
     // Existence guard: check again to avoid double-reap (gc may have removed it)
     if (deps.envStore.get(vm.id, app.name, env.branch) === undefined) continue;
