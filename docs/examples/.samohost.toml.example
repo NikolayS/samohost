@@ -1,0 +1,48 @@
+# Example .samohost.toml — a repo-side app manifest for samohost.
+#
+# A client repo carries this file (typically at the repo root as `.samohost.toml`)
+# to describe its app once, so the operator runs:
+#
+#   samohost app register <vm> --from-toml .samohost.toml
+#
+# instead of passing every field as a flag. When --from-toml is used, the
+# manifest is the SOLE source of truth: any register flags are ignored.
+#
+# Field names map 1:1 to the AppSpec interface — there is no translation jargon.
+# Unknown keys are REJECTED (typo protection): a misspelled `helathUrl` fails
+# loudly instead of being silently dropped. Validation collects ALL errors at
+# once (it never bails on the first).
+#
+# Parser + schema: src/manifest/toml.ts. No secrets ever belong in this file —
+# it lives in a (often public) client repo. Database URLs / tokens stay in the
+# app's own --env-file on the host, which samohost never reads or writes.
+
+# ---- [app] — required fields ------------------------------------------------
+name        = "field-record-1"                    # app name, unique per VM
+repo        = "Tanya301/field-record-1"           # GitHub owner/name
+branch      = "main"                              # tracked branch (deploy source)
+appDir      = "/opt/field-record-1/app"           # remote checkout dir on the VM
+buildCmd    = "npm run build"                      # build command run on deploy
+healthUrl   = "http://127.0.0.1:3000/api/version" # post-deploy health URL (must 200)
+serviceUnit = "field-record-1"                     # systemd unit restarted on deploy
+
+# ---- [app] — optional fields ------------------------------------------------
+# migrateCmd     = "npm run migrate"              # optional migration command
+# seedCmd        = "npm run seed"                 # optional, idempotent seed command
+# envFile        = "/opt/field-record-1/app.env"  # remote env file, sourced read-only on deploy
+#                                                 #   (NEVER read or written by samohost)
+# mainHost       = "field-record-1.samo.team"     # public production host for the main-env Caddy vhost
+# rlsUrlVar      = "RLS_DATABASE_URL"             # env var holding the NON-superuser URL the RLS probe uses
+# envDbVars      = ["DATABASE_URL", "APP_DATABASE_URL"]  # vars whose DB host:port is rewritten per preview env
+# rlsNonSuperuser = true                          # require the app to connect as a non-superuser (RLS gate)
+# kind           = "node"                          # "node" (default) or "static" (file_server vhost, no service/db)
+
+# ---- [provision] — OPTIONAL table -------------------------------------------
+# Parsed and validated today but NOT yet consumed by `app register`
+# (reserved for a future `provision --from-toml`). Unknown keys here are also
+# rejected. Only these three keys are allowed:
+# [provision]
+# serverType = "cx22"          # Hetzner server type
+# location   = "nbg1"          # Hetzner location/region
+# [provision.labels]           # custom provider labels (string -> string)
+# team = "field-record"

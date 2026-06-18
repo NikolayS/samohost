@@ -18,6 +18,19 @@ bun run src/cli.ts --help          # or: bun run src/cli.ts <command>
 State lives at `~/.samohost/` (VMs, apps, envs, pinned host keys). Provider
 credentials come from the environment: `HCLOUD_TOKEN` for Hetzner.
 
+**Running samohost autonomously (bot operator):** start with
+[`docs/setup-checklist.md`](docs/setup-checklist.md) — the single ordered list
+of every token, scope, and prerequisite needed before any write/network command
+works (Hetzner / GitHub / Cloudflare DNS / Cloudflare Workers / runner-admin PAT
+/ SSH keypair + host-key fingerprint). Then:
+[`docs/control-plane-setup.md`](docs/control-plane-setup.md) (what runs where +
+the trigger `.service`/`.timer` + one-time root host-prep ordering),
+[`docs/preview-reachability.md`](docs/preview-reachability.md) (the CF-proxied
+origin / origin-TLS decision + the external reachability gate),
+[`docs/dblab-install-runbook.md`](docs/dblab-install-runbook.md),
+[`docs/dns-preview-authority.md`](docs/dns-preview-authority.md), and
+[`docs/edge-preview-banner.md`](docs/edge-preview-banner.md).
+
 ## Command surface
 
 Every command supports `--json` except the interactive/streaming pair
@@ -42,6 +55,7 @@ samohost logs web --lines 200 --follow     # systemd journal via sudo journalctl
 
 # Deploy an app (CI-gated, RLS-checked, env-file sourced, rollback-safe)
 samohost app register web --name field-record --repo owner/repo --service-unit field-record --health-url http://127.0.0.1:3000/api/version --env-file /opt/app/staging.env --assert-rls --rls-url-var APP_DATABASE_URL
+samohost app register web --from-toml .samohost.toml  # …or read every app field from a repo-side manifest (see "App manifest")
 samohost app plan web field-record --sha <sha>     # print the deploy script, no execution
 samohost app deploy web field-record --sha <sha>   # CI-green gate; --skip-ci-gate / --force to override
 samohost app status web field-record
@@ -127,6 +141,55 @@ samohost app deploy web myapp --sha <sha>           # fetch → build → migrat
 ```
 
 `provision` instead of `adopt` gives you the VM too, from one command.
+
+## App manifest (`.samohost.toml`)
+
+Instead of passing every `app register` field as a flag, a client repo can
+carry a `.samohost.toml` manifest and register from it:
+
+```bash
+samohost app register web --from-toml .samohost.toml
+```
+
+When `--from-toml` is given, **the manifest is the sole source of truth** — any
+`app register` flags are ignored. Field names map **1:1** to the internal
+`AppSpec` (no translation jargon). Unknown keys are **rejected** (typo
+protection: a misspelled `helathUrl` fails loudly), and validation collects
+**all** errors before returning (never bail-on-first). The parser is
+`src/manifest/toml.ts`; a fully-commented example is at
+[`docs/examples/.samohost.toml.example`](docs/examples/.samohost.toml.example).
+
+```toml
+# [app] — required
+name        = "field-record-1"                     # app name, unique per VM
+repo        = "Tanya301/field-record-1"            # GitHub owner/name
+branch      = "main"                               # tracked branch
+appDir      = "/opt/field-record-1/app"            # remote checkout dir
+buildCmd    = "npm run build"                       # build command
+healthUrl   = "http://127.0.0.1:3000/api/version"  # post-deploy health URL (must 200)
+serviceUnit = "field-record-1"                      # systemd unit restarted on deploy
+
+# [app] — optional
+# migrateCmd      = "npm run migrate"
+# seedCmd         = "npm run seed"
+# envFile         = "/opt/field-record-1/app.env"   # sourced read-only on deploy; never read/written by samohost
+# mainHost        = "field-record-1.samo.team"       # public production host for the main-env Caddy vhost
+# rlsUrlVar       = "RLS_DATABASE_URL"               # env var holding the non-superuser URL for the RLS probe
+# envDbVars       = ["DATABASE_URL"]                 # vars whose DB host:port is rewritten per preview env
+# rlsNonSuperuser = true                             # require non-superuser connection (RLS gate)
+# kind            = "node"                            # "node" (default) | "static"
+
+# [provision] — OPTIONAL; parsed + validated but NOT yet consumed by app register
+# (reserved for a future `provision --from-toml`). Allowed keys only:
+# [provision]
+# serverType = "cx22"
+# location   = "nbg1"
+# [provision.labels]
+# team = "field-record"
+```
+
+No secrets ever belong in the manifest — it lives in a (often public) client
+repo. Database URLs / tokens stay in the app's own `--env-file` on the host.
 
 ## How it's tested
 

@@ -128,6 +128,35 @@ All three corrections below are implemented in `src/env/script.ts` +
   - `dblab clone create --branch <git-branch>` (4.x native branching) for
     per-branch previews instead of bare `--id`.
 
+## Re-creating a dblab preview is NOT yet idempotent (issue #59)
+
+A **second** `env create … --db dblab` for an env whose previous create already
+made a DBLab clone fails the **db phase**:
+
+```
+<<<SAMOHOST_PHASE:db:start>>>
+failed to get response: clone with ID "<env-name>" already exists
+<<<SAMOHOST_PHASE:db:fail>>>
+```
+
+This aborts before the vhost/health phases, so the env is never re-served.
+(The `--db template` backend does NOT have this problem — its db phase is
+`dropdb --if-exists` + `createdb --template`, i.e. recreate semantics. Only the
+dblab backend currently fails on a pre-existing clone.)
+
+**Remedy until #59 lands the `clone destroy` self-heal:** before re-creating a
+dblab preview, destroy the env first so its clone is removed, then create again:
+
+```bash
+bun run src/cli.ts env destroy <vm> <app> --branch <b>   # runs `dblab clone destroy <id>`
+bun run src/cli.ts env create  <vm> <app> --branch <b> --db dblab
+```
+
+If `env destroy` cannot run (no record), hand-destroy the clone on the VM:
+`dblab clone destroy <env-name>` (the clone id is the env name). A bot hitting
+the `clone with ID "…" already exists` db-phase failure should treat it as
+"destroy-then-recreate", **not** retry the bare `env create`.
+
 ## Sizing guardrails (8 GB VM with prod + CI)
 
 - Each clone container gets its own `shared_buffers`/shm (example config ships
