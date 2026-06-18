@@ -493,7 +493,7 @@ describe("env-dns: per-VM preview DNS (issue #37 / #54)", () => {
 
 /** Minimal scripted fetch for resolveZoneId tests. */
 function fakeZoneFetch(responses: Array<{ status?: number; json: unknown }>): FetchFn {
-  return (input, init) => {
+  return (_input, _init) => {
     const r = responses.shift();
     if (!r) throw new Error("fakeZoneFetch: no scripted response left");
     return Promise.resolve(
