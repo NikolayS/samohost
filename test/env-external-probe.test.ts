@@ -10,7 +10,7 @@
  * runEnvCreate performs a real EXTERNAL HTTPS check before reporting success.
  * - URL: https://<vhost>/
  * - Expects HTTP 200; any non-200 or thrown error is a failure.
- * - Bounded retry: max EXTERNAL_PROBE_RETRIES=5, EXTERNAL_PROBE_SLEEP_MS=5000
+ * - Bounded retry: max EXTERNAL_PROBE_RETRIES=8, EXTERNAL_PROBE_SLEEP_MS=5000
  *   (SAFETY CAPS, not targets — returns immediately on first 200).
  * - On ultimate failure: outcome downgraded to "failed", exit code 1, env record
  *   kept for inspection (idempotent re-run), DNS record kept.
