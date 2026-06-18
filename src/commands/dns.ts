@@ -23,11 +23,15 @@ import {
 } from "../dns/preflight.ts";
 
 /**
- * Zones the operator's existing Cloudflare config/token are known to cover
- * (infra repo documents samo.team + samo.green; samo.cat is NOT among them).
+ * Client-facing Cloudflare zones, defaulted for the CLIENT domain model:
+ * samo.team (production) + samo.cat (preview environments). samo.green is
+ * samo's OWN dev/platform domain and is deliberately excluded here — it is
+ * never client-facing. (The air-infra repo documents samo's *infra* domains
+ * — samo.team + samo.green — which is a different concern from the client
+ * model and must not leak into this default.)
  * Overridable per call with --cf-zone.
  */
-export const DEFAULT_CLOUDFLARE_ZONES = ["samo.team", "samo.green"];
+export const DEFAULT_CLOUDFLARE_ZONES = ["samo.team", "samo.cat"];
 
 /** Probe label that proves a wildcard: nobody creates this record explicitly. */
 export const WILDCARD_PROBE_LABEL = "samohost-wildcard-probe";
