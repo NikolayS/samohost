@@ -770,27 +770,38 @@ export function defaultTriggerDeps(): TriggerDeps {
           }
         }
 
-        if (existingCommentId !== undefined) {
-          // PATCH existing comment
-          spawnSync(
-            "gh",
-            [
-              "api", "--method", "PATCH",
-              `repos/${repo}/issues/comments/${existingCommentId}`,
-              "-f", `body=${body}`,
-            ],
-            { encoding: "utf8" },
-          );
-        } else {
-          // POST new comment
-          spawnSync(
-            "gh",
-            [
-              "api", "--method", "POST",
-              `repos/${repo}/issues/${prNumber}/comments`,
-              "-f", `body=${body}`,
-            ],
-            { encoding: "utf8" },
+        // Inspect the write call's exit status: a 401 / network drop here
+        // otherwise silently skips the comment (the env is fine, but the client
+        // never gets their link with no signal). Throw on failure so the caller
+        // (runPrPreviewPass) surfaces it as a non-fatal warning instead of
+        // swallowing it. stderr is included for diagnosis; gh does not print the
+        // token, so no secret is exposed.
+        const writeRes = existingCommentId !== undefined
+          ? // PATCH existing comment
+            spawnSync(
+              "gh",
+              [
+                "api", "--method", "PATCH",
+                `repos/${repo}/issues/comments/${existingCommentId}`,
+                "-f", `body=${body}`,
+              ],
+              { encoding: "utf8" },
+            )
+          : // POST new comment
+            spawnSync(
+              "gh",
+              [
+                "api", "--method", "POST",
+                `repos/${repo}/issues/${prNumber}/comments`,
+                "-f", `body=${body}`,
+              ],
+              { encoding: "utf8" },
+            );
+        if (writeRes.status !== 0) {
+          const verb = existingCommentId !== undefined ? "PATCH" : "POST";
+          throw new Error(
+            `gh api ${verb} preview comment failed (exit ${writeRes.status}): ` +
+              `${(writeRes.stderr ?? "").trim() || (writeRes.error?.message ?? "")}`,
           );
         }
       };
