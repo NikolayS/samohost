@@ -560,4 +560,89 @@ describe("runPrPreviewPass", () => {
     expect(reaped.length).toBe(1);
     expect(reaped[0]!.branch).toBe(prBranch);
   });
+
+  // ---------------------------------------------------------------------------
+  // Case 10: comment-post failure is SURFACED, not swallowed (samorev nit).
+  //
+  // The env is created/deployed fine, but the gh PATCH/POST that posts the
+  // preview-link comment fails (e.g. 401 / network drop). The client never
+  // gets their link — that must NOT be silent. Requirements:
+  //   - The env deploy stays successful: action=created, url present.
+  //   - The comment failure is logged LOUDLY (err sink).
+  //   - The cycle report REFLECTS it as a non-fatal warning (result.commentError).
+  //   - One failing comment must NOT abort the pass for OTHER PRs.
+  // ---------------------------------------------------------------------------
+  test("pr-10 — comment post fails: env still created+url; failure logged loudly AND in report (commentError); non-fatal", async () => {
+    const pr = makePr({ number: 55, headRef: "feature/comment-fail", headSha: "sha-cf-000000000000000000000000000" });
+
+    const { ensurePreview } = makeFakeEnsurePreview(envStore, vm);
+    const { reapPreview } = makeFakeReapPreview();
+
+    // upsertPrComment rejects, mirroring a gh call that returned non-zero.
+    const failingUpsert: PrPreviewDeps["upsertPrComment"] = async () => {
+      throw new Error("gh api PATCH failed (exit 1): HTTP 401: Bad credentials");
+    };
+
+    const deps: PrPreviewDeps = {
+      listOpenPrs: async () => [pr],
+      ensurePreview,
+      upsertPrComment: failingUpsert,
+      reapPreview,
+      envStore,
+      now: () => new Date(),
+    };
+
+    const c = capture();
+    const summary = await runPrPreviewPass(app, vm, deps, c.out, c.err);
+
+    const result = summary.results.find((r) => r.prNumber === 55);
+    expect(result).toBeDefined();
+    // Env deploy itself succeeded — the comment failure must NOT downgrade it.
+    expect(result!.action).toBe("created");
+    expect(result!.url).toContain("https://");
+    // The comment failure is reflected in the cycle report (non-fatal warning).
+    expect(result!.commentError).toBeDefined();
+    expect(result!.commentError).toContain("401");
+    // And logged loudly to the err sink so it is visible in logs.
+    expect(c.e).toContain("comment");
+    expect(c.e).toContain("55");
+    expect(c.e).toContain("401");
+  });
+
+  test("pr-11 — comment fails for PR #1 only: PR #2's comment still posts; both envs created", async () => {
+    const pr1 = makePr({ number: 1, headRef: "feature/cf-1", headSha: "sha-cf1-00000000000000000000000000" });
+    const pr2 = makePr({ number: 2, headRef: "feature/cf-2", headSha: "sha-cf2-00000000000000000000000000" });
+
+    const { ensurePreview } = makeFakeEnsurePreview(envStore, vm);
+    const { reapPreview } = makeFakeReapPreview();
+
+    const okCalls: number[] = [];
+    const partlyFailingUpsert: PrPreviewDeps["upsertPrComment"] = async (_repo, prNumber) => {
+      if (prNumber === 1) throw new Error("network drop");
+      okCalls.push(prNumber);
+    };
+
+    const deps: PrPreviewDeps = {
+      listOpenPrs: async () => [pr1, pr2],
+      ensurePreview,
+      upsertPrComment: partlyFailingUpsert,
+      reapPreview,
+      envStore,
+      now: () => new Date(),
+    };
+
+    const c = capture();
+    const summary = await runPrPreviewPass(app, vm, deps, c.out, c.err);
+
+    const r1 = summary.results.find((r) => r.prNumber === 1);
+    const r2 = summary.results.find((r) => r.prNumber === 2);
+
+    // PR #1: env created, comment failed (surfaced).
+    expect(r1!.action).toBe("created");
+    expect(r1!.commentError).toContain("network drop");
+    // PR #2: fully successful — comment posted, no commentError.
+    expect(r2!.action).toBe("created");
+    expect(r2!.commentError).toBeUndefined();
+    expect(okCalls).toContain(2);
+  });
 });

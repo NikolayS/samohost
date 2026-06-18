@@ -59,6 +59,14 @@ export interface PrPreviewResult {
   url?: string;
   action: "created" | "redeployed" | "unchanged" | "failed" | "reaped" | "error";
   error?: string;
+  /**
+   * Non-fatal warning: the env was created/redeployed fine, but POSTING/PATCHING
+   * the preview-link comment failed (e.g. gh 401 / network drop). The deploy
+   * itself stays successful (`action` unchanged, `url` present), but the client
+   * never received their link — so this is surfaced here (and logged loudly via
+   * `err`) instead of being silently swallowed.
+   */
+  commentError?: string;
 }
 
 /** Summary of one pass across all open (and newly-reaped closed) PRs for an app. */
@@ -225,13 +233,33 @@ export async function runPrPreviewPass(
           action = "redeployed";
         }
 
-        // Post/update comment when state changed (created or redeployed)
+        // Post/update comment when state changed (created or redeployed).
+        // A comment-post failure is NON-FATAL: the env is up, so we keep the
+        // deploy action (created/redeployed) and the url — but we must NOT
+        // swallow the failure. The client never got their link, so surface it
+        // loudly (err) AND reflect it in the cycle report (result.commentError).
+        let commentError: string | undefined;
         if (action !== "failed" && url !== undefined) {
           const body = buildCommentBody(url);
-          await deps.upsertPrComment(app.repo, pr.number, PR_PREVIEW_COMMENT_MARKER, body);
+          try {
+            await deps.upsertPrComment(app.repo, pr.number, PR_PREVIEW_COMMENT_MARKER, body);
+          } catch (e) {
+            commentError = e instanceof Error ? e.message : String(e);
+            err(
+              `samohost: pr-preview: PR #${pr.number} (${app.name}): env is up at ` +
+                `${url} but POSTING the preview-link comment FAILED — the client ` +
+                `did not receive their link: ${commentError}`,
+            );
+          }
         }
 
-        results.push({ prNumber: pr.number, branch, url, action });
+        results.push({
+          prNumber: pr.number,
+          branch,
+          url,
+          action,
+          ...(commentError !== undefined ? { commentError } : {}),
+        });
       } else {
         // Unchanged: url from existing env record; no API calls
         const url = `https://${existing!.vhost}`;
