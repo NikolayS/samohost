@@ -107,6 +107,28 @@ describe("buildEnvCreateScript", () => {
     expect(s).not.toMatch(/echo .*PASSWORD/i);
   });
 
+  test("dblab backend: clone create is idempotent — destroy-then-create so a re-create over an existing clone succeeds (issue #59)", () => {
+    const s = buildEnvCreateScript(app(), target({ dbBackend: "dblab" }));
+    // A fresh clone matching the deploy requires destroying any prior clone of
+    // the same id FIRST (mirrors the template backend's dropdb --if-exists +
+    // createdb). Without this, `dblab clone create --id <x>` fails at the engine
+    // with "clone already exists" and the preview cannot be re-made.
+    expect(s).toContain('"$SAMOHOST_DBLAB_BIN" clone destroy "$SAMOHOST_CLONE_ID"');
+    // The pre-create destroy must tolerate an ABSENT clone gracefully (first
+    // create, or engine already expired it) — never abort the create on a
+    // missing-clone error. Same posture as the destroy script (issue #7).
+    expect(s).toMatch(/clone destroy "\$SAMOHOST_CLONE_ID"[^\n]*\|\| true/);
+    // Ordering: the idempotent destroy precedes the create within the db phase.
+    const destroyIdx = s.indexOf('clone destroy "$SAMOHOST_CLONE_ID"');
+    const createIdx = s.indexOf("clone create --id");
+    expect(destroyIdx).toBeGreaterThan(-1);
+    expect(createIdx).toBeGreaterThan(-1);
+    expect(destroyIdx).toBeLessThan(createIdx);
+    // And the destroy happens AFTER the engine preflight gate (no clone ops
+    // before the engine is confirmed live/drivable).
+    expect(s.indexOf("db-preflight:start")).toBeLessThan(destroyIdx);
+  });
+
   test("template backend: exact-path sudo createdb from the template db", () => {
     const s = buildEnvCreateScript(app(), target({ dbBackend: "template", dbName: "fr_feat_x" }));
     expect(s).toContain("sudo -u postgres /usr/bin/createdb --template=");

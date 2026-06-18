@@ -745,9 +745,21 @@ export function buildEnvCreateScript(
       "",
       ...REWIRE_DB_HOSTPORT_FN_LINES,
       "",
+      // Idempotent re-create (issue #59): destroy any prior clone of this id
+      // FIRST, so a re-create over an existing clone succeeds instead of failing
+      // at the engine with "clone already exists". This mirrors the template
+      // backend's `dropdb --if-exists && createdb`: a re-create gives a FRESH
+      // clone matching the deploy (previews are disposable; reusing the old
+      // clone would serve stale data). The destroy tolerates an ABSENT clone
+      // (first create, or the engine already expired it) — same `2>/dev/null ||
+      // true` posture as the destroy script (issue #7) — so it never aborts the
+      // create on a missing-clone error.
+      '# Pre-create: drop any existing clone of this id so re-create is idempotent (issue #59).',
+      '"$SAMOHOST_DBLAB_BIN" clone destroy "$SAMOHOST_CLONE_ID" 2>/dev/null || true',
+      "",
       ...phaseBlock(
         "db",
-        "DBLab thin clone + .db.port extraction + prod globals sync (issue #7)",
+        "DBLab thin clone (destroy-if-exists + create) + .db.port extraction + prod globals sync (issue #7, #59)",
         [
           'if "$SAMOHOST_DBLAB_BIN" clone create --id "$SAMOHOST_CLONE_ID" \\',
           '     --username samohost_env --password "$SAMOHOST_DB_PASSWORD" \\',
