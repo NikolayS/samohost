@@ -489,6 +489,24 @@ function buildStaticEnvCreateScript(
 
   lines.push('cd "$SAMOHOST_ENV_DIR"', "");
 
+  // ----- config.js: write the preview-env marker for the SPA banner -----------
+  // The SPA reads window.__GC1_CONFIG__ from /config.js; the banner fires when
+  // preview is true. The repo commits a default config.js with preview:false, so
+  // we OVERWRITE it (>) — never append. config.js is a public static asset (644
+  // under the default umask) and file_server serves it fine; NO chmod 600.
+  // Placed as bare lines (not inside the phaseBlock body): the phaseBlock
+  // convention wraps body in `if ...; then ok else fail fi` — inserting
+  // arbitrary commands in the body array would break that contract. Under
+  // `set -euo pipefail` a failed write here aborts the script, so no extra
+  // phase marker is required.
+  // $SAMOHOST_BRANCH is already sq()-escaped at the top of the script; a slash
+  // in the branch value (e.g. demo/red-bg) is safe inside a JS string literal.
+  lines.push(
+    "# --- config.js: overwrite with preview marker so the SPA banner fires ---",
+    `printf 'window.__GC1_CONFIG__ = { version: "", preview: true, branch: "%s" };\\n' "$SAMOHOST_BRANCH" > "$SAMOHOST_ENV_DIR/config.js"`,
+    "",
+  );
+
   // ----- vhost: Caddy file_server (tls internal — CF Full-mode proxied origin)
   // The record is PROXIED (orange cloud), so CF edge fronts the origin. Caddy
   // uses `tls internal` (self-signed cert); CF Full mode accepts a self-signed
@@ -716,6 +734,14 @@ export function buildEnvCreateScript(
       '   && samohost_rewire_db_hostport "$SAMOHOST_ENV_DIR/.env" \\',
     );
   }
+  // Set the preview-env marker so the banner fires. env create is
+  // preview-ONLY by construction (prod ships via app/script.ts, a separate
+  // path). SAMO_BRANCH uses $SAMOHOST_BRANCH (already sq()-escaped at the top
+  // of the script) so branch values with slashes (e.g. demo/red-login) are
+  // interpolated safely without further quoting in an env-file value.
+  envfileBody.push(
+    '   && printf \'\\nSAMO_ENV=preview\\nSAMO_BRANCH=%s\\n\' "$SAMOHOST_BRANCH" >> "$SAMOHOST_ENV_DIR/.env" \\',
+  );
   envfileBody.push("   && true; ");
   lines.push(
     ...phaseBlock(
