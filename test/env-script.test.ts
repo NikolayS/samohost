@@ -1,8 +1,9 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, test, afterEach } from "bun:test";
 import { spawnSync } from "node:child_process";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import * as net from "node:net";
 import {
   buildEnvCreateScript,
   buildEnvDestroyScript,
@@ -1984,5 +1985,138 @@ describe("preview-flag: prod deploy path stays clean (SAMO_ENV=preview must NOT 
 
   test("buildDeployScript bash syntax is still valid (non-regression)", () => {
     expect(bashSyntaxOk(buildDeployScript(prodApp(), PROD_TARGET))).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Port-check phase — foreign-occupant detection (field-record VM bug 2026-06-18)
+//
+// Root cause: allocatePort is pure (no OS visibility); a foreign process bound
+// 0.0.0.0:3100 before the preview env tried to start. The preview's systemd
+// unit failed with EADDRINUSE, but the Caddy snippet was already written, so
+// the URL silently served the foreign squatter (wrong code, SAMO_ENV missing).
+//
+// Fix: the generated env-create script's FIRST phase is "port-check". It uses
+// `ss -ltnH` to detect any listener on the allocated port. If a foreign
+// process holds the port (something is listening AND our unit is not active),
+// the phase emits a :fail marker, removes the stale Caddy snippet, reloads
+// Caddy, and exits 1 — so the URL goes DARK rather than serving the squatter.
+// ---------------------------------------------------------------------------
+
+/**
+ * Run the extracted `samohost_port_check_ok` bash function against a given
+ * port and unit name. Returns the spawnSync result.
+ */
+function runPortCheck(port: number, unitActive: boolean): ReturnType<typeof spawnSync> {
+  const script = buildEnvCreateScript(app(), target({ port }));
+  const fn = extractFn(script, "samohost_port_check_ok");
+  // Stub systemctl: return 0 (active) or 1 (inactive) for our unit.
+  const systemctlStub = [
+    "systemctl() {",
+    '  if [[ "$1" == "is-active" ]]; then',
+    unitActive ? "    return 0" : "    return 1",
+    "  fi",
+    '  command systemctl "$@"',
+    "}",
+  ].join("\n");
+  const prog = [
+    "set -uo pipefail",
+    systemctlStub,
+    fn,
+    `samohost_port_check_ok ${port} 'field-record@field-record-1-feat-x.service'`,
+  ].join("\n");
+  return spawnSync("bash", ["-c", prog], { encoding: "utf8" });
+}
+
+describe("port-check phase — foreign-occupant detection", () => {
+  // Track open servers for cleanup.
+  const _servers: net.Server[] = [];
+  afterEach(async () => {
+    await Promise.all(_servers.map((s) => new Promise<void>((r) => s.close(() => r()))));
+    _servers.length = 0;
+  });
+
+  /** Bind a real TCP listener on an ephemeral port and return the port. */
+  function bindListener(): Promise<{ server: net.Server; port: number }> {
+    return new Promise((resolve, reject) => {
+      const server = net.createServer();
+      _servers.push(server);
+      server.listen(0, "127.0.0.1", () => {
+        const addr = server.address();
+        if (!addr || typeof addr === "string") return reject(new Error("bad addr"));
+        resolve({ server, port: addr.port });
+      });
+      server.on("error", reject);
+    });
+  }
+
+  // (a) PORT-CHECK INTEGRATION: real bound socket → non-zero (foreign occupant)
+  test("(a) executed: function returns non-zero when a foreign process holds the port", async () => {
+    const { port } = await bindListener();
+    // Unit is NOT active → this is a foreign occupant, not our own restarting unit.
+    const r = runPortCheck(port, false);
+    expect(r.status).not.toBe(0);
+  });
+
+  test("(a) executed: function returns zero when the port is free", () => {
+    // Pick a port unlikely to be in use. We let the OS assign one with bindListener
+    // and then CLOSE it, so we know it was free recently.
+    // Use a static high port that is almost certainly free.
+    const freePort = 19877;
+    const r = runPortCheck(freePort, false);
+    expect(r.status).toBe(0);
+  });
+
+  test("(a) executed: function returns zero (passes) when port is held by OUR OWN active unit", async () => {
+    const { port } = await bindListener();
+    // Unit IS active → this is our own running instance, treat as idempotent re-create.
+    const r = runPortCheck(port, true);
+    expect(r.status).toBe(0);
+  });
+
+  // (b) SCRIPT-CONTENT: port-check phase emitted BEFORE clone, fail path removes Caddy snippet
+  test("(b) port-check phase marker appears BEFORE clone phase marker in node path", () => {
+    const s = buildEnvCreateScript(app(), target());
+    const portCheckIdx = s.indexOf("SAMOHOST_PHASE:port-check:start");
+    const cloneIdx = s.indexOf("SAMOHOST_PHASE:clone:start");
+    expect(portCheckIdx).toBeGreaterThan(-1);
+    expect(cloneIdx).toBeGreaterThan(-1);
+    expect(portCheckIdx).toBeLessThan(cloneIdx);
+  });
+
+  test("(b) port-check fail path removes the Caddy snippet (rm -f CADDY_SNIPPET)", () => {
+    const s = buildEnvCreateScript(app(), target());
+    // Must include removal of the stale snippet on failure.
+    expect(s).toContain("SAMOHOST_CADDY_SNIPPET");
+    // The fail path must include rm -f of the caddy snippet AND caddy reload.
+    const portCheckSection = s.slice(
+      s.indexOf("SAMOHOST_PHASE:port-check"),
+      s.indexOf("SAMOHOST_PHASE:clone"),
+    );
+    expect(portCheckSection).toContain("rm -f");
+    expect(portCheckSection).toContain("SAMOHOST_CADDY_SNIPPET");
+    expect(portCheckSection).toContain("reload caddy");
+  });
+
+  // (c) STATIC PATH UNCHANGED: static buildEnvCreateScript must NOT contain port-check
+  test("(c) static path does NOT emit a port-check phase (no port/unit for static envs)", () => {
+    const staticApp = { ...app(), kind: "static" as const };
+    const s = buildEnvCreateScript(staticApp, target());
+    expect(s).not.toContain("port-check");
+    expect(s).not.toContain("SAMOHOST_PHASE:port-check");
+  });
+
+  // (d) SAMO_ENV/SAMO_BRANCH regression guard (extend existing content check)
+  test("(d) node-path script still sets SAMO_ENV=preview and SAMO_BRANCH= in the envfile", () => {
+    const s = buildEnvCreateScript(app(), target());
+    expect(s).toContain("SAMO_ENV=preview");
+    expect(s).toContain("SAMO_BRANCH=");
+  });
+
+  // (e) bash syntax still valid with port-check phase included
+  test("(e) buildEnvCreateScript (node path) is still valid bash with all db backends", () => {
+    for (const db of ["dblab", "template", "none"] as const) {
+      expect(bashSyntaxOk(buildEnvCreateScript(app(), target({ dbBackend: db })))).toBe(true);
+    }
   });
 });
