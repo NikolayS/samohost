@@ -275,6 +275,10 @@ export interface EnvRecord {
   createdAt: string;
   /** Last SHA deployed into this env (set by env-aware deploys; optional). */
   lastDeployedSha?: string;
+  /** PR number that owns this preview env, when it was created by the PR-preview
+   * pass (src/preview/pr.ts). Absent for manually-created or demo previews —
+   * which the closed-PR reaper MUST NEVER touch. */
+  prNumber?: number;
 }
 
 /**
