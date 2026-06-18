@@ -60,6 +60,7 @@ import {
   runEnvList,
   runEnvDestroy,
   runEnvPreflight,
+  runEnvGc,
   defaultEnvExecDeps,
   defaultEnvStore,
   DEFAULT_PREVIEW_DOMAIN,
@@ -69,7 +70,9 @@ import {
   type EnvListInput,
   type EnvDestroyInput,
   type EnvPreflightInput,
+  type EnvGcInput,
 } from "./commands/env.ts";
+import { parseDuration } from "./util/duration.ts";
 import {
   runDnsStatus,
   defaultDnsStatusDeps,
@@ -116,6 +119,7 @@ Usage:
   samohost env list <vm> [--app <name>] [--json]
   samohost env destroy <vm> <app> --branch <b> [--json]
   samohost env preflight <vm> [--json]
+  samohost env gc <vm> [--reap] [--ttl <dur>] [--app <name>] [--json]
   samohost dns status <domain> [--expect-ip <ip>] [--cf-zone <z>] [--json]
   samohost trigger run [--vm <name>] [--app <name>] [--dry-run] [--json]
   samohost --help
@@ -266,6 +270,19 @@ env preflight (READ-ONLY probes over one SSH connection):
   reports dblab engine READY/BLOCKED/UNKNOWN (gate for --db dblab) and the
   template-fallback readiness, with per-check detail and reasons
 
+env gc options (SAFE DEFAULT = dry-run; use --reap to actually destroy/prune):
+  <vm>                       VM name or id to scan (required)
+  --reap                     actually destroy/prune candidates (default: dry-run)
+  --ttl <dur>                reap envs older than duration (7d/168h/30m/45s);
+                             default OFF — no age-based reaping without explicit flag
+  --app <name>               narrow to one app on the VM (optional)
+  --json                     emit a JSON gc report
+  Candidates: (a) branch deleted/merged on remote (--reap calls the destroy
+  script + removes the record), (b) orphan-vm (VM missing/dead — state-only prune,
+  NO SSH), (c) orphan-app (no AppRecord — state-only prune), (d) ttl-expired.
+  Transitional VMs (planned/creating/booting/degraded) are always KEPT.
+  Exit 0 unless --reap had failures (exit 1 when any env failed to be reaped).
+
 dns status options (READ-ONLY: public NS/A lookups + token PRESENCE check):
   --expect-ip <ip>           IP the preview wildcard must point at
   --cf-zone <zone>           zone the local Cloudflare token/config covers
@@ -406,6 +423,12 @@ export interface ParsedEnvPreflight {
   json: boolean;
 }
 
+export interface ParsedEnvGc {
+  kind: "env-gc";
+  input: EnvGcInput;
+  json: boolean;
+}
+
 export interface ParsedDnsStatus {
   kind: "dns-status";
   input: DnsStatusInput;
@@ -445,6 +468,7 @@ export type ParsedCommand =
   | ParsedEnvList
   | ParsedEnvDestroy
   | ParsedEnvPreflight
+  | ParsedEnvGc
   | ParsedDnsStatus
   | ParsedDoctor
   | ParsedTriggerRun
@@ -1317,7 +1341,7 @@ function parseEnv(args: string[]): ParsedCommand {
   const sub = args[0];
   if (sub === undefined) {
     throw new UsageError(
-      "env requires a subcommand: plan | create | list | destroy",
+      "env requires a subcommand: plan | create | list | destroy | gc",
     );
   }
   const rest = args.slice(1);
@@ -1332,8 +1356,12 @@ function parseEnv(args: string[]): ParsedCommand {
       return parseEnvDestroy(rest);
     case "preflight":
       return parseEnvPreflight(rest);
+    case "gc":
+      return parseEnvGc(rest);
     default:
-      throw new UsageError(`unknown env subcommand: ${sub}`);
+      throw new UsageError(
+        `unknown env subcommand: ${sub} (plan | create | list | destroy | preflight | gc)`,
+      );
   }
 }
 
@@ -1349,6 +1377,57 @@ function parseEnvPreflight(args: string[]): ParsedEnvPreflight {
   }
   if (vm === undefined) throw new UsageError("env preflight requires <vm>");
   return { kind: "env-preflight", input: { vm }, json };
+}
+
+function parseEnvGc(args: string[]): ParsedEnvGc {
+  let vm: string | undefined;
+  let reap = false;
+  let ttl: number | undefined;
+  let app: string | undefined;
+  let json = false;
+
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i]!;
+    switch (a) {
+      case "--reap":
+        reap = true;
+        break;
+      case "--ttl": {
+        const raw = takeValue(args, i, a);
+        const ms = parseDuration(raw);
+        if (ms === undefined) {
+          throw new UsageError(
+            `invalid --ttl: ${raw} (expected a duration like 7d / 168h / 30m / 45s; ` +
+              `must be positive and use a lowercase unit letter)`,
+          );
+        }
+        ttl = ms;
+        i++;
+        break;
+      }
+      case "--app":
+        app = takeValue(args, i, a);
+        i++;
+        break;
+      case "--json":
+        json = true;
+        break;
+      default:
+        if (a.startsWith("-")) throw new UsageError(`unknown flag: ${a}`);
+        if (vm !== undefined) throw new UsageError(`unexpected extra argument: ${a}`);
+        vm = a;
+    }
+  }
+
+  if (vm === undefined) throw new UsageError("env gc requires <vm>");
+
+  const input: EnvGcInput = {
+    vm,
+    reap,
+    ...(ttl !== undefined ? { ttl } : {}),
+    ...(app !== undefined ? { app } : {}),
+  };
+  return { kind: "env-gc", input, json };
 }
 
 function parseDns(args: string[]): ParsedDnsStatus {
@@ -1735,6 +1814,17 @@ export async function main(
         cmd.input,
         { json: cmd.json },
         new StateStore(),
+        defaultEnvExecDeps(),
+        out,
+        err,
+      );
+    case "env-gc":
+      return runEnvGc(
+        cmd.input,
+        { json: cmd.json },
+        new StateStore(),
+        defaultAppStore(),
+        defaultEnvStore(),
         defaultEnvExecDeps(),
         out,
         err,
