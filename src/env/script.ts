@@ -32,6 +32,7 @@ export const ENV_PHASE_PREFIX = "<<<SAMOHOST_PHASE:";
 
 /** Env-create phases, in order. Destroy uses the destroy phases. */
 export type EnvPhaseName =
+  | "port-check"
   | "clone"
   | "install"
   | "build"
@@ -51,6 +52,43 @@ const HEALTH_SLEEP_SEC = 3;
 
 /** Default DB var mapping when the app declares none (issue #11). */
 export const DEFAULT_ENV_DB_VARS: readonly string[] = ["DATABASE_URL"];
+
+/**
+ * Bash function: check whether the allocated port is free for this env.
+ * Returns 0 (ok — proceed) when:
+ *   a) nothing is listening on the port at all, OR
+ *   b) the port is held by THIS preview's own systemd instance (idempotent
+ *      re-create of an already-running env — the unit phase will restart it).
+ * Returns non-zero (fail — abort) when a FOREIGN process holds the port.
+ *
+ * Detection uses `ss -ltnH` which is available without sudo on Ubuntu hosts
+ * and lists TCP listen sockets in the form:
+ *   LISTEN 0 128 0.0.0.0:<port>   0.0.0.0:*
+ * Both `0.0.0.0:<port>` and `127.0.0.1:<port>` bindings are matched so that
+ * a process bound to INADDR_ANY is caught (the observed squatter case).
+ *
+ * Ownership signal: `systemctl is-active "$unit"` returning active means the
+ * unit samohost started IS the listener — the port is legitimately ours.
+ * If we cannot cleanly attribute the listener to our unit we fail CLOSED.
+ *
+ * (Closing brace at column 0 — tests extract and execute this function.)
+ */
+const PORT_CHECK_FN_LINES: string[] = [
+  "samohost_port_check_ok() {",
+  '  local port="$1" unit="$2"',
+  '  if ! ss -ltnH 2>/dev/null | grep -qE "(0\\.0\\.0\\.0|127\\.0\\.0\\.1):${port}[[:space:]]"; then',
+  "    # Nothing listening on this port — free to proceed.",
+  "    return 0",
+  "  fi",
+  "  # Something is listening. Check if it is OUR own active unit.",
+  '  if systemctl is-active "$unit" >/dev/null 2>&1; then',
+  "    # Port held by our own running instance — idempotent re-create, allow.",
+  "    return 0",
+  "  fi",
+  "  # Foreign process holds the port — fail CLOSED.",
+  "  return 1",
+  "}",
+];
 
 /**
  * Bash function: two-strategy branch checkout (issue #11 finding 5). A
@@ -602,6 +640,34 @@ export function buildEnvCreateScript(
     `SAMOHOST_CADDY_SNIPPET=${sq(`/etc/caddy/sites.d/${t.name}.caddy`)}`,
     "",
   ];
+
+  // ----- port-check: FIRST phase — fail CLOSED if a foreign process already
+  // holds the allocated port (observed bug: ghrunner CI zombie on 0.0.0.0:3100
+  // caused the preview URL to silently serve the wrong process). Detection uses
+  // `ss -ltnH` (no sudo required on Ubuntu). If the port is held by OUR OWN
+  // active systemd instance (idempotent re-create), it is NOT a foreign
+  // occupant and we allow it (the unit phase will restart it). On a foreign
+  // occupant we emit :fail, remove any stale Caddy snippet (so the URL goes
+  // DARK rather than continuing to serve the squatter), reload Caddy, and
+  // exit 1. Reuses the existing sudo rm/reload caddy grants from host-prep
+  // sudoers — no new grants needed.
+  lines.push(
+    ...PORT_CHECK_FN_LINES,
+    "",
+    `# --- port-check: abort if a foreign process holds port $SAMOHOST_PORT ---`,
+    marker("port-check", "start"),
+    `if samohost_port_check_ok "$SAMOHOST_PORT" "$SAMOHOST_UNIT_INSTANCE"; then`,
+    `  ${marker("port-check", "ok")}`,
+    "else",
+    `  ${marker("port-check", "fail")}`,
+    '  echo "samohost: port-check FAILED — a foreign process is already listening on port $SAMOHOST_PORT (not our own active unit $SAMOHOST_UNIT_INSTANCE); allocate a different port or clean up the occupant before retrying" >&2',
+    "  # Remove any stale Caddy snippet so the URL goes DARK (not serving the squatter).",
+    '  sudo /usr/bin/rm -f "$SAMOHOST_CADDY_SNIPPET"',
+    "  sudo /usr/bin/systemctl reload caddy || true",
+    "  exit 1",
+    "fi",
+    "",
+  );
 
   // ----- clone: reference clone from the production checkout (cheap) with an
   // explicit plain-clone fallback for shallow/unusable references (issue #11
