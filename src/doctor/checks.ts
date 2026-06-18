@@ -68,6 +68,82 @@ export const newCoreHostChecks: DoctorCheck[] = [
     requiresSudo: true,
     group: "core-host",
   },
+  // --- air-conformance sshd directives (#64): every directive the cloud-init
+  // baseline sets gets a matching effective-config probe. sshd -T lowercases
+  // all keys, so the expect regexes match the lowercased form. ---
+  {
+    id: "maxauthtries",
+    description: "MaxAuthTries effective value is 3 (air)",
+    probeCommand: "sudo /usr/sbin/sshd -T 2>/dev/null | grep -i '^maxauthtries '",
+    expect: /maxauthtries 3/i,
+    requiresSudo: true,
+    group: "core-host",
+  },
+  {
+    id: "clientalive",
+    description: "ClientAliveInterval 300 + ClientAliveCountMax 2 (air)",
+    probeCommand:
+      "sudo /usr/sbin/sshd -T 2>/dev/null | grep -iE '^clientalive(interval|countmax) '",
+    // Both lines must be present with the expected values.
+    expect: /clientaliveinterval 300[\s\S]*clientalivecountmax 2|clientalivecountmax 2[\s\S]*clientaliveinterval 300/i,
+    requiresSudo: true,
+    group: "core-host",
+  },
+  {
+    id: "x11forwarding",
+    description: "X11Forwarding effective value is no (air)",
+    probeCommand: "sudo /usr/sbin/sshd -T 2>/dev/null | grep -i '^x11forwarding '",
+    expect: /x11forwarding no/i,
+    requiresSudo: true,
+    group: "core-host",
+  },
+  {
+    id: "allowagentforwarding",
+    description: "AllowAgentForwarding effective value is no (air)",
+    probeCommand:
+      "sudo /usr/sbin/sshd -T 2>/dev/null | grep -i '^allowagentforwarding '",
+    expect: /allowagentforwarding no/i,
+    requiresSudo: true,
+    group: "core-host",
+  },
+  {
+    id: "permituserenvironment",
+    description: "PermitUserEnvironment effective value is no (air)",
+    probeCommand:
+      "sudo /usr/sbin/sshd -T 2>/dev/null | grep -i '^permituserenvironment '",
+    expect: /permituserenvironment no/i,
+    requiresSudo: true,
+    group: "core-host",
+  },
+  {
+    id: "permitemptypasswords",
+    description: "PermitEmptyPasswords effective value is no (air)",
+    probeCommand:
+      "sudo /usr/sbin/sshd -T 2>/dev/null | grep -i '^permitemptypasswords '",
+    expect: /permitemptypasswords no/i,
+    requiresSudo: true,
+    group: "core-host",
+  },
+  {
+    id: "root-authorized-keys-empty",
+    description: "root's authorized_keys is empty/absent (air)",
+    // Print byte size; empty file => 0, absent => stat errors (folded to stderr).
+    // requiresSudo: /root is 0700. Non-root user => permission error => unknown.
+    probeCommand:
+      "sudo stat -c '%s' /root/.ssh/authorized_keys 2>/dev/null || echo 0",
+    expect: /^0$/m,
+    requiresSudo: true,
+    group: "core-host",
+  },
+  {
+    id: "ufw-limit-ssh",
+    description: "UFW rate-limits (LIMIT) the SSH port, not plain ALLOW (air)",
+    // ufw status shows "LIMIT" for limited ports. Requires root.
+    probeCommand: "sudo /usr/sbin/ufw status 2>/dev/null | grep -i 'limit'",
+    expect: /limit/i,
+    requiresSudo: true,
+    group: "core-host",
+  },
   {
     id: "unattended-upgrades-active",
     description: "unattended-upgrades service is active",

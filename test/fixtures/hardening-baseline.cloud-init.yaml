@@ -44,14 +44,20 @@ write_files:
   - path: /etc/ssh/sshd_config.d/10-samohost.conf
     permissions: '0644'
     content: |
-      # Managed by samohost — hardening baseline
+      # Managed by samohost — hardening baseline (air-conformant; see #64)
       Port 2223
       PasswordAuthentication no
       PermitRootLogin no
       KbdInteractiveAuthentication no
       ChallengeResponseAuthentication no
+      MaxAuthTries 3
+      ClientAliveInterval 300
+      ClientAliveCountMax 2
+      PermitEmptyPasswords no
       MaxStartups 100:30:200
       X11Forwarding no
+      AllowAgentForwarding no
+      PermitUserEnvironment no
       AllowUsers samo
   - path: /etc/sysctl.d/99-samohost.conf
     permissions: '0644'
@@ -83,12 +89,16 @@ runcmd:
   - ufw --force reset
   - ufw default deny incoming
   - ufw default allow outgoing
-  - ufw allow 2223/tcp
+  - ufw limit 2223/tcp
   - ufw --force enable
   - systemctl enable --now fail2ban
   - sysctl --system
   - systemctl enable --now unattended-upgrades
   - systemctl enable --now apparmor
   - 'aa-enforce /etc/apparmor.d/* || true'
+  - 'mkdir -p /root/.ssh && chmod 700 /root/.ssh'
+  - 'truncate -s 0 /root/.ssh/authorized_keys 2>/dev/null || : > /root/.ssh/authorized_keys'
+  - rm -f /root/.ssh/authorized_keys2
+  - chmod 600 /root/.ssh/authorized_keys
   - mkdir -p /var/lib/samohost
   - 'echo 97e8a741 > /var/lib/samohost/provision-complete'

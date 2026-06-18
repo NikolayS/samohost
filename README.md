@@ -28,8 +28,11 @@ the trigger `.service`/`.timer` + one-time root host-prep ordering),
 [`docs/preview-reachability.md`](docs/preview-reachability.md) (the CF-proxied
 origin / origin-TLS decision + the external reachability gate),
 [`docs/dblab-install-runbook.md`](docs/dblab-install-runbook.md),
-[`docs/dns-preview-authority.md`](docs/dns-preview-authority.md), and
-[`docs/edge-preview-banner.md`](docs/edge-preview-banner.md).
+[`docs/dns-preview-authority.md`](docs/dns-preview-authority.md),
+[`docs/edge-preview-banner.md`](docs/edge-preview-banner.md), and
+[`docs/air-conformance.md`](docs/air-conformance.md) (the CI-enforced mapping of
+each [postgres-ai/air](https://gitlab.com/postgres-ai/air) hardening directive to
+samohost's cloud-init baseline + `doctor` probes — generated, never hand-edited).
 
 ## Command surface
 

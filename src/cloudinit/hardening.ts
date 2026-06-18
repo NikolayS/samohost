@@ -51,16 +51,34 @@ export function specHash(spec: ProvisionSpec): string {
   return (h >>> 0).toString(16).padStart(8, "0");
 }
 
+/**
+ * sshd hardening directives. Values + intent traced to air
+ * `infrastructure/001_vm-creation-for-agents.md` via the conformance matrix in
+ * NikolayS/samohost#64; each directive is enforced present by
+ * test/air-conformance.test.ts (the AIR_DIRECTIVES registry). Changing one here
+ * without updating the registry fails CI by design.
+ */
 const SSHD_CONFIG = (port: number, adminUser: string): string =>
   [
-    "# Managed by samohost — hardening baseline",
+    "# Managed by samohost — hardening baseline (air-conformant; see #64)",
     `Port ${port}`,
     "PasswordAuthentication no",
     "PermitRootLogin no",
     "KbdInteractiveAuthentication no",
     "ChallengeResponseAuthentication no",
+    // air: cap brute-force attempts per connection (alongside fail2ban + ufw limit).
+    "MaxAuthTries 3",
+    // air: drop idle/dead sessions — interval 300s, disconnect after 2 missed.
+    "ClientAliveInterval 300",
+    "ClientAliveCountMax 2",
+    // air: refuse empty-password logins (defense-in-depth atop PasswordAuthentication no).
+    "PermitEmptyPasswords no",
     "MaxStartups 100:30:200",
     "X11Forwarding no",
+    // air: no agent forwarding (limit credential blast radius from the box).
+    "AllowAgentForwarding no",
+    // air: do not honour ~/.ssh/environment / environment= in authorized_keys.
+    "PermitUserEnvironment no",
     `AllowUsers ${adminUser}`,
     "",
   ].join("\n");
@@ -161,11 +179,13 @@ function buildFragment(spec: ProvisionSpec): CloudInitFragment {
     "systemctl daemon-reload",
     "systemctl restart ssh.socket",
     "systemctl restart ssh",
-    // UFW: default deny incoming, allow the hardened SSH port only.
+    // UFW: default deny incoming; rate-LIMIT the hardened SSH port (air: brute-
+    // force damping in addition to fail2ban — `limit` blocks an IP with >6
+    // connections in 30s). `allow` would leave SSH unthrottled at the firewall.
     "ufw --force reset",
     "ufw default deny incoming",
     "ufw default allow outgoing",
-    `ufw allow ${sshPort}/tcp`,
+    `ufw limit ${sshPort}/tcp`,
     "ufw --force enable",
     // fail2ban.
     "systemctl enable --now fail2ban",
@@ -176,6 +196,13 @@ function buildFragment(spec: ProvisionSpec): CloudInitFragment {
     // AppArmor enforced.
     "systemctl enable --now apparmor",
     "aa-enforce /etc/apparmor.d/* || true",
+    // air: remove/empty root's authorized_keys so no key can log in as root even
+    // if PermitRootLogin is ever relaxed. Truncate (not delete) both legacy and
+    // .d locations so the empty file is durable state, and lock the dir 0700.
+    "mkdir -p /root/.ssh && chmod 700 /root/.ssh",
+    "truncate -s 0 /root/.ssh/authorized_keys 2>/dev/null || : > /root/.ssh/authorized_keys",
+    "rm -f /root/.ssh/authorized_keys2",
+    "chmod 600 /root/.ssh/authorized_keys",
     // Completion sentinel MUST be the final runcmd.
     `mkdir -p ${dirname(PROVISION_SENTINEL_PATH)}`,
     `echo ${specHash(spec)} > ${PROVISION_SENTINEL_PATH}`,
