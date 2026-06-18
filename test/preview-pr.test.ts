@@ -85,6 +85,7 @@ function makeEnvRecord(
   appName: string,
   branch: string,
   lastDeployedSha: string,
+  prNumber?: number,
 ): EnvRecord {
   const safeBranch = branch.replace(/[^a-z0-9]/gi, "-").toLowerCase().slice(0, 40);
   const name = `${appName}-${safeBranch}`.slice(0, 63);
@@ -99,6 +100,7 @@ function makeEnvRecord(
     dbBackend: "template",
     createdAt: "2026-01-01T00:00:00.000Z",
     lastDeployedSha,
+    ...(prNumber !== undefined ? { prNumber } : {}),
   };
 }
 
@@ -120,6 +122,8 @@ function capture() {
 /**
  * A fake ensurePreview that writes the EnvRecord into the SAME envStore,
  * mirroring the prod-shape so SHA-compare works on subsequent calls.
+ * Also stamps prNumber onto the EnvRecord to match prod shape (trigger.ts
+ * upserts {…rec, lastDeployedSha, prNumber} after calling runEnvCreate).
  */
 function makeFakeEnsurePreview(
   envStore: EnvStore,
@@ -127,16 +131,17 @@ function makeFakeEnsurePreview(
   outcome: "ok" | "failed" = "ok",
 ): {
   ensurePreview: PrPreviewDeps["ensurePreview"];
-  calls: Array<{ vm: string; app: string; branch: string; headSha: string }>;
+  calls: Array<{ vm: string; app: string; branch: string; headSha: string; prNumber: number }>;
 } {
-  const calls: Array<{ vm: string; app: string; branch: string; headSha: string }> = [];
-  const ensurePreview = async (args: { vm: string; app: string; branch: string; headSha: string }): Promise<EnsurePreviewResult> => {
+  const calls: Array<{ vm: string; app: string; branch: string; headSha: string; prNumber: number }> = [];
+  const ensurePreview = async (args: { vm: string; app: string; branch: string; headSha: string; prNumber: number }): Promise<EnsurePreviewResult> => {
     calls.push({ ...args });
     if (outcome === "failed") {
       return { vhost: "", outcome: "failed", lastDeployedSha: args.headSha };
     }
     // Write EnvRecord to the shared store (prod shape) so sha-compare works.
-    const rec = makeEnvRecord(vm.id, args.app, args.branch, args.headSha);
+    // Stamp prNumber so the reap guard (env.prNumber !== undefined) works.
+    const rec = makeEnvRecord(vm.id, args.app, args.branch, args.headSha, args.prNumber);
     envStore.upsert(rec);
     return { vhost: rec.vhost, outcome: "ok", lastDeployedSha: args.headSha };
   };
@@ -364,8 +369,9 @@ describe("runPrPreviewPass", () => {
   // ---------------------------------------------------------------------------
   test("pr-6 — closed PR branch in store: reapPreview called once; guarded against double-reap", async () => {
     const oldBranch = "old/feature";
-    // Seed an env for a closed branch
-    const staleEnv = makeEnvRecord(vm.id, app.name, oldBranch, "sha-stale");
+    // Seed an env for a closed branch — prNumber set because this was created
+    // by the PR-preview pass (prod shape: only PR-managed envs are reap-eligible).
+    const staleEnv = makeEnvRecord(vm.id, app.name, oldBranch, "sha-stale", 77);
     envStore.upsert(staleEnv);
 
     // Current open PRs do NOT include oldBranch
@@ -422,10 +428,10 @@ describe("runPrPreviewPass", () => {
     const pr2 = makePr({ number: 2, headRef: "feature/good", headSha: "sha-good-0000000000000000000000000" });
 
     let callCount = 0;
-    const throwingEnsure = async (args: { vm: string; app: string; branch: string; headSha: string }): Promise<EnsurePreviewResult> => {
+    const throwingEnsure = async (args: { vm: string; app: string; branch: string; headSha: string; prNumber: number }): Promise<EnsurePreviewResult> => {
       callCount++;
       if (args.branch === "feature/bad") throw new Error("SSH timeout");
-      const rec = makeEnvRecord(vm.id, args.app, args.branch, args.headSha);
+      const rec = makeEnvRecord(vm.id, args.app, args.branch, args.headSha, args.prNumber);
       envStore.upsert(rec);
       return { vhost: rec.vhost, outcome: "ok", lastDeployedSha: args.headSha };
     };
@@ -495,5 +501,63 @@ describe("runPrPreviewPass", () => {
     // (first call at pass 1 = 1, second pass should not add)
     const commentsBefore = commentCalls.filter((c) => c.prNumber === 10).length;
     expect(commentsBefore).toBe(1);
+  });
+
+  // ---------------------------------------------------------------------------
+  // Case 9: closed-PR reap NEVER touches a manually-created env (prNumber undefined)
+  //
+  // Setup: TWO envs in the store for the same (vm, app), neither branch is in the
+  // open-PR set:
+  //   - prEnv: prNumber=42, branch="feature/closed-pr" — WAS created by the
+  //     PR-preview pass → MUST be reaped.
+  //   - demoEnv: prNumber=undefined, branch="demo/red-login" — manually-created
+  //     demo preview → MUST NOT be reaped (ever).
+  //
+  // The current implementation (no prNumber guard) would reap BOTH.
+  // After the fix, only the PR-managed env is reaped.
+  // ---------------------------------------------------------------------------
+  test("pr-9 — closed-PR reap NEVER touches a manually-created env (prNumber undefined)", async () => {
+    const prBranch = "feature/closed-pr";
+    const demoBranch = "demo/red-login";
+
+    // PR-managed env (prNumber set) — branch NOT in open-PR set → should be reaped
+    const prEnv = makeEnvRecord(vm.id, app.name, prBranch, "sha-pr-old", 42);
+    envStore.upsert(prEnv);
+
+    // Demo env (prNumber NOT set) — manually-created; branch NOT in open-PR set
+    // → MUST be kept regardless
+    const demoEnv = makeEnvRecord(vm.id, app.name, demoBranch, "sha-demo");
+    envStore.upsert(demoEnv);
+
+    // Open PRs: a different PR, so neither stale branch is in the open set
+    const openPr = makePr({ number: 99, headRef: "feature/other", headSha: "sha-other-000000000000000000000000" });
+
+    const { ensurePreview } = makeFakeEnsurePreview(envStore, vm);
+    const { upsertPrComment } = makeFakeUpsertPrComment();
+    const { reapPreview, calls: reapCalls } = makeFakeReapPreview();
+
+    const deps: PrPreviewDeps = {
+      listOpenPrs: async () => [openPr],
+      ensurePreview,
+      upsertPrComment,
+      reapPreview,
+      envStore,
+      now: () => new Date(),
+    };
+
+    const c = capture();
+    const summary = await runPrPreviewPass(app, vm, deps, c.out, c.err);
+
+    // reapPreview called EXACTLY ONCE — only for the PR-managed branch
+    expect(reapCalls.length).toBe(1);
+    expect(reapCalls[0]!.branch).toBe(prBranch);
+
+    // The demo branch is NEVER passed to reapPreview
+    expect(reapCalls.some((r) => r.branch === demoBranch)).toBe(false);
+
+    // summary has one reaped result (the PR env) — demo is silent (not listed as reaped)
+    const reaped = summary.results.filter((r) => r.action === "reaped");
+    expect(reaped.length).toBe(1);
+    expect(reaped[0]!.branch).toBe(prBranch);
   });
 });
