@@ -1,0 +1,30 @@
+# Cloudflare Worker: samohost-preview-banner
+#
+# Deploys the platform preview banner Worker to the samo.cat zone.
+# This Worker intercepts every response for *.samo.cat/* and injects a
+# platform-defined banner into HTML pages at the Cloudflare edge.
+#
+# CREDENTIALS: account_id and the API token are NEVER committed here.
+# Supply them at deploy time via environment variables:
+#   CLOUDFLARE_ACCOUNT_ID  — the CF account that owns the samo.cat zone
+#   CLOUDFLARE_API_TOKEN   — a token with the exact permissions listed in
+#                            docs/edge-preview-banner.md (Workers Scripts:Edit +
+#                            Workers Routes:Edit on samo.cat zone)
+#
+# Deploy command (see docs/edge-preview-banner.md for full details):
+#   CLOUDFLARE_ACCOUNT_ID=<id> CLOUDFLARE_API_TOKEN=<token> \
+#     bunx wrangler deploy
+
+name            = "samohost-preview-banner"
+main            = "src/edge/worker.ts"
+compatibility_date = "2024-11-01"
+
+# Route: bind the Worker to all *.samo.cat preview SUBDOMAINS.
+# The leading "*." (with the dot) restricts the route to subdomains and does
+# NOT match the apex samo.cat — apex would otherwise be matched by a bare "*".
+# Production hosts live on the samo.team zone and are NOT matched here.
+# The route + zone_name pair is all that wrangler needs to register the route
+# in the CF dashboard for the samo.cat zone.
+[[routes]]
+pattern   = "*.samo.cat/*"
+zone_name = "samo.cat"
