@@ -27,7 +27,12 @@ import {
 } from "../dblab/preflight.ts";
 import { parseEnvOutcome, type EnvOutcome } from "../env/parse.ts";
 import { envName } from "../env/name.ts";
-import { allocatePort, DEFAULT_POOL, type PortPool } from "../env/ports.ts";
+import {
+  allocatePort,
+  DEFAULT_POOL,
+  parseListeningPorts,
+  type PortPool,
+} from "../env/ports.ts";
 import {
   buildEnvCreateScript,
   buildEnvDestroyScript,
@@ -204,6 +209,15 @@ export function deriveTarget(
   existingOnVm: readonly EnvRecord[],
   pool: PortPool = DEFAULT_POOL,
   templateDb?: string,
+  /**
+   * Extra ports to treat as taken during allocation, on top of the ports
+   * recorded in `existingOnVm`. Used to inject ports that are LIVE-BOUND on the
+   * host (parsed from `ss -ltnH`) so allocation skips a foreign squatter that
+   * has no env record — the reliability complement to #71 (squatter robustness).
+   * Pure: name/branch collision still derives from `existingOnVm` only; this
+   * affects port selection only.
+   */
+  extraUsedPorts: readonly number[] = [],
 ): EnvScriptTarget | { error: string } {
   // Fail closed on a bad preview domain. The TS type says `string`, but JS
   // callers (e.g. an ad-hoc driver reading a nonexistent `app.previewDomain`
@@ -221,7 +235,7 @@ export function deriveTarget(
   const names = new Map(existingOnVm.map((e) => [e.name, e.branch]));
   const name = envName(app.name, branch, names);
   const port = allocatePort(
-    existingOnVm.map((e) => e.port),
+    [...existingOnVm.map((e) => e.port), ...extraUsedPorts],
     pool,
   );
   if (port === undefined) {
@@ -413,6 +427,33 @@ export interface EnvExecDeps {
    * spawnSync so a hung VM cannot stall the CLI indefinitely.
    */
   remoteTimeoutMs?: number;
+  /**
+   * Optional probe for ports ACTUALLY bound on the target host (issue: squatter
+   * robustness — complement to #71's fail-closed).
+   *
+   * `allocatePort` is pure and sees only ports recorded in the env STORE, so a
+   * foreign process binding a pool port (observed: a CI runner's Playwright e2e
+   * server permanently holding 0.0.0.0:3100, INSIDE the 3100-3199 preview pool)
+   * is invisible to it — allocation hands out the squatted port, the preview
+   * unit dies with EADDRINUSE, and #71 correctly fails it CLOSED (URL dark).
+   *
+   * When wired, `runEnvCreate` calls this for a FRESH allocation (no existing
+   * record) and feeds the live-bound ports into allocation alongside the
+   * store-recorded ones, so the preview lands on the lowest pool port that is
+   * neither store-recorded NOR live-bound. A re-create reuses its OWN recorded
+   * port and never consults the probe (idempotent — its own port shows as bound
+   * but is legitimately ours, exactly #71's is-active case).
+   *
+   * Production impl runs `ss -ltnH` over the pinned SSH runner and parses the
+   * output with {@link parseListeningPorts}. THROWS on probe failure so the
+   * caller can fail-closed rather than silently allocate onto a squatter; #71
+   * remains the on-host backstop for the probe->bind race.
+   *
+   * The field is OPTIONAL so the existing test fixtures that build
+   * `{ remote, now, uuid }` keep compiling. When absent, allocation falls back
+   * to store-only (pre-existing behaviour) and #71 alone guards the bind.
+   */
+  inUsePorts?: (vm: VmRecord) => Promise<readonly number[]>;
 }
 
 /**
@@ -547,19 +588,44 @@ export async function runEnvCreate(
   if (r === undefined) return 1;
 
   const existing = envStore.get(r.vm.id, r.app.name, input.branch);
-  // Re-create reuses the recorded name/port (idempotent re-run after a failed
-  // create); a fresh env allocates.
-  const target = existing
-    ? targetFromRecord(existing)
-    : deriveTarget(
-        r.app,
-        input.branch,
-        input.db,
-        input.previewDomain,
-        envStore.listFor(r.vm.id),
-        DEFAULT_POOL,
-        input.templateDb,
-      );
+  let target: EnvScriptTarget | { error: string };
+  if (existing) {
+    // Re-create reuses the recorded name/port (idempotent re-run after a failed
+    // create). It keeps its OWN port even when that port shows as live-bound —
+    // the bound listener IS our own unit (#71's is-active case), not a squatter.
+    target = targetFromRecord(existing);
+  } else {
+    // Fresh env: probe the host for ports ACTUALLY bound (squatter robustness,
+    // complement to #71). Allocation then skips any pool port that is either
+    // store-recorded OR live-bound, so the preview never lands on a squatted
+    // port (e.g. a CI runner holding 0.0.0.0:3100). On probe failure we FAIL
+    // CLOSED rather than risk allocating onto a squatter — re-run after the
+    // host is reachable. When no probe is wired, fall back to store-only and
+    // let #71 guard the bind.
+    let liveBound: readonly number[] = [];
+    if (deps.inUsePorts !== undefined) {
+      try {
+        liveBound = await deps.inUsePorts(r.vm);
+      } catch (e) {
+        err(
+          `error: could not probe in-use ports on ${r.vm.name} — ` +
+            `${e instanceof Error ? e.message : String(e)}; refusing to allocate ` +
+            `(a stale probe risks landing the preview on a squatted port — re-run create)`,
+        );
+        return 1;
+      }
+    }
+    target = deriveTarget(
+      r.app,
+      input.branch,
+      input.db,
+      input.previewDomain,
+      envStore.listFor(r.vm.id),
+      DEFAULT_POOL,
+      input.templateDb,
+      liveBound,
+    );
+  }
   if ("error" in target) {
     err(`error: ${target.error}`);
     return 1;
@@ -844,12 +910,51 @@ function defaultRemoteScriptRunner(timeoutMs?: number): RemoteScriptRunner {
   };
 }
 
+/**
+ * Probe ports LIVE-BOUND on the VM via `ss -ltnH` over the pinned SSH runner,
+ * parsed with {@link parseListeningPorts}. THROWS on connection failure or a
+ * non-zero ss exit so `runEnvCreate` can fail CLOSED (refuse to allocate onto a
+ * possibly-squatted port) rather than allocate blind. `ss -ltnH` needs no sudo
+ * on Ubuntu, matching #71's on-host port-check.
+ */
+function defaultInUsePortsProbe(
+  timeoutMs?: number,
+): (vm: VmRecord) => Promise<readonly number[]> {
+  return async (vm) => {
+    const deps: RunDeps = {
+      clock: () => Date.now(),
+      knownHostsDir:
+        process.env["SAMOHOST_KNOWN_HOSTS_DIR"] ?? defaultKnownHostsDir(),
+      spawn: (file, args) => {
+        const res = spawnSync(file, args, {
+          encoding: "utf8",
+          maxBuffer: 16 * 1024 * 1024,
+          timeout: timeoutMs ?? 120_000,
+        });
+        return Promise.resolve({
+          code: typeof res.status === "number" ? res.status : 255,
+          stdout: res.stdout ?? "",
+          stderr: res.stderr ?? (res.error ? String(res.error.message) : ""),
+        });
+      },
+    };
+    const result = await runRemote(vm, "ss -ltnH", deps);
+    if (result.code !== 0) {
+      throw new Error(
+        `ss -ltnH exited ${result.code} on ${vm.name}: ${result.stderr.trim()}`,
+      );
+    }
+    return [...parseListeningPorts(result.stdout)];
+  };
+}
+
 /** Default production env-exec deps. */
 export function defaultEnvExecDeps(): EnvExecDeps {
   const remoteTimeoutMs = 120_000;
   return {
     remote: defaultRemoteScriptRunner(remoteTimeoutMs),
     remoteTimeoutMs,
+    inUsePorts: defaultInUsePortsProbe(remoteTimeoutMs),
     now: () => new Date(),
     uuid: () => crypto.randomUUID(),
     // Per-preview DNS factory (issue #37, updated issue #54).
