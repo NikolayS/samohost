@@ -371,6 +371,127 @@ describe("env commands", () => {
     expect(c.o).toContain("3101");
   });
 
+  // -------------------------------------------------------------------------
+  // Live-bound port skip (squatter robustness — complement to #71's fail-closed)
+  //
+  // Root context: a CI runner's Playwright e2e server permanently binds
+  // 0.0.0.0:3100 (INSIDE the 3100-3199 preview pool) on the shared
+  // field-record VM. allocatePort sees only STORE-recorded ports, so it would
+  // hand out 3100, the preview unit dies with EADDRINUSE, and #71 fails it
+  // CLOSED (URL goes dark). The reliability complement: probe the host's live
+  // listeners and allocate the lowest pool port that is neither store-recorded
+  // NOR live-bound — so the preview just lands on the next free port (3101).
+  // -------------------------------------------------------------------------
+  function fakeDepsWithProbe(
+    output: string,
+    inUse: readonly number[],
+    scripts?: string[],
+  ): EnvExecDeps {
+    let n = 0;
+    return {
+      remote: (_vm, script) => {
+        scripts?.push(script);
+        return Promise.resolve({ code: 0, stdout: output, stderr: "" });
+      },
+      now: () => new Date("2026-06-11T12:00:00.000Z"),
+      uuid: () => `uuid-${++n}`,
+      // Live in-use ports on the target VM (parsed from `ss -ltnH`).
+      inUsePorts: () => Promise.resolve(inUse),
+    };
+  }
+
+  test("create skips a live-bound (squatted) pool port and picks the next free one", async () => {
+    const scripts: string[] = [];
+    const c = capture();
+    // 3100 is store-FREE but held by a CI runner's e2e server on the host.
+    const code = await runEnvCreate(
+      { vm: "samo-we-field-record", app: "field-record-1", branch: "feat/x",
+        db: "dblab", previewDomain: "samo.cat" },
+      { json: false }, vmStore, appStore, envStore,
+      fakeDepsWithProbe(CREATE_OK, [3100], scripts), c.out, c.err,
+    );
+    expect(code).toBe(0);
+    const rec = envStore.get("vm-1111", "field-record-1", "feat/x");
+    expect(rec?.port).toBe(3101); // skipped the squatter at 3100
+    // The generated create script must target the FREE port, not 3100.
+    expect(scripts[0]).toContain("3101");
+    expect(scripts[0]).not.toMatch(/SAMOHOST_PORT='?3100'?/);
+  });
+
+  test("create allocates 3100 when the host has no squatter (probe returns [])", async () => {
+    const c = capture();
+    const code = await runEnvCreate(
+      { vm: "samo-we-field-record", app: "field-record-1", branch: "feat/x",
+        db: "dblab", previewDomain: "samo.cat" },
+      { json: false }, vmStore, appStore, envStore,
+      fakeDepsWithProbe(CREATE_OK, []), c.out, c.err,
+    );
+    expect(code).toBe(0);
+    expect(envStore.get("vm-1111", "field-record-1", "feat/x")?.port).toBe(3100);
+  });
+
+  test("re-create keeps its OWN recorded port even if that port is live-bound (idempotent)", async () => {
+    // First create lands on 3100 (no squatter).
+    await runEnvCreate(
+      { vm: "samo-we-field-record", app: "field-record-1", branch: "feat/x",
+        db: "dblab", previewDomain: "samo.cat" },
+      { json: false }, vmStore, appStore, envStore,
+      fakeDepsWithProbe(CREATE_OK, []), capture().out, capture().err,
+    );
+    const first = envStore.get("vm-1111", "field-record-1", "feat/x");
+    expect(first?.port).toBe(3100);
+
+    // Re-create: 3100 now shows as live-bound (it's OUR OWN running unit).
+    // The env must REUSE its recorded port, not flee to 3101.
+    const c = capture();
+    const code = await runEnvCreate(
+      { vm: "samo-we-field-record", app: "field-record-1", branch: "feat/x",
+        db: "dblab", previewDomain: "samo.cat" },
+      { json: false }, vmStore, appStore, envStore,
+      fakeDepsWithProbe(CREATE_OK, [3100]), c.out, c.err,
+    );
+    expect(code).toBe(0);
+    const second = envStore.get("vm-1111", "field-record-1", "feat/x");
+    expect(second?.id).toBe(first!.id);
+    expect(second?.port).toBe(3100);
+  });
+
+  test("pool exhaustion (store + live-bound together fill the pool) errors clearly", async () => {
+    // Record one env at 3100, then claim every OTHER pool port as live-bound.
+    await runEnvCreate(
+      { vm: "samo-we-field-record", app: "field-record-1", branch: "feat/x",
+        db: "dblab", previewDomain: "samo.cat" },
+      { json: false }, vmStore, appStore, envStore,
+      fakeDepsWithProbe(CREATE_OK, []), capture().out, capture().err,
+    );
+    const liveRest = Array.from(
+      { length: DEFAULT_POOL.size - 1 },
+      (_, i) => DEFAULT_POOL.base + 1 + i,
+    ); // 3101..3199
+    const c = capture();
+    const code = await runEnvCreate(
+      { vm: "samo-we-field-record", app: "field-record-1", branch: "feat/z",
+        db: "dblab", previewDomain: "samo.cat" },
+      { json: false }, vmStore, appStore, envStore,
+      fakeDepsWithProbe(CREATE_OK, liveRest), c.out, c.err,
+    );
+    expect(code).toBe(1);
+    expect(c.e).toMatch(/port pool exhausted/i);
+  });
+
+  test("create still succeeds when no inUsePorts probe is wired (back-compat)", async () => {
+    // Existing fixtures build deps WITHOUT inUsePorts; behaviour is unchanged.
+    const c = capture();
+    const code = await runEnvCreate(
+      { vm: "samo-we-field-record", app: "field-record-1", branch: "feat/x",
+        db: "dblab", previewDomain: "samo.cat" },
+      { json: false }, vmStore, appStore, envStore,
+      fakeDeps(CREATE_OK), c.out, c.err,
+    );
+    expect(code).toBe(0);
+    expect(envStore.get("vm-1111", "field-record-1", "feat/x")?.port).toBe(3100);
+  });
+
   test("destroy removes the record on success, keeps it on failure", async () => {
     await runEnvCreate(
       { vm: "samo-we-field-record", app: "field-record-1", branch: "feat/x",
