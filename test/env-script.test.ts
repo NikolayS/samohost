@@ -1715,23 +1715,15 @@ describe("preview-flag: node env create appends SAMO_ENV=preview and SAMO_BRANCH
     // This is the required round-trip test: string-match on the builder output
     // proves template shape, but an executed run proves the bash actually works
     // for branch names that contain slashes (e.g. demo/red-login).
-    const slashTarget = target({ branch: "demo/red-login", name: "field-record-1-demo-red-login" });
-    const s = buildEnvCreateScript(app(), slashTarget);
+    // We cannot run the full create script (it would clone a git repo, create a DB,
+    // etc.), so we construct a minimal bash program that replicates only the
+    // envfile-phase steps — mirroring the runRewire/runClone pattern above.
     const dir = mkdtempSync(join(tmpdir(), "samohost-preview-flag-"));
     try {
       const envDir = join(dir, "envdir");
       const templateEnv = join(dir, "template.env");
       // Minimal template env: just NODE_ENV so the copy succeeds.
       writeFileSync(templateEnv, "NODE_ENV=production\n", { mode: 0o600 });
-      // Extract only the envfile-phase printf lines (the CP + chmod + printf
-      // chain). We cannot run the full create script (it would clone a git repo,
-      // create a DB, etc.), so we extract the envfile body and execute just that
-      // portion — mirroring the runRewire/runClone pattern above.
-      //
-      // Construct a minimal program that:
-      //   1. Sets the shell vars the envfile body uses.
-      //   2. Creates the env dir and runs cp + chmod + the appended printfs.
-      //   3. We then read back the .env and assert its contents.
       const prog = [
         "set -euo pipefail",
         `SAMOHOST_ENV_DIR='${envDir}'`,
