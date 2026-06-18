@@ -316,6 +316,25 @@ export interface EnvExecDeps {
    * Returns a DnsProviderPort or undefined when no credentials are available.
    */
   dns?: () => DnsProviderPort | undefined;
+  /**
+   * Optional external HTTPS probe for the real reachability gate (issue #55).
+   *
+   * The field is OPTIONAL (`?:`) so all existing test fixtures that build
+   * `{ remote, now, uuid }` keep compiling unchanged. When absent, no
+   * external gate is applied (back-compat). When present, it is called with
+   * `https://<vhost>/` after a successful on-host create and must return
+   * `{ status, ok }` — any non-200 or thrown error is treated as failure.
+   *
+   * In production this is wired to `global fetch`. In unit tests pass a
+   * deterministic fake; never use a real network in tests.
+   */
+  httpProbe?: (url: string) => Promise<{ status: number; ok: boolean }>;
+  /**
+   * Optional injectable sleep used between external probe retry attempts
+   * (issue #55). Defaults to a real Promise-based setTimeout in production.
+   * Inject a no-op in unit tests so they don't sleep 25s.
+   */
+  sleep?: (ms: number) => Promise<void>;
 }
 
 /** Warning emitted when no DNS provider is configured. */
@@ -335,6 +354,24 @@ export interface EnvCreateReport {
   outcome: EnvOutcome;
   exitCode: number;
 }
+
+// ---------------------------------------------------------------------------
+// External HTTPS probe constants (issue #55)
+// ---------------------------------------------------------------------------
+
+/**
+ * Maximum number of external probe attempts after a successful on-host create.
+ * SAFETY CAP — not a target. Returns as soon as the first 200 is received.
+ * Worst-case added wall-clock: EXTERNAL_PROBE_RETRIES × EXTERNAL_PROBE_SLEEP_MS
+ */
+const EXTERNAL_PROBE_RETRIES = 5;
+
+/**
+ * Milliseconds to sleep between external probe retry attempts.
+ * SAFETY CAP — not a target; the sleep only fires if the previous attempt
+ * did not return 200.
+ */
+const EXTERNAL_PROBE_SLEEP_MS = 5000;
 
 export async function runEnvCreate(
   input: EnvCreateInput,
@@ -395,7 +432,54 @@ export async function runEnvCreate(
     return 1;
   }
 
-  const { outcome } = parseEnvOutcome(result.stdout + "\n" + result.stderr);
+  let { outcome } = parseEnvOutcome(result.stdout + "\n" + result.stderr);
+
+  // External HTTPS reachability gate (issue #55).
+  //
+  // Root cause: the on-host health phase runs `curl http://localhost:PORT/`
+  // inside the remote bash script, so it returns ok even when the preview
+  // URL is EXTERNALLY unreachable (TLS not provisioned, DNS not propagated,
+  // Caddy not listening on the public port, etc.).
+  //
+  // When httpProbe is wired AND the on-host outcome is ok, probe the public
+  // URL to get real external confirmation before reporting success. If all
+  // attempts fail, downgrade outcome to "failed" and exit 1. The env record
+  // is still persisted for an idempotent re-run (same as a failed on-host
+  // create). DNS record is kept (re-create reuses it).
+  if (outcome === "ok" && deps.httpProbe !== undefined) {
+    const probeUrl = `https://${target.vhost}/`;
+    const sleep = deps.sleep ?? ((ms) => new Promise((r) => setTimeout(r, ms)));
+    let lastStatus: number | undefined;
+    let lastError: string | undefined;
+    let probeOk = false;
+    for (let attempt = 0; attempt < EXTERNAL_PROBE_RETRIES; attempt++) {
+      if (attempt > 0) {
+        await sleep(EXTERNAL_PROBE_SLEEP_MS);
+      }
+      try {
+        const probeResult = await deps.httpProbe(probeUrl);
+        lastStatus = probeResult.status;
+        if (probeResult.ok) {
+          probeOk = true;
+          break;
+        }
+      } catch (e) {
+        lastError = e instanceof Error ? e.message : String(e);
+      }
+    }
+    if (!probeOk) {
+      outcome = "failed";
+      const detail =
+        lastError !== undefined
+          ? `error: ${lastError}`
+          : `HTTP ${lastStatus}`;
+      err(
+        `samohost: external probe failed for https://${target.vhost}/ — ` +
+          `on-host phases passed but the public URL is unreachable (${detail}); ` +
+          `env record kept for inspection — re-run create or destroy to clean up`,
+      );
+    }
+  }
 
   // Record on success — AND on failure, so the allocated name/port are pinned
   // for an idempotent re-run / destroy-cleanup. Failed envs are visible in
@@ -619,6 +703,21 @@ export function defaultEnvExecDeps(): EnvExecDeps {
       }
       return new CloudflareDns({ token, zoneId });
     },
+    // External HTTPS reachability probe (issue #55).
+    // Uses global fetch with a 10s per-attempt timeout (AbortSignal.timeout
+    // is available in Bun). redirect:"manual" so a redirect (e.g. 301→HTTPS)
+    // is not followed and is NOT counted as 200 — the vhost must serve 200
+    // directly. A thrown fetch error propagates to the retry loop in
+    // runEnvCreate, which catches it and treats it as a failed attempt.
+    httpProbe: async (url: string) => {
+      const res = await fetch(url, {
+        redirect: "manual",
+        signal: AbortSignal.timeout(10000),
+      });
+      return { status: res.status, ok: res.status === 200 };
+    },
+    // Promise-based sleep wired to real setTimeout.
+    sleep: (ms: number) => new Promise((resolve) => setTimeout(resolve, ms)),
   };
 }
 
