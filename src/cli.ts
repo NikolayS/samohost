@@ -293,6 +293,9 @@ trigger run options (samo-level auto-deploy poller — replaces per-client on-bo
   --vm <name>                narrow to apps on this VM only (name or id; optional)
   --app <name>               narrow to this app only (optional)
   --dry-run                  report what WOULD happen without deploying
+  --gc                       run env GC (branch-gone + orphan-vm reap) after the deploy loop
+  --pr-previews              ensure a preview env for each open PR and post/update a comment
+                             with the clickable preview URL; reap envs for closed PRs
   --json                     emit a JSON TriggerRunReport
 
   Intended to be called from a samohost-managed control-plane systemd timer.
@@ -1602,6 +1605,7 @@ function parseTriggerRun(args: string[]): ParsedTriggerRun {
   let dryRun = false;
   let json = false;
   let gc: boolean | undefined;
+  let prPreviews: boolean | undefined;
 
   for (let i = 0; i < args.length; i++) {
     const a = args[i]!;
@@ -1623,6 +1627,9 @@ function parseTriggerRun(args: string[]): ParsedTriggerRun {
       case "--gc":
         gc = true;
         break;
+      case "--pr-previews":
+        prPreviews = true;
+        break;
       default:
         throw new UsageError(`unknown flag: ${a}`);
     }
@@ -1633,6 +1640,7 @@ function parseTriggerRun(args: string[]): ParsedTriggerRun {
     ...(vm !== undefined ? { vm } : {}),
     ...(app !== undefined ? { app } : {}),
     ...(gc !== undefined ? { gc } : {}),
+    ...(prPreviews !== undefined ? { prPreviews } : {}),
   };
   return { kind: "trigger-run", input, json };
 }

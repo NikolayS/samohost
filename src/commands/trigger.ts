@@ -45,6 +45,8 @@ import {
   defaultEnvStore,
 } from "./env.ts";
 import type { EnvStore } from "../state/envs.ts";
+import type { PrPreviewSummary } from "../preview/pr.ts";
+import type { AppRecord, VmRecord } from "../types.ts";
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -75,6 +77,15 @@ export interface TriggerRunInput {
    * operations must never happen unless explicitly requested.
    */
   gc?: boolean;
+  /**
+   * When true, run the PR-preview pass per live app in scope after the GC pass.
+   * DEFAULT: false (absent = no PR previews at all). For each open PR, ensures
+   * a preview env exists at the PR head SHA and posts/updates a clickable URL
+   * comment. Reaps envs for PRs that are no longer open.
+   * SAFETY: OPT-IN — destructive (reap) operations never happen unless explicitly
+   * requested.
+   */
+  prPreviews?: boolean;
 }
 
 export interface TriggerAppResult {
@@ -105,6 +116,11 @@ export interface TriggerRunReport {
    * at least one live VM was in scope and the gc dep is wired.
    */
   gc?: Record<string, GcSummary>;
+  /**
+   * Per-app PR-preview summaries. Only present when --pr-previews was active,
+   * at least one live app was in scope, and the prPreview dep is wired.
+   */
+  prPreviews?: PrPreviewSummary[];
 }
 
 /**
@@ -158,6 +174,18 @@ export interface TriggerDeps {
    * OPTIONAL to preserve backward compatibility with existing test fixtures.
    */
   envStore?: EnvStore;
+  /**
+   * OPTIONAL: Curried PR-preview function. When present and input.prPreviews is
+   * true, called once per live candidate app (after the GC pass, so gc's reap
+   * results are visible to the reaper). Returns a PrPreviewSummary per app.
+   *
+   * Signature: (app, vm) => Promise<PrPreviewSummary>
+   *
+   * OPTIONAL so that all existing test fixtures that build {resolveRef, deploy,
+   * fetch, now} continue to compile and run unchanged. When absent, the PR-preview
+   * pass is silently skipped even if input.prPreviews is true.
+   */
+  prPreview?: (app: AppRecord, vm: VmRecord) => Promise<PrPreviewSummary>;
 }
 
 // ---------------------------------------------------------------------------
@@ -423,6 +451,41 @@ export async function runTriggerRun(
     }
   }
 
+  // ---- PR-preview pass (opt-in: only when input.prPreviews is true and dep is wired) ----
+  // Runs AFTER the GC pass so gc's reap results are visible to the pr-preview
+  // reaper (guards against double-reap: if gc removed a branch-gone env, the
+  // existence guard in runPrPreviewPass will see it as already gone).
+  // Per-app isolation: one app's prPreview failure must not abort the cycle.
+  let prPreviewSummaries: PrPreviewSummary[] | undefined;
+
+  if (input.prPreviews === true && deps.prPreview !== undefined) {
+    const liveCandidateApps: Array<{ app: (typeof candidates)[number]; vm: VmRecord }> = [];
+
+    for (const app of candidates) {
+      const vmRecord = allVms.find((v) => v.id === app.vmId);
+      if (vmRecord === undefined) continue;
+      if (!LIVE_STATES.has(vmRecord.lifecycleState)) continue;
+      liveCandidateApps.push({ app, vm: vmRecord });
+    }
+
+    if (liveCandidateApps.length > 0) {
+      prPreviewSummaries = [];
+
+      for (const { app, vm: vmRecord } of liveCandidateApps) {
+        try {
+          const summary = await deps.prPreview(app, vmRecord);
+          prPreviewSummaries.push(summary);
+        } catch (e) {
+          // PR-preview failure for one app must not abort the cycle
+          err(
+            `samohost: warning: pr-preview pass failed for app ${app.name}: ` +
+              (e instanceof Error ? e.message : String(e)),
+          );
+        }
+      }
+    }
+  }
+
   // ---- Build report -------------------------------------------------------
   let deployed = 0;
   let skipped = 0;
@@ -453,6 +516,7 @@ export async function runTriggerRun(
     skipped,
     failed,
     ...(gcByVm !== undefined ? { gc: gcByVm } : {}),
+    ...(prPreviewSummaries !== undefined ? { prPreviews: prPreviewSummaries } : {}),
   };
 
   if (opts.json) {
@@ -564,5 +628,211 @@ export function defaultTriggerDeps(): TriggerDeps {
     },
 
     envStore,
+
+    // Curried PR-preview function. Only invoked when input.prPreviews is true.
+    // Builds PrPreviewDeps fresh per call (lazy stores mirror the gc closure
+    // pattern above).
+    //
+    // listOpenPrs: spawnSync `gh pr list --repo <repo> --state open
+    //   --json number,headRefName,headRefOid,isCrossRepository`
+    //   → parse JSON → filter out isCrossRepository → map to OpenPr.
+    //   gh reads GH_TOKEN from process.env at runtime (already exported by the
+    //   wrapper). On gh failure → throw (caught per-app upstream).
+    //
+    // ensurePreview: calls runEnvCreate (db="template", DEFAULT_PREVIEW_DOMAIN).
+    //   Reads the persisted record back and sets lastDeployedSha on it.
+    //
+    // upsertPrComment: spawnSync gh api to list issue comments, find one whose
+    //   body includes the marker → PATCH; else POST. NEVER writes tokens to disk.
+    //
+    // reapPreview: calls runEnvDestroy; if record already gone (runEnvDestroy
+    //   returns 1 with "no env recorded") → treat as no-op (swallow, log warn).
+    prPreview: async (app: AppRecord, vmRecord: VmRecord): Promise<PrPreviewSummary> => {
+      const { spawnSync } = await import("node:child_process");
+      const {
+        runPrPreviewPass,
+      } = await import("../preview/pr.ts");
+      const { DEFAULT_PREVIEW_DOMAIN, runEnvCreate, runEnvDestroy, defaultEnvExecDeps: mkEnvExecDeps } = await import("./env.ts");
+      const { StateStore: PrVmStore } = await import("../state/store.ts");
+      const { AppStore: PrAppStore } = await import("../state/apps.ts");
+      const { EnvStore: PrEnvStore } = await import("../state/envs.ts");
+
+      const prEnvStore = new PrEnvStore();
+
+      const listOpenPrs = async (repo: string) => {
+        const res = spawnSync(
+          "gh",
+          ["pr", "list", "--repo", repo, "--state", "open",
+           "--json", "number,headRefName,headRefOid,isCrossRepository"],
+          { encoding: "utf8" },
+        );
+        if (res.status !== 0) {
+          throw new Error(
+            `gh pr list failed (exit ${res.status}): ${res.stderr ?? ""}`,
+          );
+        }
+        const parsed = JSON.parse(res.stdout) as Array<{
+          number: number;
+          headRefName: string;
+          headRefOid: string;
+          isCrossRepository: boolean;
+        }>;
+        // Filter out cross-repository (fork) PRs to avoid branch-name collisions.
+        return parsed
+          .filter((pr) => !pr.isCrossRepository)
+          .map((pr) => ({
+            number: pr.number,
+            headRef: pr.headRefName,
+            headSha: pr.headRefOid,
+          }));
+      };
+
+      const ensurePreviewImpl = async (args: {
+        vm: string;
+        app: string;
+        branch: string;
+        headSha: string;
+      }) => {
+        const prVmStore = new PrVmStore();
+        const prAppStore = new PrAppStore();
+        const envExecDeps = mkEnvExecDeps();
+        const noop = (_s: string) => {};
+        let capturedOut = "";
+        const capOut = (s: string) => { capturedOut += s; };
+
+        await runEnvCreate(
+          {
+            vm: args.vm,
+            app: args.app,
+            branch: args.branch,
+            db: "template",
+            previewDomain: DEFAULT_PREVIEW_DOMAIN,
+          },
+          { json: true },
+          prVmStore,
+          prAppStore,
+          prEnvStore,
+          envExecDeps,
+          capOut,
+          noop,
+        );
+
+        // Parse the EnvCreateReport to get vhost + outcome.
+        let vhost = "";
+        let outcome: "ok" | "failed" = "failed";
+        try {
+          const createReport = JSON.parse(capturedOut) as import("./env.ts").EnvCreateReport;
+          vhost = createReport.vhost;
+          outcome = createReport.outcome === "ok" ? "ok" : "failed";
+        } catch {
+          // Parse failure → treat as failed
+        }
+
+        // Re-read the persisted record and stamp lastDeployedSha.
+        // We need the vm id — resolve it from the store.
+        const vmRec = prVmStore.list().find((v) => v.name === args.vm);
+        if (vmRec !== undefined && vhost !== "") {
+          const rec = prEnvStore.get(vmRec.id, args.app, args.branch);
+          if (rec !== undefined) {
+            prEnvStore.upsert({ ...rec, lastDeployedSha: args.headSha });
+          }
+        }
+
+        return { vhost, outcome, lastDeployedSha: args.headSha };
+      };
+
+      const upsertPrCommentImpl = async (
+        repo: string,
+        prNumber: number,
+        marker: string,
+        body: string,
+      ) => {
+        // List existing comments for the PR issue.
+        const listRes = spawnSync(
+          "gh",
+          ["api", `repos/${repo}/issues/${prNumber}/comments`, "--paginate"],
+          { encoding: "utf8" },
+        );
+        let existingCommentId: number | undefined;
+        if (listRes.status === 0) {
+          try {
+            const comments = JSON.parse(listRes.stdout) as Array<{
+              id: number;
+              body: string;
+            }>;
+            const found = comments.find((c) => c.body.includes(marker));
+            if (found !== undefined) existingCommentId = found.id;
+          } catch {
+            // Parse failure → create new comment
+          }
+        }
+
+        if (existingCommentId !== undefined) {
+          // PATCH existing comment
+          spawnSync(
+            "gh",
+            [
+              "api", "--method", "PATCH",
+              `repos/${repo}/issues/comments/${existingCommentId}`,
+              "-f", `body=${body}`,
+            ],
+            { encoding: "utf8" },
+          );
+        } else {
+          // POST new comment
+          spawnSync(
+            "gh",
+            [
+              "api", "--method", "POST",
+              `repos/${repo}/issues/${prNumber}/comments`,
+              "-f", `body=${body}`,
+            ],
+            { encoding: "utf8" },
+          );
+        }
+      };
+
+      const reapPreviewImpl = async (args: {
+        vm: string;
+        app: string;
+        branch: string;
+      }) => {
+        const prVmStore = new PrVmStore();
+        const prAppStore = new PrAppStore();
+        const envExecDeps = mkEnvExecDeps();
+        const noop = (_s: string) => {};
+
+        const exitCode = await runEnvDestroy(
+          { vm: args.vm, app: args.app, branch: args.branch },
+          { json: false },
+          prVmStore,
+          prAppStore,
+          prEnvStore,
+          envExecDeps,
+          noop,
+          (s: string) => {
+            // "no env recorded" → idempotent, swallow gracefully
+            if (!s.includes("no env recorded")) {
+              process.stderr.write(`samohost: pr-preview reap: ${s}\n`);
+            }
+          },
+        );
+        // Non-zero exit (e.g. "no env recorded") → idempotent no-op
+        if (exitCode !== 0) {
+          // Already logged above; continue.
+        }
+      };
+
+      const noop = (_s: string) => {};
+
+      return runPrPreviewPass(app, vmRecord, {
+        listOpenPrs,
+        ensurePreview: ensurePreviewImpl,
+        upsertPrComment: upsertPrCommentImpl,
+        reapPreview: reapPreviewImpl,
+        envStore: prEnvStore,
+        now: () => new Date(),
+      }, noop, noop);
+    },
   };
 }
