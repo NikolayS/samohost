@@ -295,6 +295,10 @@ export function runEnvPlan(
         envStore.listFor(r.vm.id),
         DEFAULT_POOL,
         input.templateDb,
+        // NO extraUsedPorts here: `plan` is OFFLINE (no network/SSH/state), so
+        // it cannot probe the host's live listeners. The live-bound skip
+        // happens in `runEnvCreate` (which has the SSH runner); the printed
+        // plan is a preview, and #71's on-host port-check guards the bind.
       );
   if ("error" in target) {
     err(`error: ${target.error}`);
