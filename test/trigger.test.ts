@@ -1124,3 +1124,136 @@ describe("trigger run --gc (PR-2)", () => {
     expect(gcCallCount).toBe(0);
   });
 });
+
+// ---------------------------------------------------------------------------
+// trigger run --pr-previews (PR-3)
+// ---------------------------------------------------------------------------
+
+import type { PrPreviewSummary } from "../src/preview/pr.ts";
+
+describe("trigger run --pr-previews (PR-3)", () => {
+  let dir: string;
+  let vmStore: StateStore;
+  let appStore: AppStore;
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), "samohost-trigger-prprev-"));
+    vmStore = new StateStore(join(dir, "state.json"));
+    appStore = new AppStore(join(dir, "apps.json"));
+  });
+
+  afterEach(() => rmSync(dir, { recursive: true, force: true }));
+
+  function makeFakePrPreview(): {
+    prPreview: NonNullable<TriggerDeps["prPreview"]>;
+    calls: Array<{ app: AppRecord; vm: VmRecord }>;
+  } {
+    const calls: Array<{ app: AppRecord; vm: VmRecord }> = [];
+    const prPreview = async (app: AppRecord, vm: VmRecord): Promise<PrPreviewSummary> => {
+      calls.push({ app, vm });
+      return {
+        app: app.name,
+        vm: vm.name,
+        openPrs: 2,
+        results: [],
+      };
+    };
+    return { prPreview, calls };
+  }
+
+  // -------------------------------------------------------------------------
+  // prprev-1: WITHOUT --pr-previews, prPreview dep NEVER called; no prPreviews key
+  // -------------------------------------------------------------------------
+  test("prprev-1 — without --pr-previews flag, prPreview dep never called; report has no prPreviews key", async () => {
+    vmStore.upsert(makeVm());
+    appStore.upsert(makeApp({ deployedSha: SHA_A }));
+
+    const { prPreview, calls } = makeFakePrPreview();
+    const { fetch: fakeFetch } = makeFakeFetch([]);
+    const deps: TriggerDeps = {
+      resolveRef: () => Promise.resolve(SHA_A),
+      deploy: makeFakeDeploy(0).deploy,
+      fetch: fakeFetch,
+      env: {},
+      now: () => new Date(),
+      prPreview,
+    };
+
+    const c = capture();
+    const code = await runTriggerRun({ dryRun: false }, { json: true }, vmStore, appStore, deps, c.out, c.err);
+    expect(code).toBe(0);
+
+    expect(calls.length).toBe(0);
+
+    const report: TriggerRunReport = JSON.parse(c.o);
+    expect("prPreviews" in report).toBe(false);
+  });
+
+  // -------------------------------------------------------------------------
+  // prprev-2: WITH --pr-previews, prPreview called once per live app; prPreviews present
+  // -------------------------------------------------------------------------
+  test("prprev-2 — with --pr-previews, prPreview called once per live app; report.prPreviews present", async () => {
+    vmStore.upsert(makeVm({ id: "vm-1111", name: "samo-we-field-record" }));
+    appStore.upsert(makeApp({ deployedSha: SHA_A }));
+
+    const { prPreview, calls } = makeFakePrPreview();
+    const { fetch: fakeFetch } = makeFakeFetch([]);
+    const deps: TriggerDeps = {
+      resolveRef: () => Promise.resolve(SHA_A),
+      deploy: makeFakeDeploy(0).deploy,
+      fetch: fakeFetch,
+      env: {},
+      now: () => new Date(),
+      prPreview,
+    };
+
+    const c = capture();
+    const code = await runTriggerRun({ dryRun: false, prPreviews: true }, { json: true }, vmStore, appStore, deps, c.out, c.err);
+    expect(code).toBe(0);
+
+    expect(calls.length).toBe(1);
+    expect(calls[0]!.app.name).toBe("field-record");
+
+    const report: TriggerRunReport = JSON.parse(c.o);
+    expect("prPreviews" in report).toBe(true);
+    expect(Array.isArray(report.prPreviews)).toBe(true);
+    expect(report.prPreviews!.length).toBe(1);
+  });
+
+  // -------------------------------------------------------------------------
+  // prprev-3: destroyed VM → prPreview not called
+  // -------------------------------------------------------------------------
+  test("prprev-3 — destroyed VM: prPreview not called", async () => {
+    vmStore.upsert(makeVm({ lifecycleState: "destroyed" }));
+    appStore.upsert(makeApp());
+
+    const { prPreview, calls } = makeFakePrPreview();
+    const { fetch: fakeFetch } = makeFakeFetch([]);
+    const deps: TriggerDeps = {
+      resolveRef: () => Promise.resolve(SHA_A),
+      deploy: makeFakeDeploy(0).deploy,
+      fetch: fakeFetch,
+      env: {},
+      now: () => new Date(),
+      prPreview,
+    };
+
+    const c = capture();
+    await runTriggerRun({ dryRun: false, prPreviews: true }, { json: true }, vmStore, appStore, deps, c.out, c.err);
+
+    expect(calls.length).toBe(0);
+  });
+
+  // -------------------------------------------------------------------------
+  // prprev-4: parseArgs — trigger run --pr-previews sets prPreviews:true; absent → falsy
+  // -------------------------------------------------------------------------
+  test("prprev-4 — parseArgs: trigger run --pr-previews sets prPreviews:true; absent = falsy", () => {
+    const withFlag = parseArgs(["trigger", "run", "--pr-previews"]);
+    if (withFlag.kind !== "trigger-run") throw new Error(`expected trigger-run, got ${withFlag.kind}`);
+    expect(withFlag.input.prPreviews).toBe(true);
+
+    const withoutFlag = parseArgs(["trigger", "run"]);
+    if (withoutFlag.kind !== "trigger-run") throw new Error(`expected trigger-run, got ${withoutFlag.kind}`);
+    expect(withoutFlag.input.prPreviews ?? false).toBe(false);
+  });
+});
