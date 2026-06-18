@@ -978,7 +978,7 @@ export function buildHostPrepScript(app: AppRecord, sshUser: string): string {
       throw new Error(
         `invalid mainHost ${JSON.stringify(app.mainHost)} for app ` +
           `'${app.name}' — expected a dotted lowercase DNS name like ` +
-          `"field-record-1.samo.team" (embedded in a root-run script; ` +
+          `"app.example.com" (embedded in a root-run script; ` +
           `failing closed)`,
       );
     }
