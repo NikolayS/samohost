@@ -97,6 +97,49 @@ export interface EnvDestroyInput {
   branch: string;
 }
 
+/**
+ * Input for `env gc` (preview environment garbage collection).
+ *
+ * `reap: false` (the default) = dry-run: list candidates but make NO writes
+ * and NO SSH calls.
+ * `reap: true` = actually destroy/prune the candidates.
+ */
+export interface EnvGcInput {
+  /** VM name or id to scan. Required at CLI level. */
+  vm: string;
+  /** Narrow to a single app on the VM. Optional. */
+  app?: string;
+  /** Whether to actually reap (destroy/prune). Default false = dry-run. */
+  reap: boolean;
+  /**
+   * TTL in milliseconds (from `--ttl <dur>`). When set, an env older than this
+   * value is a candidate even if its branch is open.
+   * When absent (default), TTL-based reaping is disabled.
+   */
+  ttl?: number;
+}
+
+/** A single candidate in the GC report. */
+export interface GcCandidate {
+  name: string;
+  appName: string;
+  branch: string;
+  reason: "branch-gone" | "orphan-vm" | "orphan-app" | "ttl-expired";
+  action: "destroy" | "prune-record";
+  vmState: string;
+}
+
+/** JSON summary for `env gc --json`. */
+export interface GcReport {
+  vm: string;
+  dryRun: boolean;
+  candidates: GcCandidate[];
+  reaped: string[];
+  pruned: string[];
+  kept: number;
+  failed: Array<{ name: string; reason: string; error: string }>;
+}
+
 // ---------------------------------------------------------------------------
 // Shared lookups / derivation
 // ---------------------------------------------------------------------------
@@ -335,6 +378,41 @@ export interface EnvExecDeps {
    * Inject a no-op in unit tests so they don't sleep 25s.
    */
   sleep?: (ms: number) => Promise<void>;
+  /**
+   * Optional branch-state checker for `env gc`.
+   *
+   * Returns "open" when the branch ref exists on the remote, "gone" when it
+   * does not (covers both deleted and merged-then-deleted branches — we do NOT
+   * have reliable merged-but-not-deleted detection without a PR API; ref-absent
+   * is the signal). THROWS on network error, SSH host-unreachable, or any exit
+   * code other than 0 (open) or 2 (gone), so the caller can treat the result as
+   * indeterminate and KEEP the env (fail-closed).
+   *
+   * The field is OPTIONAL so that all existing test fixtures that build
+   * `{ remote, now, uuid }` continue to compile unchanged. When absent in
+   * `runEnvGc`, branch-gone detection is SKIPPED and a single warning is
+   * emitted (only orphan-VM/orphan-app and TTL apply).
+   *
+   * Production impl uses `git ls-remote --exit-code --heads <repoUrl> <branch>`:
+   *   exit 0 → "open", exit 2 → "gone", any other exit → THROW.
+   *
+   * NOTE: `<repo>` is `owner/name` (e.g. "Tanya301/field-record-1") and the
+   * GitHub HTTPS URL is assumed (https://github.com/<repo>.git). A `repoUrl`
+   * field on AppRecord would be needed for non-GitHub remotes (TODO).
+   */
+  branchState?: (repo: string, branch: string) => Promise<"open" | "gone">;
+  /**
+   * Timeout in milliseconds applied to each remote SSH call in `runEnvGc`.
+   *
+   * When unset, defaults to 120 000ms (2 minutes). A spawn that exceeds the
+   * timeout surfaces as a thrown error and the env is counted as `failed`/KEEP.
+   *
+   * This field is OPTIONAL so that all existing test fixtures compile unchanged.
+   * It also hardens the existing `create`/`destroy` paths in production: the
+   * default runner now passes `{ timeout: remoteTimeoutMs ?? 120000 }` to
+   * spawnSync so a hung VM cannot stall the CLI indefinitely.
+   */
+  remoteTimeoutMs?: number;
 }
 
 /**
@@ -740,7 +818,7 @@ export async function runEnvPreflight(
 // ---------------------------------------------------------------------------
 
 /** Run ssh with the env script on stdin (`bash -s`) over the pinned runner. */
-function defaultRemoteScriptRunner(): RemoteScriptRunner {
+function defaultRemoteScriptRunner(timeoutMs?: number): RemoteScriptRunner {
   return (vm, script) => {
     const deps: RunDeps = {
       clock: () => Date.now(),
@@ -751,6 +829,9 @@ function defaultRemoteScriptRunner(): RemoteScriptRunner {
           encoding: "utf8",
           input: script,
           maxBuffer: 16 * 1024 * 1024,
+          // Hard wall-clock timeout so a hung VM cannot stall gc (or create/destroy).
+          // Default 120s; override via EnvExecDeps.remoteTimeoutMs.
+          timeout: timeoutMs ?? 120_000,
         });
         return Promise.resolve({
           code: typeof res.status === "number" ? res.status : 255,
@@ -765,8 +846,10 @@ function defaultRemoteScriptRunner(): RemoteScriptRunner {
 
 /** Default production env-exec deps. */
 export function defaultEnvExecDeps(): EnvExecDeps {
+  const remoteTimeoutMs = 120_000;
   return {
-    remote: defaultRemoteScriptRunner(),
+    remote: defaultRemoteScriptRunner(remoteTimeoutMs),
+    remoteTimeoutMs,
     now: () => new Date(),
     uuid: () => crypto.randomUUID(),
     // Per-preview DNS factory (issue #37, updated issue #54).
@@ -826,7 +909,326 @@ export function defaultEnvExecDeps(): EnvExecDeps {
     },
     // Promise-based sleep wired to real setTimeout.
     sleep: (ms: number) => new Promise((resolve) => setTimeout(resolve, ms)),
+    // Branch-state checker for `env gc` (brief §4 production deps).
+    //
+    // `git ls-remote --exit-code --heads <url> refs/heads/<branch>`:
+    //   exit 0 → ref exists → "open"
+    //   exit 2 → ref absent → "gone"  (covers deleted + merged-then-deleted)
+    //   any other exit (128 = host-unreachable, signal, auth error, etc.) → THROW
+    //     so the caller treats the result as indeterminate and KEEPS the env.
+    //
+    // NOTE: `repo` is "owner/name" (e.g. "Tanya301/field-record-1"); GitHub
+    // HTTPS URL is assumed. A `repoUrl` field on AppRecord would be needed for
+    // non-GitHub remotes (TODO).
+    branchState: (repo: string, branch: string): Promise<"open" | "gone"> => {
+      const url = `https://github.com/${repo}.git`;
+      const res = spawnSync(
+        "git",
+        ["ls-remote", "--exit-code", "--heads", url, `refs/heads/${branch}`],
+        { encoding: "utf8", timeout: 30_000 },
+      );
+      const code = typeof res.status === "number" ? res.status : -1;
+      if (code === 0) return Promise.resolve("open");
+      if (code === 2) return Promise.resolve("gone");
+      // Any other exit (128 = host-unreachable / auth, signals, etc.) → THROW.
+      // The caller treats a throw as indeterminate and KEEPS the env (fail-closed).
+      const detail = res.stderr?.trim() || `exit ${code}`;
+      throw new Error(`git ls-remote failed (exit ${code}): ${detail}`);
+    },
   };
+}
+
+// ---------------------------------------------------------------------------
+// env gc (preview environment garbage collection)
+// ---------------------------------------------------------------------------
+
+/**
+ * VM classification used by GC (computed once per env, not per scan).
+ *
+ * SAFETY RULES (fail closed):
+ *   - live   = lifecycleState ∈ {ready, adopted}   → full branch+TTL check; destroy on SSH path
+ *   - dead   = missing OR lifecycleState ∈ {destroyed, destroying, failed}
+ *              → orphan-vm: prune STATE RECORD ONLY, NO SSH
+ *   - transitional = {planned, creating, booting, degraded}
+ *              → KEEP unconditionally (VM may recover; SSH likely fails)
+ */
+type VmClassification = "live" | "dead" | "transitional";
+
+function classifyVm(
+  vmStore: StateStore,
+  vmId: string,
+): { classification: VmClassification; vm: import("../types.ts").VmRecord | undefined } {
+  const vm = vmStore.list().find((r) => r.id === vmId);
+  if (vm === undefined) {
+    return { classification: "dead", vm: undefined };
+  }
+  const s = vm.lifecycleState;
+  if (s === "ready" || s === "adopted") {
+    return { classification: "live", vm };
+  }
+  if (s === "destroyed" || s === "destroying" || s === "failed") {
+    return { classification: "dead", vm };
+  }
+  // planned, creating, booting, degraded → transitional → KEEP
+  return { classification: "transitional", vm };
+}
+
+/**
+ * Garbage-collect stale preview environments on a VM.
+ *
+ * SAFETY:
+ *   - Dry-run is the DEFAULT (`input.reap === false`). Reap only when
+ *     `input.reap === true` (CLI `--reap` flag).
+ *   - Fail closed everywhere: if uncertain, KEEP the env.
+ *   - NEVER touches production: operates only on EnvRecords (not AppRecords /
+ *     main vhost / deploy trigger). GC only calls `envStore.remove` or the
+ *     env-destroy SSH path.
+ *   - Transitional VMs (planned/creating/booting/degraded) → KEEP unconditionally.
+ *   - `branchState` throws → KEEP (indeterminate).
+ *   - SSH failure or non-ok outcome → `failed`/KEEP, continue to next env.
+ *   - ONE failure does NOT abort gc; every candidate is processed.
+ *
+ * Does NOT call `runEnvDestroy` (which re-runs `resolve()` and has no timeout).
+ * Instead builds the destroy script directly and calls `deps.remote()`.
+ */
+export async function runEnvGc(
+  input: EnvGcInput,
+  opts: { json: boolean },
+  vmStore: StateStore,
+  appStore: AppStore,
+  envStore: EnvStore,
+  deps: EnvExecDeps,
+  out: (s: string) => void,
+  err: (s: string) => void,
+): Promise<number> {
+  // Find the VM the caller asked us to GC.
+  const targetVm = vmStore.list().find(
+    (r) => r.id === input.vm || r.name === input.vm,
+  );
+
+  // We operate on all envs for this vm-id (or vm-name resolves to its id).
+  // When vm is not in the store we still need to handle orphan-vm envs that
+  // reference an old vmId.
+  const vmId = targetVm?.id ?? input.vm;
+
+  // List all envs for this VM, optionally narrowed to one app.
+  const envs = envStore.listFor(vmId, input.app).concat(
+    // Also pick up envs referencing the target by name when the VM isn't in state.
+    // (If vmId is already the vm.id lookup, listFor already covers them.)
+    targetVm === undefined
+      ? envStore.list().filter(
+          (e) => e.vmId === input.vm && (input.app === undefined || e.appName === input.app),
+        )
+      : [],
+  );
+  // Deduplicate by id in case both lookups returned the same record.
+  const seen = new Set<string>();
+  const allEnvs = envs.filter((e) => { if (seen.has(e.id)) return false; seen.add(e.id); return true; });
+
+  const now = deps.now();
+  const candidates: GcCandidate[] = [];
+  const reaped: string[] = [];
+  const pruned: string[] = [];
+  const failed: Array<{ name: string; reason: string; error: string }> = [];
+  let kept = 0;
+
+  // In JSON mode, per-env log lines are suppressed (only the final JSON object is emitted).
+  const log = opts.json ? (_s: string) => {} : out;
+
+  const noBranchState = deps.branchState === undefined;
+  if (noBranchState && allEnvs.length > 0) {
+    err(
+      "samohost: warning: branchState not configured — branch-gone detection " +
+        "is disabled for this gc run; only orphan-vm/orphan-app and TTL apply",
+    );
+  }
+
+  for (const env of allEnvs) {
+    const { classification, vm: vmRecord } = classifyVm(vmStore, env.vmId);
+
+    // TRANSITIONAL VMs → KEEP unconditionally (hard never-reap guard).
+    if (classification === "transitional") {
+      log(`  kept ${env.name} (vm=${env.vmId} is ${vmRecord?.lifecycleState ?? "transitional"})`);
+      kept++;
+      continue;
+    }
+
+    // DEAD VM → orphan-vm: prune the state record only (NO SSH).
+    if (classification === "dead") {
+      const candidate: GcCandidate = {
+        name: env.name,
+        appName: env.appName,
+        branch: env.branch,
+        reason: "orphan-vm",
+        action: "prune-record",
+        vmState: vmRecord?.lifecycleState ?? "missing",
+      };
+      candidates.push(candidate);
+
+      if (!input.reap) {
+        log(`  [dry-run] ${env.name} reason=orphan-vm action=prune-record vm-state=${candidate.vmState}`);
+      } else {
+        envStore.remove(env.vmId, env.appName, env.branch);
+        pruned.push(env.name);
+        log(`  pruned record ${env.name} (orphan-vm)`);
+      }
+      continue;
+    }
+
+    // LIVE VM — determine candidacy.
+    // Classification: live
+    // The vmRecord is guaranteed non-undefined here (live implies found in store).
+    const liveVm = vmRecord!;
+
+    // Check for orphan-app (live VM but AppRecord missing → stale env record).
+    const appRec = appStore.get(env.vmId, env.appName);
+    if (appRec === undefined) {
+      const candidate: GcCandidate = {
+        name: env.name,
+        appName: env.appName,
+        branch: env.branch,
+        reason: "orphan-app",
+        action: "prune-record",
+        vmState: liveVm.lifecycleState,
+      };
+      candidates.push(candidate);
+
+      if (!input.reap) {
+        log(`  [dry-run] ${env.name} reason=orphan-app action=prune-record`);
+      } else {
+        envStore.remove(env.vmId, env.appName, env.branch);
+        pruned.push(env.name);
+        log(`  pruned record ${env.name} (orphan-app)`);
+      }
+      continue;
+    }
+
+    // --- Branch check (OPTIONAL) ---
+    let branchGone = false;
+    let branchCheckFailed = false;
+    if (deps.branchState !== undefined) {
+      try {
+        const state = await deps.branchState(appRec.repo, env.branch);
+        branchGone = state === "gone";
+      } catch (e) {
+        // branchState threw → indeterminate → KEEP (fail-closed).
+        branchCheckFailed = true;
+        const msg = e instanceof Error ? e.message : String(e);
+        err(
+          `samohost: warning: branchState threw for ${env.name} (${env.branch}) ` +
+            `— keeping (fail-closed): ${msg}`,
+        );
+      }
+    }
+
+    if (branchCheckFailed) {
+      kept++;
+      log(`  kept ${env.name} (branch check failed — fail-closed)`);
+      continue;
+    }
+
+    // --- TTL check ---
+    let ttlExpired = false;
+    if (input.ttl !== undefined && input.ttl > 0) {
+      const createdMs = new Date(env.createdAt).getTime();
+      ttlExpired = !Number.isNaN(createdMs) && (now.getTime() - createdMs) >= input.ttl;
+    }
+
+    // --- Candidacy decision ---
+    // An env is a candidate when:
+    //   (a) branch-gone (and on a live VM with an app record)
+    //   (b) ttl-expired (even if branch is open)
+    // NEVER candidate if: branch is open AND not ttl-expired
+    const reason: GcCandidate["reason"] | undefined =
+      branchGone ? "branch-gone" :
+      ttlExpired ? "ttl-expired" :
+      undefined;
+
+    if (reason === undefined) {
+      // Not a candidate — KEEP.
+      kept++;
+      log(`  kept ${env.name} (branch=open, no ttl trigger)`);
+      continue;
+    }
+
+    const candidate: GcCandidate = {
+      name: env.name,
+      appName: env.appName,
+      branch: env.branch,
+      reason,
+      action: "destroy",
+      vmState: liveVm.lifecycleState,
+    };
+    candidates.push(candidate);
+
+    if (!input.reap) {
+      log(`  [dry-run] ${env.name} reason=${reason} action=destroy`);
+      continue;
+    }
+
+    // REAP: build and run the destroy script directly (NOT via runEnvDestroy
+    // which re-runs resolve() and has no timeout; brief §1 key reuse note).
+    const script = buildEnvDestroyScript(appRec, targetFromRecord(env));
+    let destroyResult: SpawnResult;
+    try {
+      destroyResult = await deps.remote(liveVm, script);
+    } catch (e) {
+      // SSH threw (timeout, connection refused, etc.) → failed/KEEP, continue.
+      const msg = e instanceof Error ? e.message : String(e);
+      err(`samohost: warning: gc destroy SSH failed for ${env.name}: ${msg} — keeping`);
+      failed.push({ name: env.name, reason, error: msg });
+      continue;
+    }
+
+    const { outcome } = parseEnvOutcome(destroyResult.stdout + "\n" + destroyResult.stderr);
+    if (outcome !== "ok") {
+      // Non-ok outcome → failed/KEEP (record NOT removed; destroy is idempotent — re-run).
+      const msg = `destroy outcome=${outcome}`;
+      err(`samohost: warning: gc destroy non-ok for ${env.name}: ${msg} — keeping`);
+      failed.push({ name: env.name, reason, error: msg });
+      continue;
+    }
+
+    // Success: remove DNS (if configured) then remove the state record.
+    const dnsProvider = deps.dns?.();
+    if (dnsProvider !== undefined) {
+      try {
+        await removePreviewDns(dnsProvider, env.vhost);
+      } catch (e) {
+        err(
+          `samohost: warning: gc DNS remove failed for ${env.vhost} — ` +
+            `${e instanceof Error ? e.message : String(e)}; record still removed`,
+        );
+      }
+    }
+
+    envStore.remove(env.vmId, env.appName, env.branch);
+    reaped.push(env.name);
+    log(`  reaped ${env.name} (${reason})`);
+  }
+
+  if (opts.json) {
+    // JSON mode: emit a single JSON document (no text summary line).
+    const report: GcReport = {
+      vm: targetVm?.name ?? input.vm,
+      dryRun: !input.reap,
+      candidates,
+      reaped,
+      pruned,
+      kept,
+      failed,
+    };
+    out(JSON.stringify(report, null, 2));
+  } else {
+    // Text mode: print the summary line.
+    const summaryLine =
+      `gc: candidates=${candidates.length} reaped=${reaped.length} ` +
+      `pruned=${pruned.length} kept=${kept} failed=${failed.length}`;
+    out(summaryLine);
+  }
+
+  // Exit code: 0 unless a requested reap had any failed entries.
+  return input.reap && failed.length > 0 ? 1 : 0;
 }
 
 /** Construct the default env store (honors SAMOHOST_ENVS). */
