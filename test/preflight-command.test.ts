@@ -3,7 +3,11 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { parseArgs } from "../src/cli.ts";
-import { runDnsStatus, type DnsStatusDeps } from "../src/commands/dns.ts";
+import {
+  DEFAULT_CLOUDFLARE_ZONES,
+  runDnsStatus,
+  type DnsStatusDeps,
+} from "../src/commands/dns.ts";
 import { runEnvPreflight, type EnvExecDeps } from "../src/commands/env.ts";
 import { StateStore } from "../src/state/store.ts";
 import type { LookupResult } from "../src/dns/preflight.ts";
@@ -65,10 +69,18 @@ describe("parseArgs env preflight / dns status", () => {
     expect(cmd.input.cfZones).toEqual(["samo.team", "samo.green"]);
   });
 
-  test("dns status defaults cf zones to samo.team + samo.green", () => {
+  test("dns status defaults cf zones to the CLIENT model: samo.team + samo.cat", () => {
     const cmd = parseArgs(["dns", "status", "samo.cat"]);
     if (cmd.kind !== "dns-status") throw new Error("expected dns-status");
-    expect(cmd.input.cfZones).toEqual(["samo.team", "samo.green"]);
+    // Clients use samo.team (prod) + samo.cat (previews). samo.green is samo's
+    // OWN dev/platform domain and must never be a client-facing default.
+    expect(cmd.input.cfZones).toEqual(["samo.team", "samo.cat"]);
+  });
+
+  test("DEFAULT_CLOUDFLARE_ZONES is the client model: includes samo.cat, excludes samo.green", () => {
+    expect(DEFAULT_CLOUDFLARE_ZONES).toContain("samo.cat");
+    expect(DEFAULT_CLOUDFLARE_ZONES).toContain("samo.team");
+    expect(DEFAULT_CLOUDFLARE_ZONES).not.toContain("samo.green");
   });
 
   test("dns requires the status subcommand", () => {
