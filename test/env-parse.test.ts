@@ -32,6 +32,26 @@ describe("parseEnvOutcome", () => {
     expect(parseEnvOutcome(raw).outcome).toBe("ok");
   });
 
+  test("port-check:fail marker yields failed outcome (not ignored as unknown phase)", () => {
+    // port-check is a KNOWN phase — its :fail must make envOutcome return "failed"
+    // so runEnvCreate exits 1 and the PR comment gate (action !== "failed") is
+    // respected (no misleading preview URL comment posted).
+    const raw = [
+      M("port-check", "start"),
+      M("port-check", "fail"),
+    ].join("\n");
+    expect(parseEnvOutcome(raw).outcome).toBe("failed");
+  });
+
+  test("port-check:ok then clone:ok yields ok outcome", () => {
+    const raw = [
+      M("port-check", "start"), M("port-check", "ok"),
+      M("clone", "start"), M("clone", "ok"),
+      M("health", "start"), M("health", "ok"),
+    ].join("\n");
+    expect(parseEnvOutcome(raw).outcome).toBe("ok");
+  });
+
   test("destroy phases parse too", () => {
     const raw = [
       M("unit-stop", "start"), M("unit-stop", "ok"),

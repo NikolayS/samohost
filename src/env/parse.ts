@@ -25,6 +25,7 @@ export interface EnvPhaseEvent {
 export type EnvOutcome = "ok" | "failed" | "incomplete";
 
 const VALID_PHASES = new Set<EnvPhaseName>([
+  "port-check",
   "clone",
   "install",
   "build",
