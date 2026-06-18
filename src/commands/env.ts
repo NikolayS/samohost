@@ -371,10 +371,7 @@ export interface EnvCreateReport {
  * Worst-case added wall-clock: EXTERNAL_PROBE_RETRIES × EXTERNAL_PROBE_SLEEP_MS
  * = 8 × 5000ms = 40s (bumped from 5 to accommodate CF edge provisioning lag).
  */
-const EXTERNAL_PROBE_RETRIES = 8;
-
-/** Exported alias used by unit tests to assert the cap value. */
-export const EXTERNAL_PROBE_RETRIES_EXPORT = EXTERNAL_PROBE_RETRIES;
+export const EXTERNAL_PROBE_RETRIES = 8;
 
 /**
  * Milliseconds to sleep between external probe retry attempts.

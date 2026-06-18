@@ -27,6 +27,7 @@
 import { describe, expect, test } from "bun:test";
 import {
   buildCurlProbeArgs,
+  EXTERNAL_PROBE_RETRIES,
   parseCurlProbeResult,
 } from "../src/commands/env.ts";
 
@@ -168,11 +169,6 @@ describe("parseCurlProbeResult: HTTP status parser", () => {
 
 describe("EXTERNAL_PROBE_RETRIES cap", () => {
   test("EXTERNAL_PROBE_RETRIES export is 8 (bumped for CF edge provisioning lag)", () => {
-    // Import the exported constant to confirm the cap was bumped.
-    // We can infer this from the probe behavior: with a fake that always
-    // returns 502, the probe must be called at most 8 times (not 5).
-    // We test this directly against the exported constant.
-    const { EXTERNAL_PROBE_RETRIES_EXPORT } = require("../src/commands/env.ts");
-    expect(EXTERNAL_PROBE_RETRIES_EXPORT).toBe(8);
+    expect(EXTERNAL_PROBE_RETRIES).toBe(8);
   });
 });
