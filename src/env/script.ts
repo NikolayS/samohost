@@ -520,7 +520,7 @@ function buildStaticEnvCreateScript(
       "vhost",
       "Caddy file_server vhost snippet + reload (sites.d include applied in host-prep)",
       [
-        "if printf '%s {\\n\\ttls internal\\n\\troot * %s\\n\\ttry_files {path} /index.html\\n\\tfile_server\\n\\tencode gzip\\n}\\n' \\",
+        "if printf '%s {\\n\\ttls internal\\n\\troot * %s\\n\\theader /config.js Cache-Control \"no-cache, no-store, must-revalidate\"\\n\\ttry_files {path} /index.html\\n\\tfile_server\\n\\tencode gzip\\n}\\n' \\",
         '     "$SAMOHOST_VHOST" "$SAMOHOST_ENV_DIR" \\',
         '   | sudo /usr/bin/tee "$SAMOHOST_CADDY_SNIPPET" >/dev/null \\',
         "   && sudo /usr/bin/systemctl reload caddy; ",
