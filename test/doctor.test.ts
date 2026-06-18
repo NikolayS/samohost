@@ -105,6 +105,15 @@ const DOCTOR_PASS_BODIES: Record<string, string> = {
   "permitrootlogin": "permitrootlogin no",
   "passwordauth": "passwordauthentication no",
   "allowusers": "allowusers agent",
+  // air-conformance sshd/ufw doctor probes (#64)
+  "maxauthtries": "maxauthtries 3",
+  "clientalive": "clientaliveinterval 300\nclientalivecountmax 2",
+  "x11forwarding": "x11forwarding no",
+  "allowagentforwarding": "allowagentforwarding no",
+  "permituserenvironment": "permituserenvironment no",
+  "permitemptypasswords": "permitemptypasswords no",
+  "root-authorized-keys-empty": "0",
+  "ufw-limit-ssh": "2223/tcp                   LIMIT       Anywhere",
   "unattended-upgrades-active": "active",
   // only-intended-ports: empty output = no unexpected listeners = pass
   "only-intended-ports": "",
@@ -640,6 +649,121 @@ describe("12. JSON output shape", () => {
       expect(chk).toHaveProperty("status");
       expect(chk).toHaveProperty("group");
     }
+  });
+});
+
+// ===========================================================================
+// 13. air-conformance doctor coverage (#64): the new sshd/ufw directives are
+//     probed by doctor AND evaluate to PASS in the all-pass scenario.
+// ===========================================================================
+describe("13. air-conformance doctor coverage (#64)", () => {
+  const AIR_DOCTOR_IDS = [
+    "maxauthtries",
+    "clientalive",
+    "x11forwarding",
+    "allowagentforwarding",
+    "permituserenvironment",
+    "permitemptypasswords",
+    "root-authorized-keys-empty",
+    "ufw-limit-ssh",
+  ];
+
+  test("each new air directive is probed in the single audit script", async () => {
+    store.upsert(rec());
+    let captured = "";
+    const remote: RemoteRunner = (_vm, cmd) => {
+      captured = cmd;
+      return Promise.resolve({ code: 0, stdout: allPassDelimited(), stderr: "" });
+    };
+    const c = capture();
+    await runDoctor(
+      { target: "test-vm", infra: false },
+      { json: false },
+      store,
+      appStore,
+      c.out,
+      c.err,
+      remote,
+    );
+    for (const id of AIR_DOCTOR_IDS) {
+      expect(captured).toContain(`<<<SAMOHOST_AUDIT:${id}>>>`);
+    }
+  });
+
+  test("all-pass bodies → each new air directive is PASS, exit 0", async () => {
+    store.upsert(rec());
+    const c = capture();
+    const code = await runDoctor(
+      { target: "test-vm", infra: false },
+      { json: true },
+      store,
+      appStore,
+      c.out,
+      c.err,
+      makePassRunner(),
+    );
+    expect(code).toBe(0);
+    const parsed = JSON.parse(c.o);
+    const byId = Object.fromEntries(
+      parsed.checks.map((r: { id: string; status: string }) => [r.id, r.status]),
+    );
+    for (const id of AIR_DOCTOR_IDS) {
+      expect(byId[id], `doctor check ${id} should PASS`).toBe("pass");
+    }
+  });
+
+  test("a wrong effective value FAILs (e.g. maxauthtries 6) → exit 1", async () => {
+    store.upsert(rec());
+    const remote: RemoteRunner = (_vm, _cmd) =>
+      Promise.resolve({
+        code: 0,
+        stdout: allPassDelimited({ "maxauthtries": "maxauthtries 6" }),
+        stderr: "",
+      });
+    const c = capture();
+    const code = await runDoctor(
+      { target: "test-vm", infra: false },
+      { json: true },
+      store,
+      appStore,
+      c.out,
+      c.err,
+      remote,
+    );
+    expect(code).toBe(1);
+    const parsed = JSON.parse(c.o);
+    const row = parsed.checks.find((r: { id: string }) => r.id === "maxauthtries");
+    expect(row.status).toBe("fail");
+  });
+
+  test("requiresSudo probe with permission error → UNKNOWN not FAIL", async () => {
+    store.upsert(rec());
+    const remote: RemoteRunner = (_vm, _cmd) =>
+      Promise.resolve({
+        code: 0,
+        stdout: allPassDelimited({
+          "maxauthtries": "permission denied",
+          "ufw-limit-ssh": "ERROR: You need to be root to run this script",
+        }),
+        stderr: "",
+      });
+    const c = capture();
+    const code = await runDoctor(
+      { target: "test-vm", infra: false },
+      { json: true },
+      store,
+      appStore,
+      c.out,
+      c.err,
+      remote,
+    );
+    expect(code).toBe(0);
+    const parsed = JSON.parse(c.o);
+    const byId = Object.fromEntries(
+      parsed.checks.map((r: { id: string; status: string }) => [r.id, r.status]),
+    );
+    expect(byId["maxauthtries"]).toBe("unknown");
+    expect(byId["ufw-limit-ssh"]).toBe("unknown");
   });
 });
 

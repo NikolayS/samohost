@@ -34,8 +34,18 @@ describe("buildCloudInit", () => {
     expect(out).toContain("PasswordAuthentication no");
     expect(out).toContain("PermitRootLogin no");
     expect(out).toContain("MaxStartups 100:30:200");
-    // ufw, fail2ban, sysctl, unattended-upgrades, apparmor
-    expect(out).toContain("ufw allow 2223/tcp");
+    // air-conformance sshd directives (#64)
+    expect(out).toContain("MaxAuthTries 3");
+    expect(out).toContain("ClientAliveInterval 300");
+    expect(out).toContain("ClientAliveCountMax 2");
+    expect(out).toContain("AllowAgentForwarding no");
+    expect(out).toContain("PermitUserEnvironment no");
+    expect(out).toContain("PermitEmptyPasswords no");
+    // air: root authorized_keys removed at provision
+    expect(out).toContain("/root/.ssh/authorized_keys");
+    // ufw (rate-LIMIT the SSH port, not allow), fail2ban, sysctl, unattended-upgrades, apparmor
+    expect(out).toContain("ufw limit 2223/tcp");
+    expect(out).not.toContain("ufw allow 2223/tcp");
     expect(out).toContain("backend = systemd");
     expect(out).toContain("net.ipv4.tcp_syncookies = 1");
     expect(out).toContain("unattended-upgrades");
@@ -80,7 +90,7 @@ describe("buildCloudInit", () => {
     });
     expect(out).toContain("Port 40022");
     expect(out).toContain("ListenStream=0.0.0.0:40022");
-    expect(out).toContain("ufw allow 40022/tcp");
+    expect(out).toContain("ufw limit 40022/tcp");
     expect(out).toContain("port = 40022");
   });
 
