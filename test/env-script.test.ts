@@ -1756,7 +1756,9 @@ describe("preview-flag: node env create appends SAMO_ENV=preview and SAMO_BRANCH
       expect(envContents).toContain("SAMO_ENV=preview");
       expect(envContents).toContain("SAMO_BRANCH=demo/red-login");
       // The slash must land as a literal character, not be shell-interpreted.
-      expect(envContents).not.toContain("SAMO_BRANCH=demo"); // no truncation at /
+      // Truncation at / would produce "SAMO_BRANCH=demo" followed by a newline,
+      // not a slash — detect that by checking the full form is present.
+      expect(envContents.match(/^SAMO_BRANCH=(.*)$/m)?.[1]).toBe("demo/red-login");
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
