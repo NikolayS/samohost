@@ -1,11 +1,13 @@
 /**
- * TDD spec for per-VM preview DNS routing (samohost issue #37).
+ * TDD spec for per-VM preview DNS routing (samohost issue #37, updated #54).
  *
- * Design: when `env create` succeeds, samohost ensures an UNPROXIED
- * Cloudflare A record `<preview-host>.samo.cat -> vm.ip` BEFORE pushing
- * the create script (so the ACME HTTP-01 challenge can resolve). When
- * `env destroy` succeeds, samohost removes that record. Both operations
- * gracefully degrade to a warning when no DNS provider is configured.
+ * Design (issue #54): when `env create` succeeds, samohost ensures a PROXIED
+ * Cloudflare A record `<preview-host>.samo.cat -> vm.ip` BEFORE pushing the
+ * create script. PROXIED (orange cloud) is required so the CF edge fronts the
+ * origin; the origin serves self-signed HTTPS via Caddy `tls internal` which
+ * CF Full mode accepts. This works even when the VM firewalls origin :443 to
+ * CF IPs only. When `env destroy` succeeds, samohost removes that record. Both
+ * operations gracefully degrade to a warning when no DNS provider is configured.
  *
  * These tests inject a fake DnsProviderPort to exercise the real
  * runEnvCreate / runEnvDestroy code paths — no mocking of the commands
@@ -16,7 +18,8 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { DnsProviderPort, DnsRecord } from "../src/dns/cloudflare.ts";
+import type { DnsProviderPort, DnsRecord, FetchFn } from "../src/dns/cloudflare.ts";
+import { resolveZoneId, CloudflareError } from "../src/dns/cloudflare.ts";
 import {
   runEnvCreate,
   runEnvDestroy,
@@ -161,8 +164,8 @@ afterEach(() => rmSync(dir, { recursive: true, force: true }));
 // Tests
 // ---------------------------------------------------------------------------
 
-describe("env-dns: per-VM preview DNS (issue #37)", () => {
-  test("create: ensureRecord called with (target.vhost, A, vm.ip, proxied=false) on success", async () => {
+describe("env-dns: per-VM preview DNS (issue #37 / #54)", () => {
+  test("create: ensureRecord called with (target.vhost, A, vm.ip, proxied=true) on success — PROXIED required so CF fronts the CF-locked origin (issue #54)", async () => {
     const { provider, calls } = fakeDnsProvider();
     let n = 0;
     const deps: EnvExecDeps = {
@@ -184,7 +187,9 @@ describe("env-dns: per-VM preview DNS (issue #37)", () => {
     expect(ensureCalls[0]!.name).toBe("myapp-feat-preview-dns.samo.cat");
     expect(ensureCalls[0]!.type).toBe("A");
     expect(ensureCalls[0]!.content).toBe("46.225.115.31"); // vm.ip
-    expect(ensureCalls[0]!.proxied).toBe(false); // UNPROXIED — critical for ACME
+    // PROXIED=true so CF edge fronts the origin; origin serves tls internal
+    // which CF Full mode accepts; works even when VM firewalls :443 to CF only.
+    expect(ensureCalls[0]!.proxied).toBe(true);
   });
 
   test("create: DNS ensured BEFORE remote script is pushed", async () => {
@@ -423,10 +428,13 @@ describe("env-dns: per-VM preview DNS (issue #37)", () => {
       { json: false }, vmStore, appStore, envStore, deps, c.out, c.err,
     );
     expect(code).toBe(0);
-    // Exactly one warning line mentioning the env var names (not their values)
+    // Exactly one warning line mentioning only CLOUDFLARE_SAMOCAT (zone-id is no
+    // longer required — it is resolved automatically from the token; issue #54).
     const warnLines = c.e.split("\n").filter((l) => l.includes("CLOUDFLARE_SAMOCAT"));
     expect(warnLines).toHaveLength(1);
-    expect(warnLines[0]).toContain("SAMOHOST_SAMOCAT_ZONE_ID");
+    // Zone-id env var is NO LONGER required in the warning message — the token
+    // alone is sufficient now (samohost resolves the zone id via zones:list).
+    expect(warnLines[0]).not.toContain("SAMOHOST_SAMOCAT_ZONE_ID");
   });
 
   test("graceful degrade: destroy without dns dep emits one warning and still succeeds", async () => {
@@ -476,5 +484,79 @@ describe("env-dns: per-VM preview DNS (issue #37)", () => {
     expect(code).toBe(0);
     const warnLines = c.e.split("\n").filter((l) => l.includes("CLOUDFLARE_SAMOCAT"));
     expect(warnLines).toHaveLength(1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// resolveZoneId unit tests (issue #54 third bullet)
+// ---------------------------------------------------------------------------
+
+/** Minimal scripted fetch for resolveZoneId tests. */
+function fakeZoneFetch(responses: Array<{ status?: number; json: unknown }>): FetchFn {
+  return (input, init) => {
+    const r = responses.shift();
+    if (!r) throw new Error("fakeZoneFetch: no scripted response left");
+    return Promise.resolve(
+      new Response(JSON.stringify(r.json), { status: r.status ?? 200 }),
+    );
+  };
+}
+
+const zoneOk = (id: string) => ({
+  json: { success: true, errors: [], result: [{ id }] },
+});
+const zoneEmpty = () => ({
+  json: { success: true, errors: [], result: [] },
+});
+
+describe("resolveZoneId (issue #54): zone-id self-resolution from token", () => {
+  test("resolves and returns the zone id when exactly one zone is found", async () => {
+    const fetchFn = fakeZoneFetch([zoneOk("zone-abc-123")]);
+    const id = await resolveZoneId({ token: "tok", fetchFn }, "samo.cat");
+    expect(id).toBe("zone-abc-123");
+  });
+
+  test("throws CloudflareError(404, ...) when zero zones are returned — never silent", async () => {
+    const fetchFn = fakeZoneFetch([zoneEmpty()]);
+    await expect(
+      resolveZoneId({ token: "tok", fetchFn }, "samo.cat"),
+    ).rejects.toBeInstanceOf(CloudflareError);
+    // Error must mention the zone name and not the token value.
+    try {
+      const fetchFn2 = fakeZoneFetch([zoneEmpty()]);
+      await resolveZoneId({ token: "secret-token", fetchFn: fetchFn2 }, "samo.cat");
+    } catch (e) {
+      expect((e as Error).message).toContain("samo.cat");
+      expect((e as Error).message).not.toContain("secret-token");
+      expect((e as CloudflareError).status).toBe(404);
+    }
+  });
+
+  test("requests /zones?name=<zoneName> — reuses same path as lookupWildcardRecord", async () => {
+    const calls: string[] = [];
+    const fetchFn: FetchFn = (input) => {
+      calls.push(String(input));
+      return Promise.resolve(
+        new Response(JSON.stringify(zoneOk("z1").json), { status: 200 }),
+      );
+    };
+    await resolveZoneId({ token: "tok", fetchFn }, "samo.cat");
+    expect(calls).toHaveLength(1);
+    expect(calls[0]).toContain("/zones?name=samo.cat");
+  });
+
+  test("CloudflareDns lazily resolves its own zone id when constructed with zoneName only", async () => {
+    // Simulate: token present, zone-id env var absent → CloudflareDns(zoneName)
+    // First call goes to /zones?name=... to resolve the id, then to the write endpoint.
+    const { CloudflareDns: CfDns } = await import("../src/dns/cloudflare.ts");
+    const responses: Array<{ status?: number; json: unknown }> = [
+      zoneOk("zone-lazy-1"), // zone lookup
+      { json: { success: true, errors: [], result: [] } }, // listRecords (ensureRecord first call)
+      { json: { success: true, errors: [], result: { id: "new-rec", type: "A", name: "x.samo.cat", content: "1.2.3.4", proxied: true } } }, // POST
+    ];
+    const fetchFn = fakeZoneFetch(responses);
+    const lazyCf = new CfDns({ token: "tok", zoneName: "samo.cat", fetchFn });
+    const rec = await lazyCf.ensureRecord("x.samo.cat", "A", "1.2.3.4", true);
+    expect(rec.id).toBe("new-rec");
   });
 });

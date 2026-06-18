@@ -323,13 +323,23 @@ describe("buildHostPrepScript", () => {
     expect(s).not.toContain("no per-env DNS API calls are needed");
   });
 
-  test("regression: vhost blocks emitted by buildEnvCreateScript carry NO tls directive", () => {
+  test("vhost blocks emitted by buildEnvCreateScript carry 'tls internal' (CF Full-mode proxied origin; self-signed cert only ever seen by CF edge — issue #54)", () => {
     for (const db of ["dblab", "template", "none"] as const) {
       const s = buildEnvCreateScript(app(), target({ dbBackend: db }));
-      // Caddy vhost blocks must remain bare (ACME mode); tls internal would
-      // force a self-signed cert → browser warning on direct-to-origin previews.
-      expect(s).not.toMatch(/^\s*tls\s/m);
+      // CF Full mode + proxied record: origin serves self-signed HTTPS via
+      // Caddy 'tls internal'. CF edge holds the real cert; no browser ever
+      // sees the self-signed cert (CF firewall blocks direct-to-origin). ACME
+      // is not used (it cannot complete behind a CF-locked :443 and the host
+      // has no DNS-01 plugin).
+      expect(s).toContain("tls internal");
     }
+  });
+
+  test("static buildEnvCreateScript vhost block also carries 'tls internal' (issue #54)", () => {
+    // Static path (buildStaticEnvCreateScript): same CF Full+proxied posture.
+    const staticApp = { ...app(), kind: "static" as const };
+    const s = buildEnvCreateScript(staticApp, target());
+    expect(s).toContain("tls internal");
   });
 
   test("regression: vhost blocks emitted by buildEnvCreateScript are valid bash", () => {
