@@ -369,8 +369,12 @@ export interface EnvCreateReport {
  * Maximum number of external probe attempts after a successful on-host create.
  * SAFETY CAP — not a target. Returns as soon as the first 200 is received.
  * Worst-case added wall-clock: EXTERNAL_PROBE_RETRIES × EXTERNAL_PROBE_SLEEP_MS
+ * = 8 × 5000ms = 40s (bumped from 5 to accommodate CF edge provisioning lag).
  */
-const EXTERNAL_PROBE_RETRIES = 5;
+const EXTERNAL_PROBE_RETRIES = 8;
+
+/** Exported alias used by unit tests to assert the cap value. */
+export const EXTERNAL_PROBE_RETRIES_EXPORT = EXTERNAL_PROBE_RETRIES;
 
 /**
  * Milliseconds to sleep between external probe retry attempts.
@@ -378,6 +382,81 @@ const EXTERNAL_PROBE_RETRIES = 5;
  * did not return 200.
  */
 const EXTERNAL_PROBE_SLEEP_MS = 5000;
+
+// ---------------------------------------------------------------------------
+// Curl-based HTTPS probe helpers (issue #55 / Bun-fetch CA bug fix)
+//
+// Background: Bun's global fetch cannot reliably verify the Cloudflare edge
+// cert chain (Google Trust Services WE1 ← GTS Root R4 ← GlobalSign) on
+// certain hostnames. Observed: game-changers-demo-red-bg.samo.cat throws
+// "unable to get local issuer certificate" on 12/12 consecutive attempts,
+// while system curl returns HTTP 200 on 5/5 (same cert chain). System curl
+// uses the OS CA bundle which verifies the CF chain correctly.
+//
+// The production httpProbe is replaced with a spawnSync curl invocation.
+// TLS verification is ON (no -k / --insecure): a cert that does not verify
+// MUST count as a probe failure; we cannot declare a preview "reachable" if
+// its TLS is broken.
+// ---------------------------------------------------------------------------
+
+/**
+ * Build the curl argument list for a single external probe attempt.
+ *
+ * Flags:
+ *   -sS          silent (suppress progress), but still emit errors to stderr
+ *   -o /dev/null discard response body
+ *   -w %{http_code}  write only the numeric HTTP status code to stdout
+ *   --max-time 10    hard limit 10s per attempt
+ *   --proto =https   allow HTTPS only (no http:// downgrade)
+ *   (NO -k / --insecure — full TLS cert verification required)
+ *   (NO -L / --location — do not follow redirects; only 200 is success)
+ */
+export function buildCurlProbeArgs(url: string): string[] {
+  return [
+    "curl",
+    "-sS",
+    "-o", "/dev/null",
+    "-w", "%{http_code}",
+    "--max-time", "10",
+    "--proto", "=https",
+    url,
+  ];
+}
+
+/**
+ * Parse the output of a curl invocation that used `-w %{http_code}`.
+ *
+ * @param stdout  - stdout from curl (the numeric HTTP status code, e.g. "200")
+ * @param exitCode - curl's exit code (0 = success, non-zero = error/TLS fail/timeout)
+ *
+ * Rules:
+ *   - Non-zero exit code always → ok:false (covers TLS errors, DNS failures,
+ *     timeouts, etc.)
+ *   - stdout "000" (connection-level failure while exit=0 is unusual but
+ *     possible in some curl versions) → status:0, ok:false
+ *   - status === 200 AND exit 0 → ok:true
+ *   - any other parseable status → ok:false (3xx not followed, 5xx, 4xx)
+ *   - unparseable stdout → status:0, ok:false
+ */
+export function parseCurlProbeResult(
+  stdout: string,
+  exitCode: number,
+): { status: number; ok: boolean } {
+  // Non-zero exit = curl encountered an error (TLS, DNS, timeout, etc.)
+  if (exitCode !== 0) {
+    return { status: 0, ok: false };
+  }
+  const trimmed = stdout.trim();
+  const parsed = parseInt(trimmed, 10);
+  if (Number.isNaN(parsed)) {
+    return { status: 0, ok: false };
+  }
+  // "000" is curl's sentinel for connection-level failure (cert error, etc.)
+  if (parsed === 0) {
+    return { status: 0, ok: false };
+  }
+  return { status: parsed, ok: parsed === 200 };
+}
 
 export async function runEnvCreate(
   input: EnvCreateInput,
@@ -723,18 +802,30 @@ export function defaultEnvExecDeps(): EnvExecDeps {
         ...(zoneId ? { zoneId } : { zoneName: DEFAULT_PREVIEW_DOMAIN }),
       });
     },
-    // External HTTPS reachability probe (issue #55).
-    // Uses global fetch with a 10s per-attempt timeout (AbortSignal.timeout
-    // is available in Bun). redirect:"manual" so a redirect (e.g. 301→HTTPS)
-    // is not followed and is NOT counted as 200 — the vhost must serve 200
-    // directly. A thrown fetch error propagates to the retry loop in
-    // runEnvCreate, which catches it and treats it as a failed attempt.
-    httpProbe: async (url: string) => {
-      const res = await fetch(url, {
-        redirect: "manual",
-        signal: AbortSignal.timeout(10000),
-      });
-      return { status: res.status, ok: res.status === 200 };
+    // External HTTPS reachability probe (issue #55, curl-CA fix).
+    //
+    // REPLACES the previous Bun-fetch implementation which produced
+    // FALSE-NEGATIVE failures: Bun's fetch cannot reliably verify the
+    // Cloudflare GTS-WE1 edge cert chain on some hostnames
+    // (game-changers-demo-red-bg.samo.cat: 12/12 attempts threw
+    // "unable to get local issuer certificate"; same cert chain on
+    // field-record-demo-red-login.samo.cat returned 200 — opposite result).
+    // System curl uses the OS CA bundle which verifies the CF chain correctly.
+    //
+    // TLS verification is ON (no -k / --insecure). A cert that does not
+    // verify is a probe FAILURE — we cannot declare a preview "reachable"
+    // when TLS is broken. curl exits non-zero on TLS errors; parseCurlProbeResult
+    // maps that to { status: 0, ok: false } which the retry loop treats as a
+    // failed attempt (same as a thrown error in the old fetch path).
+    //
+    // redirect:"manual" behavior is preserved by NOT passing -L / --location:
+    // curl returns the 3xx status code directly (not followed), which
+    // parseCurlProbeResult maps to ok:false — same as before.
+    httpProbe: (url: string) => {
+      const args = buildCurlProbeArgs(url);
+      const res = spawnSync(args[0]!, args.slice(1), { encoding: "utf8" });
+      const exitCode = typeof res.status === "number" ? res.status : 1;
+      return Promise.resolve(parseCurlProbeResult(res.stdout ?? "", exitCode));
     },
     // Promise-based sleep wired to real setTimeout.
     sleep: (ms: number) => new Promise((resolve) => setTimeout(resolve, ms)),
