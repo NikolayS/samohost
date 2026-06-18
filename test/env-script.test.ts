@@ -1887,17 +1887,25 @@ describe("static vhost: /config.js served with no-cache Cache-Control header", (
     expect(s).toContain(NOCACHE_HEADER);
   });
 
-  test("the no-cache directive is inside the site block (between root * and file_server)", () => {
+  test("the no-cache directive is inside the site block (appears between root * and the file_server directive in the printf format string)", () => {
     const s = buildEnvCreateScript(staticApp(), target({ dbBackend: "none" }));
-    const rootIdx = s.indexOf("root *");
-    const fileServerIdx = s.indexOf("file_server");
     const headerIdx = s.indexOf(NOCACHE_HEADER);
     // Directive must appear in the script.
     expect(headerIdx).toBeGreaterThan(-1);
-    // Directive must appear after 'root *' and before 'file_server' (placement
-    // inside the site block, per the brief's position guidance).
+    // Find the printf format string that contains the Caddy site block.
+    // The format string contains \n\tfile_server\n (escaped) after the header.
+    // The header appears after root * and before \tfile_server in the format str.
+    const rootMarker = "root * %s";
+    const fileServerMarker = "\\tfile_server";
+    const rootIdx = s.indexOf(rootMarker);
+    // The file_server directive inside the format string (escaped \t).
+    const fileServerFmtIdx = s.indexOf(fileServerMarker, rootIdx);
+    // All three must be present.
+    expect(rootIdx).toBeGreaterThan(-1);
+    expect(fileServerFmtIdx).toBeGreaterThan(-1);
+    // The no-cache header directive must appear after root * and before \tfile_server.
     expect(headerIdx).toBeGreaterThan(rootIdx);
-    expect(headerIdx).toBeLessThan(fileServerIdx);
+    expect(headerIdx).toBeLessThan(fileServerFmtIdx);
   });
 
   test("static vhost block still contains tls internal, root *, file_server, try_files (non-regression)", () => {
