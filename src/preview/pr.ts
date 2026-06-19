@@ -100,8 +100,8 @@ export interface PrPreviewDeps {
    * Create or redeploy the preview env for (vm, app, branch) at the current
    * branch tip, recording lastDeployedSha=headSha and prNumber on the EnvRecord.
    *
-   * IMPORTANT: the prod impl wraps runEnvCreate (db default "template",
-   * DEFAULT_PREVIEW_DOMAIN) and reads the persisted EnvRecord back from envStore
+   * IMPORTANT: the prod impl wraps runEnvCreate (db=previewDbBackendFor(app)
+   * defaulting to "dblab", DEFAULT_PREVIEW_DOMAIN) and reads the persisted EnvRecord back from envStore
    * to record lastDeployedSha and prNumber — so the unit-test fake MUST ALSO
    * upsert an EnvRecord into the SAME injected envStore (matching prod write
    * shape, including prNumber) for the SHA-compare and reap-guard in subsequent

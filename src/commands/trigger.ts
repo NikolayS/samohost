@@ -46,7 +46,23 @@ import {
 } from "./env.ts";
 import type { EnvStore } from "../state/envs.ts";
 import type { PrPreviewSummary } from "../preview/pr.ts";
-import type { AppRecord, VmRecord } from "../types.ts";
+import type { AppRecord, EnvDbBackend, VmRecord } from "../types.ts";
+
+// ---------------------------------------------------------------------------
+// Public helpers
+// ---------------------------------------------------------------------------
+
+/**
+ * Select the DB backend to use when auto-creating a PR-preview env for `app`.
+ *
+ * Returns `app.previewDbBackend` when set by the operator; otherwise defaults
+ * to `"dblab"` (DBLab Engine thin clone — instant, storage-cheap, the primary
+ * backend for the SOLO plan). There is NO silent fallback to `"template"`:
+ * any non-dblab backend must be stated explicitly in the AppSpec.
+ */
+export function previewDbBackendFor(app: AppRecord): EnvDbBackend {
+  return app.previewDbBackend ?? "dblab";
+}
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -639,8 +655,9 @@ export function defaultTriggerDeps(): TriggerDeps {
     //   gh reads GH_TOKEN from process.env at runtime (already exported by the
     //   wrapper). On gh failure → throw (caught per-app upstream).
     //
-    // ensurePreview: calls runEnvCreate (db="template", DEFAULT_PREVIEW_DOMAIN).
-    //   Reads the persisted record back and sets lastDeployedSha on it.
+    // ensurePreview: calls runEnvCreate (db=previewDbBackendFor(app) defaulting to
+    //   "dblab", DEFAULT_PREVIEW_DOMAIN). Reads the persisted record back and sets
+    //   lastDeployedSha on it.
     //
     // upsertPrComment: spawnSync gh api to list issue comments, find one whose
     //   body includes the marker → PATCH; else POST. NEVER writes tokens to disk.
@@ -706,7 +723,7 @@ export function defaultTriggerDeps(): TriggerDeps {
             vm: args.vm,
             app: args.app,
             branch: args.branch,
-            db: "template",
+            db: previewDbBackendFor(app),
             previewDomain: DEFAULT_PREVIEW_DOMAIN,
           },
           { json: true },

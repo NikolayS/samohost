@@ -214,6 +214,14 @@ export interface AppSpec {
   rlsUrlVar?: string;
   /** Optional pluggable post-deploy assertions. */
   assertions?: AppAssertions;
+  /**
+   * Per-app default DB backend for auto-created PR-preview envs (src/preview/pr.ts).
+   * Defaults to `"dblab"` when absent — thin-clone via DBLab Engine, instant and
+   * storage-cheap. Set to `"template"` only when an operator explicitly needs the
+   * legacy createdb-template fallback. There is NO silent fallback to `"template"`;
+   * any non-dblab backend must be stated explicitly here.
+   */
+  previewDbBackend?: EnvDbBackend;
 }
 
 /**
