@@ -143,7 +143,8 @@ describe("deriveTarget", () => {
     if ("error" in t) throw new Error(t.error);
     expect(t.name).toBe("field-record-1-feat-x");
     expect(t.vhost).toBe("field-record-1-feat-x.samo.cat");
-    expect(t.port).toBe(3100);
+    // First free port is 3101: 3100 is reserved for the shared CI runner.
+    expect(t.port).toBe(3101);
     expect(t.dbName).toBe("field-record-1-feat-x");
   });
 
@@ -155,11 +156,11 @@ describe("deriveTarget", () => {
 
   test("ports skip those used by existing envs", () => {
     const existing = [
-      { port: 3100 }, { port: 3101 },
+      { port: 3101 }, { port: 3102 },
     ] as never[];
     const t = deriveTarget(appRec(), "feat/y", "none", "samo.cat", existing);
     if ("error" in t) throw new Error(t.error);
-    expect(t.port).toBe(3102);
+    expect(t.port).toBe(3103);
   });
 });
 
@@ -226,7 +227,7 @@ describe("env commands", () => {
     expect(scripts[0]).toContain("git clone");
     const rec = envStore.get("vm-1111", "field-record-1", "feat/x");
     expect(rec?.name).toBe("field-record-1-feat-x");
-    expect(rec?.port).toBe(3100);
+    expect(rec?.port).toBe(3101);
     expect(rec?.vhost).toBe("field-record-1-feat-x.samo.cat");
     expect(c.o).toContain("https://field-record-1-feat-x.samo.cat");
   });
@@ -277,7 +278,7 @@ describe("env commands", () => {
         capture().out, capture().err,
       );
     }
-    expect(envStore.get("vm-1111", "field-record-1", "feat/y")?.port).toBe(3101);
+    expect(envStore.get("vm-1111", "field-record-1", "feat/y")?.port).toBe(3102);
 
     const c = capture();
     const code = runEnvList(
@@ -286,7 +287,7 @@ describe("env commands", () => {
     expect(code).toBe(0);
     expect(c.o).toContain("feat/x");
     expect(c.o).toContain("feat/y");
-    expect(c.o).toContain("3101");
+    expect(c.o).toContain("3102");
   });
 
   test("destroy removes the record on success, keeps it on failure", async () => {

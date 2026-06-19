@@ -50,6 +50,11 @@ import {
   DEFAULT_CLOUDFLARE_ZONES,
   type DnsStatusInput,
 } from "./commands/dns.ts";
+import {
+  runRunnerHostPrep,
+  type RunnerHostPrepInput,
+} from "./commands/runner.ts";
+import { DEFAULT_CI_PORTS } from "./ci/runner-hook.ts";
 import { StateStore } from "./state/store.ts";
 import type { EnvDbBackend } from "./types.ts";
 
@@ -75,6 +80,7 @@ Usage:
   samohost env list <vm> [--app <name>] [--json]
   samohost env destroy <vm> <app> --branch <b> [--json]
   samohost env preflight <vm> [--json]
+  samohost runner host-prep <vm> [--ci-port N ...] [--runner-home PATH]
   samohost dns status <domain> [--expect-ip <ip>] [--cf-zone <z>] [--json]
   samohost --help
   samohost --version
@@ -146,6 +152,15 @@ env options (per-branch preview environments — SOLO plan, one shared VM):
 env preflight (READ-ONLY probes over one SSH connection):
   reports dblab engine READY/BLOCKED/UNKNOWN (gate for --db dblab) and the
   template-fallback readiness, with per-check detail and reasons
+
+runner host-prep (OFFLINE, RENDER-ONLY — apply as root on the runner host):
+  prints the one-time script that installs a CI-port cleanup hook on the
+  shared self-hosted GitHub Actions runner and wires it into the runner job
+  hooks; frees the orphaned Playwright webServer port (default ${DEFAULT_CI_PORTS.join(", ")})
+  using ss (NOT fuser/lsof). samohost never executes it; apply + runner
+  restart are operator-gated on host root (NOT repo-admin).
+  --ci-port <N>              CI port the hook guards (repeatable; default ${DEFAULT_CI_PORTS.join(", ")})
+  --runner-home <path>       actions-runner home (default /home/ghrunner/actions-runner)
 
 dns status options (READ-ONLY: public NS/A lookups + token PRESENCE check):
   --expect-ip <ip>           IP the preview wildcard must point at
@@ -232,6 +247,12 @@ export interface ParsedEnvPreflight {
   json: boolean;
 }
 
+export interface ParsedRunnerHostPrep {
+  kind: "runner-host-prep";
+  input: RunnerHostPrepInput;
+  json: boolean;
+}
+
 export interface ParsedDnsStatus {
   kind: "dns-status";
   input: DnsStatusInput;
@@ -252,6 +273,7 @@ export type ParsedCommand =
   | ParsedEnvList
   | ParsedEnvDestroy
   | ParsedEnvPreflight
+  | ParsedRunnerHostPrep
   | ParsedDnsStatus
   | { kind: "help" }
   | { kind: "version" };
@@ -297,6 +319,9 @@ export function parseArgs(
   }
   if (first === "env") {
     return parseEnv(argv.slice(1));
+  }
+  if (first === "runner") {
+    return parseRunner(argv.slice(1));
   }
   if (first === "dns") {
     return parseDns(argv.slice(1));
@@ -777,6 +802,58 @@ function parseEnvPreflight(args: string[]): ParsedEnvPreflight {
   return { kind: "env-preflight", input: { vm }, json };
 }
 
+// ---------------------------------------------------------------------------
+// runner subcommands (runner-host provisioning; render-only, offline)
+// ---------------------------------------------------------------------------
+
+function parseRunner(args: string[]): ParsedCommand {
+  const sub = args[0];
+  if (sub === undefined) {
+    throw new UsageError("runner requires a subcommand: host-prep");
+  }
+  const rest = args.slice(1);
+  switch (sub) {
+    case "host-prep":
+      return parseRunnerHostPrep(rest);
+    default:
+      throw new UsageError(`unknown runner subcommand: ${sub}`);
+  }
+}
+
+function parseRunnerHostPrep(args: string[]): ParsedRunnerHostPrep {
+  let vm: string | undefined;
+  let runnerHome: string | undefined;
+  const ciPorts: number[] = [];
+  let json = false;
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i]!;
+    if (a === "--ci-port") {
+      ciPorts.push(parseIntFlag(takeValue(args, i, a), a));
+      i++;
+      continue;
+    }
+    if (a === "--runner-home") {
+      runnerHome = takeValue(args, i, a);
+      i++;
+      continue;
+    }
+    if (a === "--json") {
+      json = true;
+      continue;
+    }
+    if (a.startsWith("-")) throw new UsageError(`unknown flag: ${a}`);
+    if (vm !== undefined) throw new UsageError(`unexpected extra argument: ${a}`);
+    vm = a;
+  }
+  if (vm === undefined) throw new UsageError("runner host-prep requires <vm>");
+  const input: RunnerHostPrepInput = {
+    vm,
+    ciPorts: ciPorts.length > 0 ? ciPorts : [...DEFAULT_CI_PORTS],
+    ...(runnerHome !== undefined ? { runnerHome } : {}),
+  };
+  return { kind: "runner-host-prep", input, json };
+}
+
 function parseDns(args: string[]): ParsedDnsStatus {
   const sub = args[0];
   if (sub === undefined) throw new UsageError("dns requires a subcommand: status");
@@ -1037,6 +1114,14 @@ export async function main(
         { json: cmd.json },
         new StateStore(),
         defaultEnvExecDeps(),
+        out,
+        err,
+      );
+    case "runner-host-prep":
+      return runRunnerHostPrep(
+        cmd.input,
+        { json: cmd.json },
+        new StateStore(),
         out,
         err,
       );

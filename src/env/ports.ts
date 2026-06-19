@@ -3,9 +3,12 @@
  * "dedicated port from a recorded pool").
  *
  * The pool is a contiguous range reserved for envs on one VM, kept clear of
- * the production app's port (field-record production listens at 3000; the
- * default env pool starts at 3100). Allocation is deterministic: lowest free
- * port wins, so plans are reproducible and state diffs stay readable.
+ * the production app's port (field-record production listens at 3000) AND of
+ * the shared CI runner's Playwright webServer port (3100 — see
+ * `src/ci/runner-hook.ts`). The default env pool therefore starts at 3101 so a
+ * preview env can never land on the CI port (a latent prod/CI/preview
+ * collision). Allocation is deterministic: lowest free port wins, so plans are
+ * reproducible and state diffs stay readable.
  */
 
 export interface PortPool {
@@ -15,8 +18,12 @@ export interface PortPool {
   size: number;
 }
 
-/** Default pool: 3100..3199 (production stays below at 3000). */
-export const DEFAULT_POOL: PortPool = { base: 3100, size: 100 };
+/**
+ * Default pool: 3101..3199 (production stays below at 3000; the shared CI
+ * runner's Playwright webServer port 3100 is excluded — it must never be
+ * handed to a preview env).
+ */
+export const DEFAULT_POOL: PortPool = { base: 3101, size: 99 };
 
 /**
  * Lowest free port in the pool given the ports already in use on the VM.

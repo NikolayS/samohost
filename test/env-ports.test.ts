@@ -3,15 +3,30 @@ import { allocatePort, DEFAULT_POOL } from "../src/env/ports.ts";
 
 describe("allocatePort", () => {
   test("empty pool usage returns the base port", () => {
-    expect(allocatePort([])).toBe(3100);
+    expect(allocatePort([])).toBe(DEFAULT_POOL.base);
   });
 
   test("lowest free port wins (deterministic)", () => {
-    expect(allocatePort([3100, 3101, 3103])).toBe(3102);
+    const b = DEFAULT_POOL.base;
+    expect(allocatePort([b, b + 1, b + 3])).toBe(b + 2);
   });
 
   test("ports outside the pool are ignored", () => {
-    expect(allocatePort([3000, 80, 443])).toBe(3100);
+    expect(allocatePort([3000, 80, 443])).toBe(DEFAULT_POOL.base);
+  });
+
+  test("CI port 3100 is never handed out (reserved for the shared runner)", () => {
+    // Allocate every port in the pool; 3100 (the Playwright CI webServer port
+    // on the shared self-hosted runner) must never appear.
+    const handed = new Set<number>();
+    const used: number[] = [];
+    for (let i = 0; i < DEFAULT_POOL.size + 1; i++) {
+      const p = allocatePort(used);
+      if (p === undefined) break;
+      handed.add(p);
+      used.push(p);
+    }
+    expect(handed.has(3100)).toBe(false);
   });
 
   test("exhausted pool returns undefined", () => {
