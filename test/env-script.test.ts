@@ -1,6 +1,6 @@
 import { describe, expect, test, afterEach } from "bun:test";
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import * as net from "node:net";
@@ -2007,6 +2007,150 @@ describe("preview-flag: prod deploy path stays clean (SAMO_ENV=preview must NOT 
 
   test("buildDeployScript bash syntax is still valid (non-regression)", () => {
     expect(bashSyntaxOk(buildDeployScript(prodApp(), PROD_TARGET))).toBe(true);
+  });
+
+  // The deploy path SOURCES the operator envFile read-only and NEVER writes it
+  // (src/types.ts AppSpec.envFile note). So prod must keep whatever BASE_URL the
+  // operator template carries (e.g. https://field-record-1.samo.team) — the
+  // deploy script must NOT emit a BASE_URL= write line that would clobber it.
+  // This is the prod-side guard for the preview BASE_URL feature: only the
+  // preview env-create path rewrites BASE_URL to the preview vhost.
+  test("buildDeployScript output does NOT write a BASE_URL line (prod keeps the operator template's BASE_URL)", () => {
+    const s = buildDeployScript(prodApp(), PROD_TARGET);
+    expect(s).not.toMatch(/BASE_URL=/);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Magic-link correctness: the preview env-create script MUST set BASE_URL to
+// the preview's OWN vhost so the magic-link URL the app builds
+// (`${BASE_URL}/api/auth/magic-link/verify?token=...`, field-record src/app.ts)
+// points at the preview — NOT at prod. If env-create copies the operator
+// template verbatim, the preview inherits prod's BASE_URL
+// (https://field-record-1.samo.team) and every magic link clicked logs the
+// user into PROD. The fix: the envfile phase rewrites BASE_URL to
+// https://$SAMOHOST_VHOST (strip the template's BASE_URL line, append the
+// preview one), exactly like the SAMO_ENV/SAMO_BRANCH preview markers.
+// RESEND_API_KEY + MAGIC_LINK_FROM_EMAIL (the send credentials) ride along from
+// the operator template via the verbatim `cp`; samohost never sees their values.
+// ---------------------------------------------------------------------------
+describe("magic-link: preview env-create sets BASE_URL to the preview's own vhost", () => {
+  test("node create script appends BASE_URL=https://<vhost> (printf %s of $SAMOHOST_VHOST) to the composed .env", () => {
+    const s = buildEnvCreateScript(app(), target());
+    // The append is a printf with %s bound to $SAMOHOST_VHOST so vhost values
+    // are interpolated safely (no shell metachar surprises).
+    expect(s).toContain("printf 'BASE_URL=https://%s\\n' \"$SAMOHOST_VHOST\"");
+  });
+
+  test("BASE_URL append is present for every db backend", () => {
+    for (const db of ["dblab", "template", "none"] as const) {
+      const s = buildEnvCreateScript(app(), target({ dbBackend: db }));
+      expect(s).toContain("printf 'BASE_URL=https://%s\\n' \"$SAMOHOST_VHOST\"");
+    }
+  });
+
+  test("the envfile phase STRIPS any template BASE_URL before appending the preview one (no prod BASE_URL leaks through)", () => {
+    // grep -v removes the template's BASE_URL line so a last-wins-only loader
+    // (dotenv variants) can't pick up prod's value. We assert the strip step
+    // targets BASE_URL inside the envfile phase.
+    const s = buildEnvCreateScript(app(), target());
+    expect(s).toMatch(/grep -vE [^\n]*BASE_URL/);
+  });
+
+  test("the BASE_URL strip pre-creates the intermediate file at mode 600 (no world-readable credential window)", () => {
+    const s = buildEnvCreateScript(app(), target());
+    // The intermediate .env.baseurl must be created via `install -m 600` BEFORE
+    // the grep redirect; a bare `> file` would inherit the umask (644).
+    expect(s).toContain('install -m 600 /dev/null "$SAMOHOST_ENV_DIR/.env.baseurl"');
+    // And the strip APPENDS (>>) into that pre-created file, preserving 600.
+    expect(s).toMatch(/grep -vE [^\n]*BASE_URL[^\n]*>> "\$SAMOHOST_ENV_DIR\/\.env\.baseurl"/);
+  });
+
+  test("node create bash syntax still valid after BASE_URL addition (all backends)", () => {
+    for (const db of ["dblab", "template", "none"] as const) {
+      expect(bashSyntaxOk(buildEnvCreateScript(app(), target({ dbBackend: db })))).toBe(true);
+    }
+  });
+
+  test("node create is deterministic after BASE_URL addition", () => {
+    expect(buildEnvCreateScript(app(), target())).toBe(
+      buildEnvCreateScript(app(), target()),
+    );
+  });
+
+  test("executed: the ACTUAL generated envfile phase produces .env with BASE_URL=https://<vhost> and STRIPS the template's prod BASE_URL", () => {
+    // Round-trip the REAL generated envfile-phase composition — NOT a hand-coded
+    // parallel. We extract the envfile-phase `if <composition>; then` condition
+    // straight out of buildEnvCreateScript and execute it against a temp dir, so
+    // a subtly-wrong generated fragment (quoting, ordering, missing `|| true`,
+    // wrong redirect) would fail HERE. The `none` backend is used so the
+    // composition references no db-rewire helper function (isolating the
+    // BASE_URL behaviour). A template carrying a PROD BASE_URL + send
+    // credentials must come out with the preview vhost BASE_URL, exactly one
+    // BASE_URL line, send credentials preserved, prod host absent.
+    const vhost = "field-record-1-feat-x.samo.cat";
+    const s = buildEnvCreateScript(app(), target({ dbBackend: "none", vhost }));
+
+    // Extract the envfile-phase `if ... ; then` condition from the real script.
+    const startMarker = '<<<SAMOHOST_PHASE:envfile:start>>>';
+    const startIdx = s.indexOf(startMarker);
+    expect(startIdx).toBeGreaterThanOrEqual(0);
+    const ifIdx = s.indexOf("\nif ", startIdx);
+    expect(ifIdx).toBeGreaterThan(startIdx);
+    const thenIdx = s.indexOf("\nthen", ifIdx);
+    expect(thenIdx).toBeGreaterThan(ifIdx);
+    // The condition is everything between the `if` and the `then` (inclusive of
+    // the `if`). Drop the leading `if ` so it runs as a plain &&-chain command.
+    const condition = s.slice(ifIdx + 1, thenIdx).replace(/^if\s+/, "");
+    // Sanity: the extracted condition is the real BASE_URL composition.
+    expect(condition).toContain("BASE_URL=https://%s");
+    expect(condition).toMatch(/grep -vE [^\n]*BASE_URL/);
+
+    const dir = mkdtempSync(join(tmpdir(), "samohost-baseurl-"));
+    try {
+      const envDir = join(dir, "envdir");
+      const templateEnv = join(dir, "template.env");
+      writeFileSync(
+        templateEnv,
+        [
+          "NODE_ENV=production",
+          "BASE_URL=https://field-record-1.samo.team",
+          "RESEND_API_KEY=re_TEST_FAKE_KEY",
+          "MAGIC_LINK_FROM_EMAIL=no-reply@samo.cat",
+          "",
+        ].join("\n"),
+        { mode: 0o600 },
+      );
+      const prog = [
+        "set -euo pipefail",
+        `SAMOHOST_ENV_DIR='${envDir}'`,
+        `SAMOHOST_ENV_TEMPLATE='${templateEnv}'`,
+        `SAMOHOST_VHOST='${vhost}'`,
+        `SAMOHOST_PORT='3100'`,
+        `SAMOHOST_BRANCH='feat/x'`,
+        `mkdir -p '${envDir}'`,
+        condition, // ← the REAL generated envfile composition
+      ].join("\n");
+      const syntaxCheck = spawnSync("bash", ["-n"], { input: prog, encoding: "utf8" });
+      expect(syntaxCheck.status).toBe(0);
+      const r = spawnSync("bash", ["-c", prog], { encoding: "utf8" });
+      if (r.status !== 0) console.error("baseurl round-trip stderr:", r.stderr);
+      expect(r.status).toBe(0);
+      const env = readFileSync(join(envDir, ".env"), "utf8");
+      // Exactly one BASE_URL, and it is the preview vhost.
+      expect(env.match(/^BASE_URL=/gm)).toHaveLength(1);
+      expect(env).toContain(`BASE_URL=https://${vhost}`);
+      // Prod host is GONE.
+      expect(env).not.toContain("field-record-1.samo.team");
+      // Send credentials ride along from the template untouched.
+      expect(env).toContain("RESEND_API_KEY=re_TEST_FAKE_KEY");
+      expect(env).toContain("MAGIC_LINK_FROM_EMAIL=no-reply@samo.cat");
+      // The composed .env is mode 600 (intermediate .env.baseurl pre-created at
+      // 600; final chmod re-asserts it) — no world-readable credential window.
+      expect(statSync(join(envDir, ".env")).mode & 0o777).toBe(0o600);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });
 

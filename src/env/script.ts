@@ -827,6 +827,40 @@ export function buildEnvCreateScript(
   envfileBody.push(
     '   && printf \'\\nSAMO_ENV=preview\\nSAMO_BRANCH=%s\\n\' "$SAMOHOST_BRANCH" >> "$SAMOHOST_ENV_DIR/.env" \\',
   );
+  // BASE_URL: the app builds the magic-link sign-in URL as
+  //   `${BASE_URL}/api/auth/magic-link/verify?token=...`
+  // (field-record src/app.ts). The operator template carries PROD's BASE_URL
+  // (e.g. https://field-record-1.samo.team), so a verbatim copy makes every
+  // preview magic link point at PROD — clicking it logs the user into prod, not
+  // the preview. Rewrite BASE_URL to the preview's OWN vhost so links + cookie
+  // redirects stay on the preview. STRIP any template BASE_URL first (dotenv
+  // loaders are not all last-wins; append-only is unsafe — same reasoning as the
+  // db-var rewires), then append the preview one. The send credentials
+  // (RESEND_API_KEY / its legacy SENDGRID_TOKEN alias, MAGIC_LINK_FROM_EMAIL)
+  // ride along untouched from the verbatim `cp` above — samohost never sees
+  // their values. $SAMOHOST_VHOST is already sq()-escaped at the top of the
+  // script. Prod deploy (app/script.ts) NEVER writes the env file, so prod keeps
+  // the operator template's BASE_URL.
+  // The intermediate file is PRE-CREATED at mode 600 (install -m 600 /dev/null)
+  // BEFORE the redirect: a bare `> file` would create it under the process umask
+  // (typically 644 = world-readable), and it carries every credential except
+  // BASE_URL (RESEND_API_KEY, DATABASE_URL, ...). Pre-creating at 600 closes
+  // that window; the final chmod 600 below re-asserts it on the moved file.
+  // `grep -v` exits non-zero when NO line matches (i.e. the template carries no
+  // BASE_URL at all — the current prod template state); `|| true` keeps the &&
+  // chain alive under `set -e`, mirroring the db-var rewire helpers. `>>`
+  // (append) into the pre-created file preserves its 600 mode.
+  envfileBody.push(
+    '   && install -m 600 /dev/null "$SAMOHOST_ENV_DIR/.env.baseurl" \\',
+  );
+  envfileBody.push(
+    '   && { grep -vE \'^BASE_URL=\' "$SAMOHOST_ENV_DIR/.env" >> "$SAMOHOST_ENV_DIR/.env.baseurl" || true; } \\',
+  );
+  envfileBody.push('   && mv "$SAMOHOST_ENV_DIR/.env.baseurl" "$SAMOHOST_ENV_DIR/.env" \\');
+  envfileBody.push(
+    '   && printf \'BASE_URL=https://%s\\n\' "$SAMOHOST_VHOST" >> "$SAMOHOST_ENV_DIR/.env" \\',
+  );
+  envfileBody.push('   && chmod 600 "$SAMOHOST_ENV_DIR/.env" \\');
   envfileBody.push("   && true; ");
   lines.push(
     ...phaseBlock(
