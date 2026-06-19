@@ -29,6 +29,7 @@ import { join } from "node:path";
 import { parseArgs } from "../src/cli.ts";
 import {
   runTriggerRun,
+  previewDbBackendFor,
   type TriggerRunInput,
   type TriggerDeps,
   type TriggerRunReport,
@@ -1255,5 +1256,38 @@ describe("trigger run --pr-previews (PR-3)", () => {
     const withoutFlag = parseArgs(["trigger", "run"]);
     if (withoutFlag.kind !== "trigger-run") throw new Error(`expected trigger-run, got ${withoutFlag.kind}`);
     expect(withoutFlag.input.prPreviews ?? false).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// previewDbBackendFor — pure helper that selects the DB backend for a PR-preview
+// env from the app's optional previewDbBackend field (AppSpec).
+//
+// RED test: written BEFORE the helper is exported from trigger.ts and BEFORE
+// the field is added to AppSpec/types.ts. Must FAIL at this commit.
+// ---------------------------------------------------------------------------
+
+describe("previewDbBackendFor (PR-preview DB backend selection)", () => {
+  test("dblab-1 — absent previewDbBackend: returns 'dblab' (not the old hardcoded 'template')", () => {
+    // App with NO previewDbBackend field — the common case.
+    // Must yield "dblab", not "template".
+    const app = makeApp(); // makeApp() produces an AppRecord without previewDbBackend
+    expect(previewDbBackendFor(app)).toBe("dblab");
+  });
+
+  test("dblab-2 — previewDbBackend: 'template': returns 'template' (explicit operator override)", () => {
+    // Operator explicitly sets the legacy template backend.
+    const app = makeApp({ previewDbBackend: "template" });
+    expect(previewDbBackendFor(app)).toBe("template");
+  });
+
+  test("dblab-3 — previewDbBackend: 'none': returns 'none'", () => {
+    const app = makeApp({ previewDbBackend: "none" });
+    expect(previewDbBackendFor(app)).toBe("none");
+  });
+
+  test("dblab-4 — previewDbBackend: 'dblab': returns 'dblab' (explicit, same as default)", () => {
+    const app = makeApp({ previewDbBackend: "dblab" });
+    expect(previewDbBackendFor(app)).toBe("dblab");
   });
 });
