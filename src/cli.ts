@@ -302,7 +302,10 @@ trigger run options (samo-level auto-deploy poller — replaces per-client on-bo
   --dry-run                  report what WOULD happen without deploying
   --gc                       run env GC (branch-gone + orphan-vm reap) after the deploy loop
   --pr-previews              ensure a preview env for each open PR and post/update a comment
-                             with the clickable preview URL; reap envs for closed PRs
+                             with the clickable preview URL; reap envs for closed PRs.
+                             ALSO self-heals dblab-backed previews whose clone was reaped by
+                             the daily DBLab snapshot refresh (#78): re-cuts the clone,
+                             re-wires DATABASE_URL, restarts only that env's unit
   --json                     emit a JSON TriggerRunReport
 
   Intended to be called from a samohost-managed control-plane systemd timer.

@@ -46,6 +46,7 @@ import {
 } from "./env.ts";
 import type { EnvStore } from "../state/envs.ts";
 import type { PrPreviewSummary } from "../preview/pr.ts";
+import type { HealSummary } from "../preview/heal.ts";
 import type { AppRecord, EnvDbBackend, VmRecord } from "../types.ts";
 
 // ---------------------------------------------------------------------------
@@ -137,6 +138,12 @@ export interface TriggerRunReport {
    * at least one live app was in scope, and the prPreview dep is wired.
    */
   prPreviews?: PrPreviewSummary[];
+  /**
+   * Per-app self-heal summaries (samohost #78). Present when --pr-previews was
+   * active, a live app was in scope, and the heal dep is wired. Surfaces every
+   * clone re-cut after the daily DBLab snapshot refresh reaped it.
+   */
+  heal?: HealSummary[];
 }
 
 /**
@@ -202,6 +209,14 @@ export interface TriggerDeps {
    * pass is silently skipped even if input.prPreviews is true.
    */
   prPreview?: (app: AppRecord, vm: VmRecord) => Promise<PrPreviewSummary>;
+  /**
+   * OPTIONAL: Curried self-heal function (samohost #78). When present and
+   * input.prPreviews is true, called once per live candidate app BEFORE the
+   * PR-preview pass so a clone reaped by the ~03:00 DBLab snapshot refresh is
+   * re-cut and the preview re-wired in the same cycle. OPTIONAL so existing
+   * fixtures compile; absent => heal pass skipped.
+   */
+  heal?: (app: AppRecord, vm: VmRecord) => Promise<HealSummary>;
 }
 
 // ---------------------------------------------------------------------------
@@ -467,6 +482,38 @@ export async function runTriggerRun(
     }
   }
 
+  // ---- Self-heal pass (samohost #78) -------------------------------------
+  // Gated on the SAME --pr-previews flag; runs BEFORE the PR-preview pass and
+  // AFTER the GC pass. after GC: a GC'd env is not re-healed; before PR-preview:
+  // a clone reaped by the ~03:00 DBLab snapshot refresh is re-cut so the
+  // PR-preview pass sees a healthy env. ONE batched probe per app + budget-aware
+  // re-creates of the dead ones; healthy previews untouched. Per-app isolation:
+  // one app's heal failure must not abort the cycle.
+  let healSummaries: HealSummary[] | undefined;
+  if (input.prPreviews === true && deps.heal !== undefined) {
+    const liveHealApps: Array<{ app: AppRecord; vm: VmRecord }> = [];
+    for (const app of candidates) {
+      const vmRecord = allVms.find((v) => v.id === app.vmId);
+      if (vmRecord === undefined) continue;
+      if (!LIVE_STATES.has(vmRecord.lifecycleState)) continue;
+      liveHealApps.push({ app, vm: vmRecord });
+    }
+    if (liveHealApps.length > 0) {
+      healSummaries = [];
+      for (const { app, vm: vmRecord } of liveHealApps) {
+        try {
+          const summary = await deps.heal(app, vmRecord);
+          healSummaries.push(summary);
+          if (!opts.json && (summary.healed > 0 || summary.failed > 0 || summary.deferred > 0)) {
+            out(`  heal ${vmRecord.name}/${app.name}: examined=${summary.examined} healed=${summary.healed} failed=${summary.failed} deferred=${summary.deferred}`);
+          }
+        } catch (e) {
+          err(`samohost: warning: heal pass failed for app ${app.name}: ` + (e instanceof Error ? e.message : String(e)));
+        }
+      }
+    }
+  }
+
   // ---- PR-preview pass (opt-in: only when input.prPreviews is true and dep is wired) ----
   // Runs AFTER the GC pass so gc's reap results are visible to the pr-preview
   // reaper (guards against double-reap: if gc removed a branch-gone env, the
@@ -532,6 +579,7 @@ export async function runTriggerRun(
     skipped,
     failed,
     ...(gcByVm !== undefined ? { gc: gcByVm } : {}),
+    ...(healSummaries !== undefined ? { heal: healSummaries } : {}),
     ...(prPreviewSummaries !== undefined ? { prPreviews: prPreviewSummaries } : {}),
   };
 
@@ -664,6 +712,18 @@ export function defaultTriggerDeps(): TriggerDeps {
     //
     // reapPreview: calls runEnvDestroy; if record already gone (runEnvDestroy
     //   returns 1 with "no env recorded") → treat as no-op (swallow, log warn).
+    // Curried self-heal function (samohost #78). Only invoked when
+    // input.prPreviews is true. Fresh env store per call so the re-cut clone's
+    // wiring is persisted to ~/.samohost/envs.json (mirrors prPreview closure).
+    heal: async (app: AppRecord, vmRecord: VmRecord): Promise<HealSummary> => {
+      const { runHealPass } = await import("../preview/heal.ts");
+      const { defaultHealDeps } = await import("../preview/heal-deps.ts");
+      const { EnvStore: HealEnvStore } = await import("../state/envs.ts");
+      const healEnvStore = new HealEnvStore();
+      const noop = (_s: string) => {};
+      return runHealPass(app, vmRecord, defaultHealDeps(healEnvStore), noop, (s: string) => process.stderr.write(s + "\n"));
+    },
+
     prPreview: async (app: AppRecord, vmRecord: VmRecord): Promise<PrPreviewSummary> => {
       const { spawnSync } = await import("node:child_process");
       const {
