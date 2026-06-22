@@ -151,11 +151,13 @@ describe("buildEnvCreateScript", () => {
   test("systemd instance + caddy vhost use full-path sudo only", () => {
     const s = buildEnvCreateScript(app(), target());
     expect(s).toContain("field-record@field-record-1-feat-x.service");
-    // Fix: unit phase now emits `enable` + `restart` (not `enable --now` which
-    // is a no-op on already-active units — preview-create-restart bug #1).
-    expect(s).toContain('sudo /usr/bin/systemctl enable "$SAMOHOST_UNIT_INSTANCE"');
+    // Fix: unit phase uses is-active → restart (re-create path) or enable --now
+    // (initial create path). Both operations re-read .env; the old bare
+    // `enable --now` no-op on active units is gone from the create path.
     expect(s).toContain('sudo /usr/bin/systemctl restart "$SAMOHOST_UNIT_INSTANCE"');
-    expect(s).not.toContain('enable --now'); // no-op form must be gone
+    expect(s).toContain('systemctl is-active');
+    // enable --now is kept for the initial-create (unit inactive) branch.
+    expect(s).toContain('sudo /usr/bin/systemctl enable --now "$SAMOHOST_UNIT_INSTANCE"');
     expect(s).toContain("sudo /usr/bin/tee");
     expect(s).toContain("sudo /usr/bin/systemctl reload caddy");
     // Never a bare `sudo systemctl` (issue #99 exact-path grants).

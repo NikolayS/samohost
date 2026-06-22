@@ -876,19 +876,26 @@ export function buildEnvCreateScript(
   // is rewritten with a new port. Result: Caddy routes to new port, process
   // listens on old port → external probe 502 (preview-create-restart bug #1).
   //
-  // Fix: always `enable` (idempotent: creates the symlink on first run, no-op
-  // on subsequent runs) AND then `restart` (always brings a fresh process that
-  // re-reads the current .env). `restart` handles both cases:
-  //   - unit was active:   stops + starts with fresh env (re-reads .env)
-  //   - unit was inactive: starts it (equivalent to enable --now)
-  // The `restart` grant is added to sudoers in buildHostPrepScript.
+  // Fix: use `restart` when the unit is already active (which always stops the
+  // old process and starts a fresh one that re-reads the current .env), and
+  // fall back to `enable --now` when the unit is inactive (initial create).
+  //
+  // Grant requirements in host-prep sudoers:
+  //   - `restart field-record@*.service`  ← NEW (added by the fix)
+  //   - `enable --now field-record@*.service` ← existing (kept for the initial
+  //     create path where the unit is not yet active)
+  // `is-active` does NOT require sudo (systemctl is-active for own-user units
+  // is readable without privileges; template instances are root-owned but
+  // is-active with >/dev/null 2>&1 returns 0/non-0 without requiring sudo).
   lines.push(
     ...phaseBlock(
       "unit",
-      "systemd template instance (full-path sudo; grants in host-prep)",
+      "systemd template instance: restart if active, enable --now if new (full-path sudo; grants in host-prep)",
       [
-        'if sudo /usr/bin/systemctl enable "$SAMOHOST_UNIT_INSTANCE" \\',
-        '   && sudo /usr/bin/systemctl restart "$SAMOHOST_UNIT_INSTANCE"; ',
+        'if { systemctl is-active --quiet "$SAMOHOST_UNIT_INSTANCE" \\',
+        '     && sudo /usr/bin/systemctl restart "$SAMOHOST_UNIT_INSTANCE"; } \\',
+        '   || { ! systemctl is-active --quiet "$SAMOHOST_UNIT_INSTANCE" \\',
+        '        && sudo /usr/bin/systemctl enable --now "$SAMOHOST_UNIT_INSTANCE"; }; ',
       ],
     ),
   );
@@ -1177,7 +1184,11 @@ export function buildHostPrepScript(app: AppRecord, sshUser: string): string {
   ];
   if (!isStatic) {
     sudoersLines.push(
-      `${sshUser} ALL=(root) NOPASSWD: /usr/bin/systemctl enable ${unit}@*.service`,
+      // enable --now: initial create (unit inactive); kept for backward
+      // compat with existing hosts that may not yet have the restart grant.
+      `${sshUser} ALL=(root) NOPASSWD: /usr/bin/systemctl enable --now ${unit}@*.service`,
+      // restart: re-create of an already-active unit (re-reads .env);
+      // the new primary path after the preview-create-restart fix.
       `${sshUser} ALL=(root) NOPASSWD: /usr/bin/systemctl restart ${unit}@*.service`,
       `${sshUser} ALL=(root) NOPASSWD: /usr/bin/systemctl disable --now ${unit}@*.service`,
       `${sshUser} ALL=(root) NOPASSWD: /usr/bin/systemctl reset-failed ${unit}@*.service`,
