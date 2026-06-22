@@ -139,9 +139,18 @@ describe("HOST-PREP CONTRACT: buildHostPrepScript() generic platform invariants"
     );
   });
 
-  test("enable --now grant present for env-create systemd unit bring-up", () => {
+  test("enable + restart grants present for env-create systemd unit bring-up (preview-create-restart fix: enable --now replaced by enable + restart)", () => {
     const s = buildHostPrepScript(app(), "agent");
+    // Fix: unit phase now uses enable + restart (enable --now was a no-op on
+    // already-active units). Both grants must be present in sudoers.
     expect(s).toContain(
+      "NOPASSWD: /usr/bin/systemctl enable field-record@*.service",
+    );
+    expect(s).toContain(
+      "NOPASSWD: /usr/bin/systemctl restart field-record@*.service",
+    );
+    // The no-op form must NOT be the sole grant.
+    expect(s).not.toContain(
       "NOPASSWD: /usr/bin/systemctl enable --now field-record@*.service",
     );
   });

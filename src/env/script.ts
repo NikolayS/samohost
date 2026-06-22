@@ -871,11 +871,25 @@ export function buildEnvCreateScript(
   );
 
   // ----- unit ------------------------------------------------------------------
+  // `enable --now` is a systemd no-op when the unit is ALREADY active — the
+  // running process keeps its OLD EnvironmentFile (old PORT) even after .env
+  // is rewritten with a new port. Result: Caddy routes to new port, process
+  // listens on old port → external probe 502 (preview-create-restart bug #1).
+  //
+  // Fix: always `enable` (idempotent: creates the symlink on first run, no-op
+  // on subsequent runs) AND then `restart` (always brings a fresh process that
+  // re-reads the current .env). `restart` handles both cases:
+  //   - unit was active:   stops + starts with fresh env (re-reads .env)
+  //   - unit was inactive: starts it (equivalent to enable --now)
+  // The `restart` grant is added to sudoers in buildHostPrepScript.
   lines.push(
     ...phaseBlock(
       "unit",
       "systemd template instance (full-path sudo; grants in host-prep)",
-      ['if sudo /usr/bin/systemctl enable --now "$SAMOHOST_UNIT_INSTANCE"; '],
+      [
+        'if sudo /usr/bin/systemctl enable "$SAMOHOST_UNIT_INSTANCE" \\',
+        '   && sudo /usr/bin/systemctl restart "$SAMOHOST_UNIT_INSTANCE"; ',
+      ],
     ),
   );
 
@@ -1163,7 +1177,8 @@ export function buildHostPrepScript(app: AppRecord, sshUser: string): string {
   ];
   if (!isStatic) {
     sudoersLines.push(
-      `${sshUser} ALL=(root) NOPASSWD: /usr/bin/systemctl enable --now ${unit}@*.service`,
+      `${sshUser} ALL=(root) NOPASSWD: /usr/bin/systemctl enable ${unit}@*.service`,
+      `${sshUser} ALL=(root) NOPASSWD: /usr/bin/systemctl restart ${unit}@*.service`,
       `${sshUser} ALL=(root) NOPASSWD: /usr/bin/systemctl disable --now ${unit}@*.service`,
       `${sshUser} ALL=(root) NOPASSWD: /usr/bin/systemctl reset-failed ${unit}@*.service`,
     );
