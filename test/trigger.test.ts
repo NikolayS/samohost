@@ -1338,9 +1338,8 @@ describe("previewDbBackendFor (PR-preview DB backend selection)", () => {
 //    gets a real sink → messages never appear in c.e → test is RED.
 //
 // These tests are RED on the current codebase and MUST PASS after the fix.
+// (PrPreviewSummary imported above at the start of the PR-3 test section.)
 // ---------------------------------------------------------------------------
-
-import type { PrPreviewSummary } from "../src/preview/pr.ts";
 
 describe("trigger prPreview err-sink forwarding (preview-create-restart fix)", () => {
   let dir: string;
