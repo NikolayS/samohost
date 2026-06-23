@@ -670,7 +670,8 @@ export function buildHostBootstrapScript(
     `# §12. Full token-safe repo clone (PR-A2-f).`,
     `#      FULL clone (no --depth — deploys checkout SHAs).`,
     `#      Token is NEVER in argv or the remote URL. The credential helper reads`,
-    `#      the token file BY PATH at runtime via 'cat $TOKEN_FILE'.`,
+    `#      the token file BY ITS LITERAL PATH at runtime via 'cat ${tokenFile}'`,
+    `#      (NOT the unexported $TOKEN_FILE var — empty in git's sudo -u subshell).`,
     `#      git-safe.conf sidesteps GIT_DIR dubious-ownership warnings.`,
     `#      Idempotent: leaves an existing checkout in place.`,
     `# ---------------------------------------------------------------------------`,
@@ -697,12 +698,18 @@ export function buildHostBootstrapScript(
     `  # The inline credential helper reads the token file BY PATH at runtime.`,
     `  # The token value NEVER appears in argv, the remote URL, or git config.`,
     // Fix (samorev #32): the credential helper value MUST be single-quoted so that
-    // $(cat $TOKEN_FILE) is only evaluated LAZILY when git invokes the helper —
-    // not at bash-invocation time (which would expand the token value into git's
-    // argv, visible in /proc/<pid>/cmdline). The double-quoted form is the BUG.
-    // Single-quoting matches the persist line a few lines below and the proven
-    // field-record-1 stack-prep.sh pattern.
-    `  sudo -u ${sq(appUser)} GIT_CONFIG_GLOBAL="$GIT_SAFE_CONF" git -c 'credential.helper=!f() { echo username=x-access-token; echo "password=$(cat $TOKEN_FILE)"; }; f' clone "$REPO_URL" "$APP_DIR"`,
+    // $(cat ...) is only evaluated LAZILY when git invokes the helper — not at
+    // bash-invocation time (which would expand the token value into git's argv,
+    // visible in /proc/<pid>/cmdline). The double-quoted form is the BUG.
+    //
+    // Fix (fresh-VM, FD-3-fix-exposed): the helper must `cat` the LITERAL
+    // token-file path, NOT the bash variable $TOKEN_FILE. TOKEN_FILE is a plain,
+    // UNEXPORTED §0 assignment; git runs the credential helper in a fresh subshell
+    // under `sudo -u <appUser>` (env stripped), where $TOKEN_FILE is EMPTY → empty
+    // password → "Invalid username or token" → private-repo clone fails on a fresh
+    // VM. The literal path always resolves and matches the proven persist line just
+    // below (and field-record-1 stack-prep.sh).
+    `  sudo -u ${sq(appUser)} GIT_CONFIG_GLOBAL="$GIT_SAFE_CONF" git -c 'credential.helper=!f() { echo username=x-access-token; echo "password=$(cat ${tokenFile})"; }; f' clone "$REPO_URL" "$APP_DIR"`,
     `  sudo -u ${sq(appUser)} GIT_CONFIG_GLOBAL="$GIT_SAFE_CONF" git -C "$APP_DIR" remote set-url origin "$REPO_URL"`,
     `  echo "clone: complete; origin set to public URL (token only via runtime helper)"`,
     `  # Persist the credential helper in the app user's global gitconfig so LATER`,
