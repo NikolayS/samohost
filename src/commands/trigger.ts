@@ -103,6 +103,20 @@ export interface TriggerRunInput {
    * requested.
    */
   prPreviews?: boolean;
+  /**
+   * When true, run the self-heal pass per live app in scope INDEPENDENTLY of
+   * --pr-previews. The heal pass detects dead DBLab clone ports (DB-UNREACHABLE)
+   * and re-cuts the affected envs via the existing idempotent runEnvCreate path.
+   *
+   * DEFAULT: false (absent = heal only runs when --pr-previews is also set,
+   * for backward compatibility). Set explicitly to `true` for cron/manual
+   * invocations where PR-preview management is not needed but dead-clone
+   * healing is still required (e.g. preview VMs without a GitHub PR workflow).
+   *
+   * SAFETY: OPT-IN. Non-destructive (re-creates never drop production data —
+   * DBLab backend drops+re-creates only the per-env clone, not prod).
+   */
+  heal?: boolean;
 }
 
 export interface TriggerAppResult {
@@ -483,14 +497,21 @@ export async function runTriggerRun(
   }
 
   // ---- Self-heal pass (samohost #78) -------------------------------------
-  // Gated on the SAME --pr-previews flag; runs BEFORE the PR-preview pass and
-  // AFTER the GC pass. after GC: a GC'd env is not re-healed; before PR-preview:
-  // a clone reaped by the ~03:00 DBLab snapshot refresh is re-cut so the
-  // PR-preview pass sees a healthy env. ONE batched probe per app + budget-aware
-  // re-creates of the dead ones; healthy previews untouched. Per-app isolation:
-  // one app's heal failure must not abort the cycle.
+  // Runs BEFORE the PR-preview pass and AFTER the GC pass so:
+  //   - a GC'd env is not re-healed (consistent view)
+  //   - a clone re-cut by heal is visible to the PR-preview pass (which sees a
+  //     healthy env instead of a broken one that would need re-creating anyway)
+  //
+  // Gating: `input.heal === true` OR `input.prPreviews === true` (backward
+  // compat — before the `heal` flag existed, heal ran whenever prPreviews ran).
+  // Cron/manual invocations that don't manage PR-previews can now set
+  // `--heal` without `--pr-previews` to heal dead clones independently.
+  //
+  // ONE batched probe per app + budget-aware re-creates of the dead ones;
+  // healthy previews untouched. Per-app isolation: one app's heal failure
+  // must not abort the cycle.
   let healSummaries: HealSummary[] | undefined;
-  if (input.prPreviews === true && deps.heal !== undefined) {
+  if ((input.heal === true || input.prPreviews === true) && deps.heal !== undefined) {
     const liveHealApps: Array<{ app: AppRecord; vm: VmRecord }> = [];
     for (const app of candidates) {
       const vmRecord = allVms.find((v) => v.id === app.vmId);
@@ -785,6 +806,11 @@ export function defaultTriggerDeps(): TriggerDeps {
             branch: args.branch,
             db: previewDbBackendFor(app),
             previewDomain: DEFAULT_PREVIEW_DOMAIN,
+            // Pass the SHA to runEnvCreate so it stamps it ONLY on outcome=ok.
+            // runEnvCreate clears lastDeployedSha on failure (dishonest-state fix:
+            // MR-A). Do NOT stamp via a separate post-create upsert — that
+            // unconditional write is the root cause of needDeploy=false on broken envs.
+            lastDeployedSha: args.headSha,
           },
           { json: true },
           prVmStore,
@@ -806,15 +832,20 @@ export function defaultTriggerDeps(): TriggerDeps {
           // Parse failure → treat as failed
         }
 
-        // Re-read the persisted record and stamp lastDeployedSha + prNumber.
-        // prNumber marks this env as PR-managed so the closed-PR reaper knows it
-        // is safe to reap (manually-created/demo envs lack prNumber and are kept).
-        // We need the vm id — resolve it from the store.
-        const vmRec = prVmStore.list().find((v) => v.name === args.vm);
-        if (vmRec !== undefined && vhost !== "") {
-          const rec = prEnvStore.get(vmRec.id, args.app, args.branch);
-          if (rec !== undefined) {
-            prEnvStore.upsert({ ...rec, lastDeployedSha: args.headSha, prNumber: args.prNumber });
+        // Stamp prNumber ONLY on success: prNumber marks this env as PR-managed
+        // so the closed-PR reaper knows it is safe to reap. We only want that
+        // marker when the env is actually live (outcome=ok); a failed env without
+        // prNumber is protected from the reaper by the prNumber===undefined guard
+        // in runPrPreviewPass, which is the correct safe behavior.
+        // NOTE: lastDeployedSha was already stamped (or cleared) by runEnvCreate
+        // above — do NOT re-stamp it here.
+        if (outcome === "ok") {
+          const vmRec = prVmStore.list().find((v) => v.name === args.vm);
+          if (vmRec !== undefined && vhost !== "") {
+            const rec = prEnvStore.get(vmRec.id, args.app, args.branch);
+            if (rec !== undefined && rec.prNumber !== args.prNumber) {
+              prEnvStore.upsert({ ...rec, prNumber: args.prNumber });
+            }
           }
         }
 

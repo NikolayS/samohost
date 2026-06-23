@@ -493,10 +493,13 @@ describe("trigger.ts — heal flag is independent of --pr-previews", () => {
   afterEach(() => rmSync(dir, { recursive: true, force: true }));
 
   function baseTriggerDeps(healCalls: string[]): TriggerDeps {
+    const fakeFetch = (async (_url: unknown, _init?: unknown) => {
+      return { ok: true, json: async () => ({ workflow_runs: [] }) } as Response;
+    }) as unknown as typeof globalThis.fetch;
     return {
       resolveRef: async () => "sha-abc",
       deploy: async () => 0,
-      fetch: async () => new Response(JSON.stringify({ workflow_runs: [] }), { status: 200 }),
+      fetch: fakeFetch,
       now: () => new Date("2026-06-23T12:00:00.000Z"),
       heal: async (app: AppRecord, _vm: VmRecord): Promise<HealSummary> => {
         healCalls.push(app.name);
