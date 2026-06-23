@@ -301,11 +301,15 @@ trigger run options (samo-level auto-deploy poller — replaces per-client on-bo
   --app <name>               narrow to this app only (optional)
   --dry-run                  report what WOULD happen without deploying
   --gc                       run env GC (branch-gone + orphan-vm reap) after the deploy loop
+  --heal                     self-heal dblab-backed previews whose clone was reaped by the
+                             daily DBLab snapshot refresh (#78): re-cuts dead clones,
+                             re-wires DATABASE_URL, restarts only the affected env's unit.
+                             Runs independently of --pr-previews (use for cron/manual envs
+                             that don't need PR-preview management).
   --pr-previews              ensure a preview env for each open PR and post/update a comment
                              with the clickable preview URL; reap envs for closed PRs.
-                             ALSO self-heals dblab-backed previews whose clone was reaped by
-                             the daily DBLab snapshot refresh (#78): re-cuts the clone,
-                             re-wires DATABASE_URL, restarts only that env's unit
+                             Also runs the self-heal pass (same as --heal) before the
+                             PR-preview pass so re-cut clones are visible to the PR pass.
   --json                     emit a JSON TriggerRunReport
 
   Intended to be called from a samohost-managed control-plane systemd timer.
@@ -1615,6 +1619,7 @@ function parseTriggerRun(args: string[]): ParsedTriggerRun {
   let dryRun = false;
   let json = false;
   let gc: boolean | undefined;
+  let heal: boolean | undefined;
   let prPreviews: boolean | undefined;
 
   for (let i = 0; i < args.length; i++) {
@@ -1637,6 +1642,9 @@ function parseTriggerRun(args: string[]): ParsedTriggerRun {
       case "--gc":
         gc = true;
         break;
+      case "--heal":
+        heal = true;
+        break;
       case "--pr-previews":
         prPreviews = true;
         break;
@@ -1650,6 +1658,7 @@ function parseTriggerRun(args: string[]): ParsedTriggerRun {
     ...(vm !== undefined ? { vm } : {}),
     ...(app !== undefined ? { app } : {}),
     ...(gc !== undefined ? { gc } : {}),
+    ...(heal !== undefined ? { heal } : {}),
     ...(prPreviews !== undefined ? { prPreviews } : {}),
   };
   return { kind: "trigger-run", input, json };

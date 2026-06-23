@@ -832,6 +832,26 @@ describe("parseArgs trigger", () => {
   test("9d — trigger with no subcommand throws UsageError", () => {
     expect(() => parseArgs(["trigger"])).toThrow(/requires a subcommand/);
   });
+
+  test("9e — --heal flag parsed independently of --pr-previews", () => {
+    // --heal alone (no --pr-previews)
+    const cmd1 = parseArgs(["trigger", "run", "--heal"]);
+    if (cmd1.kind !== "trigger-run") throw new Error("expected trigger-run");
+    expect(cmd1.input.heal).toBe(true);
+    expect(cmd1.input.prPreviews).toBeUndefined();
+
+    // --pr-previews alone (no --heal) — backward compat
+    const cmd2 = parseArgs(["trigger", "run", "--pr-previews"]);
+    if (cmd2.kind !== "trigger-run") throw new Error("expected trigger-run");
+    expect(cmd2.input.heal).toBeUndefined();
+    expect(cmd2.input.prPreviews).toBe(true);
+
+    // both flags together
+    const cmd3 = parseArgs(["trigger", "run", "--heal", "--pr-previews"]);
+    if (cmd3.kind !== "trigger-run") throw new Error("expected trigger-run");
+    expect(cmd3.input.heal).toBe(true);
+    expect(cmd3.input.prPreviews).toBe(true);
+  });
 });
 
 // ---------------------------------------------------------------------------

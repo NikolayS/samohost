@@ -89,6 +89,17 @@ export interface EnvCreateInput {
   /** Template database override for the `template` backend (issue #11 f6).
    * Persisted on the EnvRecord so re-create/destroy reuse it. */
   templateDb?: string;
+  /**
+   * When set, stamped onto the EnvRecord ONLY when the create + health probe
+   * succeeds (outcome === "ok"). On failure the record carries no
+   * lastDeployedSha so the reconcile loop sees needDeploy=true and retries.
+   *
+   * Do NOT stamp via a separate post-create upsert in the caller — doing so
+   * unconditionally (regardless of outcome) is the dishonest-state trap that
+   * causes the reconciler to see needDeploy=false on a broken env and never
+   * retry it (samohost MR-A root cause).
+   */
+  lastDeployedSha?: string;
 }
 
 export interface EnvListInput {
@@ -714,6 +725,15 @@ export async function runEnvCreate(
   // Record on success — AND on failure, so the allocated name/port are pinned
   // for an idempotent re-run / destroy-cleanup. Failed envs are visible in
   // `env list` rather than silently leaking host-side residue.
+  //
+  // lastDeployedSha: ONLY written when the create + health probe succeeded
+  // (outcome === "ok"). On failure we explicitly CLEAR it (omit the field) so
+  // the reconcile loop sees needDeploy=true and retries. Stamping it on failure
+  // is the dishonest-state trap: the reconciler would see needDeploy=false and
+  // never retry the broken env (samohost MR-A root cause).
+  //
+  // Callers that pass input.lastDeployedSha: the stamp is applied here.
+  // Callers that do NOT pass it: the field stays absent (no regression).
   const record: EnvRecord = {
     id: existing?.id ?? deps.uuid(),
     vmId: r.vm.id,
@@ -726,6 +746,13 @@ export async function runEnvCreate(
     ...(target.dbName !== undefined ? { dbName: target.dbName } : {}),
     ...(target.templateDb !== undefined ? { templateDb: target.templateDb } : {}),
     createdAt: existing?.createdAt ?? deps.now().toISOString(),
+    // Preserve prNumber from the existing record when re-creating (idempotent
+    // re-run of a PR-managed env keeps its PR provenance).
+    ...(existing?.prNumber !== undefined ? { prNumber: existing.prNumber } : {}),
+    // Stamp lastDeployedSha only on success; omit (clear) on failure.
+    ...(outcome === "ok" && input.lastDeployedSha !== undefined
+      ? { lastDeployedSha: input.lastDeployedSha }
+      : {}),
   };
   envStore.upsert(record);
 
