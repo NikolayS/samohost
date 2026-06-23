@@ -545,13 +545,44 @@ echo "[$(ts)] STEP host-prep (root, on the VM) — app bootstrap -> env --host-p
 if [ "$DRYRUN" = "1" ]; then
   note "DRY-RUN: app bootstrap + env --host-prep require the VM+app in ~/.samohost state"
   note "         (real provision+register) — PLAN-echoing the exact root commands, no SSH."
+  # (0) PRE-PLACE THE GITHUB TOKEN — runtime only, never a literal on disk/log.
+  # WHY (the wiring gap this fixes — samohost private-repo clone): bootstrap §0
+  # reads the GitHub token from FD 3 *if attached* (`bash -s 3< <(gh auth token)`),
+  # else from a pre-placed 600 file at $TOKEN_FILE; with NO token it SKIPS the
+  # private-repo clone (§12), leaves $APP_DIR empty, and §13's clone self-check
+  # ("app clone at $APP_DIR/.git") FAILs -> the whole bootstrap exits 1 -> host-prep
+  # FAILs -> no app -> previews 521/522. The fixture repo ($FIXTURE_REPO) is PRIVATE
+  # and the samo-agent `gh auth token` CAN read it, so the token must reach bootstrap.
+  #
+  # FD 3 DOES NOT SURVIVE THIS HARNESS'S DELIVERY PATH (verified): `samohost ssh`
+  # spawns the inner ssh with Node `stdio:"inherit"` (only FD 0/1/2 are inherited —
+  # FD 3 is NOT), and ssh forwards ONLY stdin/stdout/stderr over the channel (no
+  # arbitrary-FD forwarding). So `samohost ssh … -- sudo bash -s 3< <(gh auth token)`
+  # would attach FD 3 to the *local* `samohost ssh` process only; it can never reach
+  # the *remote* bash. stdin (FD 0) is already consumed by the piped script body
+  # (`bash -s`), so it cannot carry the token either. The working mechanism is
+  # therefore the §0 PRE-PLACED-FILE channel: write `gh auth token` into the remote
+  # 600 file BEFORE bootstrap (token piped over ssh stdin to `dd`, never in argv).
+  # Bootstrap §0 then finds it present (skips the FD-3 read), §12 clones the private
+  # repo with it and PERSISTS a runtime credential helper that reads the same file by
+  # path for the LATER private-repo fetches env-create/redeploy need (so it must NOT
+  # be deleted mid-lifecycle). The token never outlives the THROWAWAY fixture VM: the
+  # EXIT teardown trap destroys the whole VM (and with it the token file). It is never
+  # written to local disk, never committed/versioned, never logged.
+  note "  [PLAN] would PRE-PLACE the GitHub token on the VM (runtime only; FD 3 cannot survive ssh+inherit-spawn — verified). Single-word-arg remote commands only (parseSsh joins post-'--' words with spaces, so no quoted multi-word args), token via ssh STDIN — NEVER argv/disk/log:"
+  note "  [PLAN]   samohost ssh $FIXTURE_VM -- sudo install -d -m 755 /opt/$FIXTURE_APP"
+  note "  [PLAN]   samohost ssh $FIXTURE_VM -- sudo install -m 600 /dev/null /opt/$FIXTURE_APP/.gh-token   # 0-byte 600 first (no world-readable window)"
+  note "  [PLAN]   gh auth token | samohost ssh $FIXTURE_VM -- sudo dd of=/opt/$FIXTURE_APP/.gh-token status=none   # token streamed over stdin into the 600 file; status=none => never logged"
   # (1) APP BOOTSTRAP — render then run as root on the VM (CF-locked 443 => --tls local; no-DB fixture => explicit placeholder --db-name).
   plan "app bootstrap $FIXTURE_VM $FIXTURE_APP --app-user $FIXTURE_APP_USER --db-name $FIXTURE_DB_NAME --tls local   # render to /tmp/<...>.sh"
-  note "  [PLAN] would then run as ROOT: samohost ssh $FIXTURE_VM -- sudo bash -s < /tmp/<bootstrap>.sh   # installs Caddy + base Caddyfile + Node + MAIN unit"
+  note "  [PLAN] would then run as ROOT: samohost ssh $FIXTURE_VM -- sudo bash -s < /tmp/<bootstrap>.sh   # §0 reads the pre-placed /opt/$FIXTURE_APP/.gh-token, §12 clones the PRIVATE repo, installs Caddy + base Caddyfile + Node + MAIN unit"
+  # (1b) APP-CLONE SUB-ASSERTION — fail loudly on a future token regression.
+  note "  [PLAN] would then ASSERT the private-repo clone landed: samohost ssh $FIXTURE_VM -- test -d /opt/$FIXTURE_APP/app/.git   # a missing token => empty app dir => this FAILs (mirrors bootstrap §13 'app clone at \$APP_DIR/.git')"
+  skip "host-prep-clone: would assert /opt/$FIXTURE_APP/app/.git present after bootstrap — a future GitHub-token regression (no token -> §12 clone SKIPPED -> empty app dir) FAILs loudly here, not silently as a downstream 521"
   # (2) ENV HOST-PREP — render then run as root on the VM.
   plan "env plan $FIXTURE_VM $FIXTURE_APP --host-prep   # render to /tmp/<...>.sh"
   note "  [PLAN] would then run as ROOT: samohost ssh $FIXTURE_VM -- sudo bash -s < /tmp/<host-prep>.sh   # ufw 443/tcp + <unit>@.service template + Caddy sites.d include + sudoers grants"
-  skip "host-prep: would render+root-apply app bootstrap (Caddy+Node+main unit, --tls local, no-DB) then env --host-prep (443/tcp + per-env template + Caddy include + sudoers); EXPECT-PASS in a real run, and a FAILURE here is the real cause of a CF 522 (closed 443) on previews"
+  skip "host-prep: would pre-place the GitHub token (runtime only) then render+root-apply app bootstrap (Caddy+Node+main unit, PRIVATE-repo clone, --tls local, no-DB) then env --host-prep (443/tcp + per-env template + Caddy include + sudoers); EXPECT-PASS in a real run, and a FAILURE here is the real cause of a CF 521/522 (no app / closed 443) on previews"
 else
   hp_ok=1
   bootstrap_sh="$(mktemp /tmp/fixture-bootstrap.XXXXXX.sh)"
@@ -559,25 +590,95 @@ else
   # Rendered scripts carry no secrets; we rm them at the end of this branch
   # (below). The EXIT/INT/TERM teardown trap is left UNTOUCHED.
 
+  # ---- (0) PRE-PLACE THE GITHUB TOKEN ON THE VM — runtime only, no literal ---
+  # WHY (the wiring gap this fixes): bootstrap §0 reads the GitHub token from FD 3
+  # *if attached*, else from a pre-placed 600 file at /opt/<app>/.gh-token; with NO
+  # token it SKIPS the private-repo clone (§12), leaves the app dir EMPTY, and §13's
+  # clone self-check FAILs -> bootstrap exits 1 -> host-prep FAILs -> no app ->
+  # previews 521/522. The fixture repo ('$FIXTURE_REPO') is PRIVATE and the samo-agent
+  # `gh auth token` CAN read it, so the token MUST reach bootstrap.
+  #
+  # WHY NOT FD 3 (verified — the task's `bash -s 3< <(gh auth token)` cannot work on
+  # THIS delivery path): `samohost ssh` spawns the inner ssh with Node stdio:"inherit"
+  # (only FD 0/1/2 are inherited — FD 3 is NOT), and ssh forwards ONLY stdin/stdout/
+  # stderr over its channel (no arbitrary-FD forwarding). So an FD-3 process
+  # substitution attaches to the LOCAL `samohost ssh` process only and never reaches
+  # the REMOTE bash. stdin (FD 0) is already consumed by the piped script body
+  # (`bash -s` reads the program off FD 0), so it cannot carry the token either.
+  # => use bootstrap §0's PRE-PLACED-FILE channel.
+  #
+  # The token value travels ONLY over the ssh channel's stdin into a remote `dd`
+  # writing a pre-created 600 file. NEVER in argv, NEVER on local disk, NEVER committed/versioned,
+  # NEVER logged. The remote file is read by §12 (clone) + the persisted runtime
+  # credential helper for the LATER private-repo fetches env-create/redeploy need, so
+  # it is intentionally LEFT in place for the rest of the lifecycle; it never outlives
+  # the THROWAWAY fixture VM, which the EXIT teardown trap destroys wholesale.
+  GH_TOKEN_FILE_REMOTE="/opt/${FIXTURE_APP}/.gh-token"
+  note "host-prep (0/3): pre-placing the GitHub token at $GH_TOKEN_FILE_REMOTE on '$FIXTURE_VM' (runtime only; FD 3 cannot survive ssh+inherit-spawn)…"
+  # IMPORTANT — argv quoting over `samohost ssh -- …`: parseSsh joins every word
+  # AFTER `--` with single spaces (rest.join(" ")) into ONE remote command string;
+  # the LOCAL shell's quotes are already consumed, so a quoted multi-word arg like
+  # `bash -c "a && b"` would lose its quoting and break on the remote shell. Every
+  # remote command below therefore uses ONLY single-word arguments (no quoted
+  # multi-word strings), and the token travels ONLY over ssh STDIN — never in argv.
+  pretoken_ok=0
+  if ! gh auth token >/dev/null 2>&1; then
+    note "  ERROR: 'gh auth token' is unavailable — cannot pre-place the token; bootstrap §12 will SKIP the PRIVATE-repo clone and §13's clone self-check will FAIL. Authenticate gh (samo-agent) first."
+  # (0a) ensure /opt/<app> exists (bootstrap §5 also makes it; harmless to pre-make).
+  elif ! samohost ssh "$FIXTURE_VM" -- sudo install -d -m 755 "/opt/${FIXTURE_APP}" >/dev/null 2>&1; then
+    note "  ERROR: could not create /opt/${FIXTURE_APP} on '$FIXTURE_VM' — cannot pre-place the token."
+  # (0b) create the token file EMPTY with 600 FIRST so the content write inherits
+  #      restrictive perms (no world-readable window). `install /dev/null` => 0-byte 600.
+  elif ! samohost ssh "$FIXTURE_VM" -- sudo install -m 600 /dev/null "$GH_TOKEN_FILE_REMOTE" >/dev/null 2>&1; then
+    note "  ERROR: could not create the 600 token file at $GH_TOKEN_FILE_REMOTE on '$FIXTURE_VM'."
+  # (0c) stream the token over ssh STDIN into the pre-created 600 file via `dd`
+  #      (status=none => no token echoed to stdout/stderr/log; dd preserves the
+  #      file's existing 600 perms). Token NEVER in argv, NEVER on local disk.
+  elif gh auth token | samohost ssh "$FIXTURE_VM" -- sudo dd of="$GH_TOKEN_FILE_REMOTE" status=none; then
+    pretoken_ok=1
+    note "  GitHub token pre-placed at $GH_TOKEN_FILE_REMOTE (600) — bootstrap §0 will find it present and §12 will clone the PRIVATE repo. [token value never logged]"
+  else
+    note "  ERROR: failed to stream the GitHub token to $GH_TOKEN_FILE_REMOTE on '$FIXTURE_VM'."
+  fi
+  if [ "$pretoken_ok" != "1" ]; then
+    hp_ok=0
+    note "  => without the token, bootstrap §12 SKIPS the PRIVATE-repo clone and §13's clone self-check FAILs (bootstrap exits 1)."
+  fi
+
   # ---- (1) APP BOOTSTRAP: render -> run as root on the VM --------------------
-  note "host-prep (1/2): rendering app bootstrap (--tls local, --db-name $FIXTURE_DB_NAME no-DB placeholder)…"
+  note "host-prep (1/3): rendering app bootstrap (--tls local, --db-name $FIXTURE_DB_NAME no-DB placeholder)…"
   if samohost app bootstrap "$FIXTURE_VM" "$FIXTURE_APP" \
         --app-user "$FIXTURE_APP_USER" --db-name "$FIXTURE_DB_NAME" --tls local \
         >"$bootstrap_sh" 2>/dev/null && [ -s "$bootstrap_sh" ]; then
     note "  rendered bootstrap script ($(wc -l <"$bootstrap_sh") lines) — applying as root on '$FIXTURE_VM'…"
+    # §0 reads the pre-placed /opt/<app>/.gh-token (the FD-3 read is a clean no-op
+    # over ssh, by design); §12 clones the PRIVATE repo; §13 self-checks the clone.
     if samohost ssh "$FIXTURE_VM" -- sudo bash -s <"$bootstrap_sh"; then
-      note "  app bootstrap applied (Caddy + base Caddyfile + Node + MAIN unit installed)."
+      note "  app bootstrap applied (Caddy + base Caddyfile + Node + MAIN unit installed; PRIVATE-repo clone via pre-placed token)."
     else
       hp_ok=0
-      note "  ERROR: app bootstrap script FAILED to apply as root on '$FIXTURE_VM' — Caddy/main unit not installed; 443 stays closed => CF 522 on previews."
+      note "  ERROR: app bootstrap script FAILED to apply as root on '$FIXTURE_VM' — Caddy/main unit not installed and/or §13 self-check failed (e.g. PRIVATE-repo clone missing); 443 stays closed => CF 521/522 on previews."
     fi
   else
     hp_ok=0
     note "  ERROR: 'samohost app bootstrap' failed to RENDER (empty/non-zero) — cannot host-prep '$FIXTURE_VM'."
   fi
 
-  # ---- (2) ENV HOST-PREP: render -> run as root on the VM -------------------
-  note "host-prep (2/2): rendering env --host-prep (443/tcp + per-env template + Caddy include + sudoers)…"
+  # ---- (1b) APP-CLONE SUB-ASSERTION — fail loudly on a future token regression
+  # Independent of §13's in-script self-check: assert the clone landed at the
+  # manifest's appDir (/opt/<app>/app/.git). A future GitHub-token regression (token
+  # not supplied -> §12 clone SKIPPED -> empty app dir) FAILs HERE with the real
+  # cause, instead of surfacing only as an opaque downstream preview 521.
+  note "host-prep (2/3): asserting the PRIVATE-repo clone landed at /opt/${FIXTURE_APP}/app/.git…"
+  if samohost ssh "$FIXTURE_VM" -- test -d "/opt/${FIXTURE_APP}/app/.git" >/dev/null 2>&1; then
+    pass "host-prep-clone: /opt/${FIXTURE_APP}/app/.git present — bootstrap §12 cloned the PRIVATE repo '$FIXTURE_REPO' (GitHub token reached bootstrap via the pre-placed 600 file)"
+  else
+    hp_ok=0
+    fail "host-prep-clone: /opt/${FIXTURE_APP}/app/.git ABSENT after bootstrap — the PRIVATE-repo clone did NOT happen (GitHub-token regression: bootstrap §0 found no token -> §12 SKIPPED the clone -> empty app dir -> previews 521). Supply 'gh auth token' to bootstrap (pre-placed 600 /opt/${FIXTURE_APP}/.gh-token)."
+  fi
+
+  # ---- (3) ENV HOST-PREP: render -> run as root on the VM -------------------
+  note "host-prep (3/3): rendering env --host-prep (443/tcp + per-env template + Caddy include + sudoers)…"
   if samohost env plan "$FIXTURE_VM" "$FIXTURE_APP" --host-prep \
         >"$hostprep_sh" 2>/dev/null && [ -s "$hostprep_sh" ]; then
     note "  rendered host-prep script ($(wc -l <"$hostprep_sh") lines) — applying as root on '$FIXTURE_VM'…"
