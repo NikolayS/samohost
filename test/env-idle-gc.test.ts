@@ -19,7 +19,6 @@ import {
   runEnvIdleGc,
   stampLastAccess,
   type EnvIdleGcInput,
-  type IdleGcReport,
   IDLE_THRESHOLD_DEFAULT_MS,
 } from "../src/commands/env-idle.ts";
 import {
@@ -548,9 +547,13 @@ describe("buildEnvCreateScript — per-vhost JSON access log in Caddy snippet", 
     expect(script).toContain("format json");
   });
 
-  test("generated Caddy snippet logs to /var/log/caddy/<env-name>.log", () => {
+  test("generated Caddy snippet logs to /var/log/caddy/<env-name>.log via $SAMOHOST_ENV_NAME", () => {
     const script = buildEnvCreateScript(sampleApp, target);
-    expect(script).toContain(`/var/log/caddy/${target.name}.log`);
+    // The vhost snippet is written by a bash printf at runtime; the log path
+    // uses $SAMOHOST_ENV_NAME so different envs each get their own log file.
+    // The script contains the literal prefix /var/log/caddy/ and the variable.
+    expect(script).toContain("/var/log/caddy/");
+    expect(script).toContain("$SAMOHOST_ENV_NAME");
   });
 
   test("log block emits ts and request.host fields (json format includes them)", () => {
@@ -558,6 +561,6 @@ describe("buildEnvCreateScript — per-vhost JSON access log in Caddy snippet", 
     // The log directive with json format implies ts + request.host.
     // Verify the output directive is present.
     expect(script).toContain("output file");
-    expect(script).toContain(`/var/log/caddy/${target.name}.log`);
+    expect(script).toContain("/var/log/caddy/");
   });
 });

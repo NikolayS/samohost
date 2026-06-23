@@ -287,6 +287,14 @@ export interface EnvRecord {
    * pass (src/preview/pr.ts). Absent for manually-created or demo previews —
    * which the closed-PR reaper MUST NEVER touch. */
   prNumber?: number;
+  /**
+   * ISO-8601 timestamp of the most-recent HTTP request served by the env's
+   * Caddy vhost, as stamped by the idle-GC pass from the per-vhost JSON access
+   * log at `/var/log/caddy/<name>.log`. Absent until the first GC cycle reads
+   * the log. When absent, the idle-GC falls back to `createdAt` so brand-new
+   * envs are not immediately reaped.
+   */
+  lastAccess?: string;
 }
 
 /**
