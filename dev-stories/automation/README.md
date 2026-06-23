@@ -1,22 +1,40 @@
-# Automation — dev-story-previews
+# Automation — dev-story timers
 
-The two unit files here (`dev-story-previews.service` and
-`dev-story-previews.timer`) are installed on the samohost control plane as
-reference copies for how the previews-reachable dev story runs automatically.
+The unit files here are installed on the samohost control plane as **reference
+copies** of how each read-only dev story runs automatically. All five stories
+run unattended on systemd timers; none requires a human or an interactive
+session to trigger it.
 
-**How it is installed and enabled on the control plane:**
+| Story | Service / Timer | Runner (stable path on control plane) | Cadence |
+|-------|-----------------|----------------------------------------|---------|
+| Open-PR previews reachable | `dev-story-previews.{service,timer}` | `~/bin/dev-story-previews.sh` | every 10 min |
+| Production app is up | `dev-story-prod-app-up.{service,timer}` | `~/bin/dev-story-prod-app-up.sh` | every 15 min |
+| Deploy freshness | `dev-story-deploy-freshness.{service,timer}` | `~/bin/dev-story-deploy-freshness.sh` | every 15 min |
+| Preview-link comment current | `dev-story-preview-comment-current.{service,timer}` | `~/bin/dev-story-preview-comment-current.sh` | every 15 min |
+| Demo envs reachable | `dev-story-demo-envs-reachable.{service,timer}` | `~/bin/dev-story-demo-envs-reachable.sh` | every 15 min |
+
+**How each is installed and enabled on the control plane:**
 
 ```
-sudo cp dev-story-previews.service dev-story-previews.timer \
-    /etc/systemd/system/
+# stable runner (NOT a repo-checkout path) so automation never breaks on a stale tree
+install -m 0755 <story>.sh ~/bin/dev-story-<story>.sh
+
+sudo cp dev-story-<story>.service dev-story-<story>.timer /etc/systemd/system/
 sudo systemctl daemon-reload
-sudo systemctl enable --now dev-story-previews.timer
+sudo systemctl enable --now dev-story-<story>.timer
 ```
 
-The timer fires `check-previews.sh` every 10 minutes (`OnUnitActiveSec=10min`)
-with a 3-minute delay after boot (`OnBootSec=3min`). The service unit runs as
-`testuser` and enters `failed` state when the story fails — detectable via
-`systemctl is-failed dev-story-previews.service` or
-`systemctl --failed`. The runner (`check-previews.sh`) reads runtime state from
-`~/.samohost/apps.json` and `~/.samohost/envs.json` and acquires a GitHub token
-via `gh auth token` at runtime — no credentials are embedded anywhere.
+Each timer fires its runner on a delay after boot (`OnBootSec=3min`) and then on
+an interval (`OnUnitActiveSec`, 10 min for previews / 15 min for the rest),
+`AccuracySec=30s`. Each `.service` is a `Type=oneshot` unit running as
+`testuser` with `Environment=HOME=/home/testuser`, and enters `failed` state
+when its story fails — detectable via
+`systemctl is-failed dev-story-<story>.service`, `systemctl --failed`, or the
+journal (`journalctl -u dev-story-<story>.service`). A passing story deactivates
+cleanly (`success`).
+
+The runners read runtime state from `~/.samohost/*.json` and, where GitHub is
+needed (`deploy-freshness`, `preview-comment-current`), use the `gh` CLI which
+resolves its own auth (`gh auth token`) at runtime — **no credentials are
+embedded in any committed file**. Every runner is read-only: it curls / queries
+GitHub / parses with jq and `grep`; it mutates nothing.

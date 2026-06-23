@@ -1,0 +1,9 @@
+[Unit]
+Description=dev-story: demo environments are reachable and live
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=testuser
+Environment=HOME=/home/testuser
+ExecStart=/home/testuser/bin/dev-story-demo-envs-reachable.sh
