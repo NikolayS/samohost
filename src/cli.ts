@@ -72,6 +72,11 @@ import {
   type EnvPreflightInput,
   type EnvGcInput,
 } from "./commands/env.ts";
+import {
+  runPreviewRebuild,
+  defaultPreviewRebuildDeps,
+  type PreviewRebuildInput,
+} from "./commands/preview-rebuild.ts";
 import { parseDuration } from "./util/duration.ts";
 import {
   runDnsStatus,
@@ -99,6 +104,7 @@ Usage:
   samohost destroy <vm-name-or-id> [--yes] [--json]
   samohost preview --provider <hetzner|aws> --region <r> --type <t> \\
       --ssh-pubkey <key|@file> [options]
+  samohost preview rebuild <vm> <app> <branch> [--json]
   samohost adopt --name <n> --ip <ip> --ssh-user <u> --ssh-key <path> \\
       --host-key-fingerprint 'SHA256:...' [options]
   samohost list [--json]
@@ -324,6 +330,12 @@ export interface ParsedPreview {
   json: boolean;
 }
 
+export interface ParsedPreviewRebuild {
+  kind: "preview-rebuild";
+  input: PreviewRebuildInput;
+  json: boolean;
+}
+
 export interface ParsedProvision {
   kind: "provision";
   spec: ProvisionSpec;
@@ -462,6 +474,7 @@ export interface ParsedTriggerRun {
 
 export type ParsedCommand =
   | ParsedPreview
+  | ParsedPreviewRebuild
   | ParsedProvision
   | ParsedDestroy
   | ParsedAdopt
@@ -562,6 +575,17 @@ export function parseArgs(
 function parsePreview(
   args: string[],
   resolvePubkeyFile: (path: string) => string,
+): ParsedPreview | ParsedPreviewRebuild {
+  // Dispatch `preview rebuild <vm> <app> <branch> [--json]` first.
+  if (args[0] === "rebuild") {
+    return parsePreviewRebuild(args.slice(1));
+  }
+  return parsePreviewCloudInit(args, resolvePubkeyFile);
+}
+
+function parsePreviewCloudInit(
+  args: string[],
+  resolvePubkeyFile: (path: string) => string,
 ): ParsedPreview {
   let provider: string | undefined;
   let region: string | undefined;
@@ -660,6 +684,57 @@ function parsePreview(
   };
 
   return { kind: "preview", spec, sshPubkey, json };
+}
+
+/**
+ * Parse `preview rebuild <vm> <app> <branch> [--json]`.
+ *
+ * Three required positional args in order: vm, app, branch.
+ * The only supported flag is --json.
+ */
+function parsePreviewRebuild(args: string[]): ParsedPreviewRebuild {
+  let vm: string | undefined;
+  let app: string | undefined;
+  let branch: string | undefined;
+  let json = false;
+
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i]!;
+    if (a === "--json") {
+      json = true;
+      continue;
+    }
+    if (a.startsWith("-")) {
+      throw new UsageError(`unknown flag: ${a}`);
+    }
+    if (vm === undefined) {
+      vm = a;
+    } else if (app === undefined) {
+      app = a;
+    } else if (branch === undefined) {
+      branch = a;
+    } else {
+      throw new UsageError(`unexpected extra argument: ${a}`);
+    }
+  }
+
+  if (vm === undefined) {
+    throw new UsageError(
+      "preview rebuild requires: <vm> <app> <branch> [--json]",
+    );
+  }
+  if (app === undefined) {
+    throw new UsageError(
+      "preview rebuild requires: <vm> <app> <branch> [--json]",
+    );
+  }
+  if (branch === undefined) {
+    throw new UsageError(
+      "preview rebuild requires: <vm> <app> <branch> [--json]",
+    );
+  }
+
+  return { kind: "preview-rebuild", input: { vm, app, branch }, json };
 }
 
 function parseProvision(args: string[]): ParsedProvision {
@@ -1682,6 +1757,10 @@ export async function main(
       return 0;
     case "preview":
       return runPreview(cmd.spec, cmd.sshPubkey, { json: cmd.json }, out, err);
+    case "preview-rebuild": {
+      const rebuildDeps = defaultPreviewRebuildDeps();
+      return runPreviewRebuild(cmd.input, { json: cmd.json }, rebuildDeps, out, err);
+    }
     case "provision": {
       const store = new StateStore();
       const provider = new HetznerProvider({ fetch: globalThis.fetch });

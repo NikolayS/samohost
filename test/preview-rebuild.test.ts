@@ -82,11 +82,7 @@ function capture() {
   };
 }
 
-// Phase marker helpers mirroring env-command.test.ts (prod shape).
-const M = (p: string, s: string) => `<<<SAMOHOST_PHASE:${p}:${s}>>>`;
-const CREATE_OK = ["clone", "install", "build", "db", "envfile", "unit", "vhost", "health"]
-  .flatMap((p) => [M(p, "start"), M(p, "ok")])
-  .join("\n");
+// (No phase markers needed in this file — runEnvCreate is fully faked.)
 
 // ---------------------------------------------------------------------------
 // Parser tests
