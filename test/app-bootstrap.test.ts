@@ -894,6 +894,90 @@ describe("buildHostBootstrapScript (A2) — token-safe repo clone", () => {
     // Must contain the deferred single-quoted form: -c 'credential.helper=
     expect(script).toMatch(/git -c 'credential\.helper/);
   });
+
+  // -------------------------------------------------------------------------
+  // REGRESSION (FD-3-fix-exposed, pre-existing): the INLINE clone credential
+  // helper authenticates on a fresh VM.
+  //
+  // ROOT CAUSE (fixture acceptance): §12's INLINE clone helper is single-quoted
+  // (correctly deferred, no argv leak — samorev #32), but its body referenced
+  //   echo "password=$(cat $TOKEN_FILE)"
+  // where $TOKEN_FILE is a PLAIN, UNEXPORTED bash variable (assigned in §0 as
+  // `TOKEN_FILE=...`, never `export`ed). git invokes the credential helper in a
+  // FRESH SUBSHELL — and the clone runs under `sudo -u <appUser>`, which strips
+  // the parent environment. So inside the helper subshell $TOKEN_FILE is EMPTY,
+  // `cat` gets no path, and git receives an EMPTY password →
+  //   "Invalid username or token" → private-repo clone FAILS on a fresh VM →
+  // no app checkout → previews 521.
+  //
+  // The PERSISTED helper a few lines below (git config --global ...) already
+  // uses the LITERAL token-file path (`cat <literal /opt/.../.gh-token>`) and
+  // DOES authenticate. The INLINE clone helper must resolve the token the SAME
+  // working way (literal path), while STAYING single-quoted (no argv leak).
+  // -------------------------------------------------------------------------
+  describe("buildHostBootstrapScript (A2) — inline clone credential helper resolves the token (fresh VM)", () => {
+    /** Extract the single line that is the INLINE `git -c 'credential.helper=...' clone` invocation. */
+    function inlineCloneHelperLine(script: string): string {
+      const line = script
+        .split("\n")
+        .find((l) => /git -c 'credential\.helper=/.test(l) && /\bclone\b/.test(l));
+      expect(line, "inline clone credential.helper line must exist").toBeDefined();
+      return line as string;
+    }
+
+    test("inline clone helper does NOT depend on the unexported $TOKEN_FILE var", () => {
+      // The bug: `cat $TOKEN_FILE` inside the single-quoted helper — $TOKEN_FILE
+      // is empty in git's helper subshell under `sudo -u`. The helper must use
+      // the literal token-file path (matching the proven persist line), so it
+      // must NOT reference the bare $TOKEN_FILE / ${TOKEN_FILE} variable.
+      const line = inlineCloneHelperLine(buildHostBootstrapScript(fieldRecord(), frOpts()));
+      expect(line).not.toMatch(/cat \$\{?TOKEN_FILE\}?/);
+    });
+
+    test("inline clone helper reads the token by LITERAL path (same form as the persist line)", () => {
+      const app = fieldRecord(); // appBase=/opt/field-record → token at /opt/field-record/.gh-token
+      const line = inlineCloneHelperLine(buildHostBootstrapScript(app, frOpts()));
+      // Must `cat` the literal token-file path, exactly like the persisted helper.
+      expect(line).toMatch(/cat \/opt\/field-record\/\.gh-token/);
+    });
+
+    test("rendered inline clone helper YIELDS the token even with the env stripped (sudo -u model)", () => {
+      // Strongest assertion: render the helper, point its literal token path at a
+      // temp file holding a known secret, then run the helper EXACTLY as git does
+      // — in a subshell with the environment wiped (`env -i`), modelling
+      // `sudo -u <appUser>` stripping $TOKEN_FILE. It must still emit the secret.
+      const sandbox = mkdtempSync(join(tmpdir(), "samohost-clone-helper-"));
+      const tokenPath = join(sandbox, ".gh-token");
+      const SECRET = "ghs_FRESH_VM_TOKEN_VALUE_xyz";
+      writeFileSync(tokenPath, SECRET);
+      chmodSync(tokenPath, 0o600);
+
+      // Render with appBase pointed at the sandbox so the literal token path the
+      // helper bakes in is exactly tokenPath.
+      const script = buildHostBootstrapScript(fieldRecord(), frOpts({ appBase: sandbox }));
+      const line = inlineCloneHelperLine(script);
+
+      // Pull the single-quoted credential.helper VALUE out of the rendered line:
+      //   ... git -c 'credential.helper=<HELPER>' clone ...
+      const m = line.match(/credential\.helper=([\s\S]*?)' clone/);
+      expect(m, "could not extract credential.helper value from inline clone line").not.toBeNull();
+      const helperBody = (m as RegExpMatchArray)[1] ?? ""; // !f() { ...; }; f
+
+      // git invokes the helper value by stripping the leading '!' and running the
+      // REMAINDER through the shell (in a subshell, env stripped). Model that.
+      const shellProgram = helperBody.replace(/^!/, "");
+      const res = spawnSync("bash", ["-c", shellProgram], {
+        encoding: "utf8",
+        env: {}, // wipe env → $TOKEN_FILE absent, exactly like `sudo -u` does
+      });
+      rmSync(sandbox, { recursive: true, force: true });
+
+      // The helper MUST have emitted the real token as the password line.
+      expect(res.stdout).toContain(`password=${SECRET}`);
+      // And must NOT have produced an empty password (the fresh-VM failure).
+      expect(res.stdout).not.toMatch(/password=\s*$/m);
+    });
+  });
 });
 
 // ---------------------------------------------------------------------------
