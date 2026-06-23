@@ -1,0 +1,21 @@
+# samohost manifest — generic deploy/host plumbing lives in samohost, generated
+# at provision/deploy time. This file describes the app; no secrets here.
+#
+# This is a DEDICATED platform test fixture (not a real client app). It mirrors
+# field-record's manifest shape so the same deploy/preview/scale plumbing runs
+# against it, but it carries NO database and provisions the smallest server type.
+name        = "samohost-fixture"
+repo        = "samo-agent/samohost-fixture"
+branch      = "main"
+appDir      = "/opt/samohost-fixture/app"
+buildCmd    = "npm run build"
+healthUrl   = "http://localhost:3000/api/version"
+serviceUnit = "samohost-fixture"
+dbBackend   = "none"
+
+[provision]
+# cx22 is DEPRECATED at Hetzner (provision returns HTTP 422 "server type not
+# available"). cx23 is the current smallest shared-vCPU type — use it for the
+# throwaway fixture VM.
+serverType = "cx23"
+location   = "fsn1"

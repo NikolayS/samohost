@@ -52,6 +52,18 @@ export interface AppManifest {
    * Optional: absent means node.
    */
   kind?: "node" | "static";
+  /**
+   * Persistent DB backend for this app's own production database.
+   * `"none"` = app has no database; preview envs skip all DB phases.
+   * Maps to {@link AppSpec.dbBackend}.
+   */
+  dbBackend?: "dblab" | "template" | "none";
+  /**
+   * Per-app default DB backend for auto-created PR-preview envs.
+   * When absent, inherits from dbBackend (none→none, otherwise dblab).
+   * Maps to {@link AppSpec.previewDbBackend}.
+   */
+  previewDbBackend?: "dblab" | "template" | "none";
 }
 
 /**
@@ -98,6 +110,10 @@ const APP_KEYS = new Set<string>([
   "rlsNonSuperuser",
   // Issue #36: serve kind ("node" | "static")
   "kind",
+  // App-level DB backend — 'none' means no database; preview envs skip DB phases.
+  "dbBackend",
+  // Per-app default DB backend for auto-created PR-preview envs.
+  "previewDbBackend",
   // `provision` is the only allowed sub-table at top level
   "provision",
 ]);
@@ -303,6 +319,39 @@ export function parseSamohostToml(text: string): ParseTomlResult {
     }
   }
 
+  // optional enum: dbBackend ("dblab" | "template" | "none")
+  const DB_BACKEND_VALUES = ["dblab", "template", "none"] as const;
+  type DbBackendValue = "dblab" | "template" | "none";
+
+  let dbBackend: DbBackendValue | undefined;
+  {
+    const rawDbBackend = raw["dbBackend"];
+    if (rawDbBackend !== undefined) {
+      if (typeof rawDbBackend !== "string") {
+        errors.push(`field dbBackend must be a string (got ${typeof rawDbBackend})`);
+      } else if (!(DB_BACKEND_VALUES as readonly string[]).includes(rawDbBackend)) {
+        errors.push(`field dbBackend must be "dblab", "template", or "none" (got "${rawDbBackend}")`);
+      } else {
+        dbBackend = rawDbBackend as DbBackendValue;
+      }
+    }
+  }
+
+  // optional enum: previewDbBackend ("dblab" | "template" | "none")
+  let previewDbBackend: DbBackendValue | undefined;
+  {
+    const rawPreviewDbBackend = raw["previewDbBackend"];
+    if (rawPreviewDbBackend !== undefined) {
+      if (typeof rawPreviewDbBackend !== "string") {
+        errors.push(`field previewDbBackend must be a string (got ${typeof rawPreviewDbBackend})`);
+      } else if (!(DB_BACKEND_VALUES as readonly string[]).includes(rawPreviewDbBackend)) {
+        errors.push(`field previewDbBackend must be "dblab", "template", or "none" (got "${rawPreviewDbBackend}")`);
+      } else {
+        previewDbBackend = rawPreviewDbBackend as DbBackendValue;
+      }
+    }
+  }
+
   // ---- 5. Validate [provision] table (optional) ----------------------------
   let provision: ProvisionManifest | undefined;
   const rawProvision = raw["provision"];
@@ -368,6 +417,8 @@ export function parseSamohostToml(text: string): ParseTomlResult {
     ...(envDbVars !== undefined ? { envDbVars } : {}),
     ...(rlsNonSuperuser !== undefined ? { rlsNonSuperuser } : {}),
     ...(kind !== undefined ? { kind } : {}),
+    ...(dbBackend !== undefined ? { dbBackend } : {}),
+    ...(previewDbBackend !== undefined ? { previewDbBackend } : {}),
   };
 
   return {
