@@ -20,6 +20,9 @@
 
 import { describe, expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync, chmodSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import {
   buildHostBootstrapScript,
   type HostBootstrapOptions,
@@ -95,6 +98,60 @@ function bashSyntaxOk(script: string): boolean {
   return res.status === 0;
 }
 
+/**
+ * Result of executing a rendered bootstrap script EXACTLY the way samohost
+ * delivers it in production: piped to `bash` on STDIN (the `bash -s` over-ssh
+ * contract — see defaultRemoteScriptRunner in src/commands/app.ts, which feeds
+ * the whole script body as the process's stdin).
+ *
+ * This is strictly stronger than `bash -n`: `bash -n` never EXECUTES the §0
+ * `read`, so it cannot catch a `read` that consumes the script's own bytes off
+ * the same FD 0 that bash is reading the program from. The fresh-VM regression
+ * (`bash: line 31: syntax error near unexpected token 'else'`) only manifests
+ * at runtime, under exactly this stdin delivery, when no token file is present.
+ */
+interface PipedRun {
+  status: number | null;
+  stderr: string;
+}
+
+/**
+ * Render → execute the script by PIPING it to `bash` on stdin (mirrors
+ * `bash -s`). The PATH is replaced with stubbed no-op binaries so the script
+ * has ZERO host side effects (no apt-get, no systemctl, no useradd, etc.) —
+ * we only care whether bash can PARSE+RUN the program without the §0 `read`
+ * stealing the script body off FD 0. `appBase` is pointed at a writable temp
+ * dir so §0's `mkdir`/token-file writes succeed and execution reaches the §0
+ * if/else (the exact spot that broke on the fixture VM).
+ */
+function runPipedToBash(app: AppRecord, opts: HostBootstrapOptions): PipedRun {
+  const sandbox = mkdtempSync(join(tmpdir(), "samohost-bootstrap-pipe-"));
+  const stubBin = join(sandbox, "stub-bin");
+  mkdirSync(stubBin);
+  // Commands the script invokes that we must neuter to keep the test hermetic.
+  const stubs = [
+    "apt-get", "curl", "gpg", "useradd", "install", "visudo", "systemctl",
+    "caddy", "openssl", "sudo", "pg_ctlcluster", "pg_lsclusters", "lsb_release",
+    "createdb", "chown", "tee", "node", "git", "stat",
+  ];
+  for (const c of stubs) {
+    const p = join(stubBin, c);
+    writeFileSync(p, "#!/bin/sh\nexit 0\n");
+    chmodSync(p, 0o755);
+  }
+  const appBase = join(sandbox, "appbase");
+  const script = buildHostBootstrapScript(app, { ...opts, appBase });
+  // PATH: stubs first (win over real binaries), then the real dirs that hold
+  // bash/mkdir/printf/echo/grep/etc. so the interpreter and shell builtins run.
+  const res = spawnSync("bash", [], {
+    input: script,
+    encoding: "utf8",
+    env: { ...process.env, PATH: `${stubBin}:/usr/bin:/bin` },
+  });
+  rmSync(sandbox, { recursive: true, force: true });
+  return { status: res.status, stderr: res.stderr ?? "" };
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -118,6 +175,40 @@ describe("buildHostBootstrapScript — bash syntax", () => {
   test("tlsMode:acme passes bash -n", () => {
     const script = buildHostBootstrapScript(fieldRecord(), defaultOpts({ tlsMode: "acme" }));
     expect(bashSyntaxOk(script)).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// REGRESSION: fresh-VM `bash -s` delivery — §0 `read` must NOT steal the script
+//
+// ROOT CAUSE (fixture run, fresh VM): samohost delivers the bootstrap script by
+// PIPING it to `bash -s` over ssh — the whole program is on the process's
+// stdin (FD 0). §0's `IFS= read -r _tok` reads from FD 0, so on a fresh VM
+// (no pre-placed token file) `read` swallows the NEXT LINE(S) OF THE SCRIPT
+// ITSELF off FD 0. That eats `if [[ -s "$TOKEN_FILE" ]]; then`, leaving a
+// dangling `else` → `bash: line 31: syntax error near unexpected token 'else'`.
+// Caddy + the main unit then never install → previews 522.
+//
+// `bash -n` CANNOT catch this (it never runs `read`), which is why the existing
+// `bash -n` suite stayed green while a fresh VM blew up. These tests execute the
+// script the way prod does (stdin pipe) and assert §0 leaves the script intact.
+// ---------------------------------------------------------------------------
+describe("buildHostBootstrapScript — fresh-VM bash -s delivery (§0 read must not steal script)", () => {
+  test("field-record: piped to bash on stdin runs WITHOUT the §0 read stealing the script", () => {
+    const run = runPipedToBash(fieldRecord(), defaultOpts());
+    // The exact fixture-VM signature must NOT appear.
+    expect(run.stderr).not.toMatch(/syntax error near unexpected token .else/);
+    expect(run.stderr).not.toMatch(/syntax error/);
+  });
+
+  test("demo-app: piped to bash on stdin runs WITHOUT a §0 read syntax error", () => {
+    const run = runPipedToBash(demoApp(), demoOpts());
+    expect(run.stderr).not.toMatch(/syntax error/);
+  });
+
+  test("tlsMode:local: piped to bash on stdin has no §0 read syntax error", () => {
+    const run = runPipedToBash(fieldRecord(), defaultOpts({ tlsMode: "local" }));
+    expect(run.stderr).not.toMatch(/syntax error/);
   });
 });
 
