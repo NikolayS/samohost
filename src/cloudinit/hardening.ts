@@ -143,6 +143,24 @@ const UNATTENDED_UPGRADES = [
   "",
 ].join("\n");
 
+/**
+ * Bounded, non-fatal wait for the apt/dpkg lock to clear before the Phase-2
+ * service enables. On a fresh VM `apt-daily`/`apt-daily-upgrade` and cloud-init's
+ * own package phase contend for /var/lib/dpkg/lock-frontend; an unguarded
+ * `systemctl enable --now unattended-upgrades` (which seeds apt state on first
+ * start) can block on that lock long enough to strand the whole runcmd module —
+ * which in turn strands `boot-finished` and the booting→ready gate.
+ *
+ * This loop polls `fuser` on the dpkg/apt locks for up to ~120s, then gives up
+ * (the `|| true`-guarded enables run regardless). It is deliberately bounded so it
+ * can never hang indefinitely, and it touches no apt state itself.
+ */
+const APT_LOCK_WAIT =
+  "for i in $(seq 1 60); do " +
+  "fuser /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock " +
+  "/var/lib/apt/lists/lock /var/cache/apt/archives/lock >/dev/null 2>&1 " +
+  "|| break; sleep 2; done || true";
+
 function buildFragment(spec: ProvisionSpec): CloudInitFragment {
   const { sshPort, adminUser, trustedIps } = spec;
 
@@ -175,6 +193,11 @@ function buildFragment(spec: ProvisionSpec): CloudInitFragment {
   ];
 
   const runcmd: string[] = [
+    // ---- Phase 1: SSH-critical hardening (must finish before the ready gate) ----
+    // None of these touch the apt/dpkg lock, so they cannot be stranded by a
+    // first-boot apt-daily run. The provision ready gate only needs the box to be
+    // reachable on the hardened SSH port with root locked down and the firewall up.
+    //
     // SSH: apply both sshd_config and the socket override.
     "systemctl daemon-reload",
     "systemctl restart ssh.socket",
@@ -187,15 +210,8 @@ function buildFragment(spec: ProvisionSpec): CloudInitFragment {
     "ufw default allow outgoing",
     `ufw limit ${sshPort}/tcp`,
     "ufw --force enable",
-    // fail2ban.
-    "systemctl enable --now fail2ban",
-    // sysctl.
+    // sysctl — pure kernel knobs, no apt lock involved.
     "sysctl --system",
-    // unattended-upgrades.
-    "systemctl enable --now unattended-upgrades",
-    // AppArmor enforced.
-    "systemctl enable --now apparmor",
-    "aa-enforce /etc/apparmor.d/* || true",
     // air: remove/empty root's authorized_keys so no key can log in as root even
     // if PermitRootLogin is ever relaxed. Truncate (not delete) both legacy and
     // .d locations so the empty file is durable state, and lock the dir 0700.
@@ -203,9 +219,33 @@ function buildFragment(spec: ProvisionSpec): CloudInitFragment {
     "truncate -s 0 /root/.ssh/authorized_keys 2>/dev/null || : > /root/.ssh/authorized_keys",
     "rm -f /root/.ssh/authorized_keys2",
     "chmod 600 /root/.ssh/authorized_keys",
-    // Completion sentinel MUST be the final runcmd.
+    // ---- Ready sentinel ----
+    // Written as soon as SSH-critical hardening is done — BEFORE the slow,
+    // apt-lock-contending service enables below. This is the bug fix: a fresh VM
+    // whose apt/dpkg lock is held by apt-daily must never be able to strand the
+    // booting→ready gate. The remaining hardening (Phase 2) still runs and still
+    // ends enabled; it just no longer blocks readiness.
     `mkdir -p ${dirname(PROVISION_SENTINEL_PATH)}`,
     `echo ${specHash(spec)} > ${PROVISION_SENTINEL_PATH}`,
+    // ---- Phase 2: apt-lock-contending hardening (lock-tolerant + non-fatal) ----
+    // These enable services whose first `--now` start can pull/seed apt state and
+    // therefore race apt-daily for the dpkg/apt lock on a fresh box. We make them
+    // lock-tolerant (wait for cloud-init's own package phase + any apt-daily run to
+    // release the lock, bounded) and non-fatal (`|| true`) so a still-held lock can
+    // never hang the runcmd module (which would also strand boot-finished and the
+    // ready gate). The services still end ENABLED: `systemctl enable` records the
+    // wants-link regardless, and the wait makes `--now` succeed in the common case.
+    // The bounded wait avoids an indefinite hang; if it ever times out, the enable
+    // is still attempted and, failing that, unattended-upgrades/fail2ban/apparmor
+    // are started on the next boot via their enabled wants-links.
+    APT_LOCK_WAIT,
+    // fail2ban.
+    "systemctl enable --now fail2ban || true",
+    // unattended-upgrades (automatic security updates).
+    "systemctl enable --now unattended-upgrades || true",
+    // AppArmor enforced.
+    "systemctl enable --now apparmor || true",
+    "aa-enforce /etc/apparmor.d/* || true",
   ];
 
   return {

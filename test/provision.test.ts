@@ -411,6 +411,26 @@ describe("runProvision — failure paths", () => {
     expect(rec.lifecycleState).toBe("degraded");
     expect(rec.hostKeyFingerprint).toBe(ED_FP);
   });
+
+  test("--json on the readiness-timeout/degraded path emits the record with .providerId so callers can reclaim by id (no false ORPHAN)", async () => {
+    const env = makeEnv({ keyscanNeverUp: true });
+    const code = await runProvision(
+      { spec: provisionSpec({ timeoutSec: 10 }), sshKey: env.privKeyPath },
+      { json: true },
+      env.deps,
+      env.outFn,
+      env.errFn,
+    );
+    expect(code).toBe(1);
+    // The degraded path must still produce machine-readable JSON on stdout.
+    const text = env.out.join("\n").trim();
+    expect(text.length).toBeGreaterThan(0);
+    const parsed = JSON.parse(text) as VmRecord;
+    expect(parsed.lifecycleState).toBe("degraded");
+    // The crux: the provider id is present so the caller can reclaim by id and
+    // never prints "ORPHAN — no provider id" for a resource that does exist.
+    expect(parsed.providerId).toBe("9001");
+  });
 });
 
 describe("integration: provision→list→destroy full pass (fake provider)", () => {
