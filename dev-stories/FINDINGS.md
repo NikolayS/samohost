@@ -152,3 +152,51 @@ preview" path is a 522 trap for operators.
 Together: every open PR is **one always-on systemd unit + port + (dblab) clone**,
 cost scales linearly with open PRs, and there is no idle suspension. Surfaced as
 the harness's two XFAIL (documented-gap) assertions, NOT fixed here.
+
+---
+
+## NIGHTLY READINESS — current blocker (do NOT schedule yet)
+
+The harness is **ready to schedule** mechanically (it provisions, fences, reaps
+by-id, and the orphan watchdog backstops budget). The nightly is **NOT installed
+yet** because the most recent real run is not green, and the failure is
+**product-side**, not harness-side and **not** provisioning reliability.
+
+**Latest run summary:** `4 pass / 4 fail / 0 expected-fail` (run log
+`/tmp/fixture-run.log`, 2026-06-23). The PASSing assertions prove the early path
+is healthy: `teardown-by-id` (orphan-strand regression guard), `provision`
+(throwaway `cx23` came up on **attempt 1/3 — provisioning did NOT flake**),
+`register`, and `create-dns` (the 525/wrong-origin path is cleared — per-preview
+DNS wrote correctly).
+
+**Root-cause blocker — a single product/host-prep failure (NOT provisioning, NOT
+a harness assertion bug):**
+
+> `host-prep: a ROOT host-prep step FAILED on the fresh fixture VM — fresh VM has
+> no Caddy and/or 443 closed; previews will CF 522. This is the real cause; fix
+> host-prep before the lifecycle assertions can pass.`
+
+Every one of the 4 failures cascades from that one root cause — they are not
+independent bugs:
+
+- `create PR#3 [preview/blue-bg]` never reached `200+env=preview+branch` within
+  300s — **CF 522** (connection refused at origin: no Caddy / closed 443).
+- `create PR#2 [preview/green-bg]` — no preview env created (same origin failure).
+- `scale: preview count 1 != open-PR count 2` — downstream of the failed creates.
+- `redeploy PR#3` pushed a new BG/SHA but the preview never reflected it — **CF
+  522** again (the origin was never serving).
+- `teardown-on-close PR#3` — preview env still present 300s after
+  close+branch-delete (the never-ready/born-broken env did not reap; see P5/P6).
+
+**Classification:** this is the **P7 CF-522 host-prep trap surfacing live** — the
+root `app bootstrap` (Caddy + base Caddyfile + main unit) and/or
+`env plan --host-prep` (ufw 443/tcp) root step did not leave the fresh VM serving
+on 443, so Cloudflare (Full) hits a closed origin and returns **522** forever. It
+is a **remaining product-side assertion failure**, deterministic this run, and
+must be **resolved before the nightly is installed**. Once host-prep reliably
+opens 443 + serves Caddy on a fresh fixture VM (creates/redeploy/scale/teardown go
+green), flip `cleanEnoughToSchedule` and install the 03:30 UTC daily oneshot+timer.
+
+Until then: the **orphan watchdog** (`samohost-fixture-orphan-reaper.timer`, every
+30m + boot-catchup, `Persistent=true`) is the budget backstop — it reaps any
+stray `samohost-fixture-*` VM older than 60m even when a run is parked here.
