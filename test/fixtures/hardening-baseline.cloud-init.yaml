@@ -91,14 +91,15 @@ runcmd:
   - ufw default allow outgoing
   - ufw limit 2223/tcp
   - ufw --force enable
-  - systemctl enable --now fail2ban
   - sysctl --system
-  - systemctl enable --now unattended-upgrades
-  - systemctl enable --now apparmor
-  - 'aa-enforce /etc/apparmor.d/* || true'
   - 'mkdir -p /root/.ssh && chmod 700 /root/.ssh'
   - 'truncate -s 0 /root/.ssh/authorized_keys 2>/dev/null || : > /root/.ssh/authorized_keys'
   - rm -f /root/.ssh/authorized_keys2
   - chmod 600 /root/.ssh/authorized_keys
   - mkdir -p /var/lib/samohost
   - 'echo 97e8a741 > /var/lib/samohost/provision-complete'
+  - 'for i in $(seq 1 60); do fuser /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock /var/lib/apt/lists/lock /var/cache/apt/archives/lock >/dev/null 2>&1 || break; sleep 2; done || true'
+  - 'systemctl enable --now fail2ban || true'
+  - 'systemctl enable --now unattended-upgrades || true'
+  - 'systemctl enable --now apparmor || true'
+  - 'aa-enforce /etc/apparmor.d/* || true'

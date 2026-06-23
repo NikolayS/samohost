@@ -50,11 +50,19 @@ describe("buildCloudInit", () => {
     expect(out).toContain("net.ipv4.tcp_syncookies = 1");
     expect(out).toContain("unattended-upgrades");
     expect(out).toContain("aa-enforce");
-    // completion sentinel is the LAST runcmd
-    const lines = out.trimEnd().split("\n");
-    expect(lines[lines.length - 1]).toContain(
-      "/var/lib/samohost/provision-complete",
+    // The completion sentinel is written as soon as SSH-critical hardening is
+    // done — BEFORE the slow, apt-lock-contending service enables (fail2ban /
+    // unattended-upgrades / apparmor). This decouples the booting→ready gate from
+    // a first-boot apt-daily lock that could otherwise strand provisioning. The
+    // slow enables still run afterwards (still enabled, just lock-tolerant).
+    const runcmd = out.slice(out.indexOf("runcmd:"));
+    const sentinelIdx = runcmd.indexOf("/var/lib/samohost/provision-complete");
+    const unattendedIdx = runcmd.indexOf(
+      "systemctl enable --now unattended-upgrades",
     );
+    expect(sentinelIdx).toBeGreaterThan(-1);
+    expect(unattendedIdx).toBeGreaterThan(-1);
+    expect(sentinelIdx).toBeLessThan(unattendedIdx);
   });
 
   test("hardening is rendered first even if listed after other modules", () => {
