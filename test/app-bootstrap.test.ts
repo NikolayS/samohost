@@ -20,6 +20,9 @@
 
 import { describe, expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync, chmodSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import {
   buildHostBootstrapScript,
   type HostBootstrapOptions,
@@ -95,6 +98,60 @@ function bashSyntaxOk(script: string): boolean {
   return res.status === 0;
 }
 
+/**
+ * Result of executing a rendered bootstrap script EXACTLY the way samohost
+ * delivers it in production: piped to `bash` on STDIN (the `bash -s` over-ssh
+ * contract — see defaultRemoteScriptRunner in src/commands/app.ts, which feeds
+ * the whole script body as the process's stdin).
+ *
+ * This is strictly stronger than `bash -n`: `bash -n` never EXECUTES the §0
+ * `read`, so it cannot catch a `read` that consumes the script's own bytes off
+ * the same FD 0 that bash is reading the program from. The fresh-VM regression
+ * (`bash: line 31: syntax error near unexpected token 'else'`) only manifests
+ * at runtime, under exactly this stdin delivery, when no token file is present.
+ */
+interface PipedRun {
+  status: number | null;
+  stderr: string;
+}
+
+/**
+ * Render → execute the script by PIPING it to `bash` on stdin (mirrors
+ * `bash -s`). The PATH is replaced with stubbed no-op binaries so the script
+ * has ZERO host side effects (no apt-get, no systemctl, no useradd, etc.) —
+ * we only care whether bash can PARSE+RUN the program without the §0 `read`
+ * stealing the script body off FD 0. `appBase` is pointed at a writable temp
+ * dir so §0's `mkdir`/token-file writes succeed and execution reaches the §0
+ * if/else (the exact spot that broke on the fixture VM).
+ */
+function runPipedToBash(app: AppRecord, opts: HostBootstrapOptions): PipedRun {
+  const sandbox = mkdtempSync(join(tmpdir(), "samohost-bootstrap-pipe-"));
+  const stubBin = join(sandbox, "stub-bin");
+  mkdirSync(stubBin);
+  // Commands the script invokes that we must neuter to keep the test hermetic.
+  const stubs = [
+    "apt-get", "curl", "gpg", "useradd", "install", "visudo", "systemctl",
+    "caddy", "openssl", "sudo", "pg_ctlcluster", "pg_lsclusters", "lsb_release",
+    "createdb", "chown", "tee", "node", "git", "stat",
+  ];
+  for (const c of stubs) {
+    const p = join(stubBin, c);
+    writeFileSync(p, "#!/bin/sh\nexit 0\n");
+    chmodSync(p, 0o755);
+  }
+  const appBase = join(sandbox, "appbase");
+  const script = buildHostBootstrapScript(app, { ...opts, appBase });
+  // PATH: stubs first (win over real binaries), then the real dirs that hold
+  // bash/mkdir/printf/echo/grep/etc. so the interpreter and shell builtins run.
+  const res = spawnSync("bash", [], {
+    input: script,
+    encoding: "utf8",
+    env: { ...process.env, PATH: `${stubBin}:/usr/bin:/bin` },
+  });
+  rmSync(sandbox, { recursive: true, force: true });
+  return { status: res.status, stderr: res.stderr ?? "" };
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -118,6 +175,40 @@ describe("buildHostBootstrapScript — bash syntax", () => {
   test("tlsMode:acme passes bash -n", () => {
     const script = buildHostBootstrapScript(fieldRecord(), defaultOpts({ tlsMode: "acme" }));
     expect(bashSyntaxOk(script)).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// REGRESSION: fresh-VM `bash -s` delivery — §0 `read` must NOT steal the script
+//
+// ROOT CAUSE (fixture run, fresh VM): samohost delivers the bootstrap script by
+// PIPING it to `bash -s` over ssh — the whole program is on the process's
+// stdin (FD 0). §0's `IFS= read -r _tok` reads from FD 0, so on a fresh VM
+// (no pre-placed token file) `read` swallows the NEXT LINE(S) OF THE SCRIPT
+// ITSELF off FD 0. That eats `if [[ -s "$TOKEN_FILE" ]]; then`, leaving a
+// dangling `else` → `bash: line 31: syntax error near unexpected token 'else'`.
+// Caddy + the main unit then never install → previews 522.
+//
+// `bash -n` CANNOT catch this (it never runs `read`), which is why the existing
+// `bash -n` suite stayed green while a fresh VM blew up. These tests execute the
+// script the way prod does (stdin pipe) and assert §0 leaves the script intact.
+// ---------------------------------------------------------------------------
+describe("buildHostBootstrapScript — fresh-VM bash -s delivery (§0 read must not steal script)", () => {
+  test("field-record: piped to bash on stdin runs WITHOUT the §0 read stealing the script", () => {
+    const run = runPipedToBash(fieldRecord(), defaultOpts());
+    // The exact fixture-VM signature must NOT appear.
+    expect(run.stderr).not.toMatch(/syntax error near unexpected token .else/);
+    expect(run.stderr).not.toMatch(/syntax error/);
+  });
+
+  test("demo-app: piped to bash on stdin runs WITHOUT a §0 read syntax error", () => {
+    const run = runPipedToBash(demoApp(), demoOpts());
+    expect(run.stderr).not.toMatch(/syntax error/);
+  });
+
+  test("tlsMode:local: piped to bash on stdin has no §0 read syntax error", () => {
+    const run = runPipedToBash(fieldRecord(), defaultOpts({ tlsMode: "local" }));
+    expect(run.stderr).not.toMatch(/syntax error/);
   });
 });
 
@@ -802,6 +893,90 @@ describe("buildHostBootstrapScript (A2) — token-safe repo clone", () => {
     expect(script).not.toMatch(/git -c "credential\.helper/);
     // Must contain the deferred single-quoted form: -c 'credential.helper=
     expect(script).toMatch(/git -c 'credential\.helper/);
+  });
+
+  // -------------------------------------------------------------------------
+  // REGRESSION (FD-3-fix-exposed, pre-existing): the INLINE clone credential
+  // helper authenticates on a fresh VM.
+  //
+  // ROOT CAUSE (fixture acceptance): §12's INLINE clone helper is single-quoted
+  // (correctly deferred, no argv leak — samorev #32), but its body referenced
+  //   echo "password=$(cat $TOKEN_FILE)"
+  // where $TOKEN_FILE is a PLAIN, UNEXPORTED bash variable (assigned in §0 as
+  // `TOKEN_FILE=...`, never `export`ed). git invokes the credential helper in a
+  // FRESH SUBSHELL — and the clone runs under `sudo -u <appUser>`, which strips
+  // the parent environment. So inside the helper subshell $TOKEN_FILE is EMPTY,
+  // `cat` gets no path, and git receives an EMPTY password →
+  //   "Invalid username or token" → private-repo clone FAILS on a fresh VM →
+  // no app checkout → previews 521.
+  //
+  // The PERSISTED helper a few lines below (git config --global ...) already
+  // uses the LITERAL token-file path (`cat <literal /opt/.../.gh-token>`) and
+  // DOES authenticate. The INLINE clone helper must resolve the token the SAME
+  // working way (literal path), while STAYING single-quoted (no argv leak).
+  // -------------------------------------------------------------------------
+  describe("buildHostBootstrapScript (A2) — inline clone credential helper resolves the token (fresh VM)", () => {
+    /** Extract the single line that is the INLINE `git -c 'credential.helper=...' clone` invocation. */
+    function inlineCloneHelperLine(script: string): string {
+      const line = script
+        .split("\n")
+        .find((l) => /git -c 'credential\.helper=/.test(l) && /\bclone\b/.test(l));
+      expect(line, "inline clone credential.helper line must exist").toBeDefined();
+      return line as string;
+    }
+
+    test("inline clone helper does NOT depend on the unexported $TOKEN_FILE var", () => {
+      // The bug: `cat $TOKEN_FILE` inside the single-quoted helper — $TOKEN_FILE
+      // is empty in git's helper subshell under `sudo -u`. The helper must use
+      // the literal token-file path (matching the proven persist line), so it
+      // must NOT reference the bare $TOKEN_FILE / ${TOKEN_FILE} variable.
+      const line = inlineCloneHelperLine(buildHostBootstrapScript(fieldRecord(), frOpts()));
+      expect(line).not.toMatch(/cat \$\{?TOKEN_FILE\}?/);
+    });
+
+    test("inline clone helper reads the token by LITERAL path (same form as the persist line)", () => {
+      const app = fieldRecord(); // appBase=/opt/field-record → token at /opt/field-record/.gh-token
+      const line = inlineCloneHelperLine(buildHostBootstrapScript(app, frOpts()));
+      // Must `cat` the literal token-file path, exactly like the persisted helper.
+      expect(line).toMatch(/cat \/opt\/field-record\/\.gh-token/);
+    });
+
+    test("rendered inline clone helper YIELDS the token even with the env stripped (sudo -u model)", () => {
+      // Strongest assertion: render the helper, point its literal token path at a
+      // temp file holding a known secret, then run the helper EXACTLY as git does
+      // — in a subshell with the environment wiped (`env -i`), modelling
+      // `sudo -u <appUser>` stripping $TOKEN_FILE. It must still emit the secret.
+      const sandbox = mkdtempSync(join(tmpdir(), "samohost-clone-helper-"));
+      const tokenPath = join(sandbox, ".gh-token");
+      const SECRET = "ghs_FRESH_VM_TOKEN_VALUE_xyz";
+      writeFileSync(tokenPath, SECRET);
+      chmodSync(tokenPath, 0o600);
+
+      // Render with appBase pointed at the sandbox so the literal token path the
+      // helper bakes in is exactly tokenPath.
+      const script = buildHostBootstrapScript(fieldRecord(), frOpts({ appBase: sandbox }));
+      const line = inlineCloneHelperLine(script);
+
+      // Pull the single-quoted credential.helper VALUE out of the rendered line:
+      //   ... git -c 'credential.helper=<HELPER>' clone ...
+      const m = line.match(/credential\.helper=([\s\S]*?)' clone/);
+      expect(m, "could not extract credential.helper value from inline clone line").not.toBeNull();
+      const helperBody = (m as RegExpMatchArray)[1] ?? ""; // !f() { ...; }; f
+
+      // git invokes the helper value by stripping the leading '!' and running the
+      // REMAINDER through the shell (in a subshell, env stripped). Model that.
+      const shellProgram = helperBody.replace(/^!/, "");
+      const res = spawnSync("bash", ["-c", shellProgram], {
+        encoding: "utf8",
+        env: {}, // wipe env → $TOKEN_FILE absent, exactly like `sudo -u` does
+      });
+      rmSync(sandbox, { recursive: true, force: true });
+
+      // The helper MUST have emitted the real token as the password line.
+      expect(res.stdout).toContain(`password=${SECRET}`);
+      // And must NOT have produced an empty password (the fresh-VM failure).
+      expect(res.stdout).not.toMatch(/password=\s*$/m);
+    });
   });
 });
 

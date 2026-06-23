@@ -54,8 +54,9 @@
  *     PG_BACKEND is intentionally NOT written here (lives in unit Environment=).
  *     Idempotent: reuses existing pw/secret/DEPLOYED_SHA values.
  *
- *  f. FULL token-safe repo clone: token from STDIN or pre-placed 600 `.gh-token`
- *     file (NEVER in argv or remote URL). credential.helper reads the token
+ *  f. FULL token-safe repo clone: token from FD 3 or pre-placed 600 `.gh-token`
+ *     file (NEVER from FD 0/STDIN — the script body is piped there; NEVER in
+ *     argv or remote URL). credential.helper reads the token
  *     file BY PATH at runtime. Full clone (no --depth). Clone into app.appDir;
  *     git-safe.conf for dubious-ownership. Idempotent: leaves existing checkout.
  *
@@ -225,37 +226,61 @@ export function buildHostBootstrapScript(
     "# PR-A1 scope: runtimes, OS user, /opt layout, sudoers, MAIN unit,",
     "#   sshd AllowUsers, Caddy base config.",
     "# PR-A2 scope: DB bootstrap, base env file, token-safe repo clone, extended self-check.",
-    "# Token handling: read from STDIN (piped) or pre-placed 600 file at",
-    `#   ${tokenFile}. NEVER in argv, NEVER in remote URL.`,
+    "# Token handling: read from FD 3 (if attached) or pre-placed 600 file at",
+    `#   ${tokenFile}. NEVER from FD 0 (the script body is piped there via 'bash -s'),`,
+    "#   NEVER in argv, NEVER in remote URL.",
     "set -euo pipefail",
     "",
   );
 
-  // ---- section 0: read GitHub token from STDIN or pre-placed file -----------
+  // ---- section 0: read GitHub token from FD 3 or pre-placed file ------------
+  //
+  // CRITICAL (samohost#80 fresh-VM regression): this script is delivered by
+  // PIPING it to `bash -s` over ssh — the ENTIRE program body is on the
+  // process's stdin (FD 0). See defaultRemoteScriptRunner in commands/app.ts.
+  //
+  // An earlier version read the token with `IFS= read -r _tok` (from FD 0).
+  // On a fresh VM (no pre-placed token file) that `read` executed and consumed
+  // the NEXT LINE OF THE SCRIPT ITSELF off FD 0 — eating the
+  // `if [[ -s "$TOKEN_FILE" ]]; then` line and leaving a dangling `else`:
+  //   bash: line 31: syntax error near unexpected token 'else'
+  // so Caddy + the main unit never installed and every preview 522'd.
+  // `bash -n` could never catch it because `bash -n` does not RUN `read`.
+  //
+  // FIX: read the token ONLY from a dedicated file descriptor (FD 3), NEVER
+  // FD 0. With the `bash -s` delivery, FD 3 is not open, so the read is a
+  // clean no-op (the script body on FD 0 is untouched) and we fall through to
+  // the pre-placed-token-file path. A caller that genuinely wants to inject a
+  // token at runtime can attach it on FD 3 (e.g. `bash -s 3< token`), keeping
+  // the original STDIN-injection capability without ever cannibalizing FD 0.
   push(
     `# ---------------------------------------------------------------------------`,
-    `# §0. GitHub token: read from STDIN (if piped) or ${sq(tokenFile)} (pre-placed).`,
-    `#     Token arrives into the script via stdin pipe on first run, or via a`,
-    `#     pre-placed 600 file. NEVER echoed, logged, or placed in argv.`,
+    `# §0. GitHub token: read from FD 3 (if attached) or ${sq(tokenFile)} (pre-placed).`,
+    `#     This script is piped to 'bash -s' on FD 0, so the token is NEVER read`,
+    `#     from FD 0 (that would consume the script body itself — samohost#80).`,
+    `#     A caller may attach the token on FD 3 ('bash -s 3< token'); otherwise`,
+    `#     the pre-placed 600 file is used. NEVER echoed, logged, or placed in argv.`,
     `# ---------------------------------------------------------------------------`,
     "",
     `TOKEN_FILE=${sq(tokenFile)}`,
     `mkdir -p ${sq(appBase)}`,
-    `if [[ ! -t 0 ]] && [[ ! -s "$TOKEN_FILE" ]]; then`,
-    `  # STDIN is a pipe/redirect and no token file yet: read one line as the token.`,
+    `if [[ ! -s "$TOKEN_FILE" ]]; then`,
+    `  # No token file yet: try FD 3 (a dedicated channel — never the FD 0 the`,
+    `  # script itself is being read from). If FD 3 is not open the read is a`,
+    `  # clean no-op and we fall through to the pre-placed-file path below.`,
     `  _tok=""`,
-    `  IFS= read -r _tok || true`,
+    `  if { IFS= read -r _tok <&3; } 2>/dev/null; then :; else _tok=""; fi`,
     `  if [[ -n "$_tok" ]]; then`,
     `    ( umask 077; printf '%s' "$_tok" > "$TOKEN_FILE" )`,
     `    unset _tok`,
-    `    echo "GitHub token captured from STDIN -> $TOKEN_FILE (600). [value not logged]"`,
+    `    echo "GitHub token captured from FD 3 -> $TOKEN_FILE (600). [value not logged]"`,
     `  fi`,
     `fi`,
     `if [[ -s "$TOKEN_FILE" ]]; then`,
     `  chmod 600 "$TOKEN_FILE"`,
     `  echo "GitHub token present at $TOKEN_FILE."`,
     `else`,
-    `  echo "WARNING: no GitHub token (STDIN empty and $TOKEN_FILE absent). Clone step will be SKIPPED."`,
+    `  echo "WARNING: no GitHub token (FD 3 empty and $TOKEN_FILE absent). Clone step will be SKIPPED."`,
     `fi`,
     "",
   );
@@ -645,7 +670,8 @@ export function buildHostBootstrapScript(
     `# §12. Full token-safe repo clone (PR-A2-f).`,
     `#      FULL clone (no --depth — deploys checkout SHAs).`,
     `#      Token is NEVER in argv or the remote URL. The credential helper reads`,
-    `#      the token file BY PATH at runtime via 'cat $TOKEN_FILE'.`,
+    `#      the token file BY ITS LITERAL PATH at runtime via 'cat ${tokenFile}'`,
+    `#      (NOT the unexported $TOKEN_FILE var — empty in git's sudo -u subshell).`,
     `#      git-safe.conf sidesteps GIT_DIR dubious-ownership warnings.`,
     `#      Idempotent: leaves an existing checkout in place.`,
     `# ---------------------------------------------------------------------------`,
@@ -672,16 +698,23 @@ export function buildHostBootstrapScript(
     `  # The inline credential helper reads the token file BY PATH at runtime.`,
     `  # The token value NEVER appears in argv, the remote URL, or git config.`,
     // Fix (samorev #32): the credential helper value MUST be single-quoted so that
-    // $(cat $TOKEN_FILE) is only evaluated LAZILY when git invokes the helper —
-    // not at bash-invocation time (which would expand the token value into git's
-    // argv, visible in /proc/<pid>/cmdline). The double-quoted form is the BUG.
-    // Single-quoting matches the persist line a few lines below and the proven
-    // field-record-1 stack-prep.sh pattern.
-    `  sudo -u ${sq(appUser)} GIT_CONFIG_GLOBAL="$GIT_SAFE_CONF" git -c 'credential.helper=!f() { echo username=x-access-token; echo "password=$(cat $TOKEN_FILE)"; }; f' clone "$REPO_URL" "$APP_DIR"`,
+    // $(cat ...) is only evaluated LAZILY when git invokes the helper — not at
+    // bash-invocation time (which would expand the token value into git's argv,
+    // visible in /proc/<pid>/cmdline). The double-quoted form is the BUG.
+    //
+    // Fix (fresh-VM, FD-3-fix-exposed): the helper must `cat` the LITERAL
+    // token-file path, NOT the bash variable $TOKEN_FILE. TOKEN_FILE is a plain,
+    // UNEXPORTED §0 assignment; git runs the credential helper in a fresh subshell
+    // under `sudo -u <appUser>` (env stripped), where $TOKEN_FILE is EMPTY → empty
+    // password → "Invalid username or token" → private-repo clone fails on a fresh
+    // VM. The literal path always resolves and matches the proven persist line just
+    // below (and field-record-1 stack-prep.sh).
+    `  sudo -u ${sq(appUser)} GIT_CONFIG_GLOBAL="$GIT_SAFE_CONF" git -c 'credential.helper=!f() { echo username=x-access-token; echo "password=$(cat ${tokenFile})"; }; f' clone "$REPO_URL" "$APP_DIR"`,
     `  sudo -u ${sq(appUser)} GIT_CONFIG_GLOBAL="$GIT_SAFE_CONF" git -C "$APP_DIR" remote set-url origin "$REPO_URL"`,
     `  echo "clone: complete; origin set to public URL (token only via runtime helper)"`,
     `  # Persist the credential helper in the app user's global gitconfig so LATER`,
-    `  # fetches (deploy, env-create clones) authenticate without re-reading stdin.`,
+    `  # fetches (deploy, env-create clones) authenticate by reading the token file`,
+    `  # by path at runtime (no FD 3 / stdin needed on later runs).`,
     `  sudo -u ${sq(appUser)} git config --global \\`,
     `    credential."https://github.com".helper \\`,
     `    '!f() { echo username=x-access-token; echo "password=$(cat ${tokenFile})"; }; f'`,
