@@ -111,9 +111,14 @@ export function validateCustomLabels(
 
 /**
  * The pinned-SSH readiness probe. `boot-finished` proves cloud-init finished
- * its run; the samohost sentinel (the baseline's FINAL runcmd) proves OUR
- * hardening runcmds all executed. Non-blocking by design: it is polled with
- * the loop's own deadline instead of hanging in `cloud-init status --wait`.
+ * its run; the samohost sentinel proves our SSH-critical hardening ran (sshd
+ * restart on the hardened port, ufw bring-up, root authorized_keys lockdown).
+ * The sentinel is intentionally written BEFORE the slow, apt-lock-contending
+ * service enables (fail2ban / unattended-upgrades / apparmor) so a first-boot
+ * apt-daily lock can never strand this gate; those enables are lock-tolerant +
+ * non-fatal and still end enabled (see src/cloudinit/hardening.ts Phase 2).
+ * Non-blocking by design: it is polled with the loop's own deadline instead of
+ * hanging in `cloud-init status --wait`.
  */
 export const READY_PROBE_COMMAND =
   "test -f /var/lib/cloud/instance/boot-finished && " +
@@ -345,6 +350,12 @@ export async function runProvision(
         `resource EXISTS (provider id ${record.providerId}) and is ` +
         `reclaimable: \`samohost destroy ${record.name}\`.`,
     );
+    // Machine-readable degraded record on stdout so `--json` callers can reclaim
+    // by id. Omitting it made automated callers print a false "ORPHAN — no
+    // provider id" even though the resource exists and is reclaimable.
+    if (opts.json) {
+      out(JSON.stringify(record, null, 2));
+    }
     return 1;
   }
 
