@@ -115,6 +115,30 @@ entry that neither serves traffic nor gets collected. Surface: failed/never-read
 envs need their own reap path (or auto-destroy on create-failure) so a born-broken
 record doesn't accumulate.
 
+**STATUS — root dishonest-state stamp FIXED by this MVP run:** the underlying
+mechanism that *created* the born-broken-but-looks-deployed record — `trigger.ts
+ensurePreviewImpl` unconditionally stamping `lastDeployedSha = headSha` even when
+the create FAILED, so reconcile computed `needDeploy = false` and never retried the
+broken env — is now fixed. `lastDeployedSha` is stamped in `runEnvCreate` **only on
+`outcome === "ok"`** and explicitly cleared on failure, so a failed create no longer
+masquerades as deployed and the reconcile loop re-attempts it.
+Merged: **#86** (`fix/heal-dishonest-state-db-unreachable`), SHA
+`4648d26d2f95eac35e38c2aa640c2204fcfa5664`.
+(Note: a dedicated reap path for an env that *stays* born-broken across retries —
+auto-destroy-on-create-failure — is still a surface; the dishonest-state half is the
+piece fixed here.)
+
+**STATUS — DB-UNREACHABLE self-heal gap FIXED by this MVP run:** `probeClones` in
+the self-heal pass previously trusted the DBLab engine's clone status and never
+caught a clone whose TCP port went **unreachable** after the daily DBLab snapshot
+refresh, so a dead clone was never reclassified "dead" and never re-materialised.
+`probeClones` now actively probes clone reachability and classifies an unreachable
+clone as dead; the heal flag was also **ungated from `--pr-previews`** so cron/manual
+invocations heal dead clones too. Same merge as the dishonest-state fix:
+**#86**, SHA `4648d26d2f95eac35e38c2aa640c2204fcfa5664` (self-heal follow-up to the
+DBLab clone work in **#79** `feat/78-self-healing-dblab-clones`, SHA
+`b308f87253a5c32f118a4ebd89e78f3b95962ad7`).
+
 ### P6. The two reap paths disagree — PR-closed vs branch-gone
 The teardown-on-close lifecycle has two different triggers that **don't agree**:
 - `env gc` reaps on **branch-gone** (the head ref is absent on the remote —
@@ -153,9 +177,21 @@ Together: every open PR is **one always-on systemd unit + port + (dblab) clone**
 cost scales linearly with open PRs, and there is no idle suspension. Surfaced as
 the harness's two XFAIL (documented-gap) assertions, NOT fixed here.
 
----
-
-## NIGHTLY READINESS — current blocker (do NOT schedule yet)
+**STATUS — ADDRESSED by this MVP run (two of the three gaps; one still in review):**
+- **No-rebuild-command → ADDRESSED (merged).** A first-class
+  `preview rebuild <vm> <app> <branch>` subcommand now re-materialises a wedged or
+  stale preview without waiting for the next deploy/trigger — covers the "stopped
+  preview stays down until next deploy" half operationally.
+  Merged: **#85** (`feat/preview-rebuild-command`), SHA
+  `9aa93fb1b358e57701f3073575747fc41ef5df49`.
+- **No-idle-teardown → ADDRESSED (warn-only), PENDING MERGE.** Atomic idle
+  autodestroy for preview envs keyed on `lastAccess` (NOT `createdAt`), shipped
+  **warn-only first** per the operator-prereq / degraded-gate rule. This is the
+  always-on-cost reaping gap. **NOT yet merged** as of this run — tracked in PR
+  **#87** (`feat/preview-idle-autodestroy`, OPEN, tip `e476344`); no merge SHA yet.
+  Mark FIXED only once #87 lands.
+- **Wake-on-demand:** still absent — `preview rebuild` is the operator-driven
+  substitute; auto wake-on-URL-access remains a gap.
 
 The harness is **ready to schedule** mechanically (it provisions, fences, reaps
 by-id, and the orphan watchdog backstops budget). The nightly is **NOT installed
@@ -200,3 +236,37 @@ green), flip `cleanEnoughToSchedule` and install the 03:30 UTC daily oneshot+tim
 Until then: the **orphan watchdog** (`samohost-fixture-orphan-reaper.timer`, every
 30m + boot-catchup, `Persistent=true`) is the budget backstop — it reaps any
 stray `samohost-fixture-*` VM older than 60m even when a run is parked here.
+
+---
+
+## OPEN — field-record cutover onto samohost-managed lifecycle (NOT done here)
+
+> **OPEN / HELD DECISION — touches a client VM; needs platform-team + samjr-bootstrap
+> coordination. Deliberately NOT actioned in this MVP run.**
+
+The fixes above (dishonest-state stamp #86, DB-UNREACHABLE self-heal #86, idle
+autodestroy #87-pending, `preview rebuild` #85) all land in the **samohost
+platform** and are exercised against the throwaway fixture app. They do **NOT**
+automatically reach the live **field-record** VM (`samo-we-field-record`, Hetzner
+`137236481`, `ssh -p 2223 agent@178.105.246.151`).
+
+field-record today runs its **own UNVERSIONED, snowflake preview cron**
+(`preview-reconcile.sh` / `preview-teardown.sh`) — these scripts are **not present
+anywhere in this samohost repo** (verified: no match under version control) and
+**predate / sit outside** the samohost-managed lifecycle. They are therefore
+**missing the self-heal** behaviour just fixed here: a born-broken env still looks
+deployed, a DB-UNREACHABLE clone after the daily DBLab refresh is never reclassified
+dead, and there is no idle autodestroy / `preview rebuild` path.
+
+**The real fix for field-record is a CUTOVER** of that VM off its hand-rolled cron
+and onto the samohost-managed preview lifecycle (the `trigger`/`env`/`preview`
+commands carrying these fixes). That is explicitly **OUT OF SCOPE for this MVP run**
+because:
+- it **mutates a live client VM** (no silent client-VM changes), and
+- it must go through **platform-team / `samjr` bootstrap** coordination — the VM's
+  source of truth is the `samjr/samo-we-field-record-bootstrap` branch, and the
+  rule is *do not snowflake the VM*; the cutover has to be authored there, not patched
+  ad-hoc on the box.
+
+**Until the cutover happens, the merged platform fixes do not protect field-record's
+previews.** This item stays OPEN and is the one held decision from this run.
