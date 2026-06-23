@@ -151,7 +151,13 @@ describe("buildEnvCreateScript", () => {
   test("systemd instance + caddy vhost use full-path sudo only", () => {
     const s = buildEnvCreateScript(app(), target());
     expect(s).toContain("field-record@field-record-1-feat-x.service");
-    expect(s).toContain('sudo /usr/bin/systemctl enable --now');
+    // Fix: unit phase uses is-active → restart (re-create path) or enable --now
+    // (initial create path). Both operations re-read .env; the old bare
+    // `enable --now` no-op on active units is gone from the create path.
+    expect(s).toContain('sudo /usr/bin/systemctl restart "$SAMOHOST_UNIT_INSTANCE"');
+    expect(s).toContain('systemctl is-active');
+    // enable --now is kept for the initial-create (unit inactive) branch.
+    expect(s).toContain('sudo /usr/bin/systemctl enable --now "$SAMOHOST_UNIT_INSTANCE"');
     expect(s).toContain("sudo /usr/bin/tee");
     expect(s).toContain("sudo /usr/bin/systemctl reload caddy");
     // Never a bare `sudo systemctl` (issue #99 exact-path grants).
@@ -2314,5 +2320,59 @@ describe("port-check phase — foreign-occupant detection", () => {
     for (const db of ["dblab", "template", "none"] as const) {
       expect(bashSyntaxOk(buildEnvCreateScript(app(), target({ dbBackend: db })))).toBe(true);
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Bug fix: unit restart (issue preview-create-restart)
+//
+// ROOT CAUSE: the unit phase emits `systemctl enable --now "$UNIT"` which is
+// a no-op when the unit is already active (systemd returns 0 without touching
+// the running process). A process that was started on OLD_PORT keeps listening
+// on OLD_PORT even after `.env` is rewritten with NEW_PORT — the new Caddy
+// snippet routes to NEW_PORT, nothing listens there → external probe 502.
+//
+// FIX: the unit phase must ALWAYS bring the unit to a fresh state that reflects
+// the current `.env`. The correct idiom:
+//   systemctl enable "$UNIT" && systemctl restart "$UNIT"
+// or, equivalently for an already-active unit:
+//   is-active "$UNIT" → restart, else → enable --now
+//
+// Either form is acceptable; what is NOT acceptable is `enable --now` alone
+// (which systemd treats as a no-op on an active unit).
+//
+// These tests are RED on the current codebase (which only emits `enable --now`)
+// and MUST PASS after the fix.
+// ---------------------------------------------------------------------------
+
+describe("unit phase restart (preview-create-restart fix)", () => {
+  test("unit phase emits a restart command so a re-create re-reads the fresh .env (enable --now alone is a no-op on active units)", () => {
+    const s = buildEnvCreateScript(app(), target());
+    // The unit phase MUST ensure the unit (re)starts and re-reads .env.
+    // Acceptable forms: `systemctl restart`, or `is-active … restart … enable --now`.
+    // `enable --now` alone is insufficient — systemd treats it as a no-op on active units.
+    const hasRestart = s.includes("systemctl restart") || s.includes("systemctl is-active");
+    expect(hasRestart).toBe(true);
+  });
+
+  test("unit phase emits explicit restart (not just enable --now) — same for every db backend", () => {
+    for (const db of ["dblab", "template", "none"] as const) {
+      const s = buildEnvCreateScript(app(), target({ dbBackend: db }));
+      // Must have restart or is-active (conditional restart idiom).
+      // The bare `enable --now` no-op path must be replaced.
+      const hasRestart = s.includes("systemctl restart") || s.includes("systemctl is-active");
+      expect(hasRestart).toBe(true);
+    }
+  });
+
+  test("unit phase script is still valid bash after adding the restart step", () => {
+    expect(bashSyntaxOk(buildEnvCreateScript(app(), target()))).toBe(true);
+  });
+
+  test("host-prep sudoers include the restart grant (unit restart needs it)", () => {
+    const hp = buildHostPrepScript(app(), "agent");
+    // After the fix, the create script will call `systemctl restart field-record@*.service`.
+    // The sudoers NOPASSWD block must cover this or the restart will be denied.
+    expect(hp).toContain("NOPASSWD: /usr/bin/systemctl restart field-record@*.service");
   });
 });

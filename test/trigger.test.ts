@@ -1291,3 +1291,124 @@ describe("previewDbBackendFor (PR-preview DB backend selection)", () => {
     expect(previewDbBackendFor(app)).toBe("dblab");
   });
 });
+
+// ---------------------------------------------------------------------------
+// Bug fix: trigger ensurePreviewImpl err-sink (preview-create-restart)
+//
+// ROOT CAUSE: the trigger's ensurePreviewImpl closure (trigger.ts:~795) passes
+// `noop` as the err sink to runEnvCreate. When runEnvCreate fails (e.g. external
+// probe returns 502), the detailed error message is silently swallowed — the
+// trigger only logs action:"failed" with no reason. Future preview breaks are
+// completely invisible in journalctl -u samohost-trigger.
+//
+// FIX: pass a real err sink that writes to process.stderr (mirror reapPreviewImpl
+// at ~line 904 which does: `process.stderr.write("samohost: pr-preview reap: ...")`).
+//
+// The test below verifies the CONTRACT: when runTriggerRun runs a prPreview that
+// produces an error (via a fake prPreview dep that calls its own err sink), the
+// error MUST reach the trigger's err sink — not be silently dropped.
+//
+// We test the production trigger's prPreview error-forwarding path by injecting
+// a fake prPreview that invokes the trigger's own err output and asserting it
+// appears in the captured stderr.
+//
+// These tests are RED on the current codebase (err is not forwarded) and MUST
+// PASS after the fix.
+// ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// Bug fix: trigger prPreview err-sink forwarding (preview-create-restart)
+//
+// ROOT CAUSE: trigger.ts calls `deps.prPreview(app, vmRecord)` WITHOUT passing
+// the trigger's own `err` sink. Inside the prod prPreview closure, the
+// `ensurePreviewImpl` calls `runEnvCreate(..., noop)` where `noop` is the err
+// sink. When runEnvCreate fails (e.g. external probe 502), the error message
+// "samohost: external probe failed …" is silently dropped — the trigger only
+// logs action:"failed" with no reason in journalctl.
+//
+// FIX: `TriggerDeps.prPreview` signature gains an `err` sink parameter so the
+// trigger can forward its own err sink: `deps.prPreview(app, vmRecord, err)`.
+// The prod prPreview closure then threads `err` into `ensurePreviewImpl`.
+//
+// TEST CONTRACT:
+//  - After the fix, `runTriggerRun` calls `deps.prPreview(app, vm, err)`.
+//  - A fake prPreview that writes to the err it receives will surface messages
+//    in the trigger's stderr output.
+//  - Currently the call is `deps.prPreview(app, vm)` (no err) — the fake never
+//    gets a real sink → messages never appear in c.e → test is RED.
+//
+// These tests are RED on the current codebase and MUST PASS after the fix.
+// (PrPreviewSummary imported above at the start of the PR-3 test section.)
+// ---------------------------------------------------------------------------
+
+describe("trigger prPreview err-sink forwarding (preview-create-restart fix)", () => {
+  let dir: string;
+  let vmStore: StateStore;
+  let appStore: AppStore;
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), "samohost-trigger-errsink-"));
+    vmStore = new StateStore(join(dir, "state.json"));
+    appStore = new AppStore(join(dir, "apps.json"));
+  });
+
+  afterEach(() => rmSync(dir, { recursive: true, force: true }));
+
+  test("trigger passes its err sink to prPreview; errors from ensurePreview reach journalctl (not noop-swallowed)", async () => {
+    vmStore.upsert(makeVm());
+    appStore.upsert(makeApp({ deployedSha: SHA_A })); // up-to-date → no main-app deploy
+
+    const PROBE_ERR_MSG =
+      "samohost: external probe failed for https://field-record-preview-feat-x.samo.cat/" +
+      " — on-host phases passed but the public URL is unreachable (HTTP 502)";
+
+    // Fake prPreview that accepts the trigger's err sink as its third argument
+    // (the fix changes the dep signature to include err).
+    // When called WITHOUT an err sink (current behaviour), _err is undefined/noop
+    // and the message is never written → c.e stays empty → test FAILS (RED).
+    // After the fix, runTriggerRun calls prPreview(app, vm, err) and the message
+    // IS written to c.e → test PASSES (GREEN).
+    const fakePrPreview = async (
+      _app: AppRecord,
+      _vm: VmRecord,
+      errSink?: (s: string) => void,
+    ): Promise<PrPreviewSummary> => {
+      // Write the failure reason to whichever err sink we received.
+      if (errSink !== undefined) {
+        errSink(PROBE_ERR_MSG);
+      }
+      return {
+        app: _app.name,
+        vm: _vm.name,
+        openPrs: 1,
+        results: [{ prNumber: 99, branch: "feat/x", action: "failed" }],
+      };
+    };
+
+    const { fetch: fakeFetch } = makeFakeFetch([]);
+    const deps: TriggerDeps = {
+      resolveRef: () => Promise.resolve(SHA_A),
+      deploy: makeFakeDeploy(0).deploy,
+      fetch: fakeFetch,
+      env: {},
+      now: () => new Date(),
+      // Cast needed because the current signature is (app, vm) → Promise.
+      // After the fix the signature becomes (app, vm, err?) → Promise and
+      // the cast is no longer required.
+      prPreview: fakePrPreview as TriggerDeps["prPreview"],
+    };
+
+    const c = capture();
+    await runTriggerRun(
+      { dryRun: false, prPreviews: true },
+      { json: true },
+      vmStore, appStore, deps, c.out, c.err,
+    );
+
+    // After the fix runTriggerRun calls deps.prPreview(app, vm, err) so the
+    // fake receives the real err sink and the probe-failure message lands in
+    // c.e. Currently the call omits err → fakePrPreview receives undefined →
+    // message never written → c.e is empty → this assertion FAILS (RED).
+    expect(c.e).toContain(PROBE_ERR_MSG);
+  });
+});

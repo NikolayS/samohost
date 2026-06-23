@@ -711,23 +711,34 @@ export async function runEnvCreate(
     }
   }
 
-  // Record on success — AND on failure, so the allocated name/port are pinned
-  // for an idempotent re-run / destroy-cleanup. Failed envs are visible in
-  // `env list` rather than silently leaking host-side residue.
-  const record: EnvRecord = {
-    id: existing?.id ?? deps.uuid(),
-    vmId: r.vm.id,
-    appName: r.app.name,
-    branch: input.branch,
-    name: target.name,
-    port: target.port,
-    vhost: target.vhost,
-    dbBackend: target.dbBackend,
-    ...(target.dbName !== undefined ? { dbName: target.dbName } : {}),
-    ...(target.templateDb !== undefined ? { templateDb: target.templateDb } : {}),
-    createdAt: existing?.createdAt ?? deps.now().toISOString(),
-  };
-  envStore.upsert(record);
+  // Record on success — ALWAYS write for a fresh create so the allocated
+  // name/port are pinned for an idempotent re-run / destroy-cleanup.
+  // On FAILURE of a RE-CREATE (existing record found), do NOT overwrite:
+  // the existing record may carry prNumber and other fields that the
+  // new record construction does not include (prNumber is absent from
+  // target/record — it is only set by the trigger after a successful create).
+  // Overwriting on re-create failure would clear prNumber, breaking the
+  // closed-PR reaper guard (`env.prNumber !== undefined`) and causing the
+  // broken env to be silently stranded (never reaped).
+  // Idempotency for re-creates is preserved: the caller reads the same existing
+  // record on the next attempt via targetFromRecord(existing).
+  const shouldUpsert = outcome === "ok" || existing === undefined;
+  if (shouldUpsert) {
+    const record: EnvRecord = {
+      id: existing?.id ?? deps.uuid(),
+      vmId: r.vm.id,
+      appName: r.app.name,
+      branch: input.branch,
+      name: target.name,
+      port: target.port,
+      vhost: target.vhost,
+      dbBackend: target.dbBackend,
+      ...(target.dbName !== undefined ? { dbName: target.dbName } : {}),
+      ...(target.templateDb !== undefined ? { templateDb: target.templateDb } : {}),
+      createdAt: existing?.createdAt ?? deps.now().toISOString(),
+    };
+    envStore.upsert(record);
+  }
 
   const exitCode = outcome === "ok" ? 0 : 1;
   const report: EnvCreateReport = {

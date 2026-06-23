@@ -202,13 +202,19 @@ export interface TriggerDeps {
    * true, called once per live candidate app (after the GC pass, so gc's reap
    * results are visible to the reaper). Returns a PrPreviewSummary per app.
    *
-   * Signature: (app, vm) => Promise<PrPreviewSummary>
+   * Signature: (app, vm, err?) => Promise<PrPreviewSummary>
+   *
+   * The optional `err` sink receives failure reasons from ensurePreview (e.g.
+   * "external probe failed … HTTP 502") so they reach journalctl rather than
+   * being silently dropped. Callers that omit err receive no diagnostic output
+   * for create failures (backward-compatible — existing tests that pass no err
+   * still compile and run unchanged).
    *
    * OPTIONAL so that all existing test fixtures that build {resolveRef, deploy,
    * fetch, now} continue to compile and run unchanged. When absent, the PR-preview
    * pass is silently skipped even if input.prPreviews is true.
    */
-  prPreview?: (app: AppRecord, vm: VmRecord) => Promise<PrPreviewSummary>;
+  prPreview?: (app: AppRecord, vm: VmRecord, err?: (s: string) => void) => Promise<PrPreviewSummary>;
   /**
    * OPTIONAL: Curried self-heal function (samohost #78). When present and
    * input.prPreviews is true, called once per live candidate app BEFORE the
@@ -536,7 +542,7 @@ export async function runTriggerRun(
 
       for (const { app, vm: vmRecord } of liveCandidateApps) {
         try {
-          const summary = await deps.prPreview(app, vmRecord);
+          const summary = await deps.prPreview(app, vmRecord, err);
           prPreviewSummaries.push(summary);
         } catch (e) {
           // PR-preview failure for one app must not abort the cycle
@@ -724,7 +730,7 @@ export function defaultTriggerDeps(): TriggerDeps {
       return runHealPass(app, vmRecord, defaultHealDeps(healEnvStore), noop, (s: string) => process.stderr.write(s + "\n"));
     },
 
-    prPreview: async (app: AppRecord, vmRecord: VmRecord): Promise<PrPreviewSummary> => {
+    prPreview: async (app: AppRecord, vmRecord: VmRecord, callerErr?: (s: string) => void): Promise<PrPreviewSummary> => {
       const { spawnSync } = await import("node:child_process");
       const {
         runPrPreviewPass,
@@ -733,6 +739,14 @@ export function defaultTriggerDeps(): TriggerDeps {
       const { StateStore: PrVmStore } = await import("../state/store.ts");
       const { AppStore: PrAppStore } = await import("../state/apps.ts");
       const { EnvStore: PrEnvStore } = await import("../state/envs.ts");
+
+      // Real err sink: writes to caller's err (→ journalctl -u samohost-trigger)
+      // so runEnvCreate failures (e.g. "external probe failed … HTTP 502") are
+      // visible rather than silently dropped. Mirrors reapPreviewImpl (~line 904).
+      const ensureErr = (s: string) => {
+        process.stderr.write(`samohost: pr-preview ensure: ${s}\n`);
+        callerErr?.(s);
+      };
 
       const prEnvStore = new PrEnvStore();
 
@@ -774,7 +788,6 @@ export function defaultTriggerDeps(): TriggerDeps {
         const prVmStore = new PrVmStore();
         const prAppStore = new PrAppStore();
         const envExecDeps = mkEnvExecDeps();
-        const noop = (_s: string) => {};
         let capturedOut = "";
         const capOut = (s: string) => { capturedOut += s; };
 
@@ -792,7 +805,7 @@ export function defaultTriggerDeps(): TriggerDeps {
           prEnvStore,
           envExecDeps,
           capOut,
-          noop,
+          ensureErr,  // real err sink: surfaces failures in journalctl
         );
 
         // Parse the EnvCreateReport to get vhost + outcome.
@@ -806,15 +819,18 @@ export function defaultTriggerDeps(): TriggerDeps {
           // Parse failure → treat as failed
         }
 
-        // Re-read the persisted record and stamp lastDeployedSha + prNumber.
-        // prNumber marks this env as PR-managed so the closed-PR reaper knows it
-        // is safe to reap (manually-created/demo envs lack prNumber and are kept).
-        // We need the vm id — resolve it from the store.
-        const vmRec = prVmStore.list().find((v) => v.name === args.vm);
-        if (vmRec !== undefined && vhost !== "") {
-          const rec = prEnvStore.get(vmRec.id, args.app, args.branch);
-          if (rec !== undefined) {
-            prEnvStore.upsert({ ...rec, lastDeployedSha: args.headSha, prNumber: args.prNumber });
+        // Stamp lastDeployedSha + prNumber ONLY on success.
+        // On failure: do NOT update lastDeployedSha — the next cycle must see
+        // needDeploy=true (existing.lastDeployedSha !== pr.headSha) so it retries.
+        // Without this gate, a failed create stamps the headSha and the trigger
+        // silently treats the broken preview as "up to date" forever.
+        if (outcome === "ok") {
+          const vmRec = prVmStore.list().find((v) => v.name === args.vm);
+          if (vmRec !== undefined && vhost !== "") {
+            const rec = prEnvStore.get(vmRec.id, args.app, args.branch);
+            if (rec !== undefined) {
+              prEnvStore.upsert({ ...rec, lastDeployedSha: args.headSha, prNumber: args.prNumber });
+            }
           }
         }
 

@@ -548,3 +548,173 @@ describe("env commands", () => {
     expect(c2.e).toContain("app not found");
   });
 });
+
+// ---------------------------------------------------------------------------
+// Bug fix: no port-poisoning on re-create failure (preview-create-restart)
+//
+// ROOT CAUSE: envStore.upsert(record) runs on BOTH success AND failure. When
+// an existing good env is re-created and the external probe fails (HTTP 502),
+// the upsert runs again. Although the port is the same (targetFromRecord
+// preserves it), the re-create failure means the running unit was NOT restarted
+// (bug #1 — enable --now is a no-op). The env is now in a "half-updated" state:
+// .env was rewritten, Caddy was reloaded, but the unit still runs on the OLD
+// port. By always upserting, the store loses any per-field signal that the
+// env is degraded vs. healthy.
+//
+// The companion fix in the trigger (ensurePreviewImpl): lastDeployedSha MUST
+// NOT be stamped on failure, so the next cycle sees needDeploy=true and retries
+// (tested in trigger.test.ts). The env-command fix ensures a failed re-create
+// does NOT upsert when an existing good record is present.
+//
+// FIX: when outcome !== "ok" AND existing record was found, skip the upsert
+// entirely — the record is preserved unchanged from before the failed attempt.
+// A fresh create (no existing) still writes on failure (idempotent retry path).
+//
+// These tests are RED on the current codebase (which always upserts) and MUST
+// PASS after the fix.
+// ---------------------------------------------------------------------------
+
+describe("no port-poisoning on re-create failure (preview-create-restart fix)", () => {
+  let dir: string;
+  let vmStore: StateStore;
+  let appStore: AppStore;
+  let envStore: EnvStore;
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), "samohost-portpreserve-"));
+    vmStore = new StateStore(join(dir, "state.json"));
+    appStore = new AppStore(join(dir, "apps.json"));
+    envStore = new EnvStore(join(dir, "envs.json"));
+    vmStore.upsert(vm());
+    appStore.upsert(appRec());
+  });
+
+  afterEach(() => rmSync(dir, { recursive: true, force: true }));
+
+  function fakeDepsWithProbe502(output: string): EnvExecDeps {
+    let n = 0;
+    return {
+      remote: (_vm, _script) => Promise.resolve({ code: 0, stdout: output, stderr: "" }),
+      now: () => new Date("2026-06-22T12:00:00.000Z"),
+      uuid: () => `uuid-${++n}`,
+      httpProbe: async (_url: string) => ({ status: 502, ok: false }),
+      sleep: async (_ms: number) => {},
+    };
+  }
+
+  test("re-create failure does NOT clobber prNumber on an existing PR-managed env (upsert-on-failure drops the prNumber field)", async () => {
+    // A PR-preview env has prNumber stamped by the trigger after a successful
+    // create. runEnvCreate never writes prNumber (it's not in target), so
+    // if a re-create fails and the upsert still runs, the spread `{ ...record }`
+    // does NOT include prNumber → the stored record loses prNumber → the
+    // closed-PR reaper guard (`env.prNumber !== undefined`) is bypassed and the
+    // broken env is never reaped.
+    //
+    // Step 1: first create succeeds.
+    await runEnvCreate(
+      { vm: "samo-we-field-record", app: "field-record-1", branch: "feat/z",
+        db: "dblab", previewDomain: "samo.cat" },
+      { json: false }, vmStore, appStore, envStore, fakeDeps(CREATE_OK),
+      capture().out, capture().err,
+    );
+
+    // Step 2: Simulate the trigger stamping prNumber after a successful create
+    // (mirrors trigger.ts:817).
+    const rec = envStore.get("vm-1111", "field-record-1", "feat/z");
+    expect(rec).toBeDefined();
+    envStore.upsert({ ...rec!, prNumber: 42 });
+    const withPrNumber = envStore.get("vm-1111", "field-record-1", "feat/z");
+    expect(withPrNumber?.prNumber).toBe(42); // guard: prNumber is set
+
+    // Step 3: re-create the env (trigger retry cycle). On-host passes but
+    // external probe fails → outcome="failed". The FIX must skip the upsert
+    // so prNumber is preserved. Current code upserts without prNumber → it
+    // gets cleared → test FAILS (RED).
+    const code2 = await runEnvCreate(
+      { vm: "samo-we-field-record", app: "field-record-1", branch: "feat/z",
+        db: "dblab", previewDomain: "samo.cat" },
+      { json: false }, vmStore, appStore, envStore,
+      fakeDepsWithProbe502(CREATE_OK), capture().out, capture().err,
+    );
+    expect(code2).toBe(1);
+
+    // prNumber must still be 42 — not cleared by the failed re-create.
+    const afterFailure = envStore.get("vm-1111", "field-record-1", "feat/z");
+    expect(afterFailure?.prNumber).toBe(42);
+  });
+
+  test("fresh create failure (no existing record) STILL writes the record (idempotent retry)", async () => {
+    // A FRESH create (no existing) that fails must still pin name/port into
+    // the store for idempotent re-run. This behaviour is unchanged.
+    const failOut = [M("clone", "start"), M("clone", "fail")].join("\n");
+    const c = capture();
+    const code = await runEnvCreate(
+      { vm: "samo-we-field-record", app: "field-record-1", branch: "feat/fresh-fail",
+        db: "dblab", previewDomain: "samo.cat" },
+      { json: false }, vmStore, appStore, envStore, fakeDeps(failOut), c.out, c.err,
+    );
+    expect(code).toBe(1);
+    expect(envStore.get("vm-1111", "field-record-1", "feat/fresh-fail")).toBeDefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Bug fix: err-sink surfacing in runEnvCreate (preview-create-restart)
+//
+// ROOT CAUSE: the trigger's ensurePreviewImpl closure calls runEnvCreate with
+// `noop` as the err sink. When runEnvCreate fails (e.g. external probe 502),
+// the error message `"samohost: external probe failed ..."` is silently
+// swallowed — the trigger only sees outcome:"failed" with no reason. This makes
+// preview failures completely self-diagnosing: journalctl -u samohost-trigger
+// shows only `action:"failed"` with no detail.
+//
+// FIX: the err sink passed to runEnvCreate from ensurePreviewImpl must write to
+// stderr (mirror the pattern used by reapPreviewImpl). The test below verifies
+// that the err string from runEnvCreate reaches the caller's err sink — so any
+// caller that wires a real sink (not noop) will surface the failure reason.
+//
+// The trigger-side fix (changing noop → real err sink) is tested in trigger.test.ts.
+// ---------------------------------------------------------------------------
+
+describe("err-sink surfacing from runEnvCreate (preview-create-restart fix)", () => {
+  let dir: string;
+  let vmStore: StateStore;
+  let appStore: AppStore;
+  let envStore: EnvStore;
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), "samohost-errsink-"));
+    vmStore = new StateStore(join(dir, "state.json"));
+    appStore = new AppStore(join(dir, "apps.json"));
+    envStore = new EnvStore(join(dir, "envs.json"));
+    vmStore.upsert(vm());
+    appStore.upsert(appRec());
+  });
+
+  afterEach(() => rmSync(dir, { recursive: true, force: true }));
+
+  test("external probe failure reason is delivered to the err sink (not silently dropped)", async () => {
+    let n = 0;
+    const deps: EnvExecDeps = {
+      remote: (_vm, _script) => Promise.resolve({ code: 0, stdout: CREATE_OK, stderr: "" }),
+      now: () => new Date("2026-06-11T12:00:00.000Z"),
+      uuid: () => `uuid-${++n}`,
+      httpProbe: async (_url: string) => ({ status: 502, ok: false }),
+      sleep: async (_ms: number) => {},
+    };
+
+    const errMessages: string[] = [];
+    const errSink = (s: string) => errMessages.push(s);
+
+    const code = await runEnvCreate(
+      { vm: "samo-we-field-record", app: "field-record-1", branch: "feat/errsink",
+        db: "dblab", previewDomain: "samo.cat" },
+      { json: false }, vmStore, appStore, envStore, deps, capture().out, errSink,
+    );
+    expect(code).toBe(1);
+    // The err sink MUST have received the probe failure reason, not been silent.
+    const combinedErr = errMessages.join("\n");
+    expect(combinedErr).toContain("502");
+    expect(combinedErr).toContain("external probe failed");
+  });
+});
