@@ -47,6 +47,7 @@ import {
 import type { EnvStore } from "../state/envs.ts";
 import type { PrPreviewSummary } from "../preview/pr.ts";
 import type { HealSummary } from "../preview/heal.ts";
+import type { EnvIdleGcDeps } from "./env-idle.ts";
 import type { AppRecord, EnvDbBackend, VmRecord } from "../types.ts";
 
 // ---------------------------------------------------------------------------
@@ -117,6 +118,23 @@ export interface TriggerRunInput {
    * DBLab backend drops+re-creates only the per-env clone, not prod).
    */
   heal?: boolean;
+  /**
+   * When true, run an idle-GC pass per live VM in scope after the deploy loop.
+   *
+   * The idle-GC pass reads each env's Caddy JSON access log at
+   * `/var/log/caddy/<env-name>.log` via the pinned SSH runner, stamps
+   * `EnvRecord.lastAccess` from the max `ts`, then computes
+   * `idle = now - lastAccess` (falling back to `createdAt` when no access
+   * has been recorded) and reaps any env whose idle time exceeds the threshold.
+   *
+   * Threshold: `SAMOHOST_IDLE_THRESHOLD_MS` env var (default 45 min).
+   * Reap gate: `SAMOHOST_IDLE_REAP=1` env var (default warn-only).
+   *
+   * SAFETY: OPT-IN. Destructive when SAMOHOST_IDLE_REAP=1; warn-only otherwise.
+   * This flag gates whether the idle-GC dep is invoked at all — the inner
+   * SAMOHOST_IDLE_REAP env var gates whether actual destruction occurs.
+   */
+  idleGc?: boolean;
 }
 
 export interface TriggerAppResult {
@@ -231,6 +249,33 @@ export interface TriggerDeps {
    * fixtures compile; absent => heal pass skipped.
    */
   heal?: (app: AppRecord, vm: VmRecord) => Promise<HealSummary>;
+  /**
+   * OPTIONAL: Curried idle-GC function (samohost #87). When present and
+   * `input.idleGc` is true, called once per unique live VM in scope after the
+   * deploy loop and branch-gone GC pass. For each env on the VM, reads the
+   * per-vhost Caddy JSON access log via the injected `readRemoteLog` dep,
+   * stamps `EnvRecord.lastAccess`, then reaps idle-past-threshold envs.
+   *
+   * Signature: (vmId, opts) => Promise<GcSummary>
+   *
+   * `opts.reap`: false = warn-only (logs candidates, destroys nothing);
+   *             true  = actually call runEnvDestroy per candidate.
+   * `opts.envStore`: the same EnvStore instance the trigger uses (so
+   *   lastAccess stamps are visible to callers of envStore.get after the
+   *   pass without a re-load).
+   * `opts.readRemoteLog`: injectable SSH reader, same shape as EnvIdleGcDeps.
+   *
+   * OPTIONAL so all existing test fixtures that build {resolveRef, deploy,
+   * fetch, now} continue to compile and run unchanged.
+   */
+  idleGc?: (
+    vmId: string,
+    opts: {
+      reap: boolean;
+      envStore: EnvStore;
+      readRemoteLog: EnvIdleGcDeps["readRemoteLog"];
+    },
+  ) => Promise<GcSummary>;
 }
 
 // ---------------------------------------------------------------------------
@@ -489,6 +534,71 @@ export async function runTriggerRun(
           // GC failure for one VM must not abort the cycle
           err(
             `samohost: warning: gc pass failed for VM ${vmId}: ` +
+              (e instanceof Error ? e.message : String(e)),
+          );
+        }
+      }
+    }
+  }
+
+  // ---- Idle-GC pass (samohost #87) ----------------------------------------
+  // Runs AFTER the branch-gone GC pass (so gc's reap results are visible)
+  // and BEFORE the self-heal pass (so a re-healed clone is not immediately
+  // idle-reaped if it has recent traffic in the new access log).
+  //
+  // For each unique live VM in scope:
+  //   1. Call deps.idleGc(vmId, { reap, envStore, readRemoteLog }) which:
+  //      a. For every env on the VM, reads /var/log/caddy/<name>.log via SSH.
+  //      b. Stamps EnvRecord.lastAccess from max(ts) in that file (or falls
+  //         back to createdAt when the file is absent / empty / unreachable).
+  //      c. Reaps envs idle > SAMOHOST_IDLE_THRESHOLD_MS when reap=true, or
+  //         logs warn-only when reap=false.
+  //   2. The reap flag is derived from SAMOHOST_IDLE_REAP env var (default:
+  //      false = warn-only). --dry-run does NOT propagate here because the
+  //      idle-GC reap gate is a SEPARATE operator control (SAMOHOST_IDLE_REAP);
+  //      --dry-run already gates the branch-gone gc above.
+  //
+  // SAFETY: OPT-IN via input.idleGc. Absent => silently skipped.
+  //         Destructive ops gate on SAMOHOST_IDLE_REAP in the dep.
+  if (input.idleGc === true && deps.idleGc !== undefined) {
+    const seenVmIdsForIdle = new Set<string>();
+    for (const app of candidates) {
+      const vmRecord = allVms.find((v) => v.id === app.vmId);
+      if (vmRecord === undefined) continue;
+      if (!LIVE_STATES.has(vmRecord.lifecycleState)) continue;
+      seenVmIdsForIdle.add(vmRecord.id);
+    }
+
+    if (seenVmIdsForIdle.size > 0) {
+      // Resolve the effective envStore (prefer deps.envStore if set).
+      const effectiveEnvStore = deps.envStore ?? defaultEnvStore();
+
+      // Resolve the SSH-based log reader from the production dep (or a noop for tests).
+      // The production idleGc closure owns the real readRemoteLog; we pass a default
+      // that the closure may ignore (it has its own wired reader).
+      const defaultReadRemoteLog = async (_path: string): Promise<string> => "";
+
+      // Import readIdleReap lazily to avoid a circular-at-load issue.
+      const { readIdleReap: resolveIdleReap } = await import("./env-idle.ts");
+      const reap = resolveIdleReap();
+
+      for (const vmId of seenVmIdsForIdle) {
+        try {
+          const summary = await deps.idleGc(vmId, {
+            reap,
+            envStore: effectiveEnvStore,
+            readRemoteLog: defaultReadRemoteLog,
+          });
+
+          if (!opts.json && summary.candidates > 0) {
+            out(
+              `  idle-gc ${vmId}: candidates=${summary.candidates} reaped=${summary.reaped}${reap ? "" : " (warn-only)"}`,
+            );
+          }
+        } catch (e) {
+          // idle-GC failure for one VM must not abort the cycle.
+          err(
+            `samohost: warning: idle-gc pass failed for VM ${vmId}: ` +
               (e instanceof Error ? e.message : String(e)),
           );
         }
@@ -955,6 +1065,130 @@ export function defaultTriggerDeps(): TriggerDeps {
         envStore: prEnvStore,
         now: () => new Date(),
       }, noop, noop);
+    },
+
+    // Curried idle-GC function (samohost #87). Only invoked when
+    // input.idleGc is true. For each env on the VM:
+    //   1. Read /var/log/caddy/<name>.log via pinned SSH runner.
+    //   2. Parse max(ts) → stamp EnvRecord.lastAccess.
+    //   3. Compute idle = now - lastAccess (fallback to createdAt).
+    //   4. Reap envs idle > SAMOHOST_IDLE_THRESHOLD_MS when reap=true,
+    //      or log warn-only when reap=false.
+    //
+    // The `readRemoteLog` arg in opts is the caller-supplied reader — in
+    // the trigger's runTriggerRun call it is a noop default (the real reader
+    // is wired HERE in the closure via spawnSync). We build our own real
+    // readRemoteLog from the VM record (looked up by vmId at call time).
+    idleGc: async (
+      vmId: string,
+      opts: {
+        reap: boolean;
+        envStore: EnvStore;
+        readRemoteLog: EnvIdleGcDeps["readRemoteLog"];
+      },
+    ): Promise<GcSummary> => {
+      const {
+        runEnvIdleGc,
+        readAccessLogMaxTs,
+        stampLastAccess,
+        readIdleThresholdMs,
+      } = await import("./env-idle.ts");
+      const { StateStore: IdleVmStore } = await import("../state/store.ts");
+      const { spawnSync } = await import("node:child_process");
+      const { buildSshArgs, ensureKnownHosts, defaultKnownHostsDir } = await import("../ssh/runner.ts");
+
+      const idleVmStore = new IdleVmStore();
+      const allVmsForIdle = idleVmStore.list();
+      const vm = allVmsForIdle.find((v) => v.id === vmId);
+      if (vm === undefined) {
+        // VM not found in state store — skip silently.
+        return { candidates: 0, reaped: 0, pruned: 0 };
+      }
+
+      // Build a readRemoteLog backed by the pinned SSH runner for this VM.
+      // Uses `cat <logPath>` to read the file; exits 0 even when empty, 1
+      // when the file does not exist (cat returns empty stdout on missing files
+      // on some systems, but we handle that via parseAccessLogMaxTs returning
+      // null on empty content). We use `cat ... || true` to guarantee exit 0
+      // so a missing log file (env just created, no traffic yet) is not an error.
+      const knownHostsDir = process.env["SAMOHOST_KNOWN_HOSTS_DIR"] ?? defaultKnownHostsDir();
+      ensureKnownHosts(vm, knownHostsDir);
+
+      const sshReadFile = async (logPath: string): Promise<string> => {
+        const sshArgs = buildSshArgs(vm, `cat '${logPath}' 2>/dev/null || true`, {
+          knownHostsDir,
+        });
+        const res = spawnSync("ssh", sshArgs, {
+          encoding: "utf8",
+          maxBuffer: 64 * 1024 * 1024, // 64 MB max log size
+          timeout: 30_000, // 30s per file — faster than full script timeout
+        });
+        if (typeof res.status === "number" && res.status !== 0) {
+          throw new Error(`ssh cat ${logPath} exited ${res.status}: ${res.stderr ?? ""}`);
+        }
+        return res.stdout ?? "";
+      };
+
+      const idleEnvStore = opts.envStore;
+      const thresholdMs = readIdleThresholdMs();
+
+      // Step 1: Stamp lastAccess for each env from the access log.
+      const envsOnVm = idleEnvStore.listFor(vmId);
+      for (const env of envsOnVm) {
+        const maxTsEpochSec = await readAccessLogMaxTs(env.name, {
+          readRemoteLog: sshReadFile,
+        });
+        if (maxTsEpochSec !== null) {
+          const iso = new Date(maxTsEpochSec * 1000).toISOString();
+          stampLastAccess(idleEnvStore, env.vmId, env.appName, env.branch, iso);
+        }
+      }
+
+      // Step 2: Run the idle-GC sweep (uses lastAccess just stamped above).
+      const noop = (_s: string) => {};
+      const { runEnvDestroy, defaultEnvExecDeps: mkEnvExecDeps } = await import("./env.ts");
+      const { AppStore: IdleAppStore } = await import("../state/apps.ts");
+
+      const idleAppStore = new IdleAppStore();
+      const envExecDeps = mkEnvExecDeps();
+
+      const destroyEnv = async (
+        _destroyVmId: string,
+        appName: string,
+        branch: string,
+      ): Promise<number> => {
+        return runEnvDestroy(
+          { vm: vm.name, app: appName, branch },
+          { json: false },
+          idleVmStore,
+          idleAppStore,
+          idleEnvStore,
+          envExecDeps,
+          noop,
+          noop,
+        );
+      };
+
+      const report = await runEnvIdleGc(
+        {
+          vm: vmId,
+          idleThresholdMs: thresholdMs,
+          idleReap: opts.reap,
+          now: () => new Date(),
+        },
+        idleVmStore,
+        idleAppStore,
+        idleEnvStore,
+        destroyEnv,
+        noop,
+        (s: string) => process.stderr.write(s + "\n"),
+      );
+
+      return {
+        candidates: report.candidates.length,
+        reaped: report.reaped.length,
+        pruned: 0,
+      };
     },
   };
 }

@@ -231,6 +231,136 @@ export async function runEnvIdleGc(
 }
 
 // ---------------------------------------------------------------------------
+// Caddy JSON access log parsing
+// ---------------------------------------------------------------------------
+
+/**
+ * Caddy JSON access log line shape (format json).
+ *
+ * Real log line (captured from Caddy v2, verified on the field-record-1 VM):
+ *   {"level":"info","ts":1750694400.123,"logger":"http.log.access.log0",
+ *    "msg":"handled request","request":{"remote_ip":"1.2.3.4","remote_port":"55000",
+ *    "proto":"HTTP/1.1","method":"GET","host":"field-record-1-feat-idle.samo.cat",
+ *    "uri":"/","headers":{},"tls":{}},"bytes_read":0,"user_id":"",
+ *    "duration":0.002,"size":0,"status":200,"resp_headers":{}}
+ *
+ * Only `ts` (Unix epoch float, seconds.fraction) is load-bearing for
+ * idle detection. `request.host` allows future per-vhost filtering if
+ * multiple envs ever share one log file (currently each env has its own).
+ */
+interface CaddyLogLine {
+  ts?: number;
+  [key: string]: unknown;
+}
+
+/**
+ * Parse the text content of a Caddy JSON access log (one JSON object per
+ * line) and return the maximum `ts` value (Unix epoch float, seconds).
+ *
+ * Returns `null` when:
+ *   - The content is empty.
+ *   - No line has a valid numeric `ts` field.
+ *
+ * Tolerates:
+ *   - Trailing newlines (Caddy appends \n per line).
+ *   - Malformed or non-JSON lines (skipped silently — e.g. Caddy startup).
+ *   - Lines without a `ts` field (skipped).
+ *
+ * This is a PURE function — no I/O. It operates on the string content already
+ * fetched from the remote host by the caller.
+ */
+export function parseAccessLogMaxTs(content: string): number | null {
+  if (content.length === 0) return null;
+
+  let maxTs: number | null = null;
+
+  for (const rawLine of content.split("\n")) {
+    const line = rawLine.trim();
+    if (line.length === 0) continue;
+
+    let parsed: CaddyLogLine;
+    try {
+      parsed = JSON.parse(line) as CaddyLogLine;
+    } catch {
+      // Malformed line — skip silently.
+      continue;
+    }
+
+    const ts = parsed.ts;
+    if (typeof ts !== "number" || !Number.isFinite(ts)) continue;
+    if (maxTs === null || ts > maxTs) {
+      maxTs = ts;
+    }
+  }
+
+  return maxTs;
+}
+
+// ---------------------------------------------------------------------------
+// EnvIdleGcDeps — injectable dependencies for readAccessLogMaxTs
+// ---------------------------------------------------------------------------
+
+/**
+ * Injectable dependencies for `readAccessLogMaxTs`.
+ *
+ * In production this wraps the pinned SSH runner (same as `runRemote` in
+ * env.ts). In tests a deterministic fake is injected — no SSH, no network.
+ *
+ * `readRemoteLog(logPath)` reads the file at `logPath` on the remote VM via
+ * the pinned SSH runner and returns its full text content, or throws on
+ * connection failure / permission denied.
+ */
+export interface EnvIdleGcDeps {
+  readRemoteLog: (logPath: string) => Promise<string>;
+}
+
+// ---------------------------------------------------------------------------
+// readAccessLogMaxTs — SSH-based reader (uses injected deps)
+// ---------------------------------------------------------------------------
+
+/** Log directory for Caddy access logs (per-vhost JSON files). */
+export const CADDY_LOG_DIR = "/var/log/caddy";
+
+/**
+ * Compute the path of the per-env Caddy access log on the remote host.
+ * Matches the path written by `buildEnvCreateScript` (env/script.ts):
+ *   output file /var/log/caddy/<name>.log
+ */
+export function caddyLogPathFor(envName: string): string {
+  return `${CADDY_LOG_DIR}/${envName}.log`;
+}
+
+/**
+ * Read the per-vhost Caddy JSON access log from the remote VM (via the
+ * injected `deps.readRemoteLog`), parse the max `ts` value, and return it
+ * as a Unix epoch float (seconds).
+ *
+ * Returns `null` when:
+ *   - The log file does not exist (env not yet served any traffic).
+ *   - The file is empty (no requests yet).
+ *   - `deps.readRemoteLog` throws (SSH error, connection refused, permission
+ *     denied) — fail-open: the GC pass falls back to `createdAt`.
+ *
+ * NOTE: This function swallows all errors from `readRemoteLog` by design.
+ * The idle-GC pass must NEVER abort because it cannot reach one VM's log;
+ * it falls back to `createdAt` for that env and continues.
+ */
+export async function readAccessLogMaxTs(
+  envName: string,
+  deps: EnvIdleGcDeps,
+): Promise<number | null> {
+  const logPath = caddyLogPathFor(envName);
+  let content: string;
+  try {
+    content = await deps.readRemoteLog(logPath);
+  } catch {
+    // SSH failure, file-not-found, etc. — fall back gracefully.
+    return null;
+  }
+  return parseAccessLogMaxTs(content);
+}
+
+// ---------------------------------------------------------------------------
 // Production wiring helpers
 // ---------------------------------------------------------------------------
 
