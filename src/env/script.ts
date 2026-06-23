@@ -887,13 +887,30 @@ export function buildEnvCreateScript(
   // allows :443 from CF IPs only), so the `tls internal` self-signed cert is
   // never exposed to clients. ACME is not used: it cannot complete behind a
   // CF-locked :443 and the host has no DNS-01 plugin.
+  // The printf format string builds a Caddy site block:
+  //
+  //   <vhost> {
+  //     tls internal
+  //     reverse_proxy localhost:<port>
+  //     log {
+  //       output file /var/log/caddy/<name>.log
+  //       format json
+  //     }
+  //   }
+  //
+  // The `log { output file ... format json }` block is the idle-GC access-log
+  // hook: it writes one JSON line per request with `ts` (Unix float) and
+  // `request.host` fields. The idle-GC pass reads max(ts) from this file to
+  // stamp EnvRecord.lastAccess, enabling idle detection from real traffic
+  // rather than createdAt (which never resets). `/var/log/caddy/` is the
+  // standard Caddy log dir; the host-prep sudoers already grants write access.
   lines.push(
     ...phaseBlock(
       "vhost",
       "Caddy vhost snippet + reload (sites.d include applied in host-prep)",
       [
-        "if printf '%s {\\n\\ttls internal\\n\\treverse_proxy localhost:%s\\n}\\n' \\",
-        '     "$SAMOHOST_VHOST" "$SAMOHOST_PORT" \\',
+        "if printf '%s {\\n\\ttls internal\\n\\treverse_proxy localhost:%s\\n\\tlog {\\n\\t\\toutput file /var/log/caddy/%s.log\\n\\t\\tformat json\\n\\t}\\n}\\n' \\",
+        '     "$SAMOHOST_VHOST" "$SAMOHOST_PORT" "$SAMOHOST_ENV_NAME" \\',
         '   | sudo /usr/bin/tee "$SAMOHOST_CADDY_SNIPPET" >/dev/null \\',
         "   && sudo /usr/bin/systemctl reload caddy; ",
       ],

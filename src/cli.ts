@@ -316,6 +316,13 @@ trigger run options (samo-level auto-deploy poller — replaces per-client on-bo
                              with the clickable preview URL; reap envs for closed PRs.
                              Also runs the self-heal pass (same as --heal) before the
                              PR-preview pass so re-cut clones are visible to the PR pass.
+  --idle-gc                  run an idle-GC pass per live VM in scope (samohost #87):
+                             reads each env's Caddy JSON access log at
+                             /var/log/caddy/<env-name>.log via SSH, stamps
+                             EnvRecord.lastAccess from the max ts, then reaps envs
+                             idle > SAMOHOST_IDLE_THRESHOLD_MS (default 45 min).
+                             Warn-only by default (SAMOHOST_IDLE_REAP absent/0);
+                             set SAMOHOST_IDLE_REAP=1 to enable actual reaping.
   --json                     emit a JSON TriggerRunReport
 
   Intended to be called from a samohost-managed control-plane systemd timer.
@@ -1696,6 +1703,7 @@ function parseTriggerRun(args: string[]): ParsedTriggerRun {
   let gc: boolean | undefined;
   let heal: boolean | undefined;
   let prPreviews: boolean | undefined;
+  let idleGc: boolean | undefined;
 
   for (let i = 0; i < args.length; i++) {
     const a = args[i]!;
@@ -1723,6 +1731,9 @@ function parseTriggerRun(args: string[]): ParsedTriggerRun {
       case "--pr-previews":
         prPreviews = true;
         break;
+      case "--idle-gc":
+        idleGc = true;
+        break;
       default:
         throw new UsageError(`unknown flag: ${a}`);
     }
@@ -1735,6 +1746,7 @@ function parseTriggerRun(args: string[]): ParsedTriggerRun {
     ...(gc !== undefined ? { gc } : {}),
     ...(heal !== undefined ? { heal } : {}),
     ...(prPreviews !== undefined ? { prPreviews } : {}),
+    ...(idleGc !== undefined ? { idleGc } : {}),
   };
   return { kind: "trigger-run", input, json };
 }
