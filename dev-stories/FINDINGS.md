@@ -184,12 +184,12 @@ the harness's two XFAIL (documented-gap) assertions, NOT fixed here.
   preview stays down until next deploy" half operationally.
   Merged: **#85** (`feat/preview-rebuild-command`), SHA
   `9aa93fb1b358e57701f3073575747fc41ef5df49`.
-- **No-idle-teardown → ADDRESSED (warn-only), PENDING MERGE.** Atomic idle
+- **No-idle-teardown → RESOLVED (merged, warn-only).** Atomic idle
   autodestroy for preview envs keyed on `lastAccess` (NOT `createdAt`), shipped
   **warn-only first** per the operator-prereq / degraded-gate rule. This is the
-  always-on-cost reaping gap. **NOT yet merged** as of this run — tracked in PR
-  **#87** (`feat/preview-idle-autodestroy`, OPEN, tip `e476344`); no merge SHA yet.
-  Mark FIXED only once #87 lands.
+  always-on-cost reaping gap.
+  Merged: **#87** (`feat/preview-idle-autodestroy`), SHA
+  `fab981da942ecd32039be36880c4a45e59518317`.
 - **Wake-on-demand:** still absent — `preview rebuild` is the operator-driven
   substitute; auto wake-on-URL-access remains a gap.
 
@@ -237,6 +237,129 @@ Until then: the **orphan watchdog** (`samohost-fixture-orphan-reaper.timer`, eve
 30m + boot-catchup, `Persistent=true`) is the budget backstop — it reaps any
 stray `samohost-fixture-*` VM older than 60m even when a run is parked here.
 
+### P9. `app register --from-toml` silently dropped `dbBackend`/`previewDbBackend` -> no-DB apps got `dblab` previews
+
+Two coupled defects in the preview-DB-backend selection path, both surfaced by the
+fixture:
+
+1. **`previewDbBackendFor` forced `dblab` for no-DB apps.** It returned
+   `app.previewDbBackend ?? "dblab"`, so an app that carries **no database at all**
+   (`dbBackend === "none"`) still got a `dblab` thin-clone attempt for its previews
+   — a clone of a database that does not exist. The fixture's no-DB fixture app
+   should get **no-DB previews**; instead it tried (and failed) to set up a clone.
+2. **`app register --from-toml` silently dropped `dbBackend` and
+   `previewDbBackend`** from the TOML AppSpec, so even an explicit operator
+   selection never reached the persisted `AppRecord` — `previewDbBackendFor` then
+   fell through to the forced `dblab` default above. The drop was silent (no
+   warning), so the operator had no signal their selection was ignored.
+
+Fix (merged): `previewDbBackendFor` now resolves
+`app.previewDbBackend ?? (app.dbBackend === "none" ? "none" : "dblab")` — a no-DB
+app gets `none` previews, a DB-carrying app keeps the `dblab` default, and an
+explicit `previewDbBackend` always wins. `dbBackend` was added to `AppSpec`
+(`src/types.ts`) and is now carried through `register --from-toml`, and a `--db`
+override was added so the preview DB backend is **selectable** at register time.
+
+**STATUS — RESOLVED (merged).** Selectable preview DB backend + register
+no-longer-drops-`dbBackend` fix. The fixture's live acceptance of this path was
+blocked only by the **orthogonal** `ci-none-skips-preview-deploy` issue below (the
+no-CI fixture repo never deploys a preview at all), NOT by anything wrong in this
+change; CI-green + samorev-PASS on the head SHA.
+Merged: **#88** (`feat/no-db-preview`), squash SHA
+`2d6b6cb10a967ca13e0b74a56943503591e6b3e7`.
+
+---
+
+## FIXTURE BUG-CHAIN — the from-scratch fresh-VM preview path was never exercised end-to-end
+
+The single highest-value finding of this whole effort: **the fresh-VM
+from-scratch preview path (`provision -> host-prep -> register -> create ->
+deploy`) had never been driven end-to-end before this fixture.** Every prior test
+started from an already-prepared VM, so the cold-start path silently accumulated
+defects. Standing the fixture up surfaced **~10 sequential, real bugs**, each only
+reachable once the one before it was cleared:
+
+1. **`cx22-deprecated`** — Hetzner returns 422 for the old smallest type; pinned
+   `cx23` (see P1).
+2. **`provision-ready-gate-too-tight`** — 600s booting->ready gate too short for the
+   hardened first boot; raised to 1200s (see P2).
+3. **`app-bootstrap-invalid-bash`** (#83) — the rendered `app bootstrap` host-prep
+   script was invalid bash and failed when run as root on the fresh VM.
+4. **`clone-auth-unexported-TOKEN_FILE`** (#83) — the clone step's auth helper
+   referenced `TOKEN_FILE` without exporting it, so git clone auth failed on the
+   fresh VM.
+5. **`provision-apt-lock-stall`** (#84) — cloud-init/unattended-upgrades held the
+   apt/dpkg lock, stalling provision-time package installs on the fresh VM.
+6. **`host-prep-not-auto-run`** — `app bootstrap` + `env plan --host-prep` only
+   render scripts; nothing auto-runs them on register, so a fresh VM has no Caddy /
+   closed 443 -> CF 522 (see P7).
+7. **`harness-no-gh-token`** — the harness lacked a `gh`/GitHub token in its env, so
+   PR-driven steps (open/close PR, push) could not authenticate.
+8. **`previewDbBackend-forced-dblab`** (#88) — no-DB app forced to a `dblab` clone
+   for previews (P9.1).
+9. **`register-drops-dbBackend`** (#88) — `register --from-toml` silently dropped
+   `dbBackend`/`previewDbBackend` (P9.2).
+10. **`ci-none-skips-preview-deploy`** (**OPEN**) — the trigger skips deploying a
+    preview for a repo with no CI status; the fixture repo has no
+    `.github/workflows`, so every commit is `ci-none` and **no preview ever
+    deploys** (see OPEN item below).
+
+The lesson: a cold-start, from-scratch acceptance path is worth standing up even
+when it is expensive — it is the only thing that exercises this chain, and it
+found ten real bugs the warm-start tests never could.
+
+---
+
+## OPEN — CI-NONE SKIPS PREVIEW DEPLOY
+
+The trigger **skips deploying a preview when the repo has no CI status.** The
+fixture repo has no `.github/workflows`, so every commit is **`ci-none`** and no
+preview is ever deployed — which blocked the fixture's live acceptance of #88
+(orthogonally, not because #88 was wrong).
+
+Anchor (`src/commands/trigger.ts`, line numbers at time of writing):
+- `~437-443` — the skip path for `ci-none` (no CI status -> skip deploy).
+- `~467` — hardcodes `skipCiGate: false`.
+
+**QUESTION to resolve (do NOT fix now — documenting both options):**
+
+There is a **contradiction to investigate**: an earlier code-map asserted that
+**PR previews deploy at HEAD regardless of CI status.** That contradicts the
+observed `ci-none` skip. Resolve which is intended:
+
+- **Option A — previews SHOULD deploy regardless of CI status.** Then this is a
+  **product bug**: PR previews must deploy for `ci-none` repos (repos with no CI
+  configured), and the `~437-443` skip + `~467` hardcoded `skipCiGate: false`
+  should be revisited so a no-CI repo still gets its preview.
+- **Option B — a previewed repo MUST have CI.** Then this is **not** a platform
+  bug; the **fixture repo** simply needs a trivial CI workflow (a no-op
+  `.github/workflows/*.yml`) so its commits produce a CI status and previews
+  deploy.
+
+Both options are viable; the right one depends on resolving the code-map
+contradiction. Left OPEN and unfixed by this run.
+
+---
+
+## OPEN — DB-backed faithful clone-death self-heal test (not exercisable on the no-DB fixture)
+
+The DB-UNREACHABLE self-heal fix (#86) cannot be verified **live** by the current
+fixture: the fixture app carries **no database** (`dbBackend === "none"`, no-DB
+previews per P9), so there is no `dblab` clone to kill, and the
+clone-death -> DB-UNREACHABLE -> re-materialise path is never exercised
+end-to-end on the live fixture. A faithful live test needs a **DB-backed** fixture
+app whose `dblab` clone can be torn down (e.g. simulate the daily DBLab snapshot
+refresh reaping the clone) so the self-heal reclassify-and-recut path runs for
+real. Left OPEN — unit coverage exists in #86 but the live acceptance gap remains.
+
+---
+
+## OPEN — wake-on-demand (follow-on)
+
+Still absent — see P8. `preview rebuild` (#85) is the operator-driven substitute;
+auto wake-on-URL-access (start a stopped preview unit on first request) remains a
+follow-on gap, not addressed by this run.
+
 ---
 
 ## OPEN — field-record cutover onto samohost-managed lifecycle (NOT done here)
@@ -253,10 +376,20 @@ automatically reach the live **field-record** VM (`samo-we-field-record`, Hetzne
 field-record today runs its **own UNVERSIONED, snowflake preview cron**
 (`preview-reconcile.sh` / `preview-teardown.sh`) — these scripts are **not present
 anywhere in this samohost repo** (verified: no match under version control) and
-**predate / sit outside** the samohost-managed lifecycle. They are therefore
-**missing the self-heal** behaviour just fixed here: a born-broken env still looks
-deployed, a DB-UNREACHABLE clone after the daily DBLab refresh is never reclassified
-dead, and there is no idle autodestroy / `preview rebuild` path.
+**predate / sit outside** the samohost-managed lifecycle. We **watched this
+snowflake cron fail three distinct ways**:
+
+1. **No self-heal.** A born-broken env still looks deployed, and a DB-UNREACHABLE
+   clone after the daily DBLab refresh is never reclassified dead / re-materialised
+   (the exact gaps fixed by #86 in the platform, which the snowflake never gets).
+2. **Port-race on rebuild.** Rebuilding a preview races on port allocation (a port
+   freed by the old unit is re-grabbed before the new unit binds, or two rebuilds
+   collide), so a rebuild can land on an occupied port and 502.
+3. **Unversioned.** The scripts live only on the box, under no version control, so
+   there is no review, no history, and no way to roll a fix forward — every change
+   is an ad-hoc snowflake edit.
+
+It is also **missing idle autodestroy / `preview rebuild`** (#85/#87) entirely.
 
 **The real fix for field-record is a CUTOVER** of that VM off its hand-rolled cron
 and onto the samohost-managed preview lifecycle (the `trigger`/`env`/`preview`
