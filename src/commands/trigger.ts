@@ -57,13 +57,18 @@ import type { AppRecord, EnvDbBackend, VmRecord } from "../types.ts";
 /**
  * Select the DB backend to use when auto-creating a PR-preview env for `app`.
  *
- * Returns `app.previewDbBackend` when set by the operator; otherwise defaults
- * to `"dblab"` (DBLab Engine thin clone — instant, storage-cheap, the primary
- * backend for the SOLO plan). There is NO silent fallback to `"template"`:
- * any non-dblab backend must be stated explicitly in the AppSpec.
+ * Priority (highest → lowest):
+ *   1. `app.previewDbBackend` — explicit operator override for preview envs.
+ *   2. `app.dbBackend === 'none'` — app carries no database at all; previews
+ *      must not attempt a clone (no dblab or template setup needed).
+ *   3. `"dblab"` — default for all DB-carrying apps (thin clone via DBLab
+ *      Engine, instant, storage-cheap, the primary backend for the SOLO plan).
+ *
+ * There is NO silent fallback to `"template"`: any non-dblab backend must be
+ * stated explicitly in the AppSpec.
  */
 export function previewDbBackendFor(app: AppRecord): EnvDbBackend {
-  return app.previewDbBackend ?? "dblab";
+  return app.previewDbBackend ?? (app.dbBackend === "none" ? "none" : "dblab");
 }
 
 // ---------------------------------------------------------------------------

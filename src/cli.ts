@@ -698,21 +698,32 @@ function parsePreviewCloudInit(
 }
 
 /**
- * Parse `preview rebuild <vm> <app> <branch> [--json]`.
+ * Parse `preview rebuild <vm> <app> <branch> [--db dblab|template|none] [--json]`.
  *
  * Three required positional args in order: vm, app, branch.
- * The only supported flag is --json.
+ * Optional flags: --json, --db <backend>.
+ *
+ * When --db is absent the backend is resolved at runtime from the app's
+ * previewDbBackend / dbBackend fields (no-DB apps get 'none' automatically).
  */
 function parsePreviewRebuild(args: string[]): ParsedPreviewRebuild {
   let vm: string | undefined;
   let app: string | undefined;
   let branch: string | undefined;
   let json = false;
+  let db: EnvDbBackend | undefined;
 
   for (let i = 0; i < args.length; i++) {
     const a = args[i]!;
     if (a === "--json") {
       json = true;
+      continue;
+    }
+    if (a === "--db") {
+      const val = args[i + 1];
+      if (val === undefined) throw new UsageError("missing value for --db");
+      db = parseDbBackend(val);
+      i++;
       continue;
     }
     if (a.startsWith("-")) {
@@ -745,7 +756,11 @@ function parsePreviewRebuild(args: string[]): ParsedPreviewRebuild {
     );
   }
 
-  return { kind: "preview-rebuild", input: { vm, app, branch }, json };
+  return {
+    kind: "preview-rebuild",
+    input: { vm, app, branch, ...(db !== undefined ? { db } : {}) },
+    json,
+  };
 }
 
 function parseProvision(args: string[]): ParsedProvision {

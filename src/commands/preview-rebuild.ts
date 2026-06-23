@@ -20,9 +20,11 @@ import {
   type EnvCreateInput,
   type EnvExecDeps,
 } from "./env.ts";
+import { previewDbBackendFor } from "./trigger.ts";
 import { AppStore } from "../state/apps.ts";
 import { EnvStore } from "../state/envs.ts";
 import { StateStore } from "../state/store.ts";
+import type { EnvDbBackend } from "../types.ts";
 
 // ---------------------------------------------------------------------------
 // Input / dependency types
@@ -32,6 +34,12 @@ export interface PreviewRebuildInput {
   vm: string;
   app: string;
   branch: string;
+  /**
+   * Explicit DB backend override (from --db CLI flag). When set, takes
+   * precedence over the app's previewDbBackend / dbBackend fields. When
+   * absent, the backend is resolved at runtime via previewDbBackendFor(app).
+   */
+  db?: EnvDbBackend;
 }
 
 /**
@@ -109,11 +117,16 @@ export async function runPreviewRebuild(
   // Incremental status output before the (potentially long) delegate call.
   out(`rebuilding preview env for ${app.name} / ${input.branch} on ${vm.name} …`);
 
+  // Resolve the DB backend: CLI --db flag wins; otherwise derive from app config
+  // (previewDbBackend → dbBackend='none' fallback → 'dblab' default). Never
+  // hardcode 'dblab' — a no-DB app (dbBackend='none') must not attempt a clone.
+  const db = input.db ?? previewDbBackendFor(app);
+
   const createInput: EnvCreateInput = {
     vm: input.vm,
     app: input.app,
     branch: input.branch,
-    db: "dblab",
+    db,
     previewDomain: DEFAULT_PREVIEW_DOMAIN,
   };
 
