@@ -2316,3 +2316,204 @@ describe("port-check phase — foreign-occupant detection", () => {
     }
   });
 });
+
+// ---------------------------------------------------------------------------
+// Issue: unit phase uses `sudo /usr/bin/systemctl enable --now` which is a
+// NO-OP on an already-running unit — so DBLab heal / preview-rebuild re-cuts
+// the clone and rewrites .env but the app keeps its stale/dead DB connection
+// until a manual restart. Fix: the unit phase must detect an already-active
+// instance (via PLAIN `systemctl is-active`, no sudo — the hardened host's
+// sudoers NOPASSWD grants only cover enable/restart/disable/reset-failed, NOT
+// is-active) and issue `sudo /usr/bin/systemctl restart` instead of a bare
+// `enable --now`.
+//
+// Root cause: the hardened host sudoers block:
+//   agent ALL=(root) NOPASSWD: /usr/bin/systemctl enable --now ...
+//   agent ALL=(root) NOPASSWD: /usr/bin/systemctl restart ...
+//   agent ALL=(root) NOPASSWD: /usr/bin/systemctl disable --now ...
+//   agent ALL=(root) NOPASSWD: /usr/bin/systemctl reset-failed ...
+// does NOT include is-active. `sudo /usr/bin/systemctl is-active` exits 1
+// (DENIED) so the if-branch is always false and enable --now always runs,
+// which is a no-op on an already-running unit.
+//
+// Fix: call plain `systemctl is-active` (no sudo) — consistent with the
+// PORT_CHECK_FN_LINES pattern at line ~91 of script.ts.
+//
+// Three scenarios tested:
+//   A. First create: unit not yet active  → `enable --now` (start + persist)
+//   B. Re-create/heal: unit already active → `restart` (reloads rewritten .env)
+//   C. Script-level: generated script uses PLAIN `systemctl is-active` (no
+//      sudo) and includes `/usr/bin/systemctl restart` in the unit phase.
+//   D. host-prep sudoers: includes NOPASSWD restart grant; does NOT grant
+//      is-active (it is unprivileged).
+// ---------------------------------------------------------------------------
+
+/**
+ * Run the generated unit phase against stubs that accurately model the
+ * hardened-host privilege model:
+ *
+ *   - Plain `systemctl` (no sudo): handles `is-active` — returns 0/1 based
+ *     on `unitActive`. Records `"plain:<subcmd>"` in INVOCATIONS.
+ *   - `sudo /usr/bin/systemctl <subcmd>`: handles enable/restart/disable.
+ *     EXPLICITLY FAILS (exit 1) for `is-active` — models the host's sudoers
+ *     DENY (is-active is not in the NOPASSWD list). Records `"sudo:<subcmd>"`.
+ *
+ * Assertions on `invocations` then verify WHICH path was taken for each
+ * sub-command, catching any regression that sneaks sudo back into is-active.
+ */
+function runUnitPhaseWithProdStub(
+  unitActive: boolean,
+  dbBackend: "dblab" | "template" | "none" = "dblab",
+): {
+  code: number;
+  invocations: string[];
+  stdout: string;
+  stderr: string;
+} {
+  const script = buildEnvCreateScript(app(), target({ dbBackend }));
+
+  // Extract the unit phase block (between unit:start and vhost:start markers).
+  const unitEchoLine = 'echo "<<<SAMOHOST_PHASE:unit:start>>>"';
+  const vhostEchoLine = 'echo "<<<SAMOHOST_PHASE:vhost:start>>>"';
+  const unitStart = script.indexOf(unitEchoLine);
+  const vhostStart = script.indexOf(vhostEchoLine);
+  if (unitStart < 0 || vhostStart < 0) {
+    return { code: -1, invocations: [], stdout: "", stderr: "unit/vhost markers not found" };
+  }
+  const unitBlock = script.slice(unitStart, vhostStart);
+
+  const stub = [
+    "INVOCATIONS=()",
+    // Plain systemctl: handles is-active (no privilege needed).
+    // Records "plain:<subcmd>" so tests can verify the no-sudo path.
+    "systemctl() {",
+    '  INVOCATIONS+=("plain:$1")',
+    '  if [[ "$1" == "is-active" ]]; then',
+    unitActive ? "    return 0" : "    return 1",
+    "  fi",
+    "  return 0",
+    "}",
+    // sudo stub: models the hardened-host NOPASSWD list accurately.
+    // enable/restart/disable/reset-failed → allowed (return 0).
+    // is-active → DENIED (return 1) — it is NOT in the NOPASSWD grant.
+    // Records "sudo:<subcmd>" to distinguish from the plain path.
+    "sudo() {",
+    '  local sub="${2:-}"',
+    '  INVOCATIONS+=("sudo:$sub")',
+    '  if [[ "$sub" == "is-active" ]]; then',
+    "    return 1  # DENIED: not in NOPASSWD (hardened-host contract)",
+    "  fi",
+    "  return 0",
+    "}",
+    "SAMOHOST_UNIT_INSTANCE='field-record@field-record-1-feat-x.service'",
+  ].join("\n");
+
+  const prog = [
+    "set -uo pipefail",
+    stub,
+    unitBlock,
+    'printf "INVOKE:%s\\n" "${INVOCATIONS[@]}"',
+  ].join("\n");
+
+  const res = spawnSync("bash", ["-c", prog], { encoding: "utf8" });
+  const invocations = (res.stdout ?? "")
+    .split("\n")
+    .filter((l) => l.startsWith("INVOKE:"))
+    .map((l) => l.slice("INVOKE:".length));
+
+  return {
+    code: res.status ?? -1,
+    invocations,
+    stdout: res.stdout ?? "",
+    stderr: res.stderr ?? "",
+  };
+}
+
+describe("unit phase restarts an already-active instance (samohost restart-on-rewrite fix)", () => {
+  // (A) First-create: unit not yet active → enable --now (start + persist).
+  //     is-active must be called via PLAIN systemctl (not sudo).
+  test("(A) first-create path: unit NOT active → enable --now is called; is-active via plain systemctl (not sudo)", () => {
+    const r = runUnitPhaseWithProdStub(false);
+    expect(r.code).toBe(0);
+    // is-active must be checked — via plain systemctl, NOT sudo.
+    expect(r.invocations).toContain("plain:is-active");
+    expect(r.invocations).not.toContain("sudo:is-active");
+    // On a fresh unit, enable --now is the correct privileged call.
+    expect(r.invocations).toContain("sudo:enable");
+    // restart must NOT be called on first create (unit was not running).
+    expect(r.invocations).not.toContain("sudo:restart");
+  });
+
+  // (B) Re-create/heal: unit already active → restart (reloads rewritten .env).
+  //     is-active must be called via PLAIN systemctl (not sudo).
+  test("(B) re-create/heal path: unit ALREADY ACTIVE → restart is called (not a no-op enable --now); is-active via plain systemctl", () => {
+    const r = runUnitPhaseWithProdStub(true);
+    expect(r.code).toBe(0);
+    // is-active detected via plain systemctl, not sudo (which would be DENIED).
+    expect(r.invocations).toContain("plain:is-active");
+    expect(r.invocations).not.toContain("sudo:is-active");
+    // restart reloads the rewritten .env in a fresh process.
+    expect(r.invocations).toContain("sudo:restart");
+    // enable --now must NOT be called: it is a no-op on an already-active unit
+    // and the exact bug this test exists to prevent.
+    expect(r.invocations).not.toContain("sudo:enable");
+  });
+
+  // (B-template) Same restart semantics for the template db backend.
+  test("(B-template) re-create path, template backend: already-active → restart via plain is-active check", () => {
+    const r = runUnitPhaseWithProdStub(true, "template");
+    expect(r.code).toBe(0);
+    expect(r.invocations).toContain("plain:is-active");
+    expect(r.invocations).not.toContain("sudo:is-active");
+    expect(r.invocations).toContain("sudo:restart");
+    expect(r.invocations).not.toContain("sudo:enable");
+  });
+
+  // (B-none) Same restart semantics for the none db backend.
+  test("(B-none) re-create path, none backend: already-active → restart via plain is-active check", () => {
+    const r = runUnitPhaseWithProdStub(true, "none");
+    expect(r.code).toBe(0);
+    expect(r.invocations).toContain("plain:is-active");
+    expect(r.invocations).not.toContain("sudo:is-active");
+    expect(r.invocations).toContain("sudo:restart");
+    expect(r.invocations).not.toContain("sudo:enable");
+  });
+
+  // (C) Script-level content checks:
+  //     - is-active must appear WITHOUT a leading "sudo" in the unit phase.
+  //     - Full-path sudo restart must be present.
+  //     - Full-path sudo enable --now must be present (first-create path).
+  //     - Generated script is valid bash for all db backends.
+  test("(C) generated script calls plain `systemctl is-active` (no sudo) in unit phase; restart call uses full-path sudo", () => {
+    const s = buildEnvCreateScript(app(), target());
+    const unitStart = s.indexOf("<<<SAMOHOST_PHASE:unit:start>>>");
+    const vhostStart = s.indexOf("<<<SAMOHOST_PHASE:vhost:start>>>");
+    const unitBlock = s.slice(unitStart, vhostStart);
+    // is-active must appear WITHOUT a "sudo" prefix: bare `systemctl is-active`.
+    // Negative: "sudo /usr/bin/systemctl is-active" must NOT appear.
+    expect(unitBlock).not.toContain("sudo /usr/bin/systemctl is-active");
+    expect(unitBlock).not.toContain("sudo systemctl is-active");
+    // Positive: plain `systemctl is-active` must appear.
+    expect(unitBlock).toContain("systemctl is-active");
+    // Privileged calls still use full-path sudo (issue #99 lesson).
+    expect(unitBlock).toContain("sudo /usr/bin/systemctl restart");
+    expect(unitBlock).toContain("sudo /usr/bin/systemctl enable");
+  });
+
+  test("(C-syntax) generated script is valid bash for all db backends", () => {
+    for (const db of ["dblab", "template", "none"] as const) {
+      expect(bashSyntaxOk(buildEnvCreateScript(app(), target({ dbBackend: db })))).toBe(true);
+    }
+  });
+
+  // (D) host-prep sudoers: must include NOPASSWD restart grant.
+  //     is-active is unprivileged — must NOT appear in the sudoers block.
+  test("(D) host-prep sudoers include NOPASSWD restart grant; is-active is NOT in sudoers (it is unprivileged)", () => {
+    const s = buildHostPrepScript(app(), "agent");
+    // Exact-path grant for restart.
+    expect(s).toContain("NOPASSWD: /usr/bin/systemctl restart field-record@*.service");
+    // is-active is an unprivileged read — must not appear in the sudoers block.
+    // Granting NOPASSWD for is-active would be superfluous and incorrect.
+    expect(s).not.toContain("is-active");
+  });
+});
