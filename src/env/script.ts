@@ -871,11 +871,39 @@ export function buildEnvCreateScript(
   );
 
   // ----- unit ------------------------------------------------------------------
+  // Restart semantics (issue: `enable --now` is a NO-OP on an already-active
+  // unit). When a preview's DB clone is re-cut (heal / preview-rebuild) and
+  // its .env is rewritten to point at the new clone port, the app must
+  // RELOAD that .env — which only happens on a process restart, not on a
+  // bare `enable --now` that silently no-ops on a running unit.
+  //
+  // Strategy:
+  //   - already active → `sudo /usr/bin/systemctl restart` (reloads the
+  //     rewritten .env in a fresh process)
+  //   - not yet active → `sudo /usr/bin/systemctl enable --now` (first-create:
+  //     start the unit and persist it across reboots)
+  //
+  // `is-active` is an UNPRIVILEGED read — use bare `systemctl is-active`
+  // (no sudo). The hardened host's sudoers NOPASSWD block covers only
+  // enable/restart/disable/reset-failed; `sudo is-active` is DENIED (exit 1),
+  // which would make the if-branch always false and `enable --now` always run.
+  // Consistent with the existing PORT_CHECK_FN_LINES pattern (script.ts:~91).
+  //
+  // Both `enable --now` and `restart` require the exact-path sudo grant; the
+  // `restart` grant is added to host-prep sudoers (see buildHostPrepScript).
   lines.push(
     ...phaseBlock(
       "unit",
-      "systemd template instance (full-path sudo; grants in host-prep)",
-      ['if sudo /usr/bin/systemctl enable --now "$SAMOHOST_UNIT_INSTANCE"; '],
+      "systemd template instance — restart if already active, enable --now on first create (full-path sudo; grants in host-prep)",
+      [
+        "if { \\",
+        '     if systemctl is-active "$SAMOHOST_UNIT_INSTANCE" >/dev/null 2>&1; then \\',
+        '       sudo /usr/bin/systemctl restart "$SAMOHOST_UNIT_INSTANCE"; \\',
+        "     else \\",
+        '       sudo /usr/bin/systemctl enable --now "$SAMOHOST_UNIT_INSTANCE"; \\',
+        "     fi \\",
+        "   }; ",
+      ],
     ),
   );
 
@@ -1181,6 +1209,9 @@ export function buildHostPrepScript(app: AppRecord, sshUser: string): string {
   if (!isStatic) {
     sudoersLines.push(
       `${sshUser} ALL=(root) NOPASSWD: /usr/bin/systemctl enable --now ${unit}@*.service`,
+      // restart grant: required by the unit phase's already-active branch (the
+      // is-active check itself is unprivileged — plain systemctl, no sudo).
+      `${sshUser} ALL=(root) NOPASSWD: /usr/bin/systemctl restart ${unit}@*.service`,
       `${sshUser} ALL=(root) NOPASSWD: /usr/bin/systemctl disable --now ${unit}@*.service`,
       `${sshUser} ALL=(root) NOPASSWD: /usr/bin/systemctl reset-failed ${unit}@*.service`,
     );
