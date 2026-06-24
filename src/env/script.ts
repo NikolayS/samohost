@@ -871,34 +871,40 @@ export function buildEnvCreateScript(
   );
 
   // ----- unit ------------------------------------------------------------------
-  // Restart semantics (issue: `enable --now` is a NO-OP on an already-active
-  // unit). When a preview's DB clone is re-cut (heal / preview-rebuild) and
-  // its .env is rewritten to point at the new clone port, the app must
-  // RELOAD that .env — which only happens on a process restart, not on a
-  // bare `enable --now` that silently no-ops on a running unit.
+  // Restart semantics: `enable --now` is a NO-OP on an already-active unit,
+  // so a re-create/heal that rewrites .env never reloads the app's DB config.
   //
   // Strategy:
-  //   - already active → `sudo /usr/bin/systemctl restart` (reloads the
-  //     rewritten .env in a fresh process)
   //   - not yet active → `sudo /usr/bin/systemctl enable --now` (first-create:
   //     start the unit and persist it across reboots)
+  //   - already active → `sudo /usr/bin/systemctl disable --now` then
+  //     `sudo /usr/bin/systemctl enable --now` (stop + restart + persist)
+  //
+  // WHY disable--now+enable--now instead of bare restart: adopted VMs (VMs
+  // cut over to samohost without a full re-provision) received only
+  // enable --now, disable --now, and reset-failed in their NOPASSWD sudoers
+  // grant — the cutover itself restarted units via disable--now/enable--now
+  // (proven: those are the only grants present). A bare `restart` grant was
+  // NEVER added to adopted hosts, so `sudo /usr/bin/systemctl restart` exits
+  // 1 (DENIED) on every adopted VM, causing rebuild/self-heal to fail with
+  // the app never reloading its new DB. Both `disable --now` and `enable --now`
+  // are already universally granted on every host (adopted + provisioned), so
+  // the two-call sequence works everywhere with no new grant required.
   //
   // `is-active` is an UNPRIVILEGED read — use bare `systemctl is-active`
   // (no sudo). The hardened host's sudoers NOPASSWD block covers only
-  // enable/restart/disable/reset-failed; `sudo is-active` is DENIED (exit 1),
-  // which would make the if-branch always false and `enable --now` always run.
-  // Consistent with the existing PORT_CHECK_FN_LINES pattern (script.ts:~91).
-  //
-  // Both `enable --now` and `restart` require the exact-path sudo grant; the
-  // `restart` grant is added to host-prep sudoers (see buildHostPrepScript).
+  // enable --now / disable --now / reset-failed; `sudo is-active` is DENIED
+  // (exit 1), which would make the if-branch always false and only
+  // `enable --now` would ever run. Consistent with PORT_CHECK_FN_LINES (~91).
   lines.push(
     ...phaseBlock(
       "unit",
-      "systemd template instance — restart if already active, enable --now on first create (full-path sudo; grants in host-prep)",
+      "systemd template instance — disable--now+enable--now if already active, enable--now on first create (full-path sudo; grants in host-prep)",
       [
         "if { \\",
         '     if systemctl is-active "$SAMOHOST_UNIT_INSTANCE" >/dev/null 2>&1; then \\',
-        '       sudo /usr/bin/systemctl restart "$SAMOHOST_UNIT_INSTANCE"; \\',
+        '       sudo /usr/bin/systemctl disable --now "$SAMOHOST_UNIT_INSTANCE" \\',
+        '         && sudo /usr/bin/systemctl enable --now "$SAMOHOST_UNIT_INSTANCE"; \\',
         "     else \\",
         '       sudo /usr/bin/systemctl enable --now "$SAMOHOST_UNIT_INSTANCE"; \\',
         "     fi \\",
@@ -1209,9 +1215,9 @@ export function buildHostPrepScript(app: AppRecord, sshUser: string): string {
   if (!isStatic) {
     sudoersLines.push(
       `${sshUser} ALL=(root) NOPASSWD: /usr/bin/systemctl enable --now ${unit}@*.service`,
-      // restart grant: required by the unit phase's already-active branch (the
-      // is-active check itself is unprivileged — plain systemctl, no sudo).
-      `${sshUser} ALL=(root) NOPASSWD: /usr/bin/systemctl restart ${unit}@*.service`,
+      // No restart grant: the unit phase's already-active branch uses
+      // disable --now + enable --now (both universally granted on adopted and
+      // provisioned VMs alike). A bare restart was never added to adopted hosts.
       `${sshUser} ALL=(root) NOPASSWD: /usr/bin/systemctl disable --now ${unit}@*.service`,
       `${sshUser} ALL=(root) NOPASSWD: /usr/bin/systemctl reset-failed ${unit}@*.service`,
     );
