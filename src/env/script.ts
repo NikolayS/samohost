@@ -54,6 +54,36 @@ const HEALTH_SLEEP_SEC = 3;
 export const DEFAULT_ENV_DB_VARS: readonly string[] = ["DATABASE_URL"];
 
 /**
+ * Default DBLab clone lease: 20160 minutes = 14 days.
+ *
+ * Passed as `--protected <minutes>` to `dblab clone create` so the engine
+ * never auto-expires a clone underneath a running preview env.  Without this
+ * flag the engine applies its own `maxIdleMinutes` (which operators sometimes
+ * set as low as 45 min), causing the preview app to lose its database mid-life
+ * and return Internal Server Error.  14 days exceeds the samohost idle-reap
+ * threshold (also 14 days) so samohost always destroys the whole env before
+ * the clone can auto-expire at the engine.
+ *
+ * Override at script-generation time via SAMOHOST_DBLAB_LEASE_MINUTES env var.
+ */
+export const DBLAB_LEASE_DEFAULT_MINUTES = 20160; // 14 days
+
+/**
+ * Read the DBLab clone lease in minutes from SAMOHOST_DBLAB_LEASE_MINUTES,
+ * falling back to DBLAB_LEASE_DEFAULT_MINUTES (20160 = 14 days).
+ * Value is resolved at script-generation time and baked into the generated
+ * bash script (the script is pushed over SSH — no process.env on the host).
+ */
+export function readDblabLeaseMinutes(): number {
+  const raw = process.env["SAMOHOST_DBLAB_LEASE_MINUTES"];
+  if (raw !== undefined && raw !== "") {
+    const n = parseInt(raw, 10);
+    if (!isNaN(n) && n > 0) return n;
+  }
+  return DBLAB_LEASE_DEFAULT_MINUTES;
+}
+
+/**
  * Bash function: check whether the allocated port is free for this env.
  * Returns 0 (ok — proceed) when:
  *   a) nothing is listening on the port at all, OR
@@ -703,6 +733,7 @@ export function buildEnvCreateScript(
   if (t.dbBackend === "dblab") {
     const dbName = t.dbName ?? t.name;
     const envDbVars = app.envDbVars ?? [...DEFAULT_ENV_DB_VARS];
+    const leaseMinutes = readDblabLeaseMinutes();
     lines.push(
       ...DBLAB_BIN_RESOLVE_LINES,
       "",
@@ -763,6 +794,7 @@ export function buildEnvCreateScript(
         [
           'if "$SAMOHOST_DBLAB_BIN" clone create --id "$SAMOHOST_CLONE_ID" \\',
           '     --username samohost_env --password "$SAMOHOST_DB_PASSWORD" \\',
+          `     --protected ${leaseMinutes} \\`,
           "     >/dev/null \\",
           '   && SAMOHOST_DB_PORT="$(samohost_clone_port)" \\',
           '   && [[ "$SAMOHOST_DB_PORT" =~ ^[0-9]+$ ]] \\',
