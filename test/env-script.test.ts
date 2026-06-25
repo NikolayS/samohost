@@ -129,6 +129,50 @@ describe("buildEnvCreateScript", () => {
     expect(s.indexOf("db-preflight:start")).toBeLessThan(destroyIdx);
   });
 
+  test("dblab backend: clone create passes --protected with SAMOHOST_DBLAB_LEASE_MINUTES (default 20160 = 2 weeks)", () => {
+    // Root-cause: without --protected the DBLab engine uses its own
+    // maxIdleMinutes, which on a short-lived engine config can be as low as
+    // 45 min — causing a running preview to lose its database mid-life and
+    // return Internal Server Error. samohost must own the clone lifetime.
+    //
+    // The flag is --protected <minutes>, where <minutes> is the lease in
+    // minutes.  20160 = 14 days * 24 h * 60 min.
+    const s = buildEnvCreateScript(app(), target({ dbBackend: "dblab" }));
+    // The generated clone create line must carry --protected with the lease value.
+    expect(s).toContain("--protected");
+    expect(s).toContain("20160");
+    // The --protected flag + value must appear on the clone create line
+    // (not some unrelated context).
+    const createLine = s
+      .split("\n")
+      .find((l) => l.includes("clone create") || l.includes("--protected"));
+    expect(createLine).toBeDefined();
+    // Verify the lease is a number that exceeds the old 45-min IDLE_THRESHOLD
+    // so samohost always owns teardown, never the engine default.
+    const match = s.match(/--protected[= ](\d+)/);
+    expect(match).not.toBeNull();
+    expect(parseInt(match![1]!, 10)).toBeGreaterThan(45);
+
+    // Custom lease: SAMOHOST_DBLAB_LEASE_MINUTES=1440 → 1440 in the script.
+    const orig = process.env["SAMOHOST_DBLAB_LEASE_MINUTES"];
+    process.env["SAMOHOST_DBLAB_LEASE_MINUTES"] = "1440";
+    try {
+      const s2 = buildEnvCreateScript(app(), target({ dbBackend: "dblab" }));
+      expect(s2).toContain("--protected");
+      const m2 = s2.match(/--protected[= ](\d+)/);
+      expect(m2).not.toBeNull();
+      expect(m2![1]).toBe("1440");
+    } finally {
+      if (orig === undefined) delete process.env["SAMOHOST_DBLAB_LEASE_MINUTES"];
+      else process.env["SAMOHOST_DBLAB_LEASE_MINUTES"] = orig;
+    }
+
+    // Non-dblab backends must NOT carry --protected (they have no DBLab clone).
+    for (const db of ["template", "none"] as const) {
+      expect(buildEnvCreateScript(app(), target({ dbBackend: db }))).not.toContain("--protected");
+    }
+  });
+
   test("template backend: exact-path sudo createdb from the template db", () => {
     const s = buildEnvCreateScript(app(), target({ dbBackend: "template", dbName: "fr_feat_x" }));
     expect(s).toContain("sudo -u postgres /usr/bin/createdb --template=");
