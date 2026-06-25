@@ -132,7 +132,7 @@ export interface TriggerRunInput {
    * `idle = now - lastAccess` (falling back to `createdAt` when no access
    * has been recorded) and reaps any env whose idle time exceeds the threshold.
    *
-   * Threshold: `SAMOHOST_IDLE_THRESHOLD_MS` env var (default 45 min).
+   * Threshold: `SAMOHOST_IDLE_THRESHOLD_MS` env var (default 14d).
    * Reap gate: `SAMOHOST_IDLE_REAP=1` env var (default warn-only).
    *
    * SAFETY: OPT-IN. Destructive when SAMOHOST_IDLE_REAP=1; warn-only otherwise.

@@ -104,6 +104,13 @@ clients and bot PRs may have no CI). The main→prod deploy path keeps its CI ga
 unchanged. Safety backstop: `MAX_PR_PREVIEWS_PER_CYCLE` = 20 with a single
 warning. Per-PR try/catch — one PR's failure does not abort the cycle.
 
+PR preview lifetime policy: keep previews alive while the PR is open. Cleanup is
+owned by the PR-preview reaper (`--pr-previews`) when the PR is merged/closed, or
+by explicit `env destroy`. Do not rely on short idle DB clone expiry for open PR
+previews; set DBLab `maxIdleMinutes` to at least `20160` (14 days) or `0`
+(disabled) so the app process cannot outlive its preview database and start
+returning Internal Server Error.
+
 ```ini
 # To enable PR previews on the timer, append the flag to ExecStart:
 ExecStart=/usr/bin/bun run src/cli.ts trigger run --gc --pr-previews

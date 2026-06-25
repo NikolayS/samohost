@@ -23,7 +23,7 @@
  *
  * CONFIGURE
  *   `SAMOHOST_IDLE_THRESHOLD_MS` env var (ms).
- *   Default: IDLE_THRESHOLD_DEFAULT_MS = 45 min.
+ *   Default: IDLE_THRESHOLD_DEFAULT_MS = 14 days.
  *
  * DBLab maxIdleMinutes note
  *   The DBLab server.yml `maxIdleMinutes` clone-expiry reaper fights with
@@ -47,8 +47,8 @@ import type { AppStore } from "../state/apps.ts";
 // Constants
 // ---------------------------------------------------------------------------
 
-/** Default idle threshold: 45 minutes. Override via SAMOHOST_IDLE_THRESHOLD_MS. */
-export const IDLE_THRESHOLD_DEFAULT_MS = 45 * 60 * 1000;
+/** Default idle threshold: 14 days. Override via SAMOHOST_IDLE_THRESHOLD_MS. */
+export const IDLE_THRESHOLD_DEFAULT_MS = 14 * 24 * 60 * 60 * 1000;
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -366,7 +366,7 @@ export async function readAccessLogMaxTs(
 
 /**
  * Read the SAMOHOST_IDLE_THRESHOLD_MS env var, falling back to
- * IDLE_THRESHOLD_DEFAULT_MS (45 min).
+ * IDLE_THRESHOLD_DEFAULT_MS (14 days).
  */
 export function readIdleThresholdMs(): number {
   const raw = process.env["SAMOHOST_IDLE_THRESHOLD_MS"];
