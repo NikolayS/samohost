@@ -660,10 +660,19 @@ export async function runTriggerRun(
   if (input.prPreviews === true && deps.prPreview !== undefined) {
     const liveCandidateApps: Array<{ app: (typeof candidates)[number]; vm: VmRecord }> = [];
 
+    // BUG (introduced for RED test): skip apps whose prod deploy was skipped
+    // due to ci-none. This is WRONG — PR previews must deploy regardless of CI.
+    const ciNoneSkippedApps = new Set(
+      results
+        .filter((r) => r.action === "skipped" && r.reason === "ci-none")
+        .map((r) => r.app),
+    );
+
     for (const app of candidates) {
       const vmRecord = allVms.find((v) => v.id === app.vmId);
       if (vmRecord === undefined) continue;
       if (!LIVE_STATES.has(vmRecord.lifecycleState)) continue;
+      if (ciNoneSkippedApps.has(app.name)) continue; // BUG: wrong skip
       liveCandidateApps.push({ app, vm: vmRecord });
     }
 
