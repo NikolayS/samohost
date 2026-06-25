@@ -660,6 +660,11 @@ export async function runTriggerRun(
   if (input.prPreviews === true && deps.prPreview !== undefined) {
     const liveCandidateApps: Array<{ app: (typeof candidates)[number]; vm: VmRecord }> = [];
 
+    // POLICY (src/preview/pr.ts lines 9-12): PR previews deploy at HEAD
+    // regardless of CI status — DELIBERATE. checkCiGreen is NOT consulted here.
+    // The prod-deploy CI gate (above) skips apps with ci-none; the PR-preview
+    // pass must run for those apps regardless, so we filter by VM liveness only
+    // and do NOT propagate the prod-deploy CI result here.
     for (const app of candidates) {
       const vmRecord = allVms.find((v) => v.id === app.vmId);
       if (vmRecord === undefined) continue;

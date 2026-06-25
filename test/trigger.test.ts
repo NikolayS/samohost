@@ -1277,6 +1277,84 @@ describe("trigger run --pr-previews (PR-3)", () => {
     if (withoutFlag.kind !== "trigger-run") throw new Error(`expected trigger-run, got ${withoutFlag.kind}`);
     expect(withoutFlag.input.prPreviews ?? false).toBe(false);
   });
+
+  // -------------------------------------------------------------------------
+  // prprev-5 (RED): app has a new SHA, prod deploy is skipped (ci-none — no CI
+  // workflow), --pr-previews is active.
+  //
+  // INTENDED BEHAVIOR (documented in src/preview/pr.ts lines 9-12):
+  //   "PR previews are deployed at the PR HEAD regardless of CI status —
+  //   DELIBERATE. checkCiGreen is NOT consulted here."
+  //
+  // The prod-deploy CI gate (lines ~437-447 of trigger.ts) MUST block the prod
+  // deploy on ci-none — that is correct and intentional. But the PR-preview
+  // pass is INDEPENDENT of the prod deploy CI gate and MUST still run.
+  //
+  // Failure mode this pins: a ci-none skip in the prod deploy loop must NOT
+  // propagate to the PR-preview pass and cause it to skip the same app.
+  // field-record has no CI workflow → every commit is ci-none → if the
+  // PR-preview pass ever gates on the prod CI result, previews stop being
+  // created/reconciled entirely.
+  //
+  // Assertions:
+  //   - prod deploy result: action=skipped, reason=ci-none (correct gating)
+  //   - prPreview dep: called exactly once (NOT skipped — CI is irrelevant)
+  //   - report.prPreviews: present (the pass ran)
+  //   - exit code: 0 (ci-none is a transient skip, not a failure)
+  // -------------------------------------------------------------------------
+  test("prprev-5 — ci-none prod deploy does NOT skip prPreview: prPreview called; prPreviews present; exit 0", async () => {
+    vmStore.upsert(makeVm({ id: "vm-1111", name: "samo-we-field-record" }));
+    // OLD sha so a new deploy is needed — this triggers the CI check in the
+    // prod deploy loop (unlike prprev-2 which uses deployedSha===resolvedSha
+    // and short-circuits before the CI check).
+    appStore.upsert(makeApp({ deployedSha: SHA_OLD }));
+
+    const { prPreview, calls: prPreviewCalls } = makeFakePrPreview();
+    // CI returns empty runs → ciStatus = "none"
+    const { fetch: fakeFetch, callCount: fetchCallCount } = makeFakeFetch([]);
+
+    const deps: TriggerDeps = {
+      resolveRef: () => Promise.resolve(SHA_A), // NEW sha → triggers CI check
+      deploy: makeFakeDeploy(0).deploy,
+      fetch: fakeFetch,
+      env: {},
+      now: () => new Date(),
+      prPreview,
+    };
+
+    const c = capture();
+    const code = await runTriggerRun(
+      { dryRun: false, prPreviews: true },
+      { json: true },
+      vmStore,
+      appStore,
+      deps,
+      c.out,
+      c.err,
+    );
+
+    const report: TriggerRunReport = JSON.parse(c.o);
+
+    // Prod deploy must have been skipped for ci-none (CI WAS checked).
+    expect(fetchCallCount()).toBeGreaterThanOrEqual(1);
+    const deployResult = report.results[0]!;
+    expect(deployResult.action).toBe("skipped");
+    expect(deployResult.reason).toBe("ci-none");
+
+    // PR-preview pass MUST run regardless of prod deploy CI gate.
+    // prprev-2 doesn't pin this because its app is already up-to-date (same SHA)
+    // so the CI check is never reached; this test verifies the invariant for the
+    // actual scenario field-record hits every cycle (new SHA, no CI workflow).
+    expect(prPreviewCalls.length).toBe(1);
+    expect(prPreviewCalls[0]!.app.name).toBe("field-record");
+
+    // Report must include prPreviews key.
+    expect("prPreviews" in report).toBe(true);
+    expect(report.prPreviews!.length).toBe(1);
+
+    // Exit 0 — ci-none is a transient skip, not a failure.
+    expect(code).toBe(0);
+  });
 });
 
 // ---------------------------------------------------------------------------
