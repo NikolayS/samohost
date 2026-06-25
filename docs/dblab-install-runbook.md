@@ -161,7 +161,13 @@ the `clone with ID "…" already exists` db-phase failure should treat it as
 
 - Each clone container gets its own `shared_buffers`/shm (example config ships
   1 GB each — **lower to 256 MB** in `databaseConfigs`). Cap concurrent previews
-  (2–3), set `maxIdleMinutes` auto-destroy aggressively.
+  (2–3), but do not set short clone idle expiry for PR previews. Open PR
+  previews are cleaned up by samohost when the PR is merged or closed, or by
+  explicit `env destroy`; DBLab expiring the clone underneath a still-running
+  preview leaves the app process up with a dead database and can show Internal
+  Server Error. Set `maxIdleMinutes: 20160` (14 days) or `maxIdleMinutes: 0`
+  (disabled) unless samohost's own idle reaper is configured to destroy the
+  whole preview first.
 - DBLab on this box adds: engine container + second DB copy on `tank/dblab` +
   one PG container per clone. Watch `MemAvailable` before raising caps; CI's
   fence is 3 G.

@@ -6,7 +6,7 @@
  *   2. Reap fires only when idle > threshold.
  *   3. Warn-only mode (idleReap: false) logs candidates but destroys nothing.
  *   4. When idleReap: true, runEnvDestroy is called for each over-threshold env.
- *   5. SAMOHOST_IDLE_THRESHOLD_MS env var (or default 45 min) governs threshold.
+ *   5. SAMOHOST_IDLE_THRESHOLD_MS env var (or default 14 days) governs threshold.
  *   6. Access-log stamp: stampLastAccess() updates EnvRecord.lastAccess.
  *   7. buildEnvCreateScript Caddy vhost snippet includes per-vhost JSON access log.
  */
@@ -163,8 +163,8 @@ describe("stampLastAccess", () => {
 // ---------------------------------------------------------------------------
 
 describe("IDLE_THRESHOLD_DEFAULT_MS", () => {
-  test("default threshold is 45 minutes in milliseconds", () => {
-    expect(IDLE_THRESHOLD_DEFAULT_MS).toBe(45 * 60 * 1000);
+  test("default threshold is 14 days in milliseconds", () => {
+    expect(IDLE_THRESHOLD_DEFAULT_MS).toBe(14 * 24 * 60 * 60 * 1000);
   });
 });
 

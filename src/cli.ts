@@ -320,7 +320,7 @@ trigger run options (samo-level auto-deploy poller — replaces per-client on-bo
                              reads each env's Caddy JSON access log at
                              /var/log/caddy/<env-name>.log via SSH, stamps
                              EnvRecord.lastAccess from the max ts, then reaps envs
-                             idle > SAMOHOST_IDLE_THRESHOLD_MS (default 45 min).
+                             idle > SAMOHOST_IDLE_THRESHOLD_MS (default 14d).
                              Warn-only by default (SAMOHOST_IDLE_REAP absent/0);
                              set SAMOHOST_IDLE_REAP=1 to enable actual reaping.
   --json                     emit a JSON TriggerRunReport
