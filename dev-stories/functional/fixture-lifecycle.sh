@@ -442,10 +442,22 @@ else
     attempt_name="${FIXTURE_VM}-a${attempt}"
     PROVISIONED_VM_NAME="$attempt_name"   # current attempt (human msgs + tidy state destroy)
     note "provision attempt ${attempt}/${PROVISION_ATTEMPTS} for UNIQUE name '$attempt_name' (--timeout ${PROVISION_READY_TIMEOUT_SEC}s)…"
+    # Capture STDOUT ONLY for the jq parse. The degraded/timeout path writes a
+    # plain-text error to STDERR *and* the record JSON to STDOUT; merging them with
+    # `2>&1` made jq choke on the leading non-JSON, blanking .providerId and tripping
+    # a FALSE "no provider id reported" -> ORPHAN VM line even though the id WAS on
+    # stdout. Send stderr to its own file so it's preserved for diagnostics but never
+    # contaminates the JSON the parser sees — .providerId then parses on BOTH the ok
+    # and degraded paths.
+    prov_err="$(mktemp)"
     prov_json="$(samohost provision --provider hetzner --region "$FIXTURE_REGION" \
                    --type "$FIXTURE_TYPE" --name "$attempt_name" --ssh-key "$FIXTURE_SSH_KEY" \
-                   --timeout "$PROVISION_READY_TIMEOUT_SEC" --json 2>&1)"
+                   --timeout "$PROVISION_READY_TIMEOUT_SEC" --json 2>"$prov_err")"
     prov_rc=$?
+    if [ -s "$prov_err" ]; then
+      note "  provision stderr (attempt ${attempt}): $(tr '\n' ' ' < "$prov_err")"
+    fi
+    rm -f "$prov_err"
     # Provider id is the Hetzner-native id (.providerId). Fall back to .id only if
     # providerId is absent (it should be present once the API accepted the create).
     attempt_pid="$(printf '%s' "$prov_json" | jq -r '.providerId // empty' 2>/dev/null)"
