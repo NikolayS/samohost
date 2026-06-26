@@ -3058,8 +3058,11 @@ describe("#101: envfile phase runs all env-dir writes as appUser (complete whack
         "set -euo pipefail",
         sudoStub,
         `mkdir -p '${envDir}'`,
-        // Run the extracted if-condition as a statement (not as an if; just verify it exits 0).
+        // The extracted condition is the `if ...;` part; add then/fi to complete it.
         patchedCondition,
+        "then",
+        "  true",
+        "fi",
       ].join("\n");
 
       const syntaxCheck = spawnSync("bash", ["-n"], { input: prog, encoding: "utf8" });

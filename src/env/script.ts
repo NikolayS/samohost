@@ -719,33 +719,43 @@ function sudoWrapBuildCmd(buildCmd: string, appUser: string): string {
 }
 
 /**
- * Generate the body lines for the envfile compose bash subshell (issue #101).
+ * Generate the envfile phase body lines for the scoped file-write approach
+ * (samorev security fix for issue #101).
  *
- * When `appUser` is set the entire envfile compose runs inside a
- * `sudo -u <appUser> /usr/bin/bash -s << 'SAMOHOST_ENVFILE_EOF'` block so
- * that every file write (cp, chmod, printf>>, install, grep>>, mv) runs as
- * the directory owner — not as the SSH user (samo), which has no write
- * permission on the app-user-owned env dir (EACCES).
+ * Security rationale: the prior implementation wrapped the entire compose in
+ * `sudo -u <appUser> /usr/bin/bash -s << 'HEREDOC'`, which required a broad
+ * `SETENV: /usr/bin/bash` sudoers grant — letting the SSH user `samo` run
+ * ARBITRARY commands as appUser. This is replaced by composing the .env
+ * content entirely in the outer bash (as samo, using a samo-owned temp file
+ * in /tmp) and then writing it to the appUser-owned envfile via three
+ * specific, non-executing binaries:
  *
- * Design:
- *   - Single-quote heredoc delimiter ('SAMOHOST_ENVFILE_EOF') prevents the
- *     OUTER shell from expanding any `$` in the heredoc body.  All values
- *     are baked in as TypeScript-generated literals via sq().
- *   - The ONLY value that cannot be pre-baked is SAMOHOST_DB_PORT (dblab
- *     backend) because it is computed at runtime by `samohost_clone_port`.
- *     It is forwarded via the `KEY=val sudo` prefix (requires the
- *     SETENV: /usr/bin/bash sudoers grant added in buildHostPrepScript).
- *   - The rewire functions (REWIRE_DB_VARS_FN_LINES /
- *     REWIRE_DB_HOSTPORT_FN_LINES) are included verbatim inside the heredoc;
- *     their `$`-prefixed locals ($envfile, $var, $line, …) are literal for
- *     the inner bash, which is exactly correct.
- *   - SAMOHOST_ENV_DB_VARS is set as a literal array in the heredoc body.
- *   - SAMOHOST_DB_NAME (template backend) is set as a literal.
+ *   1. sudo -u appUser /usr/bin/install -m 600 /dev/null <envfile>
+ *      Pre-create the envfile at mode 600 as appUser before any content is
+ *      written, closing the brief world-readable window that bare tee would
+ *      leave (tee creates files at umask-derived 644 if the file is absent).
  *
- * Returns: the lines to include between `<< 'SAMOHOST_ENVFILE_EOF'` and the
- * closing `SAMOHOST_ENVFILE_EOF` sentinel.  Does NOT include the sentinel.
+ *   2. sudo -u appUser /usr/bin/tee <envfile> >/dev/null < <tmpfile>
+ *      Write the composed content atomically from stdin. The file already
+ *      exists at 600 so tee does not change permissions.
+ *
+ *   3. sudo -u appUser /usr/bin/chmod 600 <envfile>
+ *      Belt-and-suspenders re-assertion of mode 600.
+ *
+ * The rewire functions (samohost_rewire_db_vars / samohost_rewire_db_hostport)
+ * operate on the samo-owned temp file in /tmp — they are already defined in
+ * the outer bash from the db-phase setup for template/dblab backends. For the
+ * dblab backend, SAMOHOST_DB_PORT is already set in the outer bash (by
+ * `samohost_clone_port` in the db phase); no KEY=val sudo prefix is needed.
+ *
+ * Sudoers changes required in buildHostPrepScript:
+ *   REMOVE: sshUser ALL=(appUser) NOPASSWD: SETENV: /usr/bin/bash
+ *   ADD:    sshUser ALL=(appUser) NOPASSWD: /usr/bin/install -m 600 /dev/null ROOT-star-.env
+ *           sshUser ALL=(appUser) NOPASSWD: /usr/bin/tee ROOT-star-.env
+ *           sshUser ALL=(appUser) NOPASSWD: /usr/bin/chmod 600 ROOT-star-.env
+ *   (where ROOT = envsRoot(app) and star = env-name wildcard)
  */
-function buildEnvfileHeredocLines(
+function buildEnvfileScopedBodyLines(
   app: AppRecord,
   t: EnvScriptTarget,
 ): string[] {
@@ -753,63 +763,47 @@ function buildEnvfileHeredocLines(
   const envDir = `${root}/${t.name}`;
   const templatePath = `${root}.template.env`;
   const envFile = `${envDir}/.env`;
-  const envFileBaseurl = `${envDir}/.env.baseurl`;
-  const envDbVars = app.envDbVars ?? [...DEFAULT_ENV_DB_VARS];
 
+  // Build the &&-chain as the body of the `if` condition that phaseBlock wraps.
+  // All intermediate operations (cp, printf, grep, mv) run as samo on a
+  // samo-owned temp file in /tmp; only the final install/tee/chmod write to
+  // the appUser-owned envfile.
   const lines: string[] = [
-    "set -euo pipefail",
-    // Set the db-var array as a literal (same values as the outer script's
-    // SAMOHOST_ENV_DB_VARS, baked in so the rewire functions can use it).
-    `SAMOHOST_ENV_DB_VARS=(${envDbVars.map(sq).join(" ")})`,
+    // Create a samo-owned temp file (mktemp mode 600 by default).
+    `if _sh_env="$(mktemp)" \\`,
+    `   && cp ${sq(templatePath)} "$_sh_env" \\`,
+    `   && chmod 600 "$_sh_env" \\`,
+    `   && printf '\\nPORT=%s\\n' ${sq(String(t.port))} >> "$_sh_env" \\`,
   ];
 
-  // Include the relevant rewire function + any backend-specific variable.
+  // Rewire functions are already defined in the outer bash (db-phase setup).
+  // SAMOHOST_ENV_DB_VARS and SAMOHOST_DB_NAME / SAMOHOST_DB_PORT are set there.
   if (t.dbBackend === "template") {
-    const dbName = t.dbName ?? t.name.replace(/-/g, "_");
-    // SAMOHOST_DB_NAME is used by samohost_rewire_db_vars to repoint the
-    // db-name path component of every envDbVars URL.  It is known at
-    // TypeScript generation time → inline as a literal.
-    lines.push(`SAMOHOST_DB_NAME=${sq(dbName)}`);
-    // Include the rewire function definition.  All `$`-prefixed names inside
-    // are function locals or the SAMOHOST_DB_NAME/SAMOHOST_ENV_DB_VARS vars
-    // set above — inner bash expands them correctly.
-    lines.push(...REWIRE_DB_VARS_FN_LINES, "");
+    lines.push(`   && samohost_rewire_db_vars "$_sh_env" \\`);
   } else if (t.dbBackend === "dblab") {
-    // SAMOHOST_DB_PORT is runtime-computed (samohost_clone_port) and is
-    // forwarded via the `SAMOHOST_DB_PORT="$SAMOHOST_DB_PORT"` KEY=val sudo
-    // prefix (the outer script has already set it by the time envfile runs).
-    // No literal needed here — the inner bash sees it as an env var.
-    lines.push(...REWIRE_DB_HOSTPORT_FN_LINES, "");
+    // SAMOHOST_DB_PORT is already in the outer bash from samohost_clone_port.
+    // No KEY=val forwarding prefix needed.
+    lines.push(`   && samohost_rewire_db_hostport "$_sh_env" \\`);
   }
 
-  // Compose operations — all paths are TypeScript-generated literals so no
-  // outer-shell variable references appear in the single-quote heredoc body.
   lines.push(
-    // Copy the operator template; chmod 600 immediately (template may be 644).
-    `cp ${sq(templatePath)} ${sq(envFile)}`,
-    `chmod 600 ${sq(envFile)}`,
-    // Append the allocated port.
-    `printf '\\nPORT=%s\\n' ${sq(String(t.port))} >> ${sq(envFile)}`,
-  );
-
-  if (t.dbBackend === "template") {
-    lines.push(`samohost_rewire_db_vars ${sq(envFile)}`);
-  } else if (t.dbBackend === "dblab") {
-    lines.push(`samohost_rewire_db_hostport ${sq(envFile)}`);
-  }
-
-  // Append the preview-env markers.
-  lines.push(
-    `printf '\\nSAMO_ENV=preview\\nSAMO_BRANCH=%s\\n' ${sq(t.branch)} >> ${sq(envFile)}`,
-    // BASE_URL: strip any template BASE_URL line then append the preview
-    // vhost so magic-link URLs (${BASE_URL}/api/auth/…) stay on the preview
-    // (not prod).  Same strip-then-append logic as the outer-script path;
-    // intermediate file is pre-created at 600 before any redirect.
-    `install -m 600 /dev/null ${sq(envFileBaseurl)}`,
-    `{ grep -vE '^BASE_URL=' ${sq(envFile)} >> ${sq(envFileBaseurl)} || true; }`,
-    `mv ${sq(envFileBaseurl)} ${sq(envFile)}`,
-    `printf 'BASE_URL=https://%s\\n' ${sq(t.vhost)} >> ${sq(envFile)}`,
-    `chmod 600 ${sq(envFile)}`,
+    `   && printf '\\nSAMO_ENV=preview\\nSAMO_BRANCH=%s\\n' ${sq(t.branch)} >> "$_sh_env" \\`,
+    // BASE_URL strip: use a second temp file to avoid in-place rewrite on an
+    // appUser-owned file. Both temp files are samo-owned (mktemp creates 600).
+    `   && _sh_env2="$(mktemp)" \\`,
+    `   && { grep -vE '^BASE_URL=' "$_sh_env" >> "$_sh_env2" || true; } \\`,
+    `   && mv "$_sh_env2" "$_sh_env" \\`,
+    `   && chmod 600 "$_sh_env" \\`,
+    `   && printf 'BASE_URL=https://%s\\n' ${sq(t.vhost)} >> "$_sh_env" \\`,
+    // Pre-create the envfile at 600 as appUser BEFORE tee writes content,
+    // avoiding the brief world-readable window that bare tee would create.
+    `   && sudo -u ${sq(app.appUser!)} /usr/bin/install -m 600 /dev/null ${sq(envFile)} \\`,
+    // Write composed content from stdin via scoped tee (file already 600).
+    `   && sudo -u ${sq(app.appUser!)} /usr/bin/tee ${sq(envFile)} >/dev/null < "$_sh_env" \\`,
+    // Belt-and-suspenders re-assertion of 600 after tee.
+    `   && sudo -u ${sq(app.appUser!)} /usr/bin/chmod 600 ${sq(envFile)} \\`,
+    // Clean up samo-owned temp files.
+    `   && rm -f "$_sh_env" "$_sh_env2"; `,
   );
 
   return lines;
@@ -1041,33 +1035,22 @@ export function buildEnvCreateScript(
   // ----- envfile ---------------------------------------------------------------
   // Issue #101: when `appUser` is registered the env dir is owned by appUser
   // (the sudo-u-appUser clone created it); running cp/chmod/printf/install/mv
-  // as the SSH user (samo) → EACCES.  Wrap the ENTIRE compose in a single
-  // `sudo -u <appUser> /usr/bin/bash -s << 'SAMOHOST_ENVFILE_EOF'` invocation.
+  // as the SSH user (samo) → EACCES.
   //
-  // Single-quote heredoc: the outer shell does not expand any `$` in the body;
-  // all values are TypeScript-generated literals.  SAMOHOST_DB_PORT (dblab,
-  // runtime-computed by samohost_clone_port) cannot be pre-baked — it is
-  // forwarded via the `KEY=val sudo` prefix (SETENV: /usr/bin/bash grant).
+  // samorev security fix: the prior approach used a broad
+  // `sudo -u appUser /usr/bin/bash -s << 'HEREDOC'` that let samo run
+  // arbitrary commands as appUser. Replaced by composing .env content in a
+  // samo-owned temp file (mktemp, /tmp) and writing it via scoped ops:
+  //   install -m 600 /dev/null → pre-create at 600
+  //   tee < tmpfile >/dev/null → write content
+  //   chmod 600                → re-assert mode
+  // See buildEnvfileScopedBodyLines() for full design rationale.
   //
   // When appUser is absent: the original &&-chain body is used unchanged
   // (backward compatibility for AppRecords that predate the appUser field).
   let envfileBody: string[];
   if (app.appUser !== undefined) {
-    const heredocLines = buildEnvfileHeredocLines(app, t);
-    // For dblab the clone port is runtime — forward it via KEY=val sudo prefix.
-    // SETENV: /usr/bin/bash in the host-prep sudoers lets this variable pass
-    // through sudo's env_reset so the inner bash sees $SAMOHOST_DB_PORT.
-    const dbPortPrefix =
-      t.dbBackend === "dblab"
-        ? `SAMOHOST_DB_PORT="$SAMOHOST_DB_PORT" \\\n   `
-        : "";
-    envfileBody = [
-      `if ${dbPortPrefix}sudo -u ${sq(app.appUser)} /usr/bin/bash -s << 'SAMOHOST_ENVFILE_EOF'`,
-      ...heredocLines,
-      // Heredoc sentinel must be at column 0 — phaseBlock joins with \n so
-      // this line lands at the start of a new line with no leading whitespace.
-      "SAMOHOST_ENVFILE_EOF",
-    ];
+    envfileBody = buildEnvfileScopedBodyLines(app, t);
   } else {
     // Original &&-chain body (no appUser — backward compat).
     // Set the preview-env marker so the banner fires. env create is
@@ -1507,6 +1490,15 @@ export function buildHostPrepScript(app: AppRecord, sshUser: string): string {
   // A single /usr/bin/npm entry covers all three. The npm grant does NOT need
   // SETENV (no environment variable is forwarded to npm); a separate plain
   // NOPASSWD line is cleaner and avoids unnecessarily widening SETENV scope.
+  //
+  // samorev security fix (#101): the prior broad `SETENV: /usr/bin/bash` grant
+  // let samo run ARBITRARY commands as appUser. It is replaced by three scoped
+  // file-write-only grants tied to the envs-root path pattern:
+  //   /usr/bin/install -m 600 /dev/null <root>/*/.env — pre-create at 600
+  //   /usr/bin/tee <root>/*/.env                      — write content
+  //   /usr/bin/chmod 600 <root>/*/.env                — re-assert mode
+  // None of these binaries execute arbitrary code. The compose logic runs as
+  // samo in a mktemp temp file; only the final write touches the appUser dir.
   if (app.appUser !== undefined) {
     // Resolve the build-command binary so a non-npm build tool also gets a
     // grant (e.g. `node ./build.js` → /usr/bin/node). When buildCmd is already
@@ -1519,13 +1511,12 @@ export function buildHostPrepScript(app: AppRecord, sshUser: string): string {
       ...(buildBin !== "/usr/bin/npm"
         ? [`${sshUser} ALL=(${app.appUser}) NOPASSWD: ${buildBin}`]
         : []),
-      // Issue #101: the envfile phase wraps all env-dir writes in a
-      // `sudo -u <appUser> /usr/bin/bash -s << 'HEREDOC'` subshell so they
-      // run as the directory owner. SETENV is required so the
-      // `SAMOHOST_DB_PORT="$SAMOHOST_DB_PORT"` KEY=val prefix (used for the
-      // dblab backend to forward the runtime-computed clone port) passes
-      // through sudo's env_reset and is visible to the inner bash.
-      `${sshUser} ALL=(${app.appUser}) NOPASSWD: SETENV: /usr/bin/bash`,
+      // Scoped envfile write grants (samorev security fix — replaces the broad
+      // /usr/bin/bash SETENV grant). Path pattern uses the envs root so the
+      // sudoers glob covers any env name without allowing writes elsewhere.
+      `${sshUser} ALL=(${app.appUser}) NOPASSWD: /usr/bin/install -m 600 /dev/null ${root}/*/.env`,
+      `${sshUser} ALL=(${app.appUser}) NOPASSWD: /usr/bin/tee ${root}/*/.env`,
+      `${sshUser} ALL=(${app.appUser}) NOPASSWD: /usr/bin/chmod 600 ${root}/*/.env`,
     );
   }
   sudoersLines.push(
