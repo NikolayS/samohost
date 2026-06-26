@@ -2724,3 +2724,123 @@ describe("issue #97: env-create clone + preview unit must use the registered app
     expect(bashSyntaxOk(s)).toBe(true);
   });
 });
+
+// ---------------------------------------------------------------------------
+// Issue #98 follow-up: install + build phases must run as the app user when
+// appUser is registered.
+//
+// Root cause: #98 fixed the CLONE phase by wrapping `git` invocations in
+// `sudo -u <appUser>`, so the env dir is created owned by the app user.
+// However the INSTALL phase (lockfile-aware npm ci / npm install) and the
+// BUILD phase (app.buildCmd) still ran as the SSH admin user `samo` — which
+// has no write permission to the app-user-owned node_modules dir → EACCES →
+// install:fail → exit 1 → no .env/unit/Caddy written → CF 521.
+//
+// PROVEN: running the same commands as the app user completes ('env ready,
+// port 3101'); running as `samo` fails with EACCES.
+//
+// Fix:
+//   1. When appUser is set, wrap install (npm ci / npm install) in
+//      `sudo -u <appUser> /usr/bin/npm ...`.
+//   2. When appUser is set, wrap the build command similarly.
+//   3. Add a `sshUser ALL=(appUser) NOPASSWD: /usr/bin/npm` sudoers grant
+//      in buildHostPrepScript (the existing git grant does NOT cover npm).
+//
+// Secondary (latent — same function, #98 missed it):
+//   4. The fetch path in buildCloneFnLines (re-create of an existing env dir)
+//      uses `sudo -u appUser git fetch origin` WITHOUT the credential helper
+//      that the initial clone uses → private-repo re-fetch fails with
+//      'could not read Username'. Add the same literal-path credential.helper
+//      to the fetch invocation.
+// ---------------------------------------------------------------------------
+
+describe("#98 follow-up: install + build run as the app user; fetch path carries credential helper", () => {
+  const APP_USER = "samohost-fixture";
+  const TOKEN_FILE = "/opt/samohost-fixture/.gh-token";
+  const appWithUser = () =>
+    app({ appUser: APP_USER, appDir: "/opt/samohost-fixture/app" });
+
+  // (A) install phase ---------------------------------------------------------
+  test("(A-install) install phase emits sudo -u appUser /usr/bin/npm when appUser is set", () => {
+    const s = buildEnvCreateScript(appWithUser(), target());
+    // Slice out just the install phase block.
+    const installStart = s.indexOf("<<<SAMOHOST_PHASE:install:start>>>");
+    const buildStart = s.indexOf("<<<SAMOHOST_PHASE:build:start>>>");
+    expect(installStart).toBeGreaterThan(-1);
+    expect(buildStart).toBeGreaterThan(installStart);
+    const installBlock = s.slice(installStart, buildStart);
+    // Both npm-ci and npm-install paths must delegate to the app user so the
+    // write into the app-user-owned env dir does not EACCES.
+    expect(installBlock).toContain(`sudo -u '${APP_USER}' /usr/bin/npm ci`);
+    expect(installBlock).toContain(`sudo -u '${APP_USER}' /usr/bin/npm install`);
+    // The bare (non-sudoed) form must NOT appear: running npm as samo →
+    // EACCES when writing node_modules into the appUser-owned env dir.
+    expect(installBlock).not.toContain("then npm ci");
+    expect(installBlock).not.toContain("else npm install");
+    expect(bashSyntaxOk(s)).toBe(true);
+  });
+
+  // (A) build phase -----------------------------------------------------------
+  test("(A-build) build phase emits sudo -u appUser when appUser is set", () => {
+    // Use dbBackend:none so the next phase after build is envfile (no db-preflight
+    // in between), making the slice boundary unambiguous.
+    const s = buildEnvCreateScript(appWithUser(), target({ dbBackend: "none" }));
+    const buildStart = s.indexOf("<<<SAMOHOST_PHASE:build:start>>>");
+    const envfileStart = s.indexOf("<<<SAMOHOST_PHASE:envfile:start>>>");
+    expect(buildStart).toBeGreaterThan(-1);
+    expect(envfileStart).toBeGreaterThan(buildStart);
+    const buildBlock = s.slice(buildStart, envfileStart);
+    // The build command must run as the app user.
+    expect(buildBlock).toContain(`sudo -u '${APP_USER}'`);
+    // Full-path npm is required for the exact-path NOPASSWD grant to match.
+    expect(buildBlock).toContain("/usr/bin/npm");
+    expect(bashSyntaxOk(s)).toBe(true);
+  });
+
+  // (B) backward compat -------------------------------------------------------
+  test("(B) install + build are plain (no sudo -u) when appUser is absent", () => {
+    const s = buildEnvCreateScript(app(), target({ dbBackend: "none" }));
+    const installStart = s.indexOf("<<<SAMOHOST_PHASE:install:start>>>");
+    const envfileStart = s.indexOf("<<<SAMOHOST_PHASE:envfile:start>>>");
+    expect(installStart).toBeGreaterThan(-1);
+    const installBuildBlock = s.slice(installStart, envfileStart);
+    // No appUser → install + build remain unwrapped (pre-#98 behavior preserved
+    // for AppRecords that predate the appUser field).
+    expect(installBuildBlock).not.toContain("sudo -u");
+    expect(installBuildBlock).toContain("npm ci");
+    expect(bashSyntaxOk(s)).toBe(true);
+  });
+
+  // (C) host-prep sudoers -----------------------------------------------------
+  test("(C) host-prep sudoers includes /usr/bin/npm NOPASSWD grant for appUser", () => {
+    const s = buildHostPrepScript(appWithUser(), "samo");
+    // A single /usr/bin/npm grant covers npm ci, npm install, and npm run build.
+    // Without this grant the `sudo -u appUser /usr/bin/npm` calls emitted by
+    // the install + build phases fail at runtime with 'a password is required'.
+    expect(s).toContain(`samo ALL=(${APP_USER}) NOPASSWD: /usr/bin/npm`);
+    expect(bashSyntaxOk(s)).toBe(true);
+  });
+
+  // (D) fetch path credential helper ------------------------------------------
+  test("(D) fetch path in clone fn carries credential helper when appUser + tokenFile set", () => {
+    const s = buildEnvCreateScript(appWithUser(), target());
+    // Locate the clone function body (from the opening line to the closing '}'.
+    // Tests extract and run this function — closing brace is at column 0.
+    const cloneFnStart = s.indexOf("samohost_clone_env_dir()");
+    expect(cloneFnStart).toBeGreaterThan(-1);
+    const cloneFnEnd = s.indexOf("\n}", cloneFnStart) + 2;
+    const cloneFn = s.slice(cloneFnStart, cloneFnEnd);
+    // Confirm the fetch line is present (it is the re-create path).
+    const fetchIdx = cloneFn.indexOf("fetch origin");
+    expect(fetchIdx).toBeGreaterThan(-1);
+    // The 300-char window around the fetch invocation must carry the literal
+    // token file path inside the credential helper substring (not $TOKEN_FILE,
+    // which is not in scope inside the helper subprocess — proven bootstrap.ts
+    // §12 / samorev #83 pattern).
+    const context = cloneFn.slice(Math.max(0, fetchIdx - 300), fetchIdx + 300);
+    expect(context).toContain(`cat ${TOKEN_FILE}`);
+    // The clone paths already carry it — verify fetch is not the odd one out.
+    expect(cloneFn.indexOf(`cat ${TOKEN_FILE}`)).toBeGreaterThan(-1);
+    expect(bashSyntaxOk(s)).toBe(true);
+  });
+});
