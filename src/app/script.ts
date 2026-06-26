@@ -227,11 +227,20 @@ export function buildDeployScript(app: AppRecord, target: DeployTarget): string 
   // --include=dev is mandatory: the env file sourced above exports
   // NODE_ENV=production into this shell, and a plain `npm ci` would then drop
   // devDependencies — where the build/migrate toolchain (tsc, tsx) lives
-  // (issue #2 bug 3: build died with "tsc: not found").
+  // (issue #2 bug 3: build died with "tsc: not found"). This flag is preserved
+  // in BOTH branches of the lockfile check below.
+  //
+  // Lockfile-aware: apps without package-lock.json (no-DB fixtures, minimal
+  // greenfield) hard-fail npm ci with "can only install with an existing
+  // package-lock.json". Under set -euo pipefail that aborts the deploy before
+  // .env/unit/Caddy are written → no :443 listener → CF 521. Fall back to
+  // npm install --include=dev when no lockfile is present.
   push(
-    "# --- install: npm ci with dev deps (build toolchain lives in devDependencies) ---",
+    "# --- install: lockfile-aware install (npm ci if lockfile present, npm install otherwise) ---",
+    "# --include=dev: NODE_ENV=production drops devDeps (build toolchain: tsc, tsx) — issue #2 bug 3.",
+    "# lockfile fallback: apps without package-lock.json hard-fail npm ci (no-DB fixtures, greenfield).",
     marker("install", "start"),
-    "if npm ci --include=dev; then",
+    "if (if [ -f package-lock.json ] || [ -f npm-shrinkwrap.json ]; then npm ci --include=dev; else npm install --include=dev; fi); then",
     `  ${marker("install", "ok")}`,
     "else",
     `  ${marker("install", "fail")}`,

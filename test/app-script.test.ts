@@ -140,12 +140,17 @@ describe("buildDeployScript hard-won behaviors", () => {
   // NODE_ENV=production reaches the deploy shell and a plain `npm ci` drops
   // devDependencies — the build toolchain (tsc, tsx) lives there, so build
   // died with "sh: 1: tsc: not found" at runtime. The install phase must
-  // explicitly include dev deps (field-record's own deploy.sh uses
-  // `npm ci --prefer-offline --include=dev --quiet` deliberately).
-  test("install uses `npm ci --include=dev` so NODE_ENV=production cannot drop the build toolchain", () => {
+  // explicitly include dev deps in BOTH branches of the lockfile check
+  // (field-record's own deploy.sh uses `npm ci --prefer-offline --include=dev
+  // --quiet` deliberately). Updated per issue #78: bare npm ci → lockfile-aware.
+  test("install includes --include=dev in both lockfile and fallback branches so NODE_ENV=production cannot drop the build toolchain", () => {
     const script = buildDeployScript(fieldRecord(), TARGET);
-    expect(script).toContain("if npm ci --include=dev; then");
-    expect(script).not.toContain("if npm ci; then");
+    // --include=dev in the npm ci branch (lockfile present).
+    expect(script).toContain("npm ci --include=dev");
+    // --include=dev in the npm install fallback branch (lockfile absent).
+    expect(script).toContain("npm install --include=dev");
+    // Bare unguarded npm ci (no lockfile awareness, fails on greenfield apps) must be gone.
+    expect(script).not.toContain("if npm ci --include=dev; then");
   });
 
   // Issue #2 bug 1: the registered --env-file was stored but never sourced, so
@@ -208,5 +213,24 @@ describe("buildDeployScript hard-won behaviors", () => {
     const script = buildDeployScript(fieldRecord(), TARGET);
     expect(script).toContain(TARGET.sha);
     expect(script).toContain("/opt/field-record/app");
+  });
+
+  // Issue #78: lockfile-less apps (no-DB fixtures, minimal greenfield) hard-fail
+  // npm ci with "can only install with an existing package-lock.json", which aborts
+  // the whole deploy BEFORE the .env / systemd unit / Caddy vhost are written,
+  // leaving no :443 listener → CF 521. The install phase must detect whether a
+  // lockfile is present and fall back to npm install when it is not.
+  //
+  // --include=dev must be preserved in BOTH branches (issue #2 bug 3 invariant).
+  test("install phase is lockfile-aware: falls back to npm install --include=dev when no lockfile exists", () => {
+    const script = buildDeployScript(fieldRecord(), TARGET);
+    // The rendered script must gate on the presence of a lockfile.
+    expect(script).toContain("[ -f package-lock.json ] || [ -f npm-shrinkwrap.json ]");
+    // Fallback branch for lockfile-less apps.
+    expect(script).toContain("npm install --include=dev");
+    // npm ci branch preserved for the lockfile-present case.
+    expect(script).toContain("npm ci --include=dev");
+    // Bare unguarded npm ci (fails on lockfile-less apps) must be gone.
+    expect(script).not.toContain("if npm ci --include=dev; then");
   });
 });

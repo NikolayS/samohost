@@ -215,6 +215,26 @@ describe("buildEnvCreateScript", () => {
       expect(s).toContain(`<<<SAMOHOST_PHASE:${p}:start>>>`);
     }
   });
+
+  // Issue #78: lockfile-less apps (no-DB fixtures, minimal greenfield) hard-fail
+  // npm ci with "can only install with an existing package-lock.json", which under
+  // set -euo pipefail + phaseBlock default onFail=exit 1 aborts the env-create
+  // script BEFORE the .env / systemd unit / Caddy vhost are written → no :443
+  // listener → CF 521. The install phase must detect the lockfile and fall back.
+  test("install phase is lockfile-aware: falls back to npm install when no package-lock.json exists", () => {
+    // All db backends share the same install phase rendering.
+    for (const db of ["dblab", "template", "none"] as const) {
+      const s = buildEnvCreateScript(app(), target({ dbBackend: db }));
+      // Must gate on lockfile presence.
+      expect(s).toContain("[ -f package-lock.json ] || [ -f npm-shrinkwrap.json ]");
+      // Fallback branch for lockfile-less apps.
+      expect(s).toContain("npm install");
+      // npm ci branch preserved for the lockfile-present case.
+      expect(s).toContain("npm ci");
+      // The old bare unguarded form must be gone (fails on lockfile-less apps).
+      expect(s).not.toMatch(/if npm ci; /);
+    }
+  });
 });
 
 describe("buildEnvDestroyScript", () => {
