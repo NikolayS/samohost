@@ -2844,3 +2844,283 @@ describe("#98 follow-up: install + build run as the app user; fetch path carries
     expect(bashSyntaxOk(s)).toBe(true);
   });
 });
+
+// ---------------------------------------------------------------------------
+// #101: envfile phase must run ALL env-dir writes as appUser when appUser is
+// registered — the whack-a-mole root cause.
+//
+// Root cause: #98 fixed the CLONE phase (sudo -u appUser git), #100 fixed the
+// INSTALL + BUILD phases (sudo -u appUser /usr/bin/npm + build binary), but
+// the ENVFILE phase — which does cp, chmod, printf>>, install -m 600, grep>>,
+// mv, chmod on the app-user-owned env dir — still ran as the SSH user (samo).
+//
+// samorev SECURITY BLOCKER: the original fix (MR #101 GREEN) wrapped the entire
+// compose in `sudo -u appUser /usr/bin/bash -s << 'HEREDOC'`, which required a
+// broad `SETENV: /usr/bin/bash` sudoers grant — letting samo run ARBITRARY
+// commands as appUser. This is the security gap the tests below gate against.
+//
+// Fix: compose .env content in a samo-owned temp file (mktemp, /tmp), then
+// write it to the appUser-owned envfile via:
+//   sudo -u appUser /usr/bin/install -m 600 /dev/null <envfile>   (pre-create at 600)
+//   sudo -u appUser /usr/bin/tee <envfile> >/dev/null < tmpfile   (write content)
+//   sudo -u appUser /usr/bin/chmod 600 <envfile>                  (re-assert mode)
+// Sudoers grants are SCOPED to these specific non-executing binaries at the
+// envs-root path pattern — no /usr/bin/bash SETENV grant at all.
+//
+// Phase audit (buildEnvCreateScript, appUser set):
+//   port-check   — B (read-only + root Caddy/systemctl ops; no env-dir writes)
+//   clone        — A FIXED in #98 (sudo -u appUser git)
+//   install      — A FIXED in #100 (sudo -u appUser /usr/bin/npm)
+//   build        — A FIXED in #100 (sudoWrapBuildCmd)
+//   db-preflight — B (curl + CLI resolve; no env-dir writes)
+//   db           — B (sudo -u postgres psql/createdb/dropdb; no env-dir writes)
+//   envfile      — A FIX HERE (scoped tee/chmod/install as appUser; no bash)
+//   unit         — B (sudo systemctl enable/disable; no env-dir writes)
+//   vhost        — B (sudo tee /etc/caddy/... + sudo systemctl reload; no env-dir writes)
+//   health       — B (curl localhost; no writes)
+// ---------------------------------------------------------------------------
+describe("#101: envfile phase runs all env-dir writes as appUser (complete whack-a-mole audit)", () => {
+  const APP_USER = "samohost-fixture";
+  const appWithUser = () =>
+    app({ appUser: APP_USER, appDir: "/opt/samohost-fixture/app" });
+
+  // (A) envfile phase delegates to appUser via scoped tee/chmod — NOT via bash subshell.
+  // Security fix: the broad /usr/bin/bash SETENV grant is replaced by scoped
+  // /usr/bin/tee and /usr/bin/chmod grants; the compose runs as samo in a temp
+  // file, and only the final write uses sudo -u appUser.
+  for (const db of ["dblab", "template", "none"] as const) {
+    test(`(A-${db}) envfile phase uses sudo -u appUser /usr/bin/tee (not bash) when appUser is set (${db})`, () => {
+      const s = buildEnvCreateScript(
+        appWithUser(),
+        target({ dbBackend: db, dbName: "test_env_name" }),
+      );
+      const envfileStart = s.indexOf("<<<SAMOHOST_PHASE:envfile:start>>>");
+      const envfileOk = s.indexOf("<<<SAMOHOST_PHASE:envfile:ok>>>");
+      expect(envfileStart).toBeGreaterThan(-1);
+      expect(envfileOk).toBeGreaterThan(envfileStart);
+      const envfileBlock = s.slice(envfileStart, envfileOk);
+      // Final write to the envfile MUST use scoped tee as appUser.
+      expect(envfileBlock).toContain(`sudo -u '${APP_USER}' /usr/bin/tee`);
+      // Must NOT use a bash subshell (that required the broad SETENV bash grant).
+      expect(envfileBlock).not.toContain(`sudo -u '${APP_USER}' /usr/bin/bash`);
+      // The heredoc sentinel must be absent (no bash subshell).
+      expect(envfileBlock).not.toContain("SAMOHOST_ENVFILE_EOF");
+      // Valid bash after the change.
+      expect(bashSyntaxOk(s)).toBe(true);
+    });
+  }
+
+  // (B) backward compat: no sudo -u in envfile when appUser is absent
+  test("(B) envfile phase has no sudo -u delegation when appUser is absent (backward compat)", () => {
+    for (const db of ["dblab", "template", "none"] as const) {
+      const s = buildEnvCreateScript(app(), target({ dbBackend: db }));
+      const envfileStart = s.indexOf("<<<SAMOHOST_PHASE:envfile:start>>>");
+      const envfileOk = s.indexOf("<<<SAMOHOST_PHASE:envfile:ok>>>");
+      expect(envfileStart).toBeGreaterThan(-1);
+      const envfileBlock = s.slice(envfileStart, envfileOk);
+      // No appUser → envfile body is unchanged (plain cp/chmod/printf as SSH user).
+      expect(envfileBlock).not.toContain(`sudo -u`);
+      expect(bashSyntaxOk(s)).toBe(true);
+    }
+  });
+
+  // (C) host-prep sudoers must grant scoped /usr/bin/tee and /usr/bin/chmod for
+  //     appUser (tied to the envs-root path pattern), NOT the broad bash grant.
+  test("(C) host-prep sudoers grants scoped /usr/bin/tee + /usr/bin/chmod for appUser — NO bash SETENV grant", () => {
+    const prep = buildHostPrepScript(appWithUser(), "samo");
+    const root = envsRoot(appWithUser());
+    // Scoped tee grant: write-only to the env file path pattern.
+    expect(prep).toContain(`samo ALL=(${APP_USER}) NOPASSWD: /usr/bin/tee ${root}/*/.env`);
+    // Scoped chmod grant: set mode 600 on the env file.
+    expect(prep).toContain(`samo ALL=(${APP_USER}) NOPASSWD: /usr/bin/chmod 600 ${root}/*/.env`);
+    // The broad bash grant that let samo run arbitrary commands as appUser must be GONE.
+    expect(prep).not.toContain(`SETENV: /usr/bin/bash`);
+    expect(prep).not.toContain(`/usr/bin/bash`);
+    expect(bashSyntaxOk(prep)).toBe(true);
+  });
+
+  // (D) structural: every write to the appUser-owned envDir path must itself be
+  //     a sudo -u appUser call (tee, chmod, install) — no bare write by samo.
+  test("(D) structural: every env-dir write in the generated script is a sudo -u appUser scoped call", () => {
+    const envDir = "/opt/samohost-fixture/envs/field-record-1-feat-x";
+    for (const db of ["dblab", "template", "none"] as const) {
+      const s = buildEnvCreateScript(
+        appWithUser(),
+        target({ dbBackend: db, dbName: "test_env", name: "field-record-1-feat-x" }),
+      );
+      // Scan every line that references the envDir AND is a write operation.
+      const lines = s.split("\n");
+      for (let i = 0; i < lines.length; i++) {
+        const line = lines[i]!;
+        if (!line.includes(envDir)) continue;
+        // Classify: is this line a write into the env dir?
+        const isWriteOp =
+          /\bcp\b/.test(line) ||
+          /\bchmod\b/.test(line) ||
+          /\binstall\b/.test(line) ||
+          /\btee\b/.test(line) ||
+          (/\bmv\b/.test(line) && !line.trimStart().startsWith("#")) ||
+          (/>/.test(line) && !/^#/.test(line.trimStart()));
+        if (!isWriteOp) continue;
+        // Every write to the envDir must itself be a sudo -u appUser call.
+        // (With the temp-file approach the intermediate cp/grep/mv all operate on
+        // $tmpfile in /tmp; only install, tee, and chmod reference the literal
+        // envDir path, and all three go through sudo -u appUser.)
+        expect(
+          line,
+          `db=${db}, line ${i}: un-delegated write to envDir: ${JSON.stringify(line)}`,
+        ).toContain(`sudo -u '${APP_USER}'`);
+      }
+    }
+  });
+
+  // (E) envfile block contains the actual compose operations
+  //     (cp, chmod, PORT, SAMO_ENV, BASE_URL must all be visible).
+  test("(E) envfile block contains cp, chmod, PORT append, and BASE_URL append when appUser set", () => {
+    for (const db of ["dblab", "template", "none"] as const) {
+      const s = buildEnvCreateScript(
+        appWithUser(),
+        target({ dbBackend: db, dbName: "test_env", name: "field-record-1-feat-x" }),
+      );
+      const envfileStart = s.indexOf("<<<SAMOHOST_PHASE:envfile:start>>>");
+      const envfileOk = s.indexOf("<<<SAMOHOST_PHASE:envfile:ok>>>");
+      const block = s.slice(envfileStart, envfileOk);
+      expect(block).toContain("cp ");
+      expect(block).toContain("chmod 600");
+      expect(block, `db=${db}: PORT missing`).toContain("PORT=");
+      expect(block, `db=${db}: SAMO_ENV missing`).toContain("SAMO_ENV=preview");
+      expect(block, `db=${db}: BASE_URL missing`).toContain("BASE_URL=");
+    }
+  });
+
+  // (F) executed round-trip: extract the envfile phase `if` condition from the
+  //     generated script, stub out sudo -u appUser (run commands directly as
+  //     the test user — no privilege needed in a temp dir), and verify that the
+  //     resulting .env has correct content and mode 600.
+  test("(F) executed round-trip: tee-based envfile phase (none backend) produces correct .env with BASE_URL and PORT", () => {
+    const vhost = "field-record-1-feat-x.samo.cat";
+    const port = 3100;
+    const branch = "feat/x";
+    const s = buildEnvCreateScript(
+      appWithUser(),
+      target({ dbBackend: "none", vhost, port, branch }),
+    );
+    // The envfile phase must NOT use the heredoc mechanism any more.
+    expect(s).not.toContain("SAMOHOST_ENVFILE_EOF");
+
+    // Extract the envfile `if` condition (from `\nif ` after the start marker
+    // to the `\nthen` that closes it).
+    const startMarker = '<<<SAMOHOST_PHASE:envfile:start>>>';
+    const startIdx = s.indexOf(startMarker);
+    expect(startIdx).toBeGreaterThanOrEqual(0);
+    const ifIdx = s.indexOf("\nif ", startIdx);
+    expect(ifIdx).toBeGreaterThan(startIdx);
+    const thenIdx = s.indexOf("\nthen", ifIdx);
+    expect(thenIdx).toBeGreaterThan(ifIdx);
+    const ifCondition = s.slice(ifIdx + 1, thenIdx);
+
+    // Sanity: the extracted condition contains the tee call.
+    expect(ifCondition).toContain("/usr/bin/tee");
+    expect(ifCondition).toContain("cp ");
+    expect(ifCondition).toContain("chmod 600");
+
+    const dir = mkdtempSync(join(tmpdir(), "samohost-envfile-tee-"));
+    try {
+      const envDir = join(dir, "envdir");
+      const templateEnv = join(dir, "template.env");
+      writeFileSync(
+        templateEnv,
+        [
+          "NODE_ENV=production",
+          "BASE_URL=https://field-record-1.samo.team",
+          "DATABASE_URL=postgres://app_user:secret@localhost:5432/prod_db",
+          "",
+        ].join("\n"),
+        { mode: 0o600 },
+      );
+      // Patch literal paths generated by TypeScript to point at the temp dir.
+      const envDirLiteral = "/opt/samohost-fixture/envs/field-record-1-feat-x";
+      const templateLiteral = "/opt/samohost-fixture/envs.template.env";
+      const patchedCondition = ifCondition
+        .replace(new RegExp(envDirLiteral.replace(/\//g, "\\/"), "g"), envDir)
+        .replace(new RegExp(templateLiteral.replace(/\//g, "\\/"), "g"), templateEnv);
+
+      // Stub sudo -u appUser: strip the `sudo -u '<user>'` prefix and run the
+      // remaining command directly (the test user has permission on the temp dir).
+      const sudoStub = [
+        "sudo() {",
+        '  if [[ "$1" == "-u" ]]; then shift 2; fi',
+        '  "$@"',
+        "}",
+      ].join("\n");
+
+      const prog = [
+        "set -euo pipefail",
+        sudoStub,
+        `mkdir -p '${envDir}'`,
+        // The extracted condition is the `if ...;` part; add then/fi to complete it.
+        patchedCondition,
+        "then",
+        "  true",
+        "fi",
+      ].join("\n");
+
+      const syntaxCheck = spawnSync("bash", ["-n"], { input: prog, encoding: "utf8" });
+      expect(syntaxCheck.status, `syntax check failed:\n${syntaxCheck.stderr}`).toBe(0);
+      const r = spawnSync("bash", ["-c", prog], { encoding: "utf8" });
+      if (r.status !== 0) {
+        console.error("tee round-trip stderr:", r.stderr);
+      }
+      expect(r.status).toBe(0);
+      const env = readFileSync(join(envDir, ".env"), "utf8");
+      expect(env).toContain(`PORT=${port}`);
+      expect(env).toContain("SAMO_ENV=preview");
+      expect(env).toContain(`SAMO_BRANCH=${branch}`);
+      expect(env.match(/^BASE_URL=/gm)).toHaveLength(1);
+      expect(env).toContain(`BASE_URL=https://${vhost}`);
+      expect(env).not.toContain("field-record-1.samo.team");
+      expect(statSync(join(envDir, ".env")).mode & 0o777).toBe(0o600);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  // (G) dblab backend: SAMOHOST_DB_PORT is already in the outer bash (set in the
+  //     db phase by samohost_clone_port). With the tee approach the rewire function
+  //     runs in the outer bash directly — no KEY=val sudo prefix is needed.
+  test("(G) dblab backend: envfile phase has NO KEY=val sudo prefix for SAMOHOST_DB_PORT (already in outer bash)", () => {
+    const s = buildEnvCreateScript(
+      appWithUser(),
+      target({ dbBackend: "dblab", dbName: "test_clone" }),
+    );
+    const envfileStart = s.indexOf("<<<SAMOHOST_PHASE:envfile:start>>>");
+    const envfileOk = s.indexOf("<<<SAMOHOST_PHASE:envfile:ok>>>");
+    const block = s.slice(envfileStart, envfileOk);
+    // With tee approach SAMOHOST_DB_PORT is already available in the outer bash
+    // (set by `SAMOHOST_DB_PORT="$(samohost_clone_port)"` in the db phase).
+    // The KEY=val forwarding prefix was only needed for the inner bash subshell.
+    expect(block).not.toContain(`SAMOHOST_DB_PORT="$SAMOHOST_DB_PORT"`);
+    // The rewire function IS called in the envfile block (as outer-bash call).
+    expect(block).toContain("samohost_rewire_db_hostport");
+    expect(bashSyntaxOk(s)).toBe(true);
+  });
+
+  // (H) template backend: the rewire function is called in the envfile block (it
+  //     is already defined in the outer bash from the db phase). No heredoc.
+  test("(H) template backend: envfile block calls samohost_rewire_db_vars (no heredoc sentinel)", () => {
+    const dbName = "feat_x_db";
+    const s = buildEnvCreateScript(
+      appWithUser(),
+      target({ dbBackend: "template", dbName }),
+    );
+    // No heredoc — the tee approach builds content in the outer bash.
+    expect(s).not.toContain("SAMOHOST_ENVFILE_EOF");
+    const envfileStart = s.indexOf("<<<SAMOHOST_PHASE:envfile:start>>>");
+    const envfileOk = s.indexOf("<<<SAMOHOST_PHASE:envfile:ok>>>");
+    const block = s.slice(envfileStart, envfileOk);
+    // The rewire function is called in the envfile block (outer bash already
+    // defines it with SAMOHOST_DB_NAME and SAMOHOST_ENV_DB_VARS from the db phase).
+    expect(block).toContain("samohost_rewire_db_vars");
+    expect(bashSyntaxOk(s)).toBe(true);
+  });
+});
