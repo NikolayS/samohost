@@ -120,6 +120,21 @@ skip()  { SKIP=$((SKIP+1));  echo "SKIP  $*  (dry-run — needs a real VM/PR; EX
 plan()  { echo "  [PLAN] would run: samohost $*"; }   # dry-run command echo
 note()  { echo "  $*"; }
 
+# Surface the otherwise-captured/swallowed `trigger run` output when a per-PR
+# preview action (create / redeploy) is NOT ok. Without this the harness eats the
+# trigger stdout+stderr, so the REAL cause of a failed action (e.g. the 2nd
+# preview's create-script throwing before the env upsert, or a redeploy that
+# never re-stamps lastDeployedSha) is invisible in the run log. Indented +
+# prefixed so it stays scannable; callers guard the call so the blob is emitted
+# ONLY on failure, never on a passing action.
+dump_trigger_output() {
+  local label="$1" out="$2"
+  [ -z "$out" ] && out="(no trigger output captured)"
+  echo "  --- trigger output [$label] (surfaced because a per-PR action != ok) ---"
+  printf '%s\n' "$out" | sed 's/^/    | /'
+  echo "  --- end trigger output [$label] ---"
+}
+
 # Records set once the VM is (or would be) provisioned, so the trap can target it.
 # PROVISIONED_VM_NAME is the LAST (current) attempt's name, used only for human
 # messages + the state-record destroy attempt. The AUTHORITATIVE teardown list is
@@ -790,8 +805,12 @@ poll_preview_redeployed() {
     [ "$(date +%s)" -ge "$deadline" ] && return 1
     n=$((n+1))
     # Re-trigger every ~3 intervals (deploy may need another cycle to pick up head).
+    # Capture the re-trigger output into a global (instead of >/dev/null) so the
+    # redeploy assertion can surface the LAST re-trigger's error on failure — a
+    # redeploy that never takes effect (lastDeployedSha not re-stamped) leaves its
+    # cause here, previously discarded.
     if [ $((n % 3)) -eq 0 ]; then
-      samohost trigger run --vm "$FIXTURE_VM" --app "$FIXTURE_APP" --pr-previews --json >/dev/null 2>&1 || true
+      REDEPLOY_RETRIG_OUT="$(samohost trigger run --vm "$FIXTURE_VM" --app "$FIXTURE_APP" --pr-previews --json 2>&1 || true)"
     fi
     note "  poll redeploy $vhost [$branch]: code=$code sha/color not yet live — retrying in ${READY_INTERVAL_SEC}s"
     sleep "$READY_INTERVAL_SEC"
@@ -870,12 +889,21 @@ else
   npr="$(printf '%s\n' "$open_prs" | grep -c . || true)"
   note "open PRs on $FIXTURE_REPO: ${npr:-0}"
   envs="$(fixture_envs_json)"
+  # Guard so the (single, all-PR) create trigger blob is surfaced AT MOST ONCE
+  # even when several PRs fail — it already contains every PR's create error.
+  trig_dumped=0
   # while-read in the main shell (not a subshell pipe) so pass/fail counters persist.
   while read -r pr; do
     [ -z "${pr:-}" ] && continue
     num="$(jq -r '.number' <<<"$pr")"; br="$(jq -r '.headRefName' <<<"$pr")"
     vhost="$(jq -r --arg b "$br" '[.[] | select(.branch==$b)][0].vhost // empty' <<<"$envs")"
-    if [ -z "$vhost" ]; then fail "create PR#$num [$br]: no preview env created"; continue; fi
+    if [ -z "$vhost" ]; then
+      fail "create PR#$num [$br]: no preview env created"
+      # Per-PR action != ok: surface the create trigger output so the throw that
+      # skipped the env upsert (e.g. the 2nd preview's create-script error) shows.
+      [ "$trig_dumped" = "0" ] && { dump_trigger_output "create pass" "$trig_out"; trig_dumped=1; }
+      continue
+    fi
     # WHERE CHECKABLE: the created env record must resolve dbBackend='none' for the
     # no-DB fixture. If the field is present and not 'none', the no-DB backend was NOT
     # honored — fail BEFORE the 200 poll (a wrong backend invalidates the serve-200 claim).
@@ -896,6 +924,8 @@ else
       fi
     else
       fail "create-serve-200 PR#$num [$br]: $vhost never served HTTP 200+env=preview+branch within ${READY_TIMEOUT_SEC}s (last code=$LAST_READY_CODE) — no-DB surface did NOT serve"
+      # Per-PR action != ok: surface the create trigger output (once) for diagnosis.
+      [ "$trig_dumped" = "0" ] && { dump_trigger_output "create pass" "$trig_out"; trig_dumped=1; }
     fi
   done < <(printf '%s\n' "$open_prs")
 fi
@@ -970,13 +1000,20 @@ else
     # New head SHA AFTER the push (this is what the preview must reflect).
     head_sha="$(gh api "repos/$FIXTURE_REPO/commits/$tbr" --jq '.sha' 2>/dev/null | cut -c1-7)"
     note "  pushed BG-color commit to '$tbr'; new head sha=$head_sha — triggering redeploy + polling."
-    samohost trigger run --vm "$FIXTURE_VM" --app "$FIXTURE_APP" --pr-previews --json >/dev/null 2>&1
+    # Capture the initial redeploy trigger output (was >/dev/null) AND the last
+    # poll re-trigger (REDEPLOY_RETRIG_OUT) so a redeploy that never takes effect
+    # surfaces the trigger error instead of silently swallowing it.
+    REDEPLOY_RETRIG_OUT=""
+    redeploy_trig_out="$(samohost trigger run --vm "$FIXTURE_VM" --app "$FIXTURE_APP" --pr-previews --json 2>&1)"
     envs="$(fixture_envs_json)"
     vhost="$(jq -r --arg b "$tbr" '.[] | select(.branch==$b) | .vhost' <<<"$envs" | head -1)"
     if [ -n "$vhost" ] && [ -n "$head_sha" ] && poll_preview_redeployed "$vhost" "$tbr" "$head_sha" "$newcolor"; then
       pass "redeploy PR#$tnum [$tbr]: pushed BG $newcolor (sha $head_sha) and the preview reflects BOTH the new color and the new short-SHA"
     else
       fail "redeploy PR#$tnum [$tbr]: pushed BG $newcolor (sha $head_sha) but the preview did not reflect color/sha within ${READY_TIMEOUT_SEC}s (last code=$LAST_READY_CODE)"
+      # Redeploy action != ok: surface the swallowed trigger output(s) for diagnosis.
+      dump_trigger_output "redeploy initial trigger" "$redeploy_trig_out"
+      [ -n "$REDEPLOY_RETRIG_OUT" ] && dump_trigger_output "redeploy re-trigger (last poll cycle)" "$REDEPLOY_RETRIG_OUT"
     fi
   else
     fail "redeploy PR#$tnum [$tbr]: could NOT commit+push the BG-color change (clone/edit/push failed) — redeploy cannot be asserted"
