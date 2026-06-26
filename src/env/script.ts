@@ -719,6 +719,103 @@ function sudoWrapBuildCmd(buildCmd: string, appUser: string): string {
 }
 
 /**
+ * Generate the body lines for the envfile compose bash subshell (issue #101).
+ *
+ * When `appUser` is set the entire envfile compose runs inside a
+ * `sudo -u <appUser> /usr/bin/bash -s << 'SAMOHOST_ENVFILE_EOF'` block so
+ * that every file write (cp, chmod, printf>>, install, grep>>, mv) runs as
+ * the directory owner — not as the SSH user (samo), which has no write
+ * permission on the app-user-owned env dir (EACCES).
+ *
+ * Design:
+ *   - Single-quote heredoc delimiter ('SAMOHOST_ENVFILE_EOF') prevents the
+ *     OUTER shell from expanding any `$` in the heredoc body.  All values
+ *     are baked in as TypeScript-generated literals via sq().
+ *   - The ONLY value that cannot be pre-baked is SAMOHOST_DB_PORT (dblab
+ *     backend) because it is computed at runtime by `samohost_clone_port`.
+ *     It is forwarded via the `KEY=val sudo` prefix (requires the
+ *     SETENV: /usr/bin/bash sudoers grant added in buildHostPrepScript).
+ *   - The rewire functions (REWIRE_DB_VARS_FN_LINES /
+ *     REWIRE_DB_HOSTPORT_FN_LINES) are included verbatim inside the heredoc;
+ *     their `$`-prefixed locals ($envfile, $var, $line, …) are literal for
+ *     the inner bash, which is exactly correct.
+ *   - SAMOHOST_ENV_DB_VARS is set as a literal array in the heredoc body.
+ *   - SAMOHOST_DB_NAME (template backend) is set as a literal.
+ *
+ * Returns: the lines to include between `<< 'SAMOHOST_ENVFILE_EOF'` and the
+ * closing `SAMOHOST_ENVFILE_EOF` sentinel.  Does NOT include the sentinel.
+ */
+function buildEnvfileHeredocLines(
+  app: AppRecord,
+  t: EnvScriptTarget,
+): string[] {
+  const root = envsRoot(app);
+  const envDir = `${root}/${t.name}`;
+  const templatePath = `${root}.template.env`;
+  const envFile = `${envDir}/.env`;
+  const envFileBaseurl = `${envDir}/.env.baseurl`;
+  const envDbVars = app.envDbVars ?? [...DEFAULT_ENV_DB_VARS];
+
+  const lines: string[] = [
+    "set -euo pipefail",
+    // Set the db-var array as a literal (same values as the outer script's
+    // SAMOHOST_ENV_DB_VARS, baked in so the rewire functions can use it).
+    `SAMOHOST_ENV_DB_VARS=(${envDbVars.map(sq).join(" ")})`,
+  ];
+
+  // Include the relevant rewire function + any backend-specific variable.
+  if (t.dbBackend === "template") {
+    const dbName = t.dbName ?? t.name.replace(/-/g, "_");
+    // SAMOHOST_DB_NAME is used by samohost_rewire_db_vars to repoint the
+    // db-name path component of every envDbVars URL.  It is known at
+    // TypeScript generation time → inline as a literal.
+    lines.push(`SAMOHOST_DB_NAME=${sq(dbName)}`);
+    // Include the rewire function definition.  All `$`-prefixed names inside
+    // are function locals or the SAMOHOST_DB_NAME/SAMOHOST_ENV_DB_VARS vars
+    // set above — inner bash expands them correctly.
+    lines.push(...REWIRE_DB_VARS_FN_LINES, "");
+  } else if (t.dbBackend === "dblab") {
+    // SAMOHOST_DB_PORT is runtime-computed (samohost_clone_port) and is
+    // forwarded via the `SAMOHOST_DB_PORT="$SAMOHOST_DB_PORT"` KEY=val sudo
+    // prefix (the outer script has already set it by the time envfile runs).
+    // No literal needed here — the inner bash sees it as an env var.
+    lines.push(...REWIRE_DB_HOSTPORT_FN_LINES, "");
+  }
+
+  // Compose operations — all paths are TypeScript-generated literals so no
+  // outer-shell variable references appear in the single-quote heredoc body.
+  lines.push(
+    // Copy the operator template; chmod 600 immediately (template may be 644).
+    `cp ${sq(templatePath)} ${sq(envFile)}`,
+    `chmod 600 ${sq(envFile)}`,
+    // Append the allocated port.
+    `printf '\\nPORT=%s\\n' ${sq(String(t.port))} >> ${sq(envFile)}`,
+  );
+
+  if (t.dbBackend === "template") {
+    lines.push(`samohost_rewire_db_vars ${sq(envFile)}`);
+  } else if (t.dbBackend === "dblab") {
+    lines.push(`samohost_rewire_db_hostport ${sq(envFile)}`);
+  }
+
+  // Append the preview-env markers.
+  lines.push(
+    `printf '\\nSAMO_ENV=preview\\nSAMO_BRANCH=%s\\n' ${sq(t.branch)} >> ${sq(envFile)}`,
+    // BASE_URL: strip any template BASE_URL line then append the preview
+    // vhost so magic-link URLs (${BASE_URL}/api/auth/…) stay on the preview
+    // (not prod).  Same strip-then-append logic as the outer-script path;
+    // intermediate file is pre-created at 600 before any redirect.
+    `install -m 600 /dev/null ${sq(envFileBaseurl)}`,
+    `{ grep -vE '^BASE_URL=' ${sq(envFile)} >> ${sq(envFileBaseurl)} || true; }`,
+    `mv ${sq(envFileBaseurl)} ${sq(envFile)}`,
+    `printf 'BASE_URL=https://%s\\n' ${sq(t.vhost)} >> ${sq(envFile)}`,
+    `chmod 600 ${sq(envFile)}`,
+  );
+
+  return lines;
+}
+
+/**
  * Build the env CREATE script: fresh shallow clone of the branch, install +
  * build, per-env database (dblab clone / template createdb / none), env file
  * composed on-host, systemd template instance start, Caddy vhost write +
@@ -942,65 +1039,87 @@ export function buildEnvCreateScript(
   }
 
   // ----- envfile ---------------------------------------------------------------
-  const envfileBody = [
-    "if cp \"$SAMOHOST_ENV_TEMPLATE\" \"$SAMOHOST_ENV_DIR/.env\" \\",
-    "   && chmod 600 \"$SAMOHOST_ENV_DIR/.env\" \\",
-    '   && printf \'\\nPORT=%s\\n\' "$SAMOHOST_PORT" >> "$SAMOHOST_ENV_DIR/.env" \\',
-  ];
-  if (t.dbBackend === "template") {
-    // Rewire every mapped var to the per-env db ON THE HOST (issue #11).
-    envfileBody.push('   && samohost_rewire_db_vars "$SAMOHOST_ENV_DIR/.env" \\');
-  } else if (t.dbBackend === "dblab") {
-    // Rewire every mapped var's host:port at the clone ON THE HOST (issue #7,
-    // closing the PR #12 TODO): the clone is a physical copy of prod, so the
-    // template's credentials and database name stay valid inside it.
+  // Issue #101: when `appUser` is registered the env dir is owned by appUser
+  // (the sudo-u-appUser clone created it); running cp/chmod/printf/install/mv
+  // as the SSH user (samo) → EACCES.  Wrap the ENTIRE compose in a single
+  // `sudo -u <appUser> /usr/bin/bash -s << 'SAMOHOST_ENVFILE_EOF'` invocation.
+  //
+  // Single-quote heredoc: the outer shell does not expand any `$` in the body;
+  // all values are TypeScript-generated literals.  SAMOHOST_DB_PORT (dblab,
+  // runtime-computed by samohost_clone_port) cannot be pre-baked — it is
+  // forwarded via the `KEY=val sudo` prefix (SETENV: /usr/bin/bash grant).
+  //
+  // When appUser is absent: the original &&-chain body is used unchanged
+  // (backward compatibility for AppRecords that predate the appUser field).
+  let envfileBody: string[];
+  if (app.appUser !== undefined) {
+    const heredocLines = buildEnvfileHeredocLines(app, t);
+    // For dblab the clone port is runtime — forward it via KEY=val sudo prefix.
+    // SETENV: /usr/bin/bash in the host-prep sudoers lets this variable pass
+    // through sudo's env_reset so the inner bash sees $SAMOHOST_DB_PORT.
+    const dbPortPrefix =
+      t.dbBackend === "dblab"
+        ? `SAMOHOST_DB_PORT="$SAMOHOST_DB_PORT" \\\n   `
+        : "";
+    envfileBody = [
+      `if ${dbPortPrefix}sudo -u ${sq(app.appUser)} /usr/bin/bash -s << 'SAMOHOST_ENVFILE_EOF'`,
+      ...heredocLines,
+      // Heredoc sentinel must be at column 0 — phaseBlock joins with \n so
+      // this line lands at the start of a new line with no leading whitespace.
+      "SAMOHOST_ENVFILE_EOF",
+    ];
+  } else {
+    // Original &&-chain body (no appUser — backward compat).
+    // Set the preview-env marker so the banner fires. env create is
+    // preview-ONLY by construction (prod ships via app/script.ts, a separate
+    // path). SAMO_BRANCH uses $SAMOHOST_BRANCH (already sq()-escaped at the
+    // top of the script) so branch values with slashes (e.g. demo/red-login)
+    // are interpolated safely without further quoting in an env-file value.
+    // BASE_URL: the app builds the magic-link sign-in URL as
+    //   `${BASE_URL}/api/auth/magic-link/verify?token=...`
+    // (field-record src/app.ts). The operator template carries PROD's BASE_URL
+    // (e.g. https://field-record-1.samo.team), so a verbatim copy makes every
+    // preview magic link point at PROD — clicking it logs the user into prod,
+    // not the preview. Rewrite BASE_URL to the preview's OWN vhost. STRIP any
+    // template BASE_URL first (dotenv loaders are not all last-wins;
+    // append-only is unsafe). The intermediate file is PRE-CREATED at mode 600
+    // (install -m 600 /dev/null) BEFORE the redirect: a bare `> file` would
+    // create it under the umask (typically 644 = world-readable), and it
+    // carries every credential except BASE_URL. `grep -v` exits non-zero when
+    // NO line matches (template carries no BASE_URL at all — current prod
+    // template state); `|| true` keeps the && chain alive under `set -e`.
+    envfileBody = [
+      "if cp \"$SAMOHOST_ENV_TEMPLATE\" \"$SAMOHOST_ENV_DIR/.env\" \\",
+      "   && chmod 600 \"$SAMOHOST_ENV_DIR/.env\" \\",
+      '   && printf \'\\nPORT=%s\\n\' "$SAMOHOST_PORT" >> "$SAMOHOST_ENV_DIR/.env" \\',
+    ];
+    if (t.dbBackend === "template") {
+      // Rewire every mapped var to the per-env db ON THE HOST (issue #11).
+      envfileBody.push('   && samohost_rewire_db_vars "$SAMOHOST_ENV_DIR/.env" \\');
+    } else if (t.dbBackend === "dblab") {
+      // Rewire every mapped var's host:port at the clone ON THE HOST (issue #7,
+      // closing the PR #12 TODO): the clone is a physical copy of prod, so the
+      // template's credentials and database name stay valid inside it.
+      envfileBody.push(
+        '   && samohost_rewire_db_hostport "$SAMOHOST_ENV_DIR/.env" \\',
+      );
+    }
     envfileBody.push(
-      '   && samohost_rewire_db_hostport "$SAMOHOST_ENV_DIR/.env" \\',
+      '   && printf \'\\nSAMO_ENV=preview\\nSAMO_BRANCH=%s\\n\' "$SAMOHOST_BRANCH" >> "$SAMOHOST_ENV_DIR/.env" \\',
     );
+    envfileBody.push(
+      '   && install -m 600 /dev/null "$SAMOHOST_ENV_DIR/.env.baseurl" \\',
+    );
+    envfileBody.push(
+      '   && { grep -vE \'^BASE_URL=\' "$SAMOHOST_ENV_DIR/.env" >> "$SAMOHOST_ENV_DIR/.env.baseurl" || true; } \\',
+    );
+    envfileBody.push('   && mv "$SAMOHOST_ENV_DIR/.env.baseurl" "$SAMOHOST_ENV_DIR/.env" \\');
+    envfileBody.push(
+      '   && printf \'BASE_URL=https://%s\\n\' "$SAMOHOST_VHOST" >> "$SAMOHOST_ENV_DIR/.env" \\',
+    );
+    envfileBody.push('   && chmod 600 "$SAMOHOST_ENV_DIR/.env" \\');
+    envfileBody.push("   && true; ");
   }
-  // Set the preview-env marker so the banner fires. env create is
-  // preview-ONLY by construction (prod ships via app/script.ts, a separate
-  // path). SAMO_BRANCH uses $SAMOHOST_BRANCH (already sq()-escaped at the top
-  // of the script) so branch values with slashes (e.g. demo/red-login) are
-  // interpolated safely without further quoting in an env-file value.
-  envfileBody.push(
-    '   && printf \'\\nSAMO_ENV=preview\\nSAMO_BRANCH=%s\\n\' "$SAMOHOST_BRANCH" >> "$SAMOHOST_ENV_DIR/.env" \\',
-  );
-  // BASE_URL: the app builds the magic-link sign-in URL as
-  //   `${BASE_URL}/api/auth/magic-link/verify?token=...`
-  // (field-record src/app.ts). The operator template carries PROD's BASE_URL
-  // (e.g. https://field-record-1.samo.team), so a verbatim copy makes every
-  // preview magic link point at PROD — clicking it logs the user into prod, not
-  // the preview. Rewrite BASE_URL to the preview's OWN vhost so links + cookie
-  // redirects stay on the preview. STRIP any template BASE_URL first (dotenv
-  // loaders are not all last-wins; append-only is unsafe — same reasoning as the
-  // db-var rewires), then append the preview one. The send credentials
-  // (RESEND_API_KEY / its legacy SENDGRID_TOKEN alias, MAGIC_LINK_FROM_EMAIL)
-  // ride along untouched from the verbatim `cp` above — samohost never sees
-  // their values. $SAMOHOST_VHOST is already sq()-escaped at the top of the
-  // script. Prod deploy (app/script.ts) NEVER writes the env file, so prod keeps
-  // the operator template's BASE_URL.
-  // The intermediate file is PRE-CREATED at mode 600 (install -m 600 /dev/null)
-  // BEFORE the redirect: a bare `> file` would create it under the process umask
-  // (typically 644 = world-readable), and it carries every credential except
-  // BASE_URL (RESEND_API_KEY, DATABASE_URL, ...). Pre-creating at 600 closes
-  // that window; the final chmod 600 below re-asserts it on the moved file.
-  // `grep -v` exits non-zero when NO line matches (i.e. the template carries no
-  // BASE_URL at all — the current prod template state); `|| true` keeps the &&
-  // chain alive under `set -e`, mirroring the db-var rewire helpers. `>>`
-  // (append) into the pre-created file preserves its 600 mode.
-  envfileBody.push(
-    '   && install -m 600 /dev/null "$SAMOHOST_ENV_DIR/.env.baseurl" \\',
-  );
-  envfileBody.push(
-    '   && { grep -vE \'^BASE_URL=\' "$SAMOHOST_ENV_DIR/.env" >> "$SAMOHOST_ENV_DIR/.env.baseurl" || true; } \\',
-  );
-  envfileBody.push('   && mv "$SAMOHOST_ENV_DIR/.env.baseurl" "$SAMOHOST_ENV_DIR/.env" \\');
-  envfileBody.push(
-    '   && printf \'BASE_URL=https://%s\\n\' "$SAMOHOST_VHOST" >> "$SAMOHOST_ENV_DIR/.env" \\',
-  );
-  envfileBody.push('   && chmod 600 "$SAMOHOST_ENV_DIR/.env" \\');
-  envfileBody.push("   && true; ");
   lines.push(
     ...phaseBlock(
       "envfile",
@@ -1400,6 +1519,13 @@ export function buildHostPrepScript(app: AppRecord, sshUser: string): string {
       ...(buildBin !== "/usr/bin/npm"
         ? [`${sshUser} ALL=(${app.appUser}) NOPASSWD: ${buildBin}`]
         : []),
+      // Issue #101: the envfile phase wraps all env-dir writes in a
+      // `sudo -u <appUser> /usr/bin/bash -s << 'HEREDOC'` subshell so they
+      // run as the directory owner. SETENV is required so the
+      // `SAMOHOST_DB_PORT="$SAMOHOST_DB_PORT"` KEY=val prefix (used for the
+      // dblab backend to forward the runtime-computed clone port) passes
+      // through sudo's env_reset and is visible to the inner bash.
+      `${sshUser} ALL=(${app.appUser}) NOPASSWD: SETENV: /usr/bin/bash`,
     );
   }
   sudoersLines.push(

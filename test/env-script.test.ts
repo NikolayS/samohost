@@ -2994,8 +2994,12 @@ describe("#101: envfile phase runs all env-dir writes as appUser (complete whack
     // Sanity: body contains compose ops.
     expect(heredocBody).toContain("cp ");
     expect(heredocBody).toContain("chmod 600");
-    expect(heredocBody).toContain(`PORT=${port}`);
-    expect(heredocBody).toContain(`BASE_URL=https://${vhost}`);
+    // Port is embedded as the literal sq()-quoted arg to printf, not as
+    // PORT=<num> directly (format is 'PORT=%s' with '3100' as the arg).
+    expect(heredocBody).toContain("PORT=%s");
+    expect(heredocBody).toContain(`'${port}'`);
+    // BASE_URL is the printf format with the literal vhost as arg.
+    expect(heredocBody).toContain(`BASE_URL=https://%s`);
 
     // Execute the heredoc body directly in a temp dir (as current user).
     const dir = mkdtempSync(join(tmpdir(), "samohost-envfile-appuser-"));
