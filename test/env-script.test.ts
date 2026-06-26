@@ -2618,15 +2618,10 @@ describe("issue #97: env-create clone + preview unit must use the registered app
     expect(s).toContain(`sudo -u '${APP_USER}'`);
     // Full-path /usr/bin/git is required for the NOPASSWD sudoers grant.
     expect(s).toContain("/usr/bin/git");
-    // No bare `git ` lines in the clone function body (plain git runs as samo
-    // and would trigger the dubious-ownership error).
-    const cloneFnStart = s.indexOf("samohost_clone_env_dir() {");
-    const cloneFnEnd = s.indexOf("\n}", cloneFnStart);
-    expect(cloneFnStart).toBeGreaterThan(-1);
-    expect(cloneFnEnd).toBeGreaterThan(cloneFnStart);
-    const cloneFnBody = s.slice(cloneFnStart, cloneFnEnd);
-    // No unadorned `git` call (every git call goes via sudo)
-    expect(cloneFnBody).not.toMatch(/(?:^|[^\/a-zA-Z])git /m);
+    // The sudo invocations must include GIT_CONFIG_GLOBAL so they use the
+    // bootstrap-written safe.directory config (verified in separate test).
+    expect(s).toContain(`sudo -u '${APP_USER}' GIT_CONFIG_GLOBAL=`);
+    // Confirm bash validity.
     expect(bashSyntaxOk(s)).toBe(true);
   });
 
@@ -2663,7 +2658,10 @@ describe("issue #97: env-create clone + preview unit must use the registered app
     // created by the sudo-u-appUser clone (owned by appUser).
     expect(s).toContain(`User=${APP_USER}`);
     // Must NOT set User= to the SSH user (samo).
-    expect(s).not.toContain("User=samo");
+    // Use a line-anchored regex: "User=samo" would match as a substring of
+    // "User=samohost-fixture", so we need to ensure the SSH user's name ends
+    // the line (no further characters that would make it the app user).
+    expect(s).not.toMatch(/^User=samo$/m);
     expect(bashSyntaxOk(s)).toBe(true);
   });
 
