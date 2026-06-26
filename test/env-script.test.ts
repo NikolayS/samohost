@@ -2844,3 +2844,240 @@ describe("#98 follow-up: install + build run as the app user; fetch path carries
     expect(bashSyntaxOk(s)).toBe(true);
   });
 });
+
+// ---------------------------------------------------------------------------
+// #101: envfile phase must run ALL env-dir writes as appUser when appUser is
+// registered — the whack-a-mole root cause.
+//
+// Root cause: #98 fixed the CLONE phase (sudo -u appUser git), #100 fixed the
+// INSTALL + BUILD phases (sudo -u appUser /usr/bin/npm + build binary), but
+// the ENVFILE phase — which does cp, chmod, printf>>, install -m 600, grep>>,
+// mv, chmod on the app-user-owned env dir — still ran as the SSH user (samo).
+// The env dir is drwxrwxr-x owned by the app user, so samo's writes fail with
+// EACCES. Fix: wrap the entire envfile compose in a single
+// `sudo -u appUser /usr/bin/bash -s << 'HEREDOC'` invocation, with literal
+// (TypeScript-inlined) paths and values, so every write runs as the owner.
+// Runtime-only values (SAMOHOST_DB_PORT for dblab) are forwarded via
+// KEY=val sudo prefix (requires SETENV: /usr/bin/bash grant in sudoers).
+//
+// Phase audit (buildEnvCreateScript, appUser set):
+//   port-check   — B (read-only + root Caddy/systemctl ops; no env-dir writes)
+//   clone        — A FIXED in #98 (sudo -u appUser git)
+//   install      — A FIXED in #100 (sudo -u appUser /usr/bin/npm)
+//   build        — A FIXED in #100 (sudoWrapBuildCmd)
+//   db-preflight — B (curl + CLI resolve; no env-dir writes)
+//   db           — B (sudo -u postgres psql/createdb/dropdb; no env-dir writes)
+//   envfile      — A FIX HERE (cp/chmod/printf>>/install/grep>>/mv into env dir)
+//   unit         — B (sudo systemctl enable/disable; no env-dir writes)
+//   vhost        — B (sudo tee /etc/caddy/... + sudo systemctl reload; no env-dir writes)
+//   health       — B (curl localhost; no writes)
+// ---------------------------------------------------------------------------
+describe("#101: envfile phase runs all env-dir writes as appUser (complete whack-a-mole audit)", () => {
+  const APP_USER = "samohost-fixture";
+  const appWithUser = () =>
+    app({ appUser: APP_USER, appDir: "/opt/samohost-fixture/app" });
+
+  // (A) envfile phase delegates to appUser via a bash subshell for every db backend
+  for (const db of ["dblab", "template", "none"] as const) {
+    test(`(A-${db}) envfile phase body starts with sudo -u appUser /usr/bin/bash when appUser is set (${db})`, () => {
+      const s = buildEnvCreateScript(
+        appWithUser(),
+        target({ dbBackend: db, dbName: "test_env_name" }),
+      );
+      const envfileStart = s.indexOf("<<<SAMOHOST_PHASE:envfile:start>>>");
+      const envfileOk = s.indexOf("<<<SAMOHOST_PHASE:envfile:ok>>>");
+      expect(envfileStart).toBeGreaterThan(-1);
+      expect(envfileOk).toBeGreaterThan(envfileStart);
+      const envfileBlock = s.slice(envfileStart, envfileOk);
+      // All env-dir writes are delegated to appUser via a bash subshell.
+      expect(envfileBlock).toContain(`sudo -u '${APP_USER}' /usr/bin/bash`);
+      // Valid bash after the change.
+      expect(bashSyntaxOk(s)).toBe(true);
+    });
+  }
+
+  // (B) backward compat: no sudo -u in envfile when appUser is absent
+  test("(B) envfile phase has no sudo -u delegation when appUser is absent (backward compat)", () => {
+    for (const db of ["dblab", "template", "none"] as const) {
+      const s = buildEnvCreateScript(app(), target({ dbBackend: db }));
+      const envfileStart = s.indexOf("<<<SAMOHOST_PHASE:envfile:start>>>");
+      const envfileOk = s.indexOf("<<<SAMOHOST_PHASE:envfile:ok>>>");
+      expect(envfileStart).toBeGreaterThan(-1);
+      const envfileBlock = s.slice(envfileStart, envfileOk);
+      // No appUser → envfile body is unchanged (plain cp/chmod/printf as SSH user).
+      expect(envfileBlock).not.toContain(`sudo -u`);
+      expect(bashSyntaxOk(s)).toBe(true);
+    }
+  });
+
+  // (C) host-prep sudoers must add SETENV: /usr/bin/bash grant for appUser so
+  //     the KEY=val env-forwarding prefix works through sudo's env_reset.
+  test("(C) host-prep sudoers grants SETENV: /usr/bin/bash for the appUser (envfile compose subshell)", () => {
+    const prep = buildHostPrepScript(appWithUser(), "samo");
+    expect(prep).toContain(`samo ALL=(${APP_USER}) NOPASSWD: SETENV: /usr/bin/bash`);
+    expect(bashSyntaxOk(prep)).toBe(true);
+  });
+
+  // (D) no bare (non-sudoed) write into the env dir appears in the generated script
+  //     when appUser is set — structural completeness audit.
+  test("(D) structural: every env-dir write in the generated script is inside the sudo-u-appUser bash block", () => {
+    const envDir = "/opt/samohost-fixture/envs/field-record-1-feat-x";
+    for (const db of ["dblab", "template", "none"] as const) {
+      const s = buildEnvCreateScript(
+        appWithUser(),
+        target({ dbBackend: db, dbName: "test_env", name: "field-record-1-feat-x" }),
+      );
+      // Scan every line that references the env dir and is a write operation.
+      // A write line is one with cp / chmod / install -m / mv that is not
+      // inside a grep -v read context.
+      const lines = s.split("\n");
+      for (let i = 0; i < lines.length; i++) {
+        const line = lines[i]!;
+        if (!line.includes(envDir)) continue;
+        // Classify: is this line a write into the env dir?
+        const isWriteOp =
+          /\bcp\b/.test(line) ||
+          /\bchmod\b/.test(line) ||
+          /\binstall -m\b/.test(line) ||
+          (/\bmv\b/.test(line) && !line.trimStart().startsWith("#")) ||
+          (/>/.test(line) && !/^#/.test(line.trimStart()));
+        if (!isWriteOp) continue;
+        // This is a write op into the env dir. It must be preceded by the
+        // sudo delegation header within a reasonable window (50 lines).
+        const precedingCtx = lines.slice(Math.max(0, i - 50), i).join("\n");
+        expect(
+          precedingCtx,
+          `Line ${i} has un-delegated write into env dir: ${JSON.stringify(line)}`,
+        ).toContain(`sudo -u '${APP_USER}' /usr/bin/bash`);
+      }
+    }
+  });
+
+  // (E) envfile heredoc body contains the actual compose operations
+  //     (not stripped — we must see cp/chmod/PORT/BASE_URL inside the block).
+  test("(E) envfile block contains cp, chmod, PORT append, and BASE_URL append when appUser set", () => {
+    for (const db of ["dblab", "template", "none"] as const) {
+      const s = buildEnvCreateScript(
+        appWithUser(),
+        target({ dbBackend: db, dbName: "test_env", name: "field-record-1-feat-x" }),
+      );
+      const envfileStart = s.indexOf("<<<SAMOHOST_PHASE:envfile:start>>>");
+      const envfileOk = s.indexOf("<<<SAMOHOST_PHASE:envfile:ok>>>");
+      const block = s.slice(envfileStart, envfileOk);
+      expect(block).toContain("cp ");
+      expect(block).toContain("chmod 600");
+      expect(block, `db=${db}: PORT missing`).toContain("PORT=");
+      expect(block, `db=${db}: SAMO_ENV missing`).toContain("SAMO_ENV=preview");
+      expect(block, `db=${db}: BASE_URL missing`).toContain("BASE_URL=");
+    }
+  });
+
+  // (F) executed round-trip: extract the heredoc body from the generated script
+  //     and run it directly (no real sudo needed — we test the logic, not the
+  //     privilege delegation). The compose must produce a correct .env file.
+  test("(F) executed round-trip: heredoc body (none backend) produces correct .env with BASE_URL and PORT", () => {
+    const vhost = "field-record-1-feat-x.samo.cat";
+    const port = 3100;
+    const branch = "feat/x";
+    const s = buildEnvCreateScript(
+      appWithUser(),
+      target({ dbBackend: "none", vhost, port, branch }),
+    );
+    // Locate the heredoc body: from `<< 'SAMOHOST_ENVFILE_EOF'` to the
+    // `SAMOHOST_ENVFILE_EOF` sentinel line.
+    const heredocStart = s.indexOf("<< 'SAMOHOST_ENVFILE_EOF'");
+    expect(heredocStart).toBeGreaterThan(-1);
+    const bodyStart = s.indexOf("\n", heredocStart) + 1;
+    const bodyEnd = s.indexOf("\nSAMOHOST_ENVFILE_EOF\n", bodyStart);
+    expect(bodyEnd).toBeGreaterThan(bodyStart);
+    const heredocBody = s.slice(bodyStart, bodyEnd);
+    // Sanity: body contains compose ops.
+    expect(heredocBody).toContain("cp ");
+    expect(heredocBody).toContain("chmod 600");
+    expect(heredocBody).toContain(`PORT=${port}`);
+    expect(heredocBody).toContain(`BASE_URL=https://${vhost}`);
+
+    // Execute the heredoc body directly in a temp dir (as current user).
+    const dir = mkdtempSync(join(tmpdir(), "samohost-envfile-appuser-"));
+    try {
+      const envDir = join(dir, "envdir");
+      const templateEnv = join(dir, "template.env");
+      writeFileSync(
+        templateEnv,
+        [
+          "NODE_ENV=production",
+          "BASE_URL=https://field-record-1.samo.team",
+          "DATABASE_URL=postgres://app_user:secret@localhost:5432/prod_db",
+          "",
+        ].join("\n"),
+        { mode: 0o600 },
+      );
+      // The heredoc body uses literal paths inlined by TypeScript — substitute
+      // them so the test runs in the temp dir instead of the real /opt path.
+      const envDirLiteral = "/opt/samohost-fixture/envs/field-record-1-feat-x";
+      const templateLiteral = "/opt/samohost-fixture/envs.template.env";
+      const patchedBody = heredocBody
+        .replace(new RegExp(envDirLiteral.replace(/\//g, "\\/"), "g"), envDir)
+        .replace(new RegExp(templateLiteral.replace(/\//g, "\\/"), "g"), templateEnv);
+
+      // Prepend mkdir so the env dir exists.
+      const prog = `set -euo pipefail\nmkdir -p '${envDir}'\n${patchedBody}`;
+      const syntaxCheck = spawnSync("bash", ["-n"], { input: prog, encoding: "utf8" });
+      expect(syntaxCheck.status, `syntax check failed:\n${syntaxCheck.stderr}`).toBe(0);
+      const r = spawnSync("bash", ["-c", prog], { encoding: "utf8" });
+      if (r.status !== 0) {
+        console.error("heredoc round-trip stderr:", r.stderr);
+      }
+      expect(r.status).toBe(0);
+      const env = readFileSync(join(envDir, ".env"), "utf8");
+      // PORT present.
+      expect(env).toContain(`PORT=${port}`);
+      // SAMO_ENV/SAMO_BRANCH present.
+      expect(env).toContain("SAMO_ENV=preview");
+      expect(env).toContain(`SAMO_BRANCH=${branch}`);
+      // BASE_URL is the preview vhost (prod BASE_URL stripped).
+      expect(env.match(/^BASE_URL=/gm)).toHaveLength(1);
+      expect(env).toContain(`BASE_URL=https://${vhost}`);
+      expect(env).not.toContain("field-record-1.samo.team");
+      // .env is mode 600.
+      expect(statSync(join(envDir, ".env")).mode & 0o777).toBe(0o600);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  // (G) dblab backend: SAMOHOST_DB_PORT is forwarded as a KEY=val sudo prefix
+  //     (required by SETENV grant so the rewire function can access it).
+  test("(G) dblab backend: envfile phase forwards SAMOHOST_DB_PORT via KEY=val sudo prefix", () => {
+    const s = buildEnvCreateScript(
+      appWithUser(),
+      target({ dbBackend: "dblab", dbName: "test_clone" }),
+    );
+    const envfileStart = s.indexOf("<<<SAMOHOST_PHASE:envfile:start>>>");
+    const envfileOk = s.indexOf("<<<SAMOHOST_PHASE:envfile:ok>>>");
+    const block = s.slice(envfileStart, envfileOk);
+    // The KEY=val prefix must forward the runtime-computed SAMOHOST_DB_PORT.
+    expect(block).toContain(`SAMOHOST_DB_PORT="$SAMOHOST_DB_PORT"`);
+    expect(bashSyntaxOk(s)).toBe(true);
+  });
+
+  // (H) template backend: rewire function is included in the heredoc body and
+  //     SAMOHOST_DB_NAME is inlined as a literal (no runtime forwarding needed).
+  test("(H) template backend: heredoc body includes rewire-db-vars function and literal SAMOHOST_DB_NAME", () => {
+    const dbName = "feat_x_db";
+    const s = buildEnvCreateScript(
+      appWithUser(),
+      target({ dbBackend: "template", dbName }),
+    );
+    const heredocStart = s.indexOf("<< 'SAMOHOST_ENVFILE_EOF'");
+    expect(heredocStart).toBeGreaterThan(-1);
+    const bodyStart = s.indexOf("\n", heredocStart) + 1;
+    const bodyEnd = s.indexOf("\nSAMOHOST_ENVFILE_EOF\n", bodyStart);
+    const heredocBody = s.slice(bodyStart, bodyEnd);
+    // The rewire function for template backend must be defined inside the heredoc.
+    expect(heredocBody).toContain("samohost_rewire_db_vars()");
+    // SAMOHOST_DB_NAME is set as a literal (TypeScript-inlined) inside the heredoc.
+    expect(heredocBody).toContain(`SAMOHOST_DB_NAME='${dbName}'`);
+    expect(bashSyntaxOk(s)).toBe(true);
+  });
+});
