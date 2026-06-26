@@ -205,9 +205,21 @@ function buildFragment(spec: ProvisionSpec): CloudInitFragment {
     // UFW: default deny incoming; rate-LIMIT the hardened SSH port (air: brute-
     // force damping in addition to fail2ban — `limit` blocks an IP with >6
     // connections in 30s). `allow` would leave SSH unthrottled at the firewall.
+    //
+    // TRUSTED-IP EXEMPTION: emit `allow from <ip>` BEFORE the `limit` rule for
+    // every trusted IP.  UFW processes rules in first-match order, so the
+    // allow-from line wins and the trusted source is never rate-limited.  This
+    // is the primary fix for the provision self-ban: the control-plane's own
+    // egress IP (auto-injected by provision.ts) polls SSH every 5 s during the
+    // booting→ready gate; without the exemption those probes hit the `limit`
+    // rule and ban the control-plane before cloud-init writes the readiness
+    // sentinel.
     "ufw --force reset",
     "ufw default deny incoming",
     "ufw default allow outgoing",
+    ...trustedIps.map(
+      (ip) => `ufw allow from ${ip} to any port ${sshPort} proto tcp`,
+    ),
     `ufw limit ${sshPort}/tcp`,
     "ufw --force enable",
     // sysctl — pure kernel knobs, no apt lock involved.
