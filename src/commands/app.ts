@@ -31,7 +31,7 @@ import {
   type RunDeps,
   type SpawnResult,
 } from "../ssh/runner.ts";
-import type { AppRecord, AppSpec, VmRecord } from "../types.ts";
+import type { AppRecord, AppSpec, EnvDbBackend, VmRecord } from "../types.ts";
 import { parseSamohostToml } from "../manifest/toml.ts";
 
 // ---------------------------------------------------------------------------
@@ -64,6 +64,19 @@ export interface AppRegisterInput {
    * Absent = node; all existing AppRecords are valid.
    */
   kind?: "node" | "static";
+  /**
+   * Persistent DB backend for this app's own production database.
+   * `"none"` = app carries no database; preview envs must skip all DB phases.
+   * Absent on existing AppRecords; treated as implicitly DB-present.
+   * Mirrors {@link AppSpec.dbBackend}.
+   */
+  dbBackend?: EnvDbBackend;
+  /**
+   * Per-app default DB backend for auto-created PR-preview envs.
+   * When absent, falls back via previewDbBackendFor() in trigger/preview-rebuild.
+   * Mirrors {@link AppSpec.previewDbBackend}.
+   */
+  previewDbBackend?: EnvDbBackend;
 }
 
 /**
@@ -181,6 +194,8 @@ export function runAppRegister(
     ...(input.rlsNonSuperuser
       ? { assertions: { rlsNonSuperuser: true } }
       : {}),
+    ...(input.dbBackend !== undefined ? { dbBackend: input.dbBackend } : {}),
+    ...(input.previewDbBackend !== undefined ? { previewDbBackend: input.previewDbBackend } : {}),
   };
 
   const existing = appStore.get(vm.id, input.name);
@@ -277,6 +292,8 @@ export function runAppRegisterFromToml(
     ...(app.mainHost !== undefined ? { mainHost: app.mainHost } : {}),
     ...(app.rlsUrlVar !== undefined ? { rlsUrlVar: app.rlsUrlVar } : {}),
     ...(app.envDbVars !== undefined ? { envDbVars: app.envDbVars } : {}),
+    ...(app.dbBackend !== undefined ? { dbBackend: app.dbBackend } : {}),
+    ...(app.previewDbBackend !== undefined ? { previewDbBackend: app.previewDbBackend } : {}),
   };
 
   return runAppRegister(registerInput, opts, vmStore, appStore, out, err);
