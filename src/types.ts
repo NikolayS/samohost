@@ -215,6 +215,20 @@ export interface AppSpec {
   /** Optional pluggable post-deploy assertions. */
   assertions?: AppAssertions;
   /**
+   * OS user that owns the production app checkout and the envs root (created
+   * by `samohost app bootstrap --app-user <user>`). When set, env-create runs
+   * all git operations (clone/fetch/checkout) as this user via
+   * `sudo -u <appUser> GIT_CONFIG_GLOBAL=<git-safe.conf> /usr/bin/git`,
+   * preventing `fatal: detected dubious ownership in repository` (git ≥ 2.35.2
+   * rejects checkouts whose owner differs from the calling process user). The
+   * 600 `.gh-token` is also unreadable by the SSH user — this field makes the
+   * clone run as the user who CAN read it. The preview systemd template unit
+   * is also reconciled: `User=<appUser>` so the preview process runs as the
+   * user that owns the env dir and the code. Absent on existing AppRecords that
+   * pre-date this field: the SSH user is used as before (back-compat).
+   */
+  appUser?: string;
+  /**
    * Persistent DB backend for this app's own production database.
    * When set to `"none"` the app carries no database at all — preview envs
    * must not attempt a dblab clone or a template copy. Absent on existing

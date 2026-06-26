@@ -2575,3 +2575,134 @@ describe("unit phase restarts an already-active instance via disable--now+enable
     expect(s).not.toContain("is-active");
   });
 });
+
+// ---------------------------------------------------------------------------
+// Issue #97 — env-create clone runs as the wrong user (samo instead of the
+// registered app user), causing `fatal: detected dubious ownership in
+// repository` and making the 600 .gh-token unreadable. The preview systemd
+// template unit also runs as samo instead of the app user that owns the env
+// dir and the clone.
+//
+// Root cause: CLONE_FN_LINES uses plain `git` (no sudo), so git rejects
+// /opt/<app>/app (owned by the app user, not samo). Under `set -euo pipefail`
+// the clone phase fails silently → /etc/caddy/sites.d stays empty → Caddy
+// imports nothing → CF 521.
+//
+// Fix: mirror bootstrap.ts §12 — run git ops as the app user via
+//   sudo -u <appUser> GIT_CONFIG_GLOBAL=<git-safe.conf> /usr/bin/git
+// with the credential helper reading the token file by LITERAL path (not an
+// unexported shell variable). Also reconcile the preview template
+// `User=<sshUser>` → `User=<appUser>` and add the SETENV sudoers grant so
+// GIT_CONFIG_GLOBAL passes through sudo.
+// ---------------------------------------------------------------------------
+
+describe("issue #97: env-create clone + preview unit must use the registered app user", () => {
+  // Fixture: samohost-fixture owns /opt/samohost-fixture/app.
+  // The SSH user (samo) runs env-create but cannot access the app checkout
+  // or read the 600 token; all git ops must delegate to samohost-fixture.
+  const APP_USER = "samohost-fixture";
+  const appWithUser = () =>
+    app({ appUser: APP_USER, appDir: "/opt/samohost-fixture/app" });
+
+  // Paths derived from appDir at generation time (mirrors bootstrap.ts §12):
+  //   appBase    = /opt/samohost-fixture
+  //   gitSafeConf = /opt/samohost-fixture/git-safe.conf
+  //   tokenFile  = /opt/samohost-fixture/.gh-token
+  const SAFE_CONF = "/opt/samohost-fixture/git-safe.conf";
+  const TOKEN_FILE = "/opt/samohost-fixture/.gh-token";
+
+  test("clone function runs ALL git ops with sudo -u <appUser> (not plain git as samo)", () => {
+    const s = buildEnvCreateScript(appWithUser(), target());
+    // Every git invocation in the generated clone function must delegate to
+    // the app user so git does not see a dubious-ownership mismatch.
+    expect(s).toContain(`sudo -u '${APP_USER}'`);
+    // Full-path /usr/bin/git is required for the NOPASSWD sudoers grant.
+    expect(s).toContain("/usr/bin/git");
+    // No bare `git ` lines in the clone function body (plain git runs as samo
+    // and would trigger the dubious-ownership error).
+    const cloneFnStart = s.indexOf("samohost_clone_env_dir() {");
+    const cloneFnEnd = s.indexOf("\n}", cloneFnStart);
+    expect(cloneFnStart).toBeGreaterThan(-1);
+    expect(cloneFnEnd).toBeGreaterThan(cloneFnStart);
+    const cloneFnBody = s.slice(cloneFnStart, cloneFnEnd);
+    // No unadorned `git` call (every git call goes via sudo)
+    expect(cloneFnBody).not.toMatch(/(?:^|[^\/a-zA-Z])git /m);
+    expect(bashSyntaxOk(s)).toBe(true);
+  });
+
+  test("clone function uses GIT_CONFIG_GLOBAL pointing at the bootstrap-written git-safe.conf", () => {
+    const s = buildEnvCreateScript(appWithUser(), target());
+    // GIT_CONFIG_GLOBAL lets git bypass the safe.directory check that git
+    // ≥ 2.35.2 enforces even for the checkout owner when running via sudo.
+    // The path is derived from appDir at generation time (literal, not a
+    // shell variable), mirroring bootstrap.ts §12.
+    expect(s).toContain(`GIT_CONFIG_GLOBAL='${SAFE_CONF}'`);
+  });
+
+  test("clone uses a literal-path credential helper (not unexported $TOKEN_FILE)", () => {
+    const s = buildEnvCreateScript(appWithUser(), target());
+    // The inline credential helper must embed the TOKEN FILE PATH as a literal
+    // string — not $TOKEN_FILE (which is not exported into the credential
+    // helper subprocess). `cat <literal>` is the proven bootstrap.ts §12
+    // pattern (samorev #32 + #83).
+    expect(s).toContain(`cat ${TOKEN_FILE}`);
+    // The shell variable form must NOT appear in the credential helper.
+    expect(s).not.toContain("cat $TOKEN_FILE");
+  });
+
+  test("static env-create with appUser also uses sudo -u <appUser> for the clone", () => {
+    const s = buildEnvCreateScript({ ...appWithUser(), kind: "static" }, target({ dbBackend: "none" }));
+    expect(s).toContain(`sudo -u '${APP_USER}'`);
+    expect(s).toContain("/usr/bin/git");
+    expect(bashSyntaxOk(s)).toBe(true);
+  });
+
+  test("preview template unit User= matches the app user, not the SSH user", () => {
+    const s = buildHostPrepScript(appWithUser(), "samo");
+    // The preview systemd instance runs as the app user so it can access files
+    // created by the sudo-u-appUser clone (owned by appUser).
+    expect(s).toContain(`User=${APP_USER}`);
+    // Must NOT set User= to the SSH user (samo).
+    expect(s).not.toContain("User=samo");
+    expect(bashSyntaxOk(s)).toBe(true);
+  });
+
+  test("host-prep sudoers grants samo the SETENV: /usr/bin/git right to run as appUser", () => {
+    const s = buildHostPrepScript(appWithUser(), "samo");
+    // SETENV: is required so GIT_CONFIG_GLOBAL passes through sudo to git.
+    // Without it, sudo strips the env var and git falls back to the default
+    // global config, losing the safe.directory override.
+    expect(s).toContain(`samo ALL=(${APP_USER}) NOPASSWD: SETENV: /usr/bin/git`);
+  });
+
+  test("host-prep envs root is created owned by appUser (not sshUser) when appUser is set", () => {
+    // The envs root must be owned by appUser so that `sudo -u appUser git clone`
+    // can create the env subdirectory inside it. With sshUser ownership + mode 755,
+    // appUser has no write permission and clone fails with EACCES.
+    const s = buildHostPrepScript(appWithUser(), "samo");
+    const root = envsRoot(appWithUser());
+    expect(s).toContain(
+      `install -d -m 755 -o ${APP_USER} -g ${APP_USER} '${root}'`,
+    );
+    // sshUser (samo) must NOT be the owner when appUser is set.
+    expect(s).not.toContain(`install -d -m 755 -o samo -g samo '${root}'`);
+  });
+
+  test("backward compat: when appUser is absent, no sudo for git (old plain-git behavior)", () => {
+    // Existing AppRecords without appUser keep working — plain git is used,
+    // which matches the pre-#97 behavior (and only breaks on hosts where the
+    // app dir is owned by a different user, i.e. the bug being fixed).
+    const s = buildEnvCreateScript(app(), target());
+    // No git-specific sudo delegation when appUser is not set.
+    expect(s).not.toMatch(/sudo -u '[^']+'\s.*\/usr\/bin\/git/);
+    // Plain git calls are still present (the old CLONE_FN_LINES behavior).
+    expect(s).toContain("git clone");
+  });
+
+  test("backward compat: when appUser is absent, host-prep User= still uses sshUser", () => {
+    const s = buildHostPrepScript(app(), "agent");
+    expect(s).toContain("User=agent");
+    expect(s).not.toContain("User=undefined");
+    expect(bashSyntaxOk(s)).toBe(true);
+  });
+});

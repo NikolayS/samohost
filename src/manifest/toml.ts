@@ -48,6 +48,11 @@ export interface AppManifest {
   /** Maps to assertions.rlsNonSuperuser when true. */
   rlsNonSuperuser?: boolean;
   /**
+   * OS user that owns the production app checkout and the envs root.
+   * Maps to {@link AppSpec.appUser}. Optional: absent = SSH user (back-compat).
+   */
+  appUser?: string;
+  /**
    * Serve kind: `"node"` (default) or `"static"`. Maps to {@link AppSpec.kind}.
    * Optional: absent means node.
    */
@@ -114,6 +119,8 @@ const APP_KEYS = new Set<string>([
   "dbBackend",
   // Per-app default DB backend for auto-created PR-preview envs.
   "previewDbBackend",
+  // Issue #97: OS user that owns the app checkout + envs root (clone + unit user).
+  "appUser",
   // `provision` is the only allowed sub-table at top level
   "provision",
 ]);
@@ -301,6 +308,7 @@ export function parseSamohostToml(text: string): ParseTomlResult {
   const envFile = optionalString(raw, "envFile", errors);
   const mainHost = optionalString(raw, "mainHost", errors);
   const rlsUrlVar = optionalString(raw, "rlsUrlVar", errors);
+  const appUser = optionalString(raw, "appUser", errors);
   const envDbVars = optionalStringArray(raw, "envDbVars", errors);
   const rlsNonSuperuser = optionalBoolean(raw, "rlsNonSuperuser", errors);
 
@@ -414,6 +422,7 @@ export function parseSamohostToml(text: string): ParseTomlResult {
     ...(envFile !== undefined ? { envFile } : {}),
     ...(mainHost !== undefined ? { mainHost } : {}),
     ...(rlsUrlVar !== undefined ? { rlsUrlVar } : {}),
+    ...(appUser !== undefined ? { appUser } : {}),
     ...(envDbVars !== undefined ? { envDbVars } : {}),
     ...(rlsNonSuperuser !== undefined ? { rlsNonSuperuser } : {}),
     ...(kind !== undefined ? { kind } : {}),
