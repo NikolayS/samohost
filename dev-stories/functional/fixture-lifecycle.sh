@@ -297,6 +297,15 @@ teardown() {
   echo "[$(ts)] SUMMARY: ${PASS} pass / ${FAIL} fail / ${XFAIL} expected-fail (documented gaps) / ${SKIP} skipped (dry-run)"
   rm -f "$RESULTS" 2>/dev/null || true
   echo "[$(ts)] fixture-lifecycle: DONE"
+
+  # EXIT EXPLICITLY — this same handler is the INT/TERM trap too. On a SIGINT/SIGTERM
+  # a bash trap handler that merely RETURNS resumes the script at the point the signal
+  # interrupted it: teardown would destroy the VM and then the lifecycle would RESUME
+  # and fire a stray `trigger run --pr-previews` against the just-destroyed VM. Exiting
+  # here ends the run cleanly on a signal. On the normal EXIT path this preserves the
+  # exit-code-so-far ($rc, captured above); it cannot recurse because this handler
+  # cleared its own traps (`trap - EXIT INT TERM`) at the top.
+  exit "$rc"
 }
 trap teardown EXIT INT TERM
 # ^^^ THE TEARDOWN MECHANISM (quoted in the structured output).
@@ -815,6 +824,7 @@ if [ "$DRYRUN" = "1" ]; then
   note "DRY-RUN: would then POLL each preview /api/version (≤${READY_TIMEOUT_SEC}s @ ${READY_INTERVAL_SEC}s) until 200+env=preview+branch BEFORE asserting."
   note "DRY-RUN: would also assert the per-preview DNS write happened — i.e. the CLOUDFLARE_SAMOCAT-not-set DEGRADE warning is ABSENT from trigger stderr (a missing-token run must FAIL LOUDLY here, naming the real cause, not silently 525)."
   skip "create-dns: would assert per-preview DNS written (CLOUDFLARE_SAMOCAT degrade-warning ABSENT) so a missing-token run fails loudly with the real cause"
+  skip "create-serve-200: would assert the no-DB preview REALLY served — POLL the live URL to HTTP 200 (env=preview + branch match) AND, where checkable, the created env record resolves dbBackend='none' AND no forced-dblab/db-preflight phase ran; a log-only 'no dblab text' check is a false positive and is NOT sufficient"
   skip "create: would poll-to-ready then assert URL 200 + env=preview + branch match + preview-link comment posted"
 else
   # Capture trigger stderr so we can assert per-preview DNS actually happened.
@@ -831,6 +841,18 @@ else
   else
     pass "create-dns: per-preview DNS NOT degraded (no CLOUDFLARE_SAMOCAT degrade warning) — samohost-fixture-preview-*.samo.cat A record points at the fixture VM, so CF reaches the fixture origin (525 cleared)"
   fi
+  # CREATE-SERVE-200 (no-DB) precondition: the fixture app is dbBackend=none, so
+  # previewDbBackendFor must resolve the env backend to 'none' and the trigger must NOT
+  # force a dblab clone nor run the db-preflight gate for it. Grepping the trigger log
+  # for that ABSENT phase is NECESSARY but NOT SUFFICIENT — absence of a forced clone
+  # does NOT prove the preview ever answered, so a log-only check is a FALSE POSITIVE.
+  # We therefore make it a hard precondition here (fail loudly if a forced-dblab /
+  # db-preflight phase ran), and assert the SUFFICIENT facts per-PR below: each preview
+  # POLLS to a real HTTP 200 AND its created env record resolves dbBackend='none'. Only
+  # then does "create-serve-200" honestly mean the no-DB surface really served.
+  if printf '%s' "$trig_out" | grep -qiE 'forc(e|ed) ?dblab|db-preflight|dblab clone create|backend.*dblab.*samohost-fixture'; then
+    fail "create-serve-200: trigger ran a dblab clone / db-preflight phase for the no-DB fixture (dbBackend=none) — the no-DB backend was NOT honored; the no-DB preview cannot be trusted to serve 200 (the per-PR 200 + dbBackend='none' assertions below are the real proof)"
+  fi
   open_prs="$(gh pr list --repo "$FIXTURE_REPO" --state open --limit 100 \
                 --json number,headRefName 2>/dev/null | jq -c '.[]' 2>/dev/null)"
   npr="$(printf '%s\n' "$open_prs" | grep -c . || true)"
@@ -840,19 +862,28 @@ else
   while read -r pr; do
     [ -z "${pr:-}" ] && continue
     num="$(jq -r '.number' <<<"$pr")"; br="$(jq -r '.headRefName' <<<"$pr")"
-    vhost="$(jq -r --arg b "$br" '.[] | select(.branch==$b) | .vhost' <<<"$envs" | head -1)"
+    vhost="$(jq -r --arg b "$br" '[.[] | select(.branch==$b)][0].vhost // empty' <<<"$envs")"
     if [ -z "$vhost" ]; then fail "create PR#$num [$br]: no preview env created"; continue; fi
-    # READINESS WAIT: poll until 200 + env=preview + branch match (or timeout).
+    # WHERE CHECKABLE: the created env record must resolve dbBackend='none' for the
+    # no-DB fixture. If the field is present and not 'none', the no-DB backend was NOT
+    # honored — fail BEFORE the 200 poll (a wrong backend invalidates the serve-200 claim).
+    dbbk="$(jq -r --arg b "$br" '[.[] | select(.branch==$b)][0].dbBackend // empty' <<<"$envs")"
+    if [ -n "$dbbk" ] && [ "$dbbk" != "none" ]; then
+      fail "create-serve-200 PR#$num [$br]: created env record shows dbBackend='$dbbk' (expected 'none' for the no-DB fixture) — no-DB backend NOT honored"
+      continue
+    fi
+    # READINESS WAIT: POLL the LIVE URL until it REALLY serves 200 + env=preview + branch
+    # match (or timeout). This is what makes 'serve-200' mean the surface actually served.
     if poll_preview_ready "$vhost" "$br"; then
       cmt="$(gh api "repos/$FIXTURE_REPO/issues/$num/comments" --paginate 2>/dev/null \
                | jq -r '.[].body' | grep -F '🔎' | grep -oE 'https?://[^[:space:]]+' | head -1)"
       if printf '%s' "$cmt" | grep -qF "$vhost"; then
-        pass "create PR#$num [$br]: $vhost live (200, env=preview, branch match), preview-link comment posted"
+        pass "create-serve-200 PR#$num [$br]: no-DB preview $vhost REALLY served HTTP 200 (env=preview, branch match, dbBackend='${dbbk:-none}'), preview-link comment posted"
       else
-        fail "create PR#$num [$br]: $vhost live but no 🔎 preview-link comment naming the vhost (comment='${cmt:-none}')"
+        fail "create PR#$num [$br]: $vhost served 200 but no 🔎 preview-link comment naming the vhost (comment='${cmt:-none}')"
       fi
     else
-      fail "create PR#$num [$br]: $vhost never reached 200+env=preview+branch within ${READY_TIMEOUT_SEC}s (last code=$LAST_READY_CODE)"
+      fail "create-serve-200 PR#$num [$br]: $vhost never served HTTP 200+env=preview+branch within ${READY_TIMEOUT_SEC}s (last code=$LAST_READY_CODE) — no-DB surface did NOT serve"
     fi
   done < <(printf '%s\n' "$open_prs")
 fi
