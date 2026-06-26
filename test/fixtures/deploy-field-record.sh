@@ -69,9 +69,11 @@ else
   exit 1
 fi
 
-# --- install: npm ci with dev deps (build toolchain lives in devDependencies) ---
+# --- install: lockfile-aware install (npm ci if lockfile present, npm install otherwise) ---
+# --include=dev: NODE_ENV=production drops devDeps (build toolchain: tsc, tsx) — issue #2 bug 3.
+# lockfile fallback: apps without package-lock.json hard-fail npm ci (no-DB fixtures, greenfield).
 echo "<<<SAMOHOST_PHASE:install:start>>>"
-if npm ci --include=dev; then
+if (if [ -f package-lock.json ] || [ -f npm-shrinkwrap.json ]; then npm ci --include=dev; else npm install --include=dev; fi); then
   echo "<<<SAMOHOST_PHASE:install:ok>>>"
 else
   echo "<<<SAMOHOST_PHASE:install:fail>>>"

@@ -765,10 +765,20 @@ export function buildEnvCreateScript(
 
   lines.push('cd "$SAMOHOST_ENV_DIR"', "");
 
+  // Lockfile-aware install: use npm ci when a lockfile is present (reproducible,
+  // faster), fall back to npm install when it is absent (no-DB fixtures and
+  // minimal greenfield apps ship without package-lock.json; npm ci hard-fails
+  // with "can only install with an existing package-lock.json", which under
+  // set -euo pipefail aborts the whole script before .env/systemd/Caddy are
+  // written → no :443 listener → CF 521).
   lines.push(
-    ...phaseBlock("install", "npm ci (clean, reproducible install)", [
-      "if npm ci; ",
-    ]),
+    ...phaseBlock(
+      "install",
+      "lockfile-aware install (npm ci if lockfile present, npm install otherwise)",
+      [
+        "if (if [ -f package-lock.json ] || [ -f npm-shrinkwrap.json ]; then npm ci; else npm install; fi); ",
+      ],
+    ),
   );
 
   lines.push(
