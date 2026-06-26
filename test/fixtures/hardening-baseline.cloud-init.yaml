@@ -89,6 +89,8 @@ runcmd:
   - ufw --force reset
   - ufw default deny incoming
   - ufw default allow outgoing
+  - ufw allow from 203.0.113.7 to any port 2223 proto tcp
+  - ufw allow from 198.51.100.4 to any port 2223 proto tcp
   - ufw limit 2223/tcp
   - ufw --force enable
   - sysctl --system

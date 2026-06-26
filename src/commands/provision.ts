@@ -183,6 +183,13 @@ export interface ProvisionDeps {
   controlDir?: string;
   /** Delay between ready-gate attempts. Default 5000ms. */
   pollIntervalMs?: number;
+  /**
+   * Detect the control-plane's own outbound (egress) IP so it can be
+   * auto-injected into trustedIps — exempting the ready-gate's own polling
+   * IP from UFW `limit` and fail2ban. Returns null on any failure (silently
+   * skipped). Injected so tests never touch the network.
+   */
+  detectEgressIp?: () => Promise<string | null>;
 }
 
 const DEFAULT_POLL_INTERVAL_MS = 5000;
@@ -214,6 +221,19 @@ export async function runProvision(
   if (validationErrors.length > 0) {
     for (const e of validationErrors) err(`error: ${e}`);
     return 1;
+  }
+
+  // Auto-inject the control-plane's own egress IP as a trusted IP so the
+  // ready-gate SSH probes (which originate from this machine) are exempt from
+  // the UFW `limit` rule and fail2ban BEFORE cloud-init renders.  This is the
+  // root-cause fix for provision flakiness: without the exemption, 5-second
+  // polling can accumulate ≥6 connections in 30s and trip the rate-limiter,
+  // banning the control-plane from the VM it just created.
+  if (deps.detectEgressIp) {
+    const egressIp = await deps.detectEgressIp();
+    if (egressIp !== null && !spec.trustedIps.includes(egressIp)) {
+      spec.trustedIps = [egressIp, ...spec.trustedIps];
+    }
   }
 
   const userData = buildCloudInit(spec, modules, { sshPubkey: publicKey });
@@ -385,7 +405,32 @@ export function defaultProvisionDeps(provider: ProviderPort, store: StateStore):
     sleep: (ms) => new Promise((r) => setTimeout(r, ms)),
     knownHostsDir:
       process.env["SAMOHOST_KNOWN_HOSTS_DIR"] ?? defaultKnownHostsDir(),
+    detectEgressIp: defaultDetectEgressIp,
   };
+}
+
+/**
+ * Detect the outbound (egress) IP of this machine by querying a public
+ * IP-echo service.  Used once per provision to auto-exempt the control-plane
+ * from UFW `limit` + fail2ban on the newly-created VM.
+ *
+ * Failure modes (network down, non-200, non-IPv4 body) return null so the
+ * provision still succeeds — the operator can always pass `--trusted-ip`
+ * explicitly if auto-detection is unavailable.
+ */
+async function defaultDetectEgressIp(): Promise<string | null> {
+  try {
+    const res = await fetch("https://api.ipify.org?format=text", {
+      signal: AbortSignal.timeout(5000),
+    });
+    if (!res.ok) return null;
+    const ip = (await res.text()).trim();
+    // Basic sanity: four octets separated by dots (IPv4).
+    if (/^\d{1,3}(\.\d{1,3}){3}$/.test(ip)) return ip;
+    return null;
+  } catch {
+    return null;
+  }
 }
 
 /** Spawn a short-lived process and capture its output (no shell). */
