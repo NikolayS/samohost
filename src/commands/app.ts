@@ -203,6 +203,7 @@ export function runAppRegister(
       : {}),
     ...(input.dbBackend !== undefined ? { dbBackend: input.dbBackend } : {}),
     ...(input.previewDbBackend !== undefined ? { previewDbBackend: input.previewDbBackend } : {}),
+    ...(input.appUser !== undefined ? { appUser: input.appUser } : {}),
   };
 
   const existing = appStore.get(vm.id, input.name);
@@ -301,6 +302,7 @@ export function runAppRegisterFromToml(
     ...(app.envDbVars !== undefined ? { envDbVars: app.envDbVars } : {}),
     ...(app.dbBackend !== undefined ? { dbBackend: app.dbBackend } : {}),
     ...(app.previewDbBackend !== undefined ? { previewDbBackend: app.previewDbBackend } : {}),
+    ...(app.appUser !== undefined ? { appUser: app.appUser } : {}),
   };
 
   return runAppRegister(registerInput, opts, vmStore, appStore, out, err);
