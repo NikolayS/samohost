@@ -77,6 +77,13 @@ export interface AppRegisterInput {
    * Mirrors {@link AppSpec.previewDbBackend}.
    */
   previewDbBackend?: EnvDbBackend;
+  /**
+   * OS user that owns the production app checkout and the envs root (created
+   * by `samohost app bootstrap --app-user <user>`). When set, env-create runs
+   * all git operations as this user via `sudo -u <appUser> GIT_CONFIG_GLOBAL=...`.
+   * Mirrors {@link AppSpec.appUser}.
+   */
+  appUser?: string;
 }
 
 /**
@@ -196,6 +203,7 @@ export function runAppRegister(
       : {}),
     ...(input.dbBackend !== undefined ? { dbBackend: input.dbBackend } : {}),
     ...(input.previewDbBackend !== undefined ? { previewDbBackend: input.previewDbBackend } : {}),
+    ...(input.appUser !== undefined ? { appUser: input.appUser } : {}),
   };
 
   const existing = appStore.get(vm.id, input.name);
@@ -294,6 +302,7 @@ export function runAppRegisterFromToml(
     ...(app.envDbVars !== undefined ? { envDbVars: app.envDbVars } : {}),
     ...(app.dbBackend !== undefined ? { dbBackend: app.dbBackend } : {}),
     ...(app.previewDbBackend !== undefined ? { previewDbBackend: app.previewDbBackend } : {}),
+    ...(app.appUser !== undefined ? { appUser: app.appUser } : {}),
   };
 
   return runAppRegister(registerInput, opts, vmStore, appStore, out, err);

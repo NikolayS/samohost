@@ -128,41 +128,78 @@ const PORT_CHECK_FN_LINES: string[] = [
 ];
 
 /**
- * Bash function: two-strategy branch checkout (issue #11 finding 5). A
- * `git clone --reference` off the production checkout is cheap, but git
- * rejects SHALLOW (or otherwise unusable) reference repos; the old
- * `A && clone || fetch && checkout` chain then ran the fetch against the
- * nonexistent env dir, masking the real error. Now: explicit fallback to a
- * plain clone of the same origin URL, with a message NAMING which strategy
- * failed and why. (Closing brace at column 0 — tests extract and execute it.)
+ * Build the bash function `samohost_clone_env_dir` — two-strategy branch
+ * checkout (issue #11 finding 5). A `git clone --reference` off the
+ * production checkout is cheap, but git rejects SHALLOW (or otherwise
+ * unusable) reference repos; explicit fallback to a plain clone of the same
+ * origin URL, with a message NAMING which strategy failed and why.
+ *
+ * Issue #97 fix: when `appUser` is supplied all git operations run as that
+ * user via `sudo -u <appUser> GIT_CONFIG_GLOBAL=<gitSafeConf> /usr/bin/git`
+ * instead of plain `git` (the SSH user). Two failure modes prevented:
+ *   1. `fatal: detected dubious ownership in repository` — git ≥ 2.35.2
+ *      rejects a checkout whose directory owner differs from the calling
+ *      process user; running as the owner avoids this.
+ *   2. The 600 `.gh-token` is unreadable by the SSH user; running as appUser
+ *      (which bootstrap wrote the token for) enables the credential helper.
+ * The credential helper embeds the token file path as a LITERAL string (not
+ * `$TOKEN_FILE`) so it is available in the credential helper subprocess even
+ * without an exported variable.
+ *
+ * When `appUser` is absent: backward-compatible plain-`git` behavior (for
+ * AppRecords that predate the appUser field).
+ *
+ * (Closing brace at column 0 — tests extract and execute this function.)
  */
-const CLONE_FN_LINES: string[] = [
-  "samohost_clone_env_dir() {",
-  "  local origin_url",
-  '  origin_url="$(git -C "$SAMOHOST_APP_DIR" remote get-url origin)" || {',
-  '    echo "samohost: cannot read the origin URL from $SAMOHOST_APP_DIR" >&2',
-  "    return 1",
-  "  }",
-  '  if [[ -d "$SAMOHOST_ENV_DIR/.git" ]]; then',
-  '    git -C "$SAMOHOST_ENV_DIR" fetch origin "$SAMOHOST_BRANCH" \\',
-  '      && git -C "$SAMOHOST_ENV_DIR" checkout -B "$SAMOHOST_BRANCH" "origin/$SAMOHOST_BRANCH"',
-  "    return",
-  "  fi",
-  '  if git clone --reference "$SAMOHOST_APP_DIR" --dissociate \\',
-  '       --branch "$SAMOHOST_BRANCH" --single-branch \\',
-  '       "$origin_url" "$SAMOHOST_ENV_DIR"; then',
-  "    return 0",
-  "  fi",
-  '  echo "samohost: strategy 1 (git clone --reference $SAMOHOST_APP_DIR) failed — the production checkout is unusable as a clone reference (e.g. a shallow checkout); falling back to a plain clone of $origin_url" >&2',
-  '  rm -rf "$SAMOHOST_ENV_DIR"',
-  '  if git clone --branch "$SAMOHOST_BRANCH" --single-branch \\',
-  '       "$origin_url" "$SAMOHOST_ENV_DIR"; then',
-  "    return 0",
-  "  fi",
-  '  echo "samohost: strategy 2 (plain git clone of $origin_url, branch $SAMOHOST_BRANCH) ALSO failed — clone phase cannot proceed" >&2',
-  "  return 1",
-  "}",
-];
+function buildCloneFnLines(
+  appUser?: string,
+  gitSafeConf?: string,
+  tokenFile?: string,
+): string[] {
+  // Prefix for every git invocation: when appUser is set, delegate via sudo
+  // with GIT_CONFIG_GLOBAL (env var passes through thanks to the SETENV:
+  // sudoers tag emitted by buildHostPrepScript) and use the full /usr/bin/git
+  // path (required for exact-path NOPASSWD grants).
+  const gitCmd = appUser !== undefined && gitSafeConf !== undefined
+    ? `sudo -u ${sq(appUser)} GIT_CONFIG_GLOBAL=${sq(gitSafeConf)} /usr/bin/git`
+    : "git";
+
+  // Inline credential helper: embeds the token file path as a LITERAL so
+  // the helper subprocess can read it without $TOKEN_FILE in scope (proven
+  // bootstrap.ts §12 / samorev #83 pattern). Only emitted when appUser is
+  // set — without an appUser the old path had no token handling either.
+  const credHelper = appUser !== undefined && tokenFile !== undefined
+    ? ` -c 'credential.helper=!f() { echo username=x-access-token; echo "password=$(cat ${tokenFile})"; }; f'`
+    : "";
+
+  return [
+    "samohost_clone_env_dir() {",
+    "  local origin_url",
+    `  origin_url="$(${gitCmd} -C "$SAMOHOST_APP_DIR" remote get-url origin)" || {`,
+    '    echo "samohost: cannot read the origin URL from $SAMOHOST_APP_DIR" >&2',
+    "    return 1",
+    "  }",
+    '  if [[ -d "$SAMOHOST_ENV_DIR/.git" ]]; then',
+    `    ${gitCmd} -C "$SAMOHOST_ENV_DIR" fetch origin "$SAMOHOST_BRANCH" \\`,
+    `      && ${gitCmd} -C "$SAMOHOST_ENV_DIR" checkout -B "$SAMOHOST_BRANCH" "origin/$SAMOHOST_BRANCH"`,
+    "    return",
+    "  fi",
+    `  if ${gitCmd}${credHelper} clone --reference "$SAMOHOST_APP_DIR" --dissociate \\`,
+    '       --branch "$SAMOHOST_BRANCH" --single-branch \\',
+    '       "$origin_url" "$SAMOHOST_ENV_DIR"; then',
+    "    return 0",
+    "  fi",
+    '  echo "samohost: strategy 1 (git clone --reference $SAMOHOST_APP_DIR) failed — the production checkout is unusable as a clone reference (e.g. a shallow checkout); falling back to a plain clone of $origin_url" >&2',
+    '  rm -rf "$SAMOHOST_ENV_DIR"',
+    `  if ${gitCmd}${credHelper} clone --branch "$SAMOHOST_BRANCH" --single-branch \\`,
+    '       "$origin_url" "$SAMOHOST_ENV_DIR"; then',
+    "    return 0",
+    "  fi",
+    '  echo "samohost: strategy 2 (plain git clone of $origin_url, branch $SAMOHOST_BRANCH) ALSO failed — clone phase cannot proceed" >&2',
+    "  return 1",
+    "}",
+  ];
+}
 
 /**
  * Bash function: rewire each mapped DB env var (issue #11 findings 1+2+3)
@@ -553,8 +590,13 @@ function buildStaticEnvCreateScript(
     "",
   ];
 
-  // ----- clone (reuse CLONE_FN_LINES unchanged) ----------------------------
-  lines.push(...CLONE_FN_LINES, "");
+  // ----- clone: use app user when registered (issue #97) -------------------
+  // Derive bootstrap-written paths from appDir at generation time (same as
+  // bootstrap.ts §12: appBase = dirname(appDir)).
+  const appBase = app.appDir.replace(/\/+$/, "").split("/").slice(0, -1).join("/");
+  const gitSafeConf = `${appBase}/git-safe.conf`;
+  const tokenFile = `${appBase}/.gh-token`;
+  lines.push(...buildCloneFnLines(app.appUser, gitSafeConf, tokenFile), "");
   lines.push(
     ...phaseBlock("clone", "branch checkout into the env dir", [
       'mkdir -p "$SAMOHOST_ENVS_ROOT"',
@@ -709,7 +751,11 @@ export function buildEnvCreateScript(
   // ----- clone: reference clone from the production checkout (cheap) with an
   // explicit plain-clone fallback for shallow/unusable references (issue #11
   // finding 5); existing env dirs take the fetch+checkout path.
-  lines.push(...CLONE_FN_LINES, "");
+  // Issue #97: delegate git ops to the app user when appUser is registered.
+  const appBase = app.appDir.replace(/\/+$/, "").split("/").slice(0, -1).join("/");
+  const gitSafeConf = `${appBase}/git-safe.conf`;
+  const tokenFile = `${appBase}/.gh-token`;
+  lines.push(...buildCloneFnLines(app.appUser, gitSafeConf, tokenFile), "");
   lines.push(
     ...phaseBlock("clone", "branch checkout into the env dir", [
       'mkdir -p "$SAMOHOST_ENVS_ROOT"',
@@ -1169,6 +1215,10 @@ export function buildHostPrepScript(app: AppRecord, sshUser: string): string {
   const isStatic = app.kind === "static";
   const root = envsRoot(app);
   const unit = app.serviceUnit;
+  // Issue #97: the preview unit and the envs root must be owned by the app
+  // user when appUser is registered. Fall back to sshUser for back-compat with
+  // AppRecords that predate the appUser field.
+  const envUser = app.appUser ?? sshUser;
 
   // Durable MAIN-env vhost (field-record-1#117 ITEM C, 7th drift class): the
   // production vhost must be provisioned state in sites.d, not a hand-applied
@@ -1218,13 +1268,16 @@ export function buildHostPrepScript(app: AppRecord, sshUser: string): string {
       `echo 'EDIT ${root}.template.env: populate base env vars for previews' >&2`,
       "",
       `# 2. systemd template unit: one instance per env (%i = env name).`,
+      `#    User= is the app user (${envUser}) — the user that owns the env dir`,
+      `#    and the cloned code (issue #97: was sshUser which cannot read the`,
+      `#    appUser-owned checkout or the 600 .gh-token).`,
       `cat > /etc/systemd/system/${unit}@.service <<'UNIT'`,
       "[Unit]",
       `Description=${app.name} preview env %i`,
       "After=network.target",
       "",
       "[Service]",
-      `User=${sshUser}`,
+      `User=${envUser}`,
       `WorkingDirectory=${root}/%i`,
       `EnvironmentFile=${root}/%i/.env`,
       "ExecStart=/usr/bin/npm start",
@@ -1264,6 +1317,15 @@ export function buildHostPrepScript(app: AppRecord, sshUser: string): string {
       `${sshUser} ALL=(postgres) NOPASSWD: /usr/bin/createdb, /usr/bin/dropdb, /usr/bin/psql`,
     );
   }
+  // Issue #97: when appUser is registered, grant sshUser the right to run
+  // /usr/bin/git as appUser with SETENV so that GIT_CONFIG_GLOBAL passes
+  // through to the git subprocess. Without SETENV, sudo strips the variable
+  // and git loses the safe.directory override.
+  if (app.appUser !== undefined) {
+    sudoersLines.push(
+      `${sshUser} ALL=(${app.appUser}) NOPASSWD: SETENV: /usr/bin/git`,
+    );
+  }
   sudoersLines.push(
     "SUDOERS",
     `chmod 440 /etc/sudoers.d/samohost-env-${app.name}`,
@@ -1288,7 +1350,10 @@ export function buildHostPrepScript(app: AppRecord, sshUser: string): string {
     // The env-create script runs later as the non-root env user, so the envs
     // root must already exist and be writable by that user regardless of how
     // /opt/<app> was provisioned (e.g. root-owned when not via app bootstrap).
-    `install -d -m 755 -o ${sshUser} -g ${sshUser} ${sq(root)}`,
+    // Issue #97: when appUser is registered the envs root is owned by appUser
+    // so that `sudo -u appUser git clone` can create the env subdir inside it
+    // (mode 755 + sshUser owner → appUser has no write permission → EACCES).
+    `install -d -m 755 -o ${envUser} -g ${envUser} ${sq(root)}`,
     "",
     ...sudoersLines,
     "",
