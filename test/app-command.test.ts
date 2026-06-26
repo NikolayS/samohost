@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { parseArgs } from "../src/cli.ts";
@@ -8,12 +8,17 @@ import {
   runAppPlan,
   runAppDeploy,
   runAppStatus,
+  runAppRegisterFromToml,
   type AppDeployDeps,
 } from "../src/commands/app.ts";
 import { AppStore } from "../src/state/apps.ts";
 import { StateStore } from "../src/state/store.ts";
 import type { SpawnResult } from "../src/ssh/runner.ts";
 import type { VmRecord } from "../src/types.ts";
+import {
+  buildEnvCreateScript,
+  type EnvScriptTarget,
+} from "../src/env/script.ts";
 
 function vm(o: Partial<VmRecord> = {}): VmRecord {
   return {
@@ -644,5 +649,180 @@ describe("app register --kind integration (temp store)", () => {
     expect(code).toBe(0);
     const rec = appStore.get("vm-1111", "gc1");
     expect(rec?.kind).toBe("static");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Issue #97 follow-up (#98) — appUser dropped during registration
+//
+// Root cause (same bug class as #95's dbBackend): AppRegisterInput had no
+// appUser field, runAppRegister's AppSpec spread did not include it, and
+// runAppRegisterFromToml didn't thread it from AppManifest to AppRegisterInput.
+//
+// Consequence: even after adding AppSpec.appUser (done in #97's RED commit),
+// an AppRecord registered via --from-toml has appUser=undefined, so
+// buildCloneFnLines falls back to plain `git` — the dubious-ownership failure
+// the entire #97 fix was written to prevent.
+//
+// RED: reg-au-1 through reg-au-3 fail on the current code.
+// GREEN: after threading appUser through runAppRegister + runAppRegisterFromToml.
+// ---------------------------------------------------------------------------
+
+describe("issue #98 — appUser threading through runAppRegister / --from-toml", () => {
+  let dir: string;
+  let vmStore: StateStore;
+  let appStore: AppStore;
+
+  const vmRecord: VmRecord = {
+    id: "vm-2222",
+    provider: "hetzner",
+    providerId: "9876543",
+    name: "samo-we-field-record",
+    ip: "10.0.0.1",
+    sshKeyPath: "/home/u/.ssh/id_ed25519",
+    sshPort: 2223,
+    sshUser: "samo",
+    hostKeyFingerprint: "SHA256:" + "B".repeat(43),
+    region: "fsn1",
+    type: "cx23",
+    modules: [],
+    lifecycleState: "adopted",
+    createdAt: "2026-01-01T00:00:00.000Z",
+    updatedAt: "2026-01-01T00:00:00.000Z",
+  };
+
+  function capture98() {
+    let out = "";
+    let err = "";
+    return {
+      out: (s: string) => { out += s + "\n"; },
+      err: (s: string) => { err += s + "\n"; },
+      get o() { return out; },
+      get e() { return err; },
+    };
+  }
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), "samohost-appuser-"));
+    vmStore = new StateStore(join(dir, "state.json"));
+    appStore = new AppStore(join(dir, "apps.json"));
+    vmStore.upsert(vmRecord);
+  });
+
+  afterEach(() => rmSync(dir, { recursive: true, force: true }));
+
+  function writeToml98(extra: string): string {
+    const tomlPath = join(dir, "test.toml");
+    writeFileSync(tomlPath, [
+      'name        = "samohost-fixture"',
+      'repo        = "samo-agent/samohost-fixture"',
+      'branch      = "main"',
+      'appDir      = "/opt/samohost-fixture/app"',
+      'buildCmd    = "npm run build"',
+      'healthUrl   = "http://localhost:3000/api/version"',
+      'serviceUnit = "samohost-fixture"',
+      extra,
+    ].filter(Boolean).join("\n"));
+    return tomlPath;
+  }
+
+  test("reg-au-1: runAppRegister with appUser persists it on the AppRecord", () => {
+    // BUG: runAppRegister's AppSpec construction does not spread appUser from
+    // AppRegisterInput, so the AppRecord is saved without the field even when
+    // the caller explicitly supplies it.
+    const c = capture98();
+    const code = runAppRegister(
+      {
+        vm: "samo-we-field-record",
+        name: "samohost-fixture",
+        repo: "samo-agent/samohost-fixture",
+        branch: "main",
+        appDir: "/opt/samohost-fixture/app",
+        buildCmd: "npm run build",
+        serviceUnit: "samohost-fixture",
+        healthUrl: "http://localhost:3000/api/version",
+        rlsNonSuperuser: false,
+        appUser: "samohost-fixture",
+      },
+      { json: false },
+      vmStore,
+      appStore,
+      c.out,
+      c.err,
+    );
+    expect(code).toBe(0);
+    const rec = appStore.get("vm-2222", "samohost-fixture");
+    expect(rec).toBeDefined();
+    // Fails today: appUser is not spread into the AppSpec, so rec.appUser is undefined.
+    expect(rec?.appUser).toBe("samohost-fixture");
+  });
+
+  test("reg-au-2: --from-toml with appUser in the TOML yields AppRecord.appUser", () => {
+    // BUG: runAppRegisterFromToml builds AppRegisterInput from AppManifest but
+    // never passes app.appUser, so the field is dropped before runAppRegister
+    // is called.
+    const tomlPath = writeToml98('appUser = "samohost-fixture"');
+    const c = capture98();
+    const code = runAppRegisterFromToml(
+      { vm: "samo-we-field-record", tomlPath },
+      { json: false },
+      vmStore,
+      appStore,
+      c.out,
+      c.err,
+    );
+    expect(code).toBe(0);
+    const rec = appStore.get("vm-2222", "samohost-fixture");
+    expect(rec).toBeDefined();
+    // Fails today: appUser is dropped in the manifest→AppRegisterInput→AppSpec chain.
+    expect(rec?.appUser).toBe("samohost-fixture");
+  });
+
+  test("reg-au-3: AppRecord.appUser drives sudo-based git in buildEnvCreateScript", () => {
+    // End-to-end consequence: a correctly-registered app (appUser set) must
+    // produce a clone script that uses `sudo -u <appUser> ... /usr/bin/git`
+    // rather than plain git — preventing the dubious-ownership failure.
+    const tomlPath = writeToml98('appUser = "samohost-fixture"');
+    const c = capture98();
+    runAppRegisterFromToml(
+      { vm: "samo-we-field-record", tomlPath },
+      { json: false },
+      vmStore,
+      appStore,
+      c.out,
+      c.err,
+    );
+    const rec = appStore.get("vm-2222", "samohost-fixture");
+    expect(rec).toBeDefined();
+    const envTarget: EnvScriptTarget = {
+      name: "samohost-fixture-feat-x",
+      branch: "feat/x",
+      port: 3200,
+      vhost: "samohost-fixture-feat-x.samo.cat",
+      dbBackend: "none",
+    };
+    const script = buildEnvCreateScript(rec!, envTarget);
+    // Fails today: rec.appUser is undefined → buildCloneFnLines generates
+    // plain `git clone` instead of `sudo -u 'samohost-fixture' ... /usr/bin/git`.
+    expect(script).toContain("sudo -u 'samohost-fixture'");
+    expect(script).toContain("/usr/bin/git");
+  });
+
+  test("reg-au-4: absent appUser leaves AppRecord.appUser undefined (no regression)", () => {
+    // Regression guard: existing TOML manifests without appUser must not be
+    // affected — the AppRecord stays free of the field.
+    const tomlPath = writeToml98("");
+    const c = capture98();
+    const code = runAppRegisterFromToml(
+      { vm: "samo-we-field-record", tomlPath },
+      { json: false },
+      vmStore,
+      appStore,
+      c.out,
+      c.err,
+    );
+    expect(code).toBe(0);
+    const rec = appStore.get("vm-2222", "samohost-fixture");
+    expect(rec?.appUser).toBeUndefined();
   });
 });

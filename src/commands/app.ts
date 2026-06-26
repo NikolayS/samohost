@@ -77,6 +77,13 @@ export interface AppRegisterInput {
    * Mirrors {@link AppSpec.previewDbBackend}.
    */
   previewDbBackend?: EnvDbBackend;
+  /**
+   * OS user that owns the production app checkout and the envs root (created
+   * by `samohost app bootstrap --app-user <user>`). When set, env-create runs
+   * all git operations as this user via `sudo -u <appUser> GIT_CONFIG_GLOBAL=...`.
+   * Mirrors {@link AppSpec.appUser}.
+   */
+  appUser?: string;
 }
 
 /**
