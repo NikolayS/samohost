@@ -180,7 +180,10 @@ function buildCloneFnLines(
     "    return 1",
     "  }",
     '  if [[ -d "$SAMOHOST_ENV_DIR/.git" ]]; then',
-    `    ${gitCmd} -C "$SAMOHOST_ENV_DIR" fetch origin "$SAMOHOST_BRANCH" \\`,
+    // Issue #98 follow-up: the fetch path must also carry the credential helper
+    // so that private-repo re-fetches authenticate. The clone strategies already
+    // carry credHelper; the fetch path was the odd one out (samorev finding).
+    `    ${gitCmd}${credHelper} -C "$SAMOHOST_ENV_DIR" fetch origin "$SAMOHOST_BRANCH" \\`,
     `      && ${gitCmd} -C "$SAMOHOST_ENV_DIR" checkout -B "$SAMOHOST_BRANCH" "origin/$SAMOHOST_BRANCH"`,
     "    return",
     "  fi",
@@ -682,6 +685,40 @@ function buildStaticEnvCreateScript(
 }
 
 /**
+ * Resolve the first token of a build command to its canonical absolute path on
+ * Ubuntu so that an exact-path sudoers NOPASSWD grant can match it. Unknown
+ * names are returned as-is (the operator must arrange the grant manually for
+ * non-standard toolchains).
+ *
+ * Used by buildEnvCreateScript when wrapping install / build under
+ * `sudo -u <appUser>` (issue #98 follow-up).
+ */
+function resolveBuildBin(buildCmd: string): string {
+  const first = buildCmd.split(/\s+/)[0] ?? "";
+  const UBUNTU_PATHS: Record<string, string> = {
+    npm: "/usr/bin/npm",
+    node: "/usr/bin/node",
+    npx: "/usr/bin/npx",
+  };
+  return UBUNTU_PATHS[first] ?? first;
+}
+
+/**
+ * Wrap a build command under `sudo -u <appUser>`, replacing the leading bare
+ * binary name with its Ubuntu absolute path (e.g. `npm` → `/usr/bin/npm`).
+ * Preserves all arguments verbatim.
+ *
+ * Used by buildEnvCreateScript for the build phase when appUser is set.
+ */
+function sudoWrapBuildCmd(buildCmd: string, appUser: string): string {
+  const tokens = buildCmd.split(/\s+/);
+  const first = tokens[0] ?? "";
+  const bin = resolveBuildBin(first);
+  const resolved = [bin, ...tokens.slice(1)].join(" ");
+  return `sudo -u ${sq(appUser)} ${resolved}`;
+}
+
+/**
  * Build the env CREATE script: fresh shallow clone of the branch, install +
  * build, per-env database (dblab clone / template createdb / none), env file
  * composed on-host, systemd template instance start, Caddy vhost write +
@@ -771,18 +808,32 @@ export function buildEnvCreateScript(
   // with "can only install with an existing package-lock.json", which under
   // set -euo pipefail aborts the whole script before .env/systemd/Caddy are
   // written → no :443 listener → CF 521).
+  //
+  // Issue #98 follow-up: when appUser is registered the env dir is owned by
+  // appUser (the sudo-u-appUser clone created it that way). npm writes
+  // node_modules into the env dir; running npm as the SSH user (samo) →
+  // EACCES. Wrap both npm invocations under sudo -u <appUser> /usr/bin/npm so
+  // they run as the owner. The exact-path grant is added in buildHostPrepScript.
+  const npmPrefix = app.appUser !== undefined
+    ? `sudo -u ${sq(app.appUser)} /usr/bin/npm`
+    : "npm";
   lines.push(
     ...phaseBlock(
       "install",
       "lockfile-aware install (npm ci if lockfile present, npm install otherwise)",
       [
-        "if (if [ -f package-lock.json ] || [ -f npm-shrinkwrap.json ]; then npm ci; else npm install; fi); ",
+        `if (if [ -f package-lock.json ] || [ -f npm-shrinkwrap.json ]; then ${npmPrefix} ci; else ${npmPrefix} install; fi); `,
       ],
     ),
   );
 
+  // Issue #98 follow-up: build command inherits the same appUser delegation so
+  // the build output lands in the app-user-owned dir without EACCES.
+  const buildCmdExpr = app.appUser !== undefined
+    ? `if ${sudoWrapBuildCmd(app.buildCmd, app.appUser)}; `
+    : `if ${app.buildCmd}; `;
   lines.push(
-    ...phaseBlock("build", "build", [`if ${app.buildCmd}; `]),
+    ...phaseBlock("build", "build", [buildCmdExpr]),
   );
 
   // ----- db ------------------------------------------------------------------
@@ -1331,9 +1382,24 @@ export function buildHostPrepScript(app: AppRecord, sshUser: string): string {
   // /usr/bin/git as appUser with SETENV so that GIT_CONFIG_GLOBAL passes
   // through to the git subprocess. Without SETENV, sudo strips the variable
   // and git loses the safe.directory override.
+  //
+  // Issue #98 follow-up: also grant /usr/bin/npm so that the install phase
+  // (npm ci / npm install) and build phase (npm run build) can run as appUser.
+  // A single /usr/bin/npm entry covers all three. The npm grant does NOT need
+  // SETENV (no environment variable is forwarded to npm); a separate plain
+  // NOPASSWD line is cleaner and avoids unnecessarily widening SETENV scope.
   if (app.appUser !== undefined) {
+    // Resolve the build-command binary so a non-npm build tool also gets a
+    // grant (e.g. `node ./build.js` → /usr/bin/node). When buildCmd is already
+    // npm-based the resolved binary equals /usr/bin/npm and we omit the
+    // duplicate; the single /usr/bin/npm line covers install + build.
+    const buildBin = resolveBuildBin(app.buildCmd);
     sudoersLines.push(
       `${sshUser} ALL=(${app.appUser}) NOPASSWD: SETENV: /usr/bin/git`,
+      `${sshUser} ALL=(${app.appUser}) NOPASSWD: /usr/bin/npm`,
+      ...(buildBin !== "/usr/bin/npm"
+        ? [`${sshUser} ALL=(${app.appUser}) NOPASSWD: ${buildBin}`]
+        : []),
     );
   }
   sudoersLines.push(
