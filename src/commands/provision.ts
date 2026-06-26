@@ -183,6 +183,13 @@ export interface ProvisionDeps {
   controlDir?: string;
   /** Delay between ready-gate attempts. Default 5000ms. */
   pollIntervalMs?: number;
+  /**
+   * Detect the control-plane's own outbound (egress) IP so it can be
+   * auto-injected into trustedIps — exempting the ready-gate's own polling
+   * IP from UFW `limit` and fail2ban. Returns null on any failure (silently
+   * skipped). Injected so tests never touch the network.
+   */
+  detectEgressIp?: () => Promise<string | null>;
 }
 
 const DEFAULT_POLL_INTERVAL_MS = 5000;
