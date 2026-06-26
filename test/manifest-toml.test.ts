@@ -22,6 +22,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { parseSamohostToml } from "../src/manifest/toml.ts";
 import { runAppRegister, runAppRegisterFromToml } from "../src/commands/app.ts";
+import { previewDbBackendFor } from "../src/commands/trigger.ts";
 import { AppStore } from "../src/state/apps.ts";
 import { StateStore } from "../src/state/store.ts";
 import type { VmRecord } from "../src/types.ts";
@@ -536,5 +537,175 @@ describe("parseSamohostToml — kind field", () => {
     expect(result.ok).toBe(false);
     if (result.ok) throw new Error("expected ok=false");
     expect(result.errors.some((e) => e.includes("kind"))).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Issue #88 (incomplete) — dbBackend/previewDbBackend dropped by --from-toml
+//
+// Root cause: runAppRegisterFromToml builds AppRegisterInput from AppManifest
+// but omits dbBackend and previewDbBackend. AppRegisterInput has no such fields
+// and runAppRegister's AppSpec construction does not include them. The result is
+// an AppRecord with no dbBackend, so previewDbBackendFor() returns 'dblab' for
+// a no-DB app, forcing a DBLab clone path that fails on hosts with no DBLab.
+//
+// RED: these tests FAIL on current code (the thread is missing).
+// GREEN: after adding dbBackend+previewDbBackend to AppRegisterInput and
+//         threading them through runAppRegisterFromToml → runAppRegister.
+// ---------------------------------------------------------------------------
+
+describe("runAppRegisterFromToml — dbBackend/previewDbBackend threading (#88)", () => {
+  let dir: string;
+  let vmStore: StateStore;
+  let appStore: AppStore;
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), "samohost-db-backend-"));
+    vmStore = new StateStore(join(dir, "state.json"));
+    appStore = new AppStore(join(dir, "apps.json"));
+    vmStore.upsert({
+      id: "vm-1111",
+      provider: "hetzner",
+      providerId: "137236481",
+      name: "samo-we-field-record",
+      ip: "178.105.246.151",
+      sshKeyPath: "/home/fixture/.ssh/id_ed25519",
+      sshPort: 2223,
+      sshUser: "agent",
+      hostKeyFingerprint: "SHA256:" + "A".repeat(43),
+      region: "fsn1",
+      type: "cx33",
+      modules: [],
+      lifecycleState: "adopted",
+      createdAt: "2026-01-01T00:00:00.000Z",
+      updatedAt: "2026-01-01T00:00:00.000Z",
+    });
+  });
+
+  afterEach(() => rmSync(dir, { recursive: true, force: true }));
+
+  function capture() {
+    let out = "";
+    let err = "";
+    return {
+      out: (s: string) => { out += s + "\n"; },
+      err: (s: string) => { err += s + "\n"; },
+      get o() { return out; },
+      get e() { return err; },
+    };
+  }
+
+  function writeToml(extra: string): string {
+    const path = join(dir, "test.toml");
+    writeFileSync(path, [
+      'name        = "samohost-fixture"',
+      'repo        = "samo-agent/samohost-fixture"',
+      'branch      = "main"',
+      'appDir      = "/opt/samohost-fixture/app"',
+      'buildCmd    = "npm run build"',
+      'healthUrl   = "http://localhost:3000/api/version"',
+      'serviceUnit = "samohost-fixture"',
+      extra,
+    ].filter(Boolean).join("\n"));
+    return path;
+  }
+
+  test("reg-db-1: manifest with dbBackend='none' yields AppRecord.dbBackend='none'", () => {
+    // BUG: runAppRegisterFromToml drops dbBackend — the AppRecord gets no
+    // dbBackend, so previewDbBackendFor() returns 'dblab' instead of 'none'.
+    // This is the root cause of the 521 / never-serves issue on no-DB hosts.
+    const tomlPath = writeToml('dbBackend = "none"');
+    const c = capture();
+    const code = runAppRegisterFromToml(
+      { vm: "samo-we-field-record", tomlPath },
+      { json: false },
+      vmStore,
+      appStore,
+      c.out,
+      c.err,
+    );
+    expect(code).toBe(0);
+    const rec = appStore.get("vm-1111", "samohost-fixture");
+    expect(rec).toBeDefined();
+    // Fails today: rec.dbBackend is undefined (dropped during AppRegisterInput build)
+    expect(rec?.dbBackend).toBe("none");
+  });
+
+  test("reg-db-2: AppRecord from dbBackend='none' toml: previewDbBackendFor returns 'none'", () => {
+    // End-to-end: register from toml, then confirm the preview backend is 'none'.
+    // Fails today: previewDbBackendFor falls through to 'dblab' because
+    // dbBackend was dropped and both rec.previewDbBackend and rec.dbBackend are undefined.
+    const tomlPath = writeToml('dbBackend = "none"');
+    const c = capture();
+    runAppRegisterFromToml(
+      { vm: "samo-we-field-record", tomlPath },
+      { json: false },
+      vmStore,
+      appStore,
+      c.out,
+      c.err,
+    );
+    const rec = appStore.get("vm-1111", "samohost-fixture");
+    expect(rec).toBeDefined();
+    expect(previewDbBackendFor(rec!)).toBe("none");
+  });
+
+  test("reg-db-3: manifest with previewDbBackend='template' yields AppRecord.previewDbBackend='template'", () => {
+    // Also dropped: previewDbBackend is not threaded from AppManifest to AppRegisterInput.
+    const tomlPath = writeToml('previewDbBackend = "template"');
+    const c = capture();
+    const code = runAppRegisterFromToml(
+      { vm: "samo-we-field-record", tomlPath },
+      { json: false },
+      vmStore,
+      appStore,
+      c.out,
+      c.err,
+    );
+    expect(code).toBe(0);
+    const rec = appStore.get("vm-1111", "samohost-fixture");
+    expect(rec).toBeDefined();
+    // Fails today: rec.previewDbBackend is undefined (dropped)
+    expect(rec?.previewDbBackend).toBe("template");
+  });
+
+  test("reg-db-4: manifest with both dbBackend='none' and previewDbBackend='dblab' → both persisted", () => {
+    // Explicit previewDbBackend must override the dbBackend='none' fallback.
+    const tomlPath = writeToml('dbBackend = "none"\npreviewDbBackend = "dblab"');
+    const c = capture();
+    const code = runAppRegisterFromToml(
+      { vm: "samo-we-field-record", tomlPath },
+      { json: false },
+      vmStore,
+      appStore,
+      c.out,
+      c.err,
+    );
+    expect(code).toBe(0);
+    const rec = appStore.get("vm-1111", "samohost-fixture");
+    expect(rec?.dbBackend).toBe("none");
+    expect(rec?.previewDbBackend).toBe("dblab");
+    // previewDbBackend explicit value wins
+    expect(previewDbBackendFor(rec!)).toBe("dblab");
+  });
+
+  test("reg-db-5: manifest with no dbBackend/previewDbBackend → both remain undefined (no regression)", () => {
+    // Regression guard: existing apps without these fields must not be affected.
+    const tomlPath = writeToml("");
+    const c = capture();
+    const code = runAppRegisterFromToml(
+      { vm: "samo-we-field-record", tomlPath },
+      { json: false },
+      vmStore,
+      appStore,
+      c.out,
+      c.err,
+    );
+    expect(code).toBe(0);
+    const rec = appStore.get("vm-1111", "samohost-fixture");
+    expect(rec?.dbBackend).toBeUndefined();
+    expect(rec?.previewDbBackend).toBeUndefined();
+    // Default: 'dblab' for apps without explicit backend (no regression)
+    expect(previewDbBackendFor(rec!)).toBe("dblab");
   });
 });
