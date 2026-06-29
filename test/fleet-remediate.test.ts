@@ -1,22 +1,18 @@
 /**
- * test/fleet-remediate.test.ts — RED TDD for Phase C conservative auto-remediation.
- *
- * ALL four test groups in this file are RED until Phase C lands:
- *   - src/remediate/firewall-lock.ts does not exist
- *   - runFleetDoctor does not accept remediate/apply opts
- *   - classifyVm is not exported from anywhere
- *   - ParsedDoctor.input has no remediate/apply/controlPlaneIp fields
- *
- * After Phase C implementation, every test here must pass with no modification.
+ * test/fleet-remediate.test.ts — TDD for Phase C conservative auto-remediation.
  *
  * Design constraints verified by these tests:
  *   - OFF BY DEFAULT: remediate:true required; without it the new code path
  *     is never entered.
- *   - DRY-RUN: apply:false means no SSH mutation (no ufw delete ever sent).
+ *   - DRY-RUN: apply:false runs the READ-ONLY classifier to surface the TRUE
+ *     class (SAFE/ENTANGLED/UNKNOWN) but never sends any mutating SSH command.
  *   - ENTANGLED/UNKNOWN: classifier gate; these classes never trigger mutation.
  *   - SAFE + APPLY: additive CF allows appear BEFORE world-open deletes in the
  *     relock script (set -euo pipefail abort-on-curl-fail makes this safe).
  *   - SCOPED classifier: grep scoped to sites.d/ only; parent Caddyfile ignored.
+ *   - GUARD: runFleetDoctor itself throws if apply:true without controlPlaneIp —
+ *     defence-in-depth beyond CLI validation.
+ *   - NO DUPLICATE DELETES: buildRelockDeleteLines emits no duplicate lines.
  */
 
 import {
@@ -30,9 +26,9 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-// RED: module does not exist yet
 import {
   classifyVm,
+  buildRelockDeleteLines,
   type FleetRemediationResult,
   type VmClass,
 } from "../src/remediate/firewall-lock.ts";
@@ -163,14 +159,21 @@ afterEach(() => {
 // (a) DRY-RUN DEFAULT — remediate:true, apply:false
 // ===========================================================================
 describe("(a) DRY-RUN DEFAULT — remediate:true apply:false", () => {
-  test("a1 — runner called exactly once (audit only), no ufw delete ever sent", async () => {
+  test("a1 — dry-run runs the read-only classifier but sends no mutating command", async () => {
     const vm = makeVm();
     store.upsert(vm);
 
     const calls: string[] = [];
     const runner: RemoteRunner = (vmArg, cmd) => {
       calls.push(cmd);
-      return makeAuditRunner({ "web-ports-not-world-open": "443/tcp ALLOW Anywhere" })(vmArg, cmd);
+      if (isAuditScript(cmd)) {
+        return makeAuditRunner({ "web-ports-not-world-open": "443/tcp ALLOW Anywhere" })(vmArg, cmd);
+      }
+      if (isClassifierProbe(cmd)) {
+        // Return SAFE so that the real class is surfaced in the dry-run report.
+        return Promise.resolve({ code: 0, stdout: "TOTAL=1\nTLS=1", stderr: "" });
+      }
+      return Promise.resolve({ code: 0, stdout: "", stderr: "" });
     };
 
     const outLines: string[] = [];
@@ -183,17 +186,26 @@ describe("(a) DRY-RUN DEFAULT — remediate:true apply:false", () => {
       runner,
     );
 
-    // Runner called exactly once: only the audit pass.
-    expect(calls).toHaveLength(1);
-    expect(isAuditScript(calls[0]!)).toBe(true);
+    // Dry-run MUST call the classifier (read-only) to show the real class.
+    // RED: currently classifyVm is skipped in dry-run, so this fails.
+    expect(calls.some(isClassifierProbe)).toBe(true);
 
-    // No ufw delete command was ever sent.
+    // No mutating command (ufw delete / ufw allow from) ever sent in dry-run.
     expect(calls.some(isDeleteCmd)).toBe(false);
+    expect(calls.some(isCfAllowCmd)).toBe(false);
   });
 
   test("a2 — JSON output has remediation entry with applied:false and wouldLock:true", async () => {
     const vm = makeVm();
     store.upsert(vm);
+
+    // Runner handles both the audit pass and the dry-run classifier probe.
+    const runner: RemoteRunner = (vmArg, cmd) => {
+      if (isClassifierProbe(cmd)) {
+        return Promise.resolve({ code: 0, stdout: "TOTAL=1\nTLS=1", stderr: "" });
+      }
+      return makeAuditRunner({ "web-ports-not-world-open": "443/tcp ALLOW Anywhere" })(vmArg, cmd);
+    };
 
     const outLines: string[] = [];
     await runFleetDoctor(
@@ -202,7 +214,7 @@ describe("(a) DRY-RUN DEFAULT — remediate:true apply:false", () => {
       appStore,
       (s) => outLines.push(s),
       () => {},
-      makeAuditRunner({ "web-ports-not-world-open": "443/tcp ALLOW Anywhere" }),
+      runner,
     );
 
     const report = JSON.parse(outLines.join(""));
@@ -601,5 +613,49 @@ describe("(e) CLI parseArgs — --remediate / --apply / --control-plane-ip", () 
 
   test("e5 — --remediate without --all is a UsageError", () => {
     expect(() => parseArgs(["doctor", "vm-name", "--remediate"])).toThrow();
+  });
+});
+
+// ===========================================================================
+// (f) INTERNAL GUARD — apply:true without controlPlaneIp
+// ===========================================================================
+describe("(f) INTERNAL GUARD — runFleetDoctor rejects apply without controlPlaneIp", () => {
+  test("f1 — throws when apply:true and controlPlaneIp is absent", async () => {
+    // RED: no guard exists in runFleetDoctor yet; this call returns normally instead of throwing.
+    await expect(
+      runFleetDoctor(
+        { json: true, remediate: true, apply: true, controlPlaneIp: undefined },
+        store,
+        appStore,
+        () => {},
+        () => {},
+      ),
+    ).rejects.toThrow();
+  });
+
+  test("f2 — does NOT throw when controlPlaneIp is provided", async () => {
+    // No VMs in store — returns immediately with exit 0 and no throw.
+    const code = await runFleetDoctor(
+      { json: true, remediate: true, apply: true, controlPlaneIp: "10.0.0.1" },
+      store,
+      appStore,
+      () => {},
+      () => {},
+    );
+    expect(code).toBe(0);
+  });
+});
+
+// ===========================================================================
+// (g) NO DUPLICATE DELETES — buildRelockDeleteLines
+// ===========================================================================
+describe("(g) NO DUPLICATE DELETES — buildRelockDeleteLines has no repeated lines", () => {
+  test("g1 — each non-comment line appears exactly once", () => {
+    const lines = buildRelockDeleteLines();
+    // Strip comment lines, then check for duplicates among executable lines.
+    const execLines = lines.filter((l) => !l.startsWith("#"));
+    const unique = new Set(execLines);
+    // RED: current implementation has duplicate ufw delete lines for 443 and 80.
+    expect(unique.size).toBe(execLines.length);
   });
 });
