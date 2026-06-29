@@ -14,6 +14,7 @@
 
 import { auditVm, defaultRemoteRunner, type DoctorResult } from "./doctor.ts";
 import { upsertGhIssue } from "../util/gh-comment.ts";
+import { redact } from "../ssh/runner.ts";
 import type { StateStore } from "../state/store.ts";
 import type { AppStore } from "../state/apps.ts";
 import type { RemoteRunner } from "./status.ts";
@@ -39,12 +40,6 @@ export interface FleetDoctorReport {
   errorVms: number;   // VMs where probeError is set
   findingVms: number; // VMs with ≥1 suspicious finding
 }
-
-// ---------------------------------------------------------------------------
-// Default alert repo for upsertFleetAlert.
-// ---------------------------------------------------------------------------
-
-const DEFAULT_ALERT_REPO = "NikolayS/samohost";
 
 // ---------------------------------------------------------------------------
 // Fleet alert body builder.
@@ -185,7 +180,7 @@ export async function runFleetDoctor(
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
       err(`fleet-doctor: ${record.name}: probe-error: ${msg}`);
-      results.push({ vmId: record.id, vmName: record.name, probeError: `probe-error: ${msg}` });
+      results.push({ vmId: record.id, vmName: record.name, probeError: `probe-error: ${redact(msg)}` });
     }
   }
 
@@ -214,12 +209,9 @@ export async function runFleetDoctor(
   };
 
   // Post fleet alert to GitHub (non-fatal: catch any error).
-  const alertRepo = opts.alertRepo ?? DEFAULT_ALERT_REPO;
-  // Only alert when there's an explicit alertRepo or the default repo is clearly intended.
-  // For the fleet alert, we always try when alertRepo is explicitly set or VMs exist.
   if (opts.alertRepo !== undefined) {
     try {
-      upsertFleetAlert(report, alertRepo);
+      upsertFleetAlert(report, opts.alertRepo);
     } catch (e) {
       err(`fleet-doctor: alert failed (non-fatal): ${e instanceof Error ? e.message : String(e)}`);
     }
