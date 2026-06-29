@@ -894,6 +894,29 @@ describe("14. web-ports-not-world-open", () => {
     const result = parseWebPortsNotWorldOpenOutput("");
     expect(result.status).toBe("pass");
   });
+
+  // DENY/REJECT action — the rule BLOCKS Anywhere, so the port is NOT world-open.
+  test("parseWebPortsNotWorldOpenOutput: DENY from Anywhere → pass (blocks, not open)", () => {
+    const result = parseWebPortsNotWorldOpenOutput(
+      "80/tcp                     DENY        Anywhere",
+    );
+    expect(result.status).toBe("pass");
+  });
+
+  test("parseWebPortsNotWorldOpenOutput: REJECT from Anywhere (v6) → pass (blocks, not open)", () => {
+    const result = parseWebPortsNotWorldOpenOutput(
+      "443/tcp                    REJECT      Anywhere (v6)",
+    );
+    expect(result.status).toBe("pass");
+  });
+
+  // LIMIT from Anywhere = rate-limited but still publicly reachable → must still fail.
+  test("parseWebPortsNotWorldOpenOutput: LIMIT from Anywhere → fail (rate-limited but still open)", () => {
+    const result = parseWebPortsNotWorldOpenOutput(
+      "80/tcp                     LIMIT       Anywhere",
+    );
+    expect(result.status).toBe("fail");
+  });
 });
 
 // ===========================================================================
