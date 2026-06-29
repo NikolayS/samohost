@@ -28,6 +28,7 @@ import {
   parseLivenessOutput,
   parseSuspiciousOutput,
   parsePgLocalhostOutput,
+  parseWebPortsNotWorldOpenOutput,
 } from "../src/commands/doctor.ts";
 import { hardeningModule } from "../src/cloudinit/hardening.ts";
 import { StateStore } from "../src/state/store.ts";
@@ -114,6 +115,7 @@ const DOCTOR_PASS_BODIES: Record<string, string> = {
   "permitemptypasswords": "permitemptypasswords no",
   "root-authorized-keys-empty": "0",
   "ufw-limit-ssh": "2223/tcp                   LIMIT       Anywhere",
+  "web-ports-not-world-open": "",   // empty = no 80/443 rules = PASS
   "unattended-upgrades-active": "active",
   // only-intended-ports: empty output = no unexpected listeners = pass
   "only-intended-ports": "",
@@ -764,6 +766,133 @@ describe("13. air-conformance doctor coverage (#64)", () => {
     );
     expect(byId["maxauthtries"]).toBe("unknown");
     expect(byId["ufw-limit-ssh"]).toBe("unknown");
+  });
+});
+
+// ===========================================================================
+// 14. web-ports-not-world-open check: world-open 80/443 → FAIL; restricted → PASS;
+//     absent → PASS; permission error → UNKNOWN.
+//     Fixtures are the output of the grep-filtered probeCommand on the remote.
+// ===========================================================================
+describe("14. web-ports-not-world-open", () => {
+  // Section bodies = what `sudo ufw status | grep -E '^(80|443)(/|[[:space:]])'` returns.
+  const RED_WORLD_OPEN =
+    "80/tcp                     ALLOW       Anywhere\n" +
+    "443/tcp (v6)               ALLOW       Anywhere (v6)";
+  const RED_RESTRICTED = "80/tcp                     ALLOW       91.99.233.145";
+
+  test("world-open 80 and 443 (v6) → FAIL, exit 1", async () => {
+    store.upsert(rec());
+    const remote: RemoteRunner = (_vm, _cmd) =>
+      Promise.resolve({
+        code: 0,
+        stdout: allPassDelimited({ "web-ports-not-world-open": RED_WORLD_OPEN }),
+        stderr: "",
+      });
+    const c = capture();
+    const code = await runDoctor(
+      { target: "test-vm", infra: false },
+      { json: true },
+      store,
+      appStore,
+      c.out,
+      c.err,
+      remote,
+    );
+    expect(code).toBe(1);
+    const parsed = JSON.parse(c.o);
+    const row = parsed.checks.find((r: { id: string }) => r.id === "web-ports-not-world-open");
+    expect(row.status).toBe("fail");
+  });
+
+  test("restricted to specific IP → PASS, exit 0", async () => {
+    store.upsert(rec());
+    const remote: RemoteRunner = (_vm, _cmd) =>
+      Promise.resolve({
+        code: 0,
+        stdout: allPassDelimited({ "web-ports-not-world-open": RED_RESTRICTED }),
+        stderr: "",
+      });
+    const c = capture();
+    const code = await runDoctor(
+      { target: "test-vm", infra: false },
+      { json: true },
+      store,
+      appStore,
+      c.out,
+      c.err,
+      remote,
+    );
+    expect(code).toBe(0);
+    const parsed = JSON.parse(c.o);
+    const row = parsed.checks.find((r: { id: string }) => r.id === "web-ports-not-world-open");
+    expect(row.status).toBe("pass");
+  });
+
+  test("80/443 absent from ufw → PASS, exit 0", async () => {
+    store.upsert(rec());
+    const remote: RemoteRunner = (_vm, _cmd) =>
+      Promise.resolve({
+        code: 0,
+        stdout: allPassDelimited({ "web-ports-not-world-open": "" }),
+        stderr: "",
+      });
+    const c = capture();
+    const code = await runDoctor(
+      { target: "test-vm", infra: false },
+      { json: true },
+      store,
+      appStore,
+      c.out,
+      c.err,
+      remote,
+    );
+    expect(code).toBe(0);
+    const parsed = JSON.parse(c.o);
+    const row = parsed.checks.find((r: { id: string }) => r.id === "web-ports-not-world-open");
+    expect(row.status).toBe("pass");
+  });
+
+  test("permission error → UNKNOWN, exit 0", async () => {
+    store.upsert(rec());
+    const remote: RemoteRunner = (_vm, _cmd) =>
+      Promise.resolve({
+        code: 0,
+        stdout: allPassDelimited({
+          "web-ports-not-world-open": "ERROR: You need to be root to run this script",
+        }),
+        stderr: "",
+      });
+    const c = capture();
+    const code = await runDoctor(
+      { target: "test-vm", infra: false },
+      { json: true },
+      store,
+      appStore,
+      c.out,
+      c.err,
+      remote,
+    );
+    expect(code).toBe(0);
+    const parsed = JSON.parse(c.o);
+    const row = parsed.checks.find((r: { id: string }) => r.id === "web-ports-not-world-open");
+    expect(row.status).toBe("unknown");
+  });
+
+  // Pure-function unit tests for the parser — no runDoctor overhead.
+  test("parseWebPortsNotWorldOpenOutput: 0.0.0.0/0 source → fail", () => {
+    const result = parseWebPortsNotWorldOpenOutput("80/tcp ALLOW 0.0.0.0/0");
+    expect(result.status).toBe("fail");
+  });
+
+  test("parseWebPortsNotWorldOpenOutput: ::/0 source → fail", () => {
+    const result = parseWebPortsNotWorldOpenOutput("443/tcp (v6) ALLOW ::/0");
+    expect(result.status).toBe("fail");
+  });
+
+  test("parseWebPortsNotWorldOpenOutput: empty → pass", () => {
+    const result = parseWebPortsNotWorldOpenOutput("");
+    expect(result.status).toBe("pass");
   });
 });
 
