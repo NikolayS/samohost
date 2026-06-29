@@ -127,9 +127,11 @@ function isClassifierProbe(cmd: string): boolean {
   return cmd.includes("/etc/caddy/sites.d/");
 }
 
-/** Return true if the command contains additive CF allow rules. */
+/** Return true if the command contains additive CF allow rules (correct proto-tcp form). */
 function isCfAllowCmd(cmd: string): boolean {
-  return cmd.includes("ufw allow from") && cmd.includes("443");
+  // The correct UFW extended syntax is `ufw allow proto tcp from <src> to any port 443`.
+  // Ubuntu 24.04 rejects the combined `port 443/tcp` form — the rule is never added.
+  return cmd.includes("ufw allow proto tcp from") && cmd.includes("443");
 }
 
 /** Return true if the command issues a ufw delete. */
@@ -432,7 +434,7 @@ describe("(c) SAFE + APPLY — additive-first lock, verify", () => {
     if (firstCfAllowIdx === firstDeleteIdx) {
       // Same command — check by string position within the script.
       const script = commands[firstCfAllowIdx]!;
-      const allowPos = script.indexOf("ufw allow from");
+      const allowPos = script.indexOf("ufw allow proto tcp from");
       const deletePos = script.indexOf("ufw delete");
       expect(allowPos).toBeGreaterThanOrEqual(0);
       expect(deletePos).toBeGreaterThanOrEqual(0);

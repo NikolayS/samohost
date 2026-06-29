@@ -1375,6 +1375,12 @@ function mainEnvPort(app: AppRecord): number {
  *   module side-effect-free (no network I/O in the builder).
  * - :80 rule (when controlPlaneIp is provided) is source-restricted to the
  *   single control-plane IP/CIDR.
+ *
+ * UFW syntax: the extended `from … to any port N` form requires proto to be
+ * specified as a separate keyword BEFORE `from`, not as a `/proto` suffix on
+ * the port number.  Ubuntu 24.04 ufw rejects `port 443/tcp` inside extended
+ * rules — the rule errors out and is silently not added.  Correct form:
+ *   ufw allow proto tcp from <src> to any port 443
  */
 export function buildFirewallLines(
   isStatic: boolean,
@@ -1407,10 +1413,10 @@ export function buildFirewallLines(
       `#    are added — the host will reject CF edge connections until host-prep is`,
       `#    re-run with connectivity. '|| true' prevents script abort on curl failure.`,
       `for _cf4 in $(curl -fsS --max-time 15 https://www.cloudflare.com/ips-v4 2>/dev/null || true); do`,
-      `  /usr/sbin/ufw allow from "$_cf4" to any port 443/tcp`,
+      `  /usr/sbin/ufw allow proto tcp from "$_cf4" to any port 443`,
       `done`,
       `for _cf6 in $(curl -fsS --max-time 15 https://www.cloudflare.com/ips-v6 2>/dev/null || true); do`,
-      `  /usr/sbin/ufw allow from "$_cf6" to any port 443/tcp`,
+      `  /usr/sbin/ufw allow proto tcp from "$_cf6" to any port 443`,
       `done`,
     );
   }
@@ -1420,7 +1426,7 @@ export function buildFirewallLines(
       `#`,
       `#    :80 — Allow ONLY from the control-plane IP (CF→control-plane→VM:80`,
       `#    internal leg). World-open :80 is never emitted.`,
-      `/usr/sbin/ufw allow from '${controlPlaneIp}' to any port 80/tcp`,
+      `/usr/sbin/ufw allow proto tcp from '${controlPlaneIp}' to any port 80`,
     );
   }
 
@@ -1448,7 +1454,7 @@ export interface HostPrepFirewallOpts {
    * For the CF→control-plane→VM:80 serving shape: IP or CIDR of the control
    * plane whose requests must reach the VM on port 80 (plain HTTP, internal
    * leg).  When set, the generated script emits:
-   *   /usr/sbin/ufw allow from '<controlPlaneIp>' to any port 80/tcp
+   *   /usr/sbin/ufw allow proto tcp from '<controlPlaneIp>' to any port 80
    * Absent: no :80 rule is emitted (VM:80 stays blocked — correct for
    * CF-direct VMs where CF terminates TLS at the VM itself).
    */
@@ -1459,7 +1465,7 @@ export interface HostPrepFirewallOpts {
    * When `true` (the default), the generated script fetches CF IP ranges at
    * runtime from https://www.cloudflare.com/ips-v4 and ips-v6 and emits a
    * source-restricted allow rule per CIDR:
-   *   /usr/sbin/ufw allow from '<cidr>' to any port 443/tcp
+   *   /usr/sbin/ufw allow proto tcp from '<cidr>' to any port 443
    * Set to `false` only for control-plane-fronted VMs that never receive
    * direct CF ingress on :443.
    *
