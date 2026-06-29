@@ -668,6 +668,14 @@ export function buildHostBootstrapScript(
   // ---- section 10 (PR-A2-d): PostgreSQL DB bootstrap ------------------------
   // Static apps skip §10 and §11 entirely: they have no database and no env file.
   if (!isStatic) {
+  // The outer guard (~line 221) already throws when !isStatic && dbName===undefined,
+  // but TypeScript cannot carry that narrowing through the `const dbName` assignment.
+  // This guard is the TS-visible narrowing point: after it dbName is `string`.
+  if (dbName === undefined) {
+    throw new Error(
+      "buildHostBootstrapScript: dbName is required for non-static apps (internal invariant violated)",
+    );
+  }
   push(
     `# ---------------------------------------------------------------------------`,
     `# §10. DB bootstrap (PR-A2-d): enable postgresql, wait-for-ready,`,
