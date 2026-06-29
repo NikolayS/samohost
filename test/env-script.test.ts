@@ -405,8 +405,13 @@ describe("buildHostPrepScript", () => {
     // Must fetch CF ranges at host-prep time (inside the generated bash script).
     expect(s).toContain("https://www.cloudflare.com/ips-v4");
     expect(s).toContain("https://www.cloudflare.com/ips-v6");
-    // Must emit source-restricted form (not world-open).
-    expect(s).toMatch(/ufw allow from .* to any port 443\/tcp/);
+    // Must emit source-restricted form using the correct UFW extended syntax:
+    // `proto tcp` comes before `from`, port number has no /tcp suffix.
+    // Ubuntu 24.04 ufw REJECTS the combined `port 443/tcp` form inside
+    // `from ... to any port` rules — it silently errors and the rule is never added.
+    expect(s).toMatch(/ufw allow proto tcp from .* to any port 443/);
+    // The combined port/proto form that Ubuntu 24.04 ufw rejects must be absent.
+    expect(s).not.toContain("to any port 443/tcp");
     // World-open form MUST NOT appear.
     expect(s).not.toMatch(/\/usr\/sbin\/ufw allow 443(\/tcp)?(\s|$)/m);
   });
@@ -416,7 +421,10 @@ describe("buildHostPrepScript", () => {
     // :443 is opened via CF-IP-restricted ufw rules by the root operator
     // running host-prep. Source-restricted form only, never world-open.
     expect(hp).toContain("https://www.cloudflare.com/ips-v4");
-    expect(hp).toMatch(/ufw allow from .* to any port 443\/tcp/);
+    // Correct UFW extended syntax: proto before from, no /tcp on port number.
+    expect(hp).toMatch(/ufw allow proto tcp from .* to any port 443/);
+    // Ubuntu 24.04 ufw rejects `port 443/tcp` in extended-form rules.
+    expect(hp).not.toContain("to any port 443/tcp");
     expect(hp).not.toMatch(/\/usr\/sbin\/ufw allow 443(\/tcp)?(\s|$)/m);
     // It must NOT be added to the per-(vm,app) sudoers block: the env scripts
     // run later as the non-root sshUser and have no reason to touch ufw, so a
@@ -450,15 +458,22 @@ describe("buildHostPrepScript", () => {
     const s = buildHostPrepScript(app(), "agent"); // default: allowCfHttps=true
     expect(s).toContain("https://www.cloudflare.com/ips-v4");
     expect(s).toContain("https://www.cloudflare.com/ips-v6");
-    // Source-restricted form only:
-    expect(s).toMatch(/ufw allow from .* to any port 443\/tcp/);
+    // Source-restricted form only, correct UFW extended syntax (proto before from,
+    // no /tcp suffix on the port number — the combined form fails on Ubuntu 24.04):
+    expect(s).toMatch(/ufw allow proto tcp from .* to any port 443/);
+    // The buggy `port 443/tcp` combined form must be absent.
+    expect(s).not.toContain("to any port 443/tcp");
     // World-open form must be absent:
     expect(s).not.toMatch(/ufw allow 443\/tcp/);
   });
 
   test("POLICY: host-prep with controlPlaneIp emits source-restricted :80 rule, not world-open", () => {
     const s = buildHostPrepScript(app(), "agent", { controlPlaneIp: "10.0.0.1" });
-    expect(s).toContain("/usr/sbin/ufw allow from '10.0.0.1' to any port 80/tcp");
+    // Correct UFW extended syntax: proto before from, no /tcp suffix on port.
+    // Ubuntu 24.04 ufw rejects the combined `port 80/tcp` form in extended rules.
+    expect(s).toContain("/usr/sbin/ufw allow proto tcp from '10.0.0.1' to any port 80");
+    // The buggy combined form must be absent.
+    expect(s).not.toContain("to any port 80/tcp");
     expect(s).not.toMatch(/ufw allow 80(\/tcp)?(\s|$)/m);
   });
 
@@ -1784,7 +1799,11 @@ describe("static host-prep path (kind='static')", () => {
     // is equally critical — world-open would expose the origin to arbitrary IPs.
     expect(s).toContain("https://www.cloudflare.com/ips-v4");
     expect(s).toContain("https://www.cloudflare.com/ips-v6");
-    expect(s).toMatch(/ufw allow from .* to any port 443\/tcp/);
+    // Correct UFW extended syntax: proto before from, no /tcp suffix on port.
+    // Ubuntu 24.04 ufw rejects the combined `port 443/tcp` form in extended rules.
+    expect(s).toMatch(/ufw allow proto tcp from .* to any port 443/);
+    // The buggy combined form that Ubuntu 24.04 ufw rejects must be absent.
+    expect(s).not.toContain("to any port 443/tcp");
     expect(s).not.toMatch(/\/usr\/sbin\/ufw allow 443(\/tcp)?(\s|$)/m);
   });
 

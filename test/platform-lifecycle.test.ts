@@ -205,8 +205,11 @@ describe("HOST-PREP CONTRACT: buildHostPrepScript() generic platform invariants"
     // CF ranges are fetched at host-prep time (inside the generated bash script).
     expect(s).toContain("https://www.cloudflare.com/ips-v4");
     expect(s).toContain("https://www.cloudflare.com/ips-v6");
-    // Source-restricted form must be present.
-    expect(s).toMatch(/ufw allow from .* to any port 443\/tcp/);
+    // Correct UFW extended syntax: proto before from, no /tcp suffix on port.
+    // Ubuntu 24.04 ufw rejects the combined `port 443/tcp` form in extended rules.
+    expect(s).toMatch(/ufw allow proto tcp from .* to any port 443/);
+    // The buggy combined form must be absent.
+    expect(s).not.toContain("to any port 443/tcp");
     // World-open form must be absent.
     expect(s).not.toMatch(/\/usr\/sbin\/ufw allow 443(\/tcp)?(\s|$)/m);
   });
