@@ -44,7 +44,7 @@ import {
 import { parseArgs } from "../src/cli.ts";
 import { StateStore } from "../src/state/store.ts";
 import { AppStore } from "../src/state/apps.ts";
-import type { VmRecord, AppRecord } from "../src/types.ts";
+import type { VmRecord } from "../src/types.ts";
 import type { RemoteRunner } from "../src/commands/status.ts";
 
 // ---------------------------------------------------------------------------
