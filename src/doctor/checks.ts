@@ -210,8 +210,31 @@ export const SS_LISTENERS_CHECK: DoctorCheck = {
   kind: "liveness",
 };
 
+/**
+ * caddy-serving: verify Caddy is listening on expected web ports.
+ *
+ * Node apps require both :80 (HTTP→HTTPS redirect) and :443 (HTTPS).
+ * Static/CF-fronted apps bind only :443; Caddy omits :80 intentionally.
+ * parseLivenessOutput("caddy-serving", ..., serveKind) handles the distinction.
+ *
+ * Probe captures port listeners; evaluation uses ss-listeners output as a
+ * fallback (same data, no extra SSH round-trip).
+ */
+const CADDY_SERVING_CHECK: DoctorCheck = {
+  id: "caddy-serving",
+  description: "Caddy is serving on expected ports (:443 always; :80 for node apps)",
+  // Re-run ss -ltnH; evaluation falls back to ss-listeners section if this
+  // section is empty. Single-connection invariant preserved — same command,
+  // different named section.
+  probeCommand: "ss -ltnH",
+  expect: /.*/,
+  group: "core-liveness",
+  kind: "liveness",
+};
+
 export const corelivenessChecks: DoctorCheck[] = [
   SS_LISTENERS_CHECK,
+  CADDY_SERVING_CHECK,
   {
     id: "fail2ban-jail",
     description: "fail2ban sshd jail is loaded and enforcing",

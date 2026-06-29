@@ -90,6 +90,7 @@ import {
 } from "./commands/provision.ts";
 import { runDestroy, defaultConfirm, type DestroyInput } from "./commands/destroy.ts";
 import { runDoctor } from "./commands/doctor.ts";
+import { runFleetDoctor } from "./commands/fleet-doctor.ts";
 import { HetznerProvider } from "./providers/hetzner.ts";
 import { StateStore } from "./state/store.ts";
 import type { EnvDbBackend } from "./types.ts";
@@ -473,7 +474,7 @@ export interface ParsedDnsStatus {
 
 export interface ParsedDoctor {
   kind: "doctor";
-  input: { target: string; infra: boolean };
+  input: { target?: string; infra: boolean; all?: boolean; alertRepo?: string };
   json: boolean;
 }
 
@@ -1010,6 +1011,8 @@ function parseDoctor(args: string[]): ParsedDoctor {
   let target: string | undefined;
   let infra = false;
   let json = false;
+  let all = false;
+  let alertRepo: string | undefined;
 
   for (let i = 0; i < args.length; i++) {
     const a = args[i]!;
@@ -1020,6 +1023,18 @@ function parseDoctor(args: string[]): ParsedDoctor {
       case "--json":
         json = true;
         break;
+      case "--all":
+        all = true;
+        break;
+      case "--alert-repo": {
+        const val = args[i + 1];
+        if (val === undefined || val.startsWith("-")) {
+          throw new UsageError("--alert-repo requires a value");
+        }
+        alertRepo = val;
+        i++;
+        break;
+      }
       default:
         if (a.startsWith("-")) throw new UsageError(`unknown flag: ${a}`);
         if (target !== undefined) {
@@ -1029,10 +1044,16 @@ function parseDoctor(args: string[]): ParsedDoctor {
     }
   }
 
-  if (target === undefined) {
-    throw new UsageError("doctor requires a VM name or id");
+  if (all && target !== undefined) {
+    throw new UsageError("--all and a VM target are mutually exclusive; cannot use both");
   }
-  return { kind: "doctor", input: { target, infra }, json };
+  if (alertRepo !== undefined && !all) {
+    throw new UsageError("--alert-repo requires --all");
+  }
+  if (!all && target === undefined) {
+    throw new UsageError("doctor requires a VM name or id, or use --all");
+  }
+  return { kind: "doctor", input: { target, infra, all: all || undefined, alertRepo }, json };
 }
 
 function parseSsh(args: string[]): ParsedSsh {
@@ -1976,8 +1997,17 @@ export async function main(
         err,
       );
     case "doctor":
+      if (cmd.input.all) {
+        return runFleetDoctor(
+          { json: cmd.json, alertRepo: cmd.input.alertRepo },
+          new StateStore(),
+          defaultAppStore(),
+          out,
+          err,
+        );
+      }
       return runDoctor(
-        cmd.input,
+        { target: cmd.input.target!, infra: cmd.input.infra },
         { json: cmd.json },
         new StateStore(),
         defaultAppStore(),

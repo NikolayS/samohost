@@ -30,6 +30,7 @@ import {
 } from "./status.ts";
 import type { StateStore } from "../state/store.ts";
 import type { AppStore } from "../state/apps.ts";
+import type { AppRecord } from "../types.ts";
 import {
   buildDoctorChecks,
   type DoctorCheck,
@@ -74,6 +75,7 @@ export function parseLivenessOutput(
   checkId: string,
   stdout: string,
   sshPort: number,
+  serveKind?: "node" | "static",
 ): Pick<DoctorResult, "status" | "stdout" | "stderr"> {
   const out = stdout.trim();
 
@@ -87,8 +89,12 @@ export function parseLivenessOutput(
   if (checkId === "caddy-serving") {
     const has80 = /:80\b/.test(out);
     const has443 = /:443\b/.test(out);
+    // Static apps and CF-fronted boxes route HTTPS via Cloudflare; Caddy binds
+    // only :443, leaving :80 intentionally closed. Only "node" (or absent,
+    // backward-compat) requires both ports.
+    const needsBoth = serveKind === undefined || serveKind === "node";
     return {
-      status: has80 && has443 ? "pass" : "fail",
+      status: has443 && (!needsBoth || has80) ? "pass" : "fail",
       stdout: out,
       stderr: "",
     };
@@ -288,6 +294,7 @@ function evaluateDoctorCheck(
   sshStderr: string,
   sshPort: number,
   skip: boolean,
+  serveKind?: "node" | "static",
 ): DoctorResult {
   if (skip) {
     return {
@@ -335,7 +342,7 @@ function evaluateDoctorCheck(
 
   // Liveness checks: use parseLivenessOutput.
   if (check.kind === "liveness" && check.id !== "ss-listeners") {
-    const parsed = parseLivenessOutput(check.id, observed, sshPort);
+    const parsed = parseLivenessOutput(check.id, observed, sshPort, serveKind);
     return {
       id: check.id,
       description: check.description,
@@ -459,7 +466,7 @@ function formatDoctor(results: DoctorResult[]): string {
 // defaultRemoteRunner — mirrors status.ts.
 // ---------------------------------------------------------------------------
 
-function defaultRemoteRunner(): RemoteRunner {
+export function defaultRemoteRunner(): RemoteRunner {
   const deps: RunDeps = {
     clock: () => Date.now(),
     knownHostsDir:
@@ -477,6 +484,79 @@ function defaultRemoteRunner(): RemoteRunner {
     },
   };
   return (vm, command) => runRemote(vm, command, deps);
+}
+
+// ---------------------------------------------------------------------------
+// auditVm — extracted core probe logic. Exported so fleet-doctor.ts can use it.
+//
+// Throws when the SSH probe fails (unlike runDoctor which catches and returns 1).
+// Callers (fleet-doctor) catch per-VM so one failure doesn't abort the sweep.
+// ---------------------------------------------------------------------------
+
+export async function auditVm(
+  record: import("../types.ts").VmRecord,
+  app: AppRecord | undefined,
+  remote: RemoteRunner,
+): Promise<DoctorResult[]> {
+  // Build app params if an app is registered.
+  const appParams = app
+    ? {
+        appDir: app.appDir,
+        envFile: app.envFile ?? `/opt/${app.name}/.env`,
+        serviceUnit: app.serviceUnit,
+        healthUrl: app.healthUrl,
+        rlsUrlVar: app.rlsUrlVar ?? "DATABASE_URL",
+      }
+    : undefined;
+
+  // Build the full check list (with app-param substitutions).
+  const checks = buildDoctorChecks(record.sshPort, appParams);
+
+  // ONE connection — all probes in one script. Re-throws on SSH failure.
+  const sshResult = await remote(record, buildAuditScript(checks));
+
+  // Parse all sections from the single output.
+  const sections = parseAuditOutput(sshResult.stdout, checks);
+
+  // Extract ss-listeners output for: liveness, pg-localhost, auto-detect.
+  const ssListenersOutput = sections.get("ss-listeners") ?? "";
+
+  // Determine if Postgres is on loopback (for auto-detect scoping).
+  const pgLoopback = detectPostgresLoopback(ssListenersOutput);
+
+  // Determine whether app-db checks should be skipped.
+  // Skip when: no app AND no :5432 loopback. (infra flag is handled in runDoctor.)
+  const skipAppDb = !app && !pgLoopback;
+
+  // Derive serveKind from the app record (for caddy-serving liveness check).
+  const serveKind = app?.kind;
+
+  // Evaluate each check.
+  const results: DoctorResult[] = checks.map((check) => {
+    const isAppScoped = check.appScoped === true;
+    const skip = isAppScoped && skipAppDb;
+
+    // For pg-localhost and caddy-serving: use ssListenersOutput as a fallback
+    // when the dedicated section is absent or empty (both probe ss -ltnH; same
+    // data captured in the shared ss-listeners section avoids duplication).
+    let observed = sections.get(check.id);
+    if (check.id === "pg-localhost" && observed !== undefined) {
+      // The probe runs ss -ltnH | grep ':5432' — observed is the filtered output.
+      // Fall through to evaluateDoctorCheck which calls parsePgLocalhostOutput.
+    } else if (check.id === "pg-localhost" && ssListenersOutput) {
+      // Fallback: derive from ss-listeners.
+      observed = ssListenersOutput;
+    } else if (check.id === "caddy-serving" && (!observed || observed.trim() === "") && ssListenersOutput) {
+      // caddy-serving uses ss-listeners output. Falls back when the dedicated
+      // section is absent or empty (test runners that mock at the check-id level
+      // may not provide a specific caddy-serving body).
+      observed = ssListenersOutput;
+    }
+
+    return evaluateDoctorCheck(check, observed, sshResult.stderr, record.sshPort, skip, serveKind);
+  });
+
+  return results;
 }
 
 // ---------------------------------------------------------------------------
@@ -503,60 +583,36 @@ export async function runDoctor(
   const apps = appStore.list().filter((a) => a.vmId === record.id);
   const app = apps[0];
 
-  // Build app params if an app is registered.
-  const appParams = app
-    ? {
-        appDir: app.appDir,
-        envFile: app.envFile ?? `/opt/${app.name}/.env`,
-        serviceUnit: app.serviceUnit,
-        healthUrl: app.healthUrl,
-        rlsUrlVar: app.rlsUrlVar ?? "DATABASE_URL",
-      }
-    : undefined;
-
-  // Build the full check list (with app-param substitutions).
-  const checks = buildDoctorChecks(record.sshPort, appParams);
-
-  // ONE connection — all probes in one script.
-  let sshResult: SpawnResult;
+  // Delegate probe + evaluation to auditVm.
+  let results: DoctorResult[];
   try {
-    sshResult = await remote(record, buildAuditScript(checks));
+    results = await auditVm(record, app, remote);
   } catch (e) {
     err(`error: doctor probe failed: ${e instanceof Error ? e.message : String(e)}`);
     return 1;
   }
 
-  // Parse all sections from the single output.
-  const sections = parseAuditOutput(sshResult.stdout, checks);
-
-  // Extract ss-listeners output for: liveness, pg-localhost, auto-detect.
-  const ssListenersOutput = sections.get("ss-listeners") ?? "";
-
-  // Determine if Postgres is on loopback (for auto-detect scoping).
-  const pgLoopback = detectPostgresLoopback(ssListenersOutput);
-
-  // Determine whether app-db checks should be skipped.
-  // Skip when: --infra flag, OR (no app AND no :5432 loopback).
-  const skipAppDb = input.infra || (!app && !pgLoopback);
-
-  // Evaluate each check.
-  const results: DoctorResult[] = checks.map((check) => {
-    const isAppScoped = check.appScoped === true;
-    const skip = isAppScoped && skipAppDb;
-
-    // For pg-localhost: use ssListenersOutput (both the explicit pg grep and
-    // the ss-listeners section work; prefer the ss-listeners for consistency).
-    let observed = sections.get(check.id);
-    if (check.id === "pg-localhost" && observed !== undefined) {
-      // The probe runs ss -ltnH | grep ':5432' — observed is the filtered output.
-      // Fall through to evaluateDoctorCheck which calls parsePgLocalhostOutput.
-    } else if (check.id === "pg-localhost" && ssListenersOutput) {
-      // Fallback: derive from ss-listeners.
-      observed = ssListenersOutput;
-    }
-
-    return evaluateDoctorCheck(check, observed, sshResult.stderr, record.sshPort, skip);
-  });
+  // Re-apply infra flag: if --infra, mark ALL appScoped checks as skip.
+  // auditVm computes skipAppDb from (no-app AND no-pgLoopback); infra=true skips
+  // regardless. We identify appScoped check IDs by rebuilding the check list.
+  if (input.infra) {
+    const appParams = app
+      ? {
+          appDir: app.appDir,
+          envFile: app.envFile ?? `/opt/${app.name}/.env`,
+          serviceUnit: app.serviceUnit,
+          healthUrl: app.healthUrl,
+          rlsUrlVar: app.rlsUrlVar ?? "DATABASE_URL",
+        }
+      : undefined;
+    const allChecks = buildDoctorChecks(record.sshPort, appParams);
+    const appScopedIds = new Set(allChecks.filter((c) => c.appScoped).map((c) => c.id));
+    results = results.map((r) =>
+      appScopedIds.has(r.id)
+        ? { ...r, status: "skip" as DoctorStatus, stdout: "", stderr: "" }
+        : r
+    );
+  }
 
   // Exit code: 1 IFF any check status === "fail".
   // unknown, skip, and suspicious findings do NOT cause exit 1.
