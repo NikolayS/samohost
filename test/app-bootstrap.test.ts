@@ -1314,11 +1314,15 @@ describe("buildHostBootstrapScript — static path (kind='static')", () => {
   test("static bootstrap firewall: source-restricts :443 to CF IP ranges, NEVER world-open", () => {
     // FAILS today: buildHostBootstrapScript has no firewall section at all.
     const script = buildHostBootstrapScript(staticRecord(), staticOpts());
-    // CF range fetch loops (same pattern as buildFirewallLines in env/script.ts:1409-1413).
+    // CF range fetch loops (same pattern as buildFirewallLines in env/script.ts).
     expect(script).toContain("https://www.cloudflare.com/ips-v4");
     expect(script).toContain("https://www.cloudflare.com/ips-v6");
-    // Source-restricted rule emitted per CIDR.
-    expect(script).toContain("to any port 443/tcp");
+    // Correct UFW extended syntax: proto before from, no /tcp suffix on port.
+    // Ubuntu 24.04 ufw rejects the combined `port 443/tcp` form in extended rules —
+    // the rule errors out silently and :443 is never locked to CF IPs.
+    expect(script).toMatch(/proto tcp from .* to any port 443/);
+    // The buggy combined form must be absent.
+    expect(script).not.toContain("to any port 443/tcp");
     // World-open forms must NEVER appear.
     expect(script).not.toMatch(/ufw allow 443/);
     expect(script).not.toMatch(/ufw allow 80/);
@@ -1331,7 +1335,10 @@ describe("buildHostBootstrapScript — static path (kind='static')", () => {
       staticOpts({ firewallOpts: { controlPlaneIp: "10.0.0.1" } }),
     );
     expect(script).toContain("10.0.0.1");
-    expect(script).toContain("to any port 80/tcp");
+    // Correct UFW extended syntax: proto before from, no /tcp suffix on port.
+    expect(script).toMatch(/proto tcp from '10\.0\.0\.1' to any port 80/);
+    // The buggy combined form must be absent.
+    expect(script).not.toContain("to any port 80/tcp");
     // Must be source-restricted, not world-open.
     expect(script).toContain("from '10.0.0.1'");
   });
