@@ -235,6 +235,32 @@ export function parsePgLocalhostOutput(
 }
 
 // ---------------------------------------------------------------------------
+// web-ports-not-world-open parser — exposed for direct unit testing.
+// ---------------------------------------------------------------------------
+
+/**
+ * Parse filtered `ufw status` output (80/443 lines only) for world-open rules.
+ * - FAIL: any line matches Anywhere / 0.0.0.0/0 / ::/0 (including "Anywhere (v6)").
+ * - PASS: all 80/443 lines have a restricted source, OR no 80/443 rules at all.
+ * - UNKNOWN: probe returned a permission error (sudo not granted).
+ */
+export function parseWebPortsNotWorldOpenOutput(
+  stdout: string,
+): Pick<DoctorResult, "status" | "stdout" | "stderr"> {
+  const out = stdout.trim();
+  if (PERMISSION_RE.test(out)) {
+    return { status: "unknown", stdout: out, stderr: "" };
+  }
+  if (out === "") {
+    // No 80/443 rules in ufw → absent = not world-open → pass.
+    return { status: "pass", stdout: out, stderr: "" };
+  }
+  const WORLD_OPEN_RE = /\bAnywhere\b|0\.0\.0\.0\/0|::\/0/i;
+  const hasWorldOpen = out.split("\n").some((line) => WORLD_OPEN_RE.test(line));
+  return { status: hasWorldOpen ? "fail" : "pass", stdout: out, stderr: "" };
+}
+
+// ---------------------------------------------------------------------------
 // Detect :5432 loopback from ss output (for auto-detect scoping).
 // ---------------------------------------------------------------------------
 
@@ -345,6 +371,17 @@ function evaluateDoctorCheck(
       status: hasToken ? "fail" : "pass",
       stdout: observed,
       stderr: "",
+    };
+  }
+
+  // web-ports-not-world-open: custom parser — FAIL when 80/443 is world-open in UFW.
+  if (check.id === "web-ports-not-world-open") {
+    const parsed = parseWebPortsNotWorldOpenOutput(observed);
+    return {
+      id: check.id,
+      description: check.description,
+      group: check.group,
+      ...parsed,
     };
   }
 
