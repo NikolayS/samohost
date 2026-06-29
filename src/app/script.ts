@@ -56,6 +56,7 @@ export type PhaseName =
   | "build"
   | "migrate"
   | "restart"
+  | "caddy-reload"
   | "health"
   | "assert-rls"
   | "seed"
@@ -184,31 +185,62 @@ export function buildDeployScript(app: AppRecord, target: DeployTarget): string 
 
   // A reusable rollback function. Invoked by the health / assert phases on
   // failure. Restores git to PRE_DEPLOY_SHA, restores dist.prev/ -> dist/,
-  // restarts, re-probes health, emits the rollback marker, and exits 1.
-  push(
-    "# rollback(): restore the pre-deploy state coherently (git + dist), then",
-    "# restart and re-health. Emits rollback:ok / rollback:fail and exits 1.",
-    "rollback() {",
-    "  git reset --hard \"${PRE_DEPLOY_SHA}\" || true",
-    '  if [[ -d "${SAMOHOST_APP_DIR}/dist.prev" ]]; then',
-    '    rm -rf "${SAMOHOST_APP_DIR}/dist"',
-    '    cp -r "${SAMOHOST_APP_DIR}/dist.prev" "${SAMOHOST_APP_DIR}/dist"',
-    "  fi",
-    // full-path systemctl: see header note (3).
-    '  sudo /usr/bin/systemctl restart "${SAMOHOST_UNIT}" || true',
-    `  sleep ${RESTART_SETTLE_SEC}`,
-    "  local rb_code",
-    '  rb_code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 "${SAMOHOST_HEALTH_URL}" || echo 000)',
-    '  if [[ "$rb_code" == "200" ]]; then',
-    `    ${marker("rollback", "ok")}`,
-    "  else",
-    `    ${marker("rollback", "fail")}`,
-    '    echo "rollback health re-check failed (HTTP $rb_code) — manual intervention required" >&2',
-    "  fi",
-    "  exit 1",
-    "}",
-    "",
-  );
+  // then either reloads Caddy (static) or restarts the systemd unit (node),
+  // re-probes health, emits the rollback marker, and exits 1.
+  if (app.kind === "static") {
+    push(
+      "# rollback(): restore the pre-deploy state coherently (git + dist), then",
+      "# reload Caddy (static site — no systemd unit to restart).",
+      "# Emits rollback:ok / rollback:fail and exits 1.",
+      "rollback() {",
+      "  git reset --hard \"${PRE_DEPLOY_SHA}\" || true",
+      '  if [[ -d "${SAMOHOST_APP_DIR}/dist.prev" ]]; then',
+      '    rm -rf "${SAMOHOST_APP_DIR}/dist"',
+      '    cp -r "${SAMOHOST_APP_DIR}/dist.prev" "${SAMOHOST_APP_DIR}/dist"',
+      "  fi",
+      // Static rollback: reload caddy, not restart a unit that doesn't exist.
+      // full-path systemctl: see header note (3).
+      "  sudo /usr/bin/systemctl reload caddy || true",
+      `  sleep ${RESTART_SETTLE_SEC}`,
+      "  local rb_code",
+      // -k: Caddy uses tls internal (self-signed origin cert); CF Full-mode proxies it.
+      '  rb_code=$(curl -s -k -o /dev/null -w "%{http_code}" --max-time 10 "${SAMOHOST_HEALTH_URL}" || echo 000)',
+      '  if [[ "$rb_code" == "200" ]]; then',
+      `    ${marker("rollback", "ok")}`,
+      "  else",
+      `    ${marker("rollback", "fail")}`,
+      '    echo "rollback health re-check failed (HTTP $rb_code) — manual intervention required" >&2',
+      "  fi",
+      "  exit 1",
+      "}",
+      "",
+    );
+  } else {
+    push(
+      "# rollback(): restore the pre-deploy state coherently (git + dist), then",
+      "# restart and re-health. Emits rollback:ok / rollback:fail and exits 1.",
+      "rollback() {",
+      "  git reset --hard \"${PRE_DEPLOY_SHA}\" || true",
+      '  if [[ -d "${SAMOHOST_APP_DIR}/dist.prev" ]]; then',
+      '    rm -rf "${SAMOHOST_APP_DIR}/dist"',
+      '    cp -r "${SAMOHOST_APP_DIR}/dist.prev" "${SAMOHOST_APP_DIR}/dist"',
+      "  fi",
+      // full-path systemctl: see header note (3).
+      '  sudo /usr/bin/systemctl restart "${SAMOHOST_UNIT}" || true',
+      `  sleep ${RESTART_SETTLE_SEC}`,
+      "  local rb_code",
+      '  rb_code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 "${SAMOHOST_HEALTH_URL}" || echo 000)',
+      '  if [[ "$rb_code" == "200" ]]; then',
+      `    ${marker("rollback", "ok")}`,
+      "  else",
+      `    ${marker("rollback", "fail")}`,
+      '    echo "rollback health re-check failed (HTTP $rb_code) — manual intervention required" >&2',
+      "  fi",
+      "  exit 1",
+      "}",
+      "",
+    );
+  }
 
   // ----- checkout ----------------------------------------------------------
   push(
@@ -223,160 +255,210 @@ export function buildDeployScript(app: AppRecord, target: DeployTarget): string 
     "",
   );
 
-  // ----- install -----------------------------------------------------------
-  // --include=dev is mandatory: the env file sourced above exports
-  // NODE_ENV=production into this shell, and a plain `npm ci` would then drop
-  // devDependencies — where the build/migrate toolchain (tsc, tsx) lives
-  // (issue #2 bug 3: build died with "tsc: not found"). This flag is preserved
-  // in BOTH branches of the lockfile check below.
-  //
-  // Lockfile-aware: apps without package-lock.json (no-DB fixtures, minimal
-  // greenfield) hard-fail npm ci with "can only install with an existing
-  // package-lock.json". Under set -euo pipefail that aborts the deploy before
-  // .env/unit/Caddy are written → no :443 listener → CF 521. Fall back to
-  // npm install --include=dev when no lockfile is present.
-  push(
-    "# --- install: lockfile-aware install (npm ci if lockfile present, npm install otherwise) ---",
-    "# --include=dev: NODE_ENV=production drops devDeps (build toolchain: tsc, tsx) — issue #2 bug 3.",
-    "# lockfile fallback: apps without package-lock.json hard-fail npm ci (no-DB fixtures, greenfield).",
-    marker("install", "start"),
-    "if (if [ -f package-lock.json ] || [ -f npm-shrinkwrap.json ]; then npm ci --include=dev; else npm install --include=dev; fi); then",
-    `  ${marker("install", "ok")}`,
-    "else",
-    `  ${marker("install", "fail")}`,
-    "  exit 1",
-    "fi",
-    "",
-  );
+  if (app.kind === "static") {
+    // ===== STATIC SITE PATH =================================================
+    // No Node.js install/build, no DB migrations, no systemd unit restart.
+    // The only "activation" step is reloading Caddy so it picks up the new
+    // static assets from the updated checkout. Health probe uses -k because
+    // Caddy uses tls internal (self-signed origin cert) with CF Full-mode.
+    // ========================================================================
 
-  // ----- build -------------------------------------------------------------
-  push(
-    "# --- build ---",
-    marker("build", "start"),
-    `if ${app.buildCmd}; then`,
-    `  ${marker("build", "ok")}`,
-    "else",
-    `  ${marker("build", "fail")}`,
-    "  exit 1",
-    "fi",
-    "",
-  );
-
-  // ----- migrate (optional) ------------------------------------------------
-  if (app.migrateCmd) {
+    // ----- caddy-reload (static) -------------------------------------------
+    // Full-path systemctl reload (not restart): see header note (3).
     push(
-      "# --- migrate: apply DB migrations before the new code boots ---",
-      marker("migrate", "start"),
-      `if ${app.migrateCmd}; then`,
-      `  ${marker("migrate", "ok")}`,
+      "# --- caddy-reload: reload Caddy to serve the updated static assets ---",
+      "# Static site: no Node.js unit to restart; Caddy serves the checkout directly.",
+      "# Full-path systemctl: see header note (3) — bare sudo systemctl fails on hardened host.",
+      marker("caddy-reload", "start"),
+      "if sudo /usr/bin/systemctl reload caddy; then",
+      `  sleep ${RESTART_SETTLE_SEC}`,
+      `  ${marker("caddy-reload", "ok")}`,
       "else",
-      `  ${marker("migrate", "fail")}`,
+      `  ${marker("caddy-reload", "fail")}`,
       "  exit 1",
       "fi",
       "",
     );
-  }
 
-  // ----- restart -----------------------------------------------------------
-  // Full-path sudo systemctl, mandatory. See header note (3).
-  push(
-    "# --- restart: full-path sudo systemctl (NOPASSWD exact-path + use_pty) ---",
-    marker("restart", "start"),
-    'if sudo /usr/bin/systemctl restart "${SAMOHOST_UNIT}"; then',
-    `  sleep ${RESTART_SETTLE_SEC}`,
-    `  ${marker("restart", "ok")}`,
-    "else",
-    `  ${marker("restart", "fail")}`,
-    "  exit 1",
-    "fi",
-    "",
-  );
-
-  // ----- health ------------------------------------------------------------
-  // N retries with sleep; on exhaustion -> rollback.
-  push(
-    "# --- health: poll the health URL, retrying; rollback on failure ---",
-    marker("health", "start"),
-    "health_ok=0",
-    `for attempt in $(seq 1 ${HEALTH_RETRIES}); do`,
-    '  code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 "${SAMOHOST_HEALTH_URL}" || echo 000)',
-    '  if [[ "$code" == "200" ]]; then health_ok=1; break; fi',
-    `  sleep ${HEALTH_SLEEP_SEC}`,
-    "done",
-    'if [[ "$health_ok" == "1" ]]; then',
-    `  ${marker("health", "ok")}`,
-    "else",
-    `  ${marker("health", "fail")}`,
-    '  echo "health check failed after retries — rolling back" >&2',
-    "  rollback",
-    "fi",
-    "",
-  );
-
-  // ----- assert-rls (optional) ---------------------------------------------
-  // Probe that the app connects as a NON-superuser. Expects 'f'. On failure ->
-  // rollback. Connection params come from the deploy environment (the env file
-  // sourced above) WITHOUT this script ever writing or echoing the secret
-  // value. The var name is configurable per app (issue #2 bug 2): the app's
-  // non-superuser URL may live under a different name (field-record:
-  // APP_DATABASE_URL) while DATABASE_URL is the SUPERUSER url — consulting the
-  // wrong var makes the probe see rolsuper=t and roll back a healthy deploy.
-  // A configured var is consulted EXCLUSIVELY (no silent fallback: falling
-  // back to DATABASE_URL is exactly the bug); the default keeps the
-  // back-compat RLS_DATABASE_URL || DATABASE_URL chain.
-  if (app.assertions?.rlsNonSuperuser) {
-    const rlsLookup =
-      app.rlsUrlVar !== undefined
-        ? [
-            `RLS_URL="\${${app.rlsUrlVar}:-}"`,
-            'if [[ -z "$RLS_URL" ]]; then',
-            `  ${marker("assert-rls", "fail")}`,
-            `  echo "assert-rls: ${app.rlsUrlVar} (configured via --rls-url-var) is not set in the deploy environment" >&2`,
-            "  rollback",
-            "fi",
-          ]
-        : [
-            'RLS_URL="${RLS_DATABASE_URL:-${DATABASE_URL:-}}"',
-            'if [[ -z "$RLS_URL" ]]; then',
-            `  ${marker("assert-rls", "fail")}`,
-            '  echo "assert-rls: neither RLS_DATABASE_URL nor DATABASE_URL is set in the deploy environment" >&2',
-            "  rollback",
-            "fi",
-          ];
+    // ----- health (static) -------------------------------------------------
+    // -k: Caddy uses tls internal (self-signed origin cert); CF Full-mode proxies it.
+    // Without -k, curl rejects the cert → HTTP 000 → deploy always rolls back.
     push(
-      "# --- assert-rls: app must connect as a non-superuser (RLS not bypassed) ---",
-      marker("assert-rls", "start"),
-      ...rlsLookup,
-      // psql reads the URL as its connection string; the secret stays in the
-      // variable and is never echoed. Probe returns 'f' for non-superuser.
-      'rls_result=$(psql "$RLS_URL" -tAc "SELECT rolsuper FROM pg_roles WHERE rolname = current_user" 2>&1 || echo CONNECTION_FAILED)',
-      'if [[ "$rls_result" == "f" ]]; then',
-      `  ${marker("assert-rls", "ok")}`,
+      "# --- health: poll the health URL (-k for tls internal / CF Full-mode), retrying; rollback on failure ---",
+      marker("health", "start"),
+      "health_ok=0",
+      `for attempt in $(seq 1 ${HEALTH_RETRIES}); do`,
+      '  code=$(curl -s -k -o /dev/null -w "%{http_code}" --max-time 10 "${SAMOHOST_HEALTH_URL}" || echo 000)',
+      '  if [[ "$code" == "200" ]]; then health_ok=1; break; fi',
+      `  sleep ${HEALTH_SLEEP_SEC}`,
+      "done",
+      'if [[ "$health_ok" == "1" ]]; then',
+      `  ${marker("health", "ok")}`,
       "else",
-      `  ${marker("assert-rls", "fail")}`,
-      '  echo "assert-rls FAILED: probe returned (not the literal value) — superuser or connection failure; RLS may be bypassed — rolling back" >&2',
+      `  ${marker("health", "fail")}`,
+      '  echo "health check failed after retries — rolling back" >&2',
       "  rollback",
       "fi",
       "",
     );
-  }
+  } else {
+    // ===== NODE PATH (default — existing behavior, unchanged) ===============
 
-  // ----- seed (optional) ---------------------------------------------------
-  // Idempotent seed, run only after a healthy deploy. A seed failure is a hard
-  // failure (non-zero exit) but NOT a rollback (the deploy is already healthy).
-  if (app.seedCmd) {
+    // ----- install -----------------------------------------------------------
+    // --include=dev is mandatory: the env file sourced above exports
+    // NODE_ENV=production into this shell, and a plain `npm ci` would then drop
+    // devDependencies — where the build/migrate toolchain (tsc, tsx) lives
+    // (issue #2 bug 3: build died with "tsc: not found"). This flag is preserved
+    // in BOTH branches of the lockfile check below.
+    //
+    // Lockfile-aware: apps without package-lock.json (no-DB fixtures, minimal
+    // greenfield) hard-fail npm ci with "can only install with an existing
+    // package-lock.json". Under set -euo pipefail that aborts the deploy before
+    // .env/unit/Caddy are written → no :443 listener → CF 521. Fall back to
+    // npm install --include=dev when no lockfile is present.
     push(
-      "# --- seed: idempotent post-deploy seed (only after healthy deploy) ---",
-      marker("seed", "start"),
-      `if ${app.seedCmd}; then`,
-      `  ${marker("seed", "ok")}`,
+      "# --- install: lockfile-aware install (npm ci if lockfile present, npm install otherwise) ---",
+      "# --include=dev: NODE_ENV=production drops devDeps (build toolchain: tsc, tsx) — issue #2 bug 3.",
+      "# lockfile fallback: apps without package-lock.json hard-fail npm ci (no-DB fixtures, greenfield).",
+      marker("install", "start"),
+      "if (if [ -f package-lock.json ] || [ -f npm-shrinkwrap.json ]; then npm ci --include=dev; else npm install --include=dev; fi); then",
+      `  ${marker("install", "ok")}`,
       "else",
-      `  ${marker("seed", "fail")}`,
+      `  ${marker("install", "fail")}`,
       "  exit 1",
       "fi",
       "",
     );
-  }
+
+    // ----- build -------------------------------------------------------------
+    push(
+      "# --- build ---",
+      marker("build", "start"),
+      `if ${app.buildCmd}; then`,
+      `  ${marker("build", "ok")}`,
+      "else",
+      `  ${marker("build", "fail")}`,
+      "  exit 1",
+      "fi",
+      "",
+    );
+
+    // ----- migrate (optional) ------------------------------------------------
+    if (app.migrateCmd) {
+      push(
+        "# --- migrate: apply DB migrations before the new code boots ---",
+        marker("migrate", "start"),
+        `if ${app.migrateCmd}; then`,
+        `  ${marker("migrate", "ok")}`,
+        "else",
+        `  ${marker("migrate", "fail")}`,
+        "  exit 1",
+        "fi",
+        "",
+      );
+    }
+
+    // ----- restart -----------------------------------------------------------
+    // Full-path sudo systemctl, mandatory. See header note (3).
+    push(
+      "# --- restart: full-path sudo systemctl (NOPASSWD exact-path + use_pty) ---",
+      marker("restart", "start"),
+      'if sudo /usr/bin/systemctl restart "${SAMOHOST_UNIT}"; then',
+      `  sleep ${RESTART_SETTLE_SEC}`,
+      `  ${marker("restart", "ok")}`,
+      "else",
+      `  ${marker("restart", "fail")}`,
+      "  exit 1",
+      "fi",
+      "",
+    );
+
+    // ----- health ------------------------------------------------------------
+    // N retries with sleep; on exhaustion -> rollback.
+    push(
+      "# --- health: poll the health URL, retrying; rollback on failure ---",
+      marker("health", "start"),
+      "health_ok=0",
+      `for attempt in $(seq 1 ${HEALTH_RETRIES}); do`,
+      '  code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 "${SAMOHOST_HEALTH_URL}" || echo 000)',
+      '  if [[ "$code" == "200" ]]; then health_ok=1; break; fi',
+      `  sleep ${HEALTH_SLEEP_SEC}`,
+      "done",
+      'if [[ "$health_ok" == "1" ]]; then',
+      `  ${marker("health", "ok")}`,
+      "else",
+      `  ${marker("health", "fail")}`,
+      '  echo "health check failed after retries — rolling back" >&2',
+      "  rollback",
+      "fi",
+      "",
+    );
+
+    // ----- assert-rls (optional) -------------------------------------------
+    // Probe that the app connects as a NON-superuser. Expects 'f'. On failure ->
+    // rollback. Connection params come from the deploy environment (the env file
+    // sourced above) WITHOUT this script ever writing or echoing the secret
+    // value. The var name is configurable per app (issue #2 bug 2): the app's
+    // non-superuser URL may live under a different name (field-record:
+    // APP_DATABASE_URL) while DATABASE_URL is the SUPERUSER url — consulting the
+    // wrong var makes the probe see rolsuper=t and roll back a healthy deploy.
+    // A configured var is consulted EXCLUSIVELY (no silent fallback: falling
+    // back to DATABASE_URL is exactly the bug); the default keeps the
+    // back-compat RLS_DATABASE_URL || DATABASE_URL chain.
+    if (app.assertions?.rlsNonSuperuser) {
+      const rlsLookup =
+        app.rlsUrlVar !== undefined
+          ? [
+              `RLS_URL="\${${app.rlsUrlVar}:-}"`,
+              'if [[ -z "$RLS_URL" ]]; then',
+              `  ${marker("assert-rls", "fail")}`,
+              `  echo "assert-rls: ${app.rlsUrlVar} (configured via --rls-url-var) is not set in the deploy environment" >&2`,
+              "  rollback",
+              "fi",
+            ]
+          : [
+              'RLS_URL="${RLS_DATABASE_URL:-${DATABASE_URL:-}}"',
+              'if [[ -z "$RLS_URL" ]]; then',
+              `  ${marker("assert-rls", "fail")}`,
+              '  echo "assert-rls: neither RLS_DATABASE_URL nor DATABASE_URL is set in the deploy environment" >&2',
+              "  rollback",
+              "fi",
+            ];
+      push(
+        "# --- assert-rls: app must connect as a non-superuser (RLS not bypassed) ---",
+        marker("assert-rls", "start"),
+        ...rlsLookup,
+        // psql reads the URL as its connection string; the secret stays in the
+        // variable and is never echoed. Probe returns 'f' for non-superuser.
+        'rls_result=$(psql "$RLS_URL" -tAc "SELECT rolsuper FROM pg_roles WHERE rolname = current_user" 2>&1 || echo CONNECTION_FAILED)',
+        'if [[ "$rls_result" == "f" ]]; then',
+        `  ${marker("assert-rls", "ok")}`,
+        "else",
+        `  ${marker("assert-rls", "fail")}`,
+        '  echo "assert-rls FAILED: probe returned (not the literal value) — superuser or connection failure; RLS may be bypassed — rolling back" >&2',
+        "  rollback",
+        "fi",
+        "",
+      );
+    }
+
+    // ----- seed (optional) -------------------------------------------------
+    // Idempotent seed, run only after a healthy deploy. A seed failure is a hard
+    // failure (non-zero exit) but NOT a rollback (the deploy is already healthy).
+    if (app.seedCmd) {
+      push(
+        "# --- seed: idempotent post-deploy seed (only after healthy deploy) ---",
+        marker("seed", "start"),
+        `if ${app.seedCmd}; then`,
+        `  ${marker("seed", "ok")}`,
+        "else",
+        `  ${marker("seed", "fail")}`,
+        "  exit 1",
+        "fi",
+        "",
+      );
+    }
+  } // end node path
 
   push('echo "deploy complete: ${SAMOHOST_SHA}"', "");
 
