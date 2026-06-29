@@ -256,7 +256,13 @@ export function parseWebPortsNotWorldOpenOutput(
     return { status: "pass", stdout: out, stderr: "" };
   }
   const WORLD_OPEN_RE = /\bAnywhere\b|0\.0\.0\.0\/0|::\/0/i;
-  const hasWorldOpen = out.split("\n").some((line) => WORLD_OPEN_RE.test(line));
+  // A DENY or REJECT rule from Anywhere BLOCKS the port — not world-open.
+  // Only ALLOW and LIMIT rules from Anywhere count as world-open (LIMIT is
+  // rate-limited but still publicly reachable, so it must still fail).
+  const BLOCK_ACTION_RE = /\b(DENY|REJECT)\b/i;
+  const hasWorldOpen = out
+    .split("\n")
+    .some((line) => WORLD_OPEN_RE.test(line) && !BLOCK_ACTION_RE.test(line));
   return { status: hasWorldOpen ? "fail" : "pass", stdout: out, stderr: "" };
 }
 
