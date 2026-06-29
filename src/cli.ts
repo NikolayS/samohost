@@ -474,7 +474,18 @@ export interface ParsedDnsStatus {
 
 export interface ParsedDoctor {
   kind: "doctor";
-  input: { target?: string; infra: boolean; all?: boolean; alertRepo?: string };
+  input: {
+    target?: string;
+    infra: boolean;
+    all?: boolean;
+    alertRepo?: string;
+    /** Phase C: enable remediation pass (dry-run unless apply is also set). */
+    remediate?: boolean;
+    /** Phase C: mutate — execute relock SSH script. Requires remediate+--all. */
+    apply?: boolean;
+    /** Phase C: control-plane IP for the :80 source-restricted rule. Required with apply. */
+    controlPlaneIp?: string;
+  };
   json: boolean;
 }
 
@@ -1013,6 +1024,9 @@ function parseDoctor(args: string[]): ParsedDoctor {
   let json = false;
   let all = false;
   let alertRepo: string | undefined;
+  let remediate = false;
+  let apply = false;
+  let controlPlaneIp: string | undefined;
 
   for (let i = 0; i < args.length; i++) {
     const a = args[i]!;
@@ -1026,12 +1040,27 @@ function parseDoctor(args: string[]): ParsedDoctor {
       case "--all":
         all = true;
         break;
+      case "--remediate":
+        remediate = true;
+        break;
+      case "--apply":
+        apply = true;
+        break;
       case "--alert-repo": {
         const val = args[i + 1];
         if (val === undefined || val.startsWith("-")) {
           throw new UsageError("--alert-repo requires a value");
         }
         alertRepo = val;
+        i++;
+        break;
+      }
+      case "--control-plane-ip": {
+        const val = args[i + 1];
+        if (val === undefined || val.startsWith("-")) {
+          throw new UsageError("--control-plane-ip requires a value");
+        }
+        controlPlaneIp = val;
         i++;
         break;
       }
@@ -1053,7 +1082,28 @@ function parseDoctor(args: string[]): ParsedDoctor {
   if (!all && target === undefined) {
     throw new UsageError("doctor requires a VM name or id, or use --all");
   }
-  return { kind: "doctor", input: { target, infra, all: all || undefined, alertRepo }, json };
+  if (apply && !remediate) {
+    throw new UsageError("--apply requires --remediate");
+  }
+  if (remediate && !all) {
+    throw new UsageError("--remediate requires --all");
+  }
+  if (apply && controlPlaneIp === undefined) {
+    throw new UsageError("--apply requires --control-plane-ip <ip>");
+  }
+  return {
+    kind: "doctor",
+    input: {
+      target,
+      infra,
+      all: all || undefined,
+      alertRepo,
+      remediate: remediate || undefined,
+      apply,
+      controlPlaneIp,
+    },
+    json,
+  };
 }
 
 function parseSsh(args: string[]): ParsedSsh {
@@ -1999,7 +2049,13 @@ export async function main(
     case "doctor":
       if (cmd.input.all) {
         return runFleetDoctor(
-          { json: cmd.json, alertRepo: cmd.input.alertRepo },
+          {
+            json: cmd.json,
+            alertRepo: cmd.input.alertRepo,
+            remediate: cmd.input.remediate,
+            apply: cmd.input.apply,
+            controlPlaneIp: cmd.input.controlPlaneIp,
+          },
           new StateStore(),
           defaultAppStore(),
           out,

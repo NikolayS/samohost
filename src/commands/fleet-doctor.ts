@@ -18,6 +18,11 @@ import { redact } from "../ssh/runner.ts";
 import type { StateStore } from "../state/store.ts";
 import type { AppStore } from "../state/apps.ts";
 import type { RemoteRunner } from "./status.ts";
+import {
+  classifyVm,
+  remediateSafeVm,
+  type FleetRemediationResult,
+} from "../remediate/firewall-lock.ts";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -39,7 +44,12 @@ export interface FleetDoctorReport {
   failingVms: number; // VMs with ≥1 fail (group !== core-suspicious)
   errorVms: number;   // VMs where probeError is set
   findingVms: number; // VMs with ≥1 suspicious finding
+  /** Populated only when opts.remediate is true. */
+  remediations?: FleetRemediationResult[];
 }
+
+// Re-export so callers (tests) can reference the type from fleet-doctor.ts imports.
+export type { FleetRemediationResult };
 
 // ---------------------------------------------------------------------------
 // Fleet alert body builder.
@@ -155,7 +165,16 @@ function formatFleetReport(report: FleetDoctorReport): string {
 // ---------------------------------------------------------------------------
 
 export async function runFleetDoctor(
-  opts: { json: boolean; alertRepo?: string },
+  opts: {
+    json: boolean;
+    alertRepo?: string;
+    /** Enable the Phase C remediation pass (dry-run unless apply is also true). */
+    remediate?: boolean;
+    /** Mutate: actually execute the relock SSH script. Requires remediate:true. */
+    apply?: boolean;
+    /** Control-plane IP for the :80 source-restricted allow rule. Required when apply:true. */
+    controlPlaneIp?: string;
+  },
   store: StateStore,
   appStore: AppStore,
   out: (s: string) => void,
@@ -199,6 +218,101 @@ export async function runFleetDoctor(
       v.checks.some((c) => (c.findings?.length ?? 0) > 0),
   ).length;
 
+  // ---------------------------------------------------------------------------
+  // Phase C — remediation pass (sequential, same constraint as audit loop).
+  // Entered only when opts.remediate is true.
+  // ---------------------------------------------------------------------------
+
+  let remediations: FleetRemediationResult[] | undefined;
+
+  if (opts.remediate) {
+    remediations = [];
+
+    // FIX 4 guard: defence-in-depth beyond CLI validation.
+    // A non-CLI caller could pass apply:true without controlPlaneIp and accidentally
+    // delete the world-open :80 rule without adding the control-plane :80 replacement,
+    // which would dark the prod control-plane→VM hop.
+    if (opts.apply && opts.controlPlaneIp === undefined) {
+      throw new Error(
+        "runFleetDoctor: apply:true requires controlPlaneIp — " +
+        "omitting it would remove the world-open :80 rule without adding " +
+        "the control-plane source-restricted replacement (darkening the prod hop).",
+      );
+    }
+
+    // Collect VMs that failed the web-ports-not-world-open check.
+    const webPortFailVms = results.filter(
+      (v) =>
+        v.checks !== undefined &&
+        v.checks.some(
+          (c) => c.id === "web-ports-not-world-open" && c.status === "fail",
+        ),
+    );
+
+    // STRICTLY SEQUENTIAL — for...of, NOT Promise.all.
+    for (const vmResult of webPortFailVms) {
+      const record = vms.find((r) => r.id === vmResult.vmId);
+      if (!record) continue;
+
+      if (!opts.apply) {
+        // Dry-run: call the read-only classifier so the report shows the TRUE class.
+        // classifyVm only greps /etc/caddy/sites.d/ over SSH — it never mutates.
+        let dryVmClass: import("../remediate/firewall-lock.ts").VmClass;
+        try {
+          dryVmClass = await classifyVm(record, runner);
+        } catch {
+          dryVmClass = "UNKNOWN";
+        }
+        remediations.push({
+          vmName: vmResult.vmName,
+          class: dryVmClass,
+          applied: false,
+          // wouldLock is true only when the VM would actually be locked (i.e., SAFE).
+          wouldLock: dryVmClass === "SAFE",
+        });
+        continue;
+      }
+
+      // Gate 3 — Classifier gate.
+      let vmClass: import("../remediate/firewall-lock.ts").VmClass;
+      try {
+        vmClass = await classifyVm(record, runner);
+      } catch {
+        vmClass = "UNKNOWN";
+      }
+
+      if (vmClass !== "SAFE") {
+        const alertMsg =
+          vmClass === "ENTANGLED"
+            ? `ENTANGLED: sites.d has missing or non-tls-internal snippets; manual review required`
+            : `UNKNOWN: classifier SSH probe failed; cannot determine TLS posture`;
+        remediations.push({
+          vmName: vmResult.vmName,
+          class: vmClass,
+          applied: false,
+          alert: alertMsg,
+        });
+        err(`fleet-doctor: ${vmResult.vmName}: remediation skipped (${vmClass}): ${alertMsg}`);
+        continue;
+      }
+
+      // Gate 4 — Apply gate: SAFE + apply.
+      const result = await remediateSafeVm(
+        record,
+        runner,
+        true,
+        opts.controlPlaneIp,
+      );
+      remediations.push(result);
+
+      if (result.verified === false) {
+        err(
+          `fleet-doctor: ${vmResult.vmName}: relock verify FAILED — ${result.alert ?? "unknown"}`,
+        );
+      }
+    }
+  }
+
   const report: FleetDoctorReport = {
     at: new Date().toISOString(),
     vms: results,
@@ -206,6 +320,7 @@ export async function runFleetDoctor(
     failingVms,
     errorVms,
     findingVms,
+    ...(remediations !== undefined ? { remediations } : {}),
   };
 
   // Post fleet alert to GitHub (non-fatal: catch any error).
