@@ -17,6 +17,7 @@
 
 import { buildFirewallLines } from "../env/script.ts";
 import { parseWebPortsNotWorldOpenOutput } from "../commands/doctor.ts";
+import { redact } from "../ssh/runner.ts";
 import type { VmRecord } from "../types.ts";
 import type { RemoteRunner } from "../commands/status.ts";
 
@@ -111,13 +112,11 @@ export async function classifyVm(vm: VmRecord, runner: RemoteRunner): Promise<Vm
 export function buildRelockDeleteLines(): string[] {
   return [
     "# Phase C relock — Step 2: remove world-open rules (AFTER additive rules above).",
+    "# UFW manages v4 and v6 together when IPV6=yes (Ubuntu default); one delete covers both.",
     "ufw delete allow 443/tcp 2>/dev/null || true",
     "ufw delete allow 443 2>/dev/null || true",
     "ufw delete allow 80/tcp 2>/dev/null || true",
     "ufw delete allow 80 2>/dev/null || true",
-    // IPv6 entries use the same syntax under UFW
-    "ufw delete allow 443/tcp 2>/dev/null || true",
-    "ufw delete allow 80/tcp 2>/dev/null || true",
   ];
 }
 
@@ -208,7 +207,7 @@ export async function remediateSafeVm(
       class: "SAFE",
       applied: false,
       verified: false,
-      alert: `relock SSH error: ${msg}`,
+      alert: `relock SSH error: ${redact(msg)}`,
     };
   }
 

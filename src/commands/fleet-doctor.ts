@@ -228,6 +228,18 @@ export async function runFleetDoctor(
   if (opts.remediate) {
     remediations = [];
 
+    // FIX 4 guard: defence-in-depth beyond CLI validation.
+    // A non-CLI caller could pass apply:true without controlPlaneIp and accidentally
+    // delete the world-open :80 rule without adding the control-plane :80 replacement,
+    // which would dark the prod control-plane→VM hop.
+    if (opts.apply && opts.controlPlaneIp === undefined) {
+      throw new Error(
+        "runFleetDoctor: apply:true requires controlPlaneIp — " +
+        "omitting it would remove the world-open :80 rule without adding " +
+        "the control-plane source-restricted replacement (darkening the prod hop).",
+      );
+    }
+
     // Collect VMs that failed the web-ports-not-world-open check.
     const webPortFailVms = results.filter(
       (v) =>
@@ -243,12 +255,20 @@ export async function runFleetDoctor(
       if (!record) continue;
 
       if (!opts.apply) {
-        // Dry-run: no SSH call to the classifier; just flag as wouldLock.
+        // Dry-run: call the read-only classifier so the report shows the TRUE class.
+        // classifyVm only greps /etc/caddy/sites.d/ over SSH — it never mutates.
+        let dryVmClass: import("../remediate/firewall-lock.ts").VmClass;
+        try {
+          dryVmClass = await classifyVm(record, runner);
+        } catch {
+          dryVmClass = "UNKNOWN";
+        }
         remediations.push({
           vmName: vmResult.vmName,
-          class: "SAFE" as const, // Not yet determined — placeholder for dry-run.
+          class: dryVmClass,
           applied: false,
-          wouldLock: true,
+          // wouldLock is true only when the VM would actually be locked (i.e., SAFE).
+          wouldLock: dryVmClass === "SAFE",
         });
         continue;
       }
