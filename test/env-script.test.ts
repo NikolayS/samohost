@@ -397,17 +397,27 @@ describe("buildHostPrepScript", () => {
   // Issue #38 — open ufw 443 in host-prep; correct preview DNS comment
   // -------------------------------------------------------------------------
 
-  test("opens ufw 443/tcp so the origin answers HTTPS (avoids 522)", () => {
+  test("opens :443 via source-restricted CF-IP ranges, not world-open (avoids 522 without exposing origin to arbitrary IPs)", () => {
     // host-prep is run with root; /usr/sbin/ufw is the canonical path on
-    // Ubuntu 22.04/24.04 and ufw allow is naturally idempotent.
+    // Ubuntu 22.04/24.04. CF IPs are fetched at host-prep time (runtime, not
+    // build-time) so the list never drifts. Each range rule is idempotent.
     const s = buildHostPrepScript(app(), "agent");
-    expect(s).toContain("/usr/sbin/ufw allow 443/tcp");
+    // Must fetch CF ranges at host-prep time (inside the generated bash script).
+    expect(s).toContain("https://www.cloudflare.com/ips-v4");
+    expect(s).toContain("https://www.cloudflare.com/ips-v6");
+    // Must emit source-restricted form (not world-open).
+    expect(s).toMatch(/ufw allow from .* to any port 443\/tcp/);
+    // World-open form MUST NOT appear.
+    expect(s).not.toMatch(/\/usr\/sbin\/ufw allow 443(\/tcp)?(\s|$)/m);
   });
 
-  test("ufw 443 is opened in host-prep only — NOT granted in the per-env NOPASSWD sudoers, and never called by the env scripts (privilege surface)", () => {
+  test("ufw :443 is opened in host-prep only — source-restricted to CF IPs, NOT granted in the per-env NOPASSWD sudoers, and never called by the env scripts (privilege surface)", () => {
     const hp = buildHostPrepScript(app(), "agent");
-    // 443 is opened once, here, by the root operator running host-prep.
-    expect(hp).toContain("/usr/sbin/ufw allow 443/tcp");
+    // :443 is opened via CF-IP-restricted ufw rules by the root operator
+    // running host-prep. Source-restricted form only, never world-open.
+    expect(hp).toContain("https://www.cloudflare.com/ips-v4");
+    expect(hp).toMatch(/ufw allow from .* to any port 443\/tcp/);
+    expect(hp).not.toMatch(/\/usr\/sbin\/ufw allow 443(\/tcp)?(\s|$)/m);
     // It must NOT be added to the per-(vm,app) sudoers block: the env scripts
     // run later as the non-root sshUser and have no reason to touch ufw, so a
     // ufw NOPASSWD grant would needlessly widen that user's privileges.
@@ -415,6 +425,47 @@ describe("buildHostPrepScript", () => {
     // And the env create/destroy scripts never invoke ufw at all.
     expect(buildEnvCreateScript(app(), target())).not.toContain("ufw");
     expect(buildEnvDestroyScript(app(), target())).not.toContain("ufw");
+  });
+
+  // -------------------------------------------------------------------------
+  // POLICY: no world-open ufw allow 443/tcp or 80/tcp — source-restricted only
+  // -------------------------------------------------------------------------
+
+  test("POLICY: host-prep never emits a world-open ufw allow 443/tcp or 80/tcp", () => {
+    // Applies to both node and static kinds, with and without controlPlaneIp.
+    for (const opts of [
+      undefined,
+      { allowCfHttps: true },
+      { controlPlaneIp: "10.0.0.1" },
+      { allowCfHttps: true, controlPlaneIp: "10.0.0.1" },
+    ] as const) {
+      const s = buildHostPrepScript(app(), "agent", opts);
+      // The banned world-open forms:
+      expect(s).not.toMatch(/\/usr\/sbin\/ufw allow 443(\/tcp)?(\s|$)/m);
+      expect(s).not.toMatch(/\/usr\/sbin\/ufw allow 80(\/tcp)?(\s|$)/m);
+    }
+  });
+
+  test("POLICY: host-prep with allowCfHttps=true (default) fetches CF IPs and emits source-restricted :443 rules", () => {
+    const s = buildHostPrepScript(app(), "agent"); // default: allowCfHttps=true
+    expect(s).toContain("https://www.cloudflare.com/ips-v4");
+    expect(s).toContain("https://www.cloudflare.com/ips-v6");
+    // Source-restricted form only:
+    expect(s).toMatch(/ufw allow from .* to any port 443\/tcp/);
+    // World-open form must be absent:
+    expect(s).not.toMatch(/ufw allow 443\/tcp/);
+  });
+
+  test("POLICY: host-prep with controlPlaneIp emits source-restricted :80 rule, not world-open", () => {
+    const s = buildHostPrepScript(app(), "agent", { controlPlaneIp: "10.0.0.1" });
+    expect(s).toContain("/usr/sbin/ufw allow from '10.0.0.1' to any port 80/tcp");
+    expect(s).not.toMatch(/ufw allow 80(\/tcp)?(\s|$)/m);
+  });
+
+  test("POLICY: host-prep with allowCfHttps=false emits no :443 rule at all", () => {
+    const s = buildHostPrepScript(app(), "agent", { allowCfHttps: false });
+    expect(s).not.toContain("cloudflare.com/ips");
+    expect(s).not.toMatch(/ufw.*443/);
   });
 
   test("DNS comment describes per-preview UNPROXIED A record + ufw 443 (not misleading wildcard claim)", () => {
@@ -1727,9 +1778,14 @@ describe("static host-prep path (kind='static')", () => {
     expect(s).toContain("mkdir -p /etc/caddy/sites.d");
   });
 
-  test("static host-prep includes the ufw 443/tcp line", () => {
+  test("static host-prep emits source-restricted CF-IP :443 rules (not world-open ufw allow 443/tcp)", () => {
     const s = buildHostPrepScript(app({ kind: "static" }), "agent");
-    expect(s).toContain("/usr/sbin/ufw allow 443/tcp");
+    // Static sites are CF-direct (CF→VM:443), so source-restriction to CF IPs
+    // is equally critical — world-open would expose the origin to arbitrary IPs.
+    expect(s).toContain("https://www.cloudflare.com/ips-v4");
+    expect(s).toContain("https://www.cloudflare.com/ips-v6");
+    expect(s).toMatch(/ufw allow from .* to any port 443\/tcp/);
+    expect(s).not.toMatch(/\/usr\/sbin\/ufw allow 443(\/tcp)?(\s|$)/m);
   });
 
   test("static host-prep includes the DNS comment with UNPROXIED", () => {
