@@ -145,6 +145,16 @@ export const newCoreHostChecks: DoctorCheck[] = [
     group: "core-host",
   },
   {
+    id: "web-ports-not-world-open",
+    description: "ports 80/443 are not world-open in UFW (Anywhere / 0.0.0.0/0 / ::/0 triggers failure)",
+    // Extracts only port 80 and 443 lines from ufw status; evaluated by
+    // parseWebPortsNotWorldOpenOutput in doctor.ts — NOT the generic expect path.
+    probeCommand: "sudo /usr/sbin/ufw status 2>/dev/null | grep -E '^(80|443)(/|[[:space:]])' || true",
+    expect: /^$/, // structural placeholder; dispatch in evaluateDoctorCheck overrides
+    requiresSudo: true,
+    group: "core-host",
+  },
+  {
     id: "unattended-upgrades-active",
     description: "unattended-upgrades service is active",
     // is-active needs no sudo
