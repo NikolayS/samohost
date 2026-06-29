@@ -124,6 +124,9 @@ const DOCTOR_PASS_BODIES: Record<string, string> = {
   "git-remote-no-token": "origin\thttps://github.com/Tanya301/field-record-1 (fetch)",
   // liveness
   "ss-listeners": "LISTEN 0 128 0.0.0.0:2223 0.0.0.0:*\nLISTEN 0 511 0.0.0.0:80 0.0.0.0:*\nLISTEN 0 511 0.0.0.0:443 0.0.0.0:*",
+  // caddy-serving: added in Phase A fleet-doctor (serveKind-aware); pass body has both :80 and :443.
+  // Providing a dedicated section avoids dependence on ss-listeners fallback in these unit tests.
+  "caddy-serving": "LISTEN 0 128 0.0.0.0:2223 0.0.0.0:*\nLISTEN 0 511 0.0.0.0:80 0.0.0.0:*\nLISTEN 0 511 0.0.0.0:443 0.0.0.0:*",
   "fail2ban-jail": "Status for the jail: sshd\n|- Filter\n|  `- Currently failed: 0\n`- Actions\n   `- Total banned: 1",
   // app-scoped liveness (skip when no app)
   "service-crash-loop": "Started field-record.service.",

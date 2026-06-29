@@ -88,55 +88,7 @@ function makeApp(vmId: string, o: Partial<AppRecord> = {}): AppRecord {
   };
 }
 
-/** All-pass delimited output for the standard check set. */
-const ALL_PASS_OUTPUT = [
-  "ssh-port", "ufw-active", "fail2ban-active", "sysctl-rpfilter",
-  "sysctl-syncookies", "sysctl-redirects", "apparmor-enforced",
-  "permitrootlogin", "passwordauth", "allowusers", "maxauthtries",
-  "clientalive", "x11forwarding", "allowagentforwarding",
-  "permituserenvironment", "permitemptypasswords", "root-authorized-keys-empty",
-  "ufw-limit-ssh", "web-ports-not-world-open", "unattended-upgrades-active",
-  "only-intended-ports", "env-file-perms", "git-remote-no-token",
-  "ss-listeners", "fail2ban-jail", "service-crash-loop",
-  "failed-auth-burst", "sudo-failures", "fail2ban-ban-spike",
-  "rls-nonsuperuser", "pg-localhost", "app-health",
-].map((id) => {
-  const body: Record<string, string> = {
-    "ssh-port": "port 2223",
-    "ufw-active": "Status: active\nDefault: deny (incoming)",
-    "fail2ban-active": "active",
-    "sysctl-rpfilter": "1",
-    "sysctl-syncookies": "1",
-    "sysctl-redirects": "0",
-    "apparmor-enforced": "12 profiles are in enforce mode.",
-    "permitrootlogin": "permitrootlogin no",
-    "passwordauth": "passwordauthentication no",
-    "allowusers": "allowusers agent",
-    "maxauthtries": "maxauthtries 3",
-    "clientalive": "clientaliveinterval 300\nclientalivecountmax 2",
-    "x11forwarding": "x11forwarding no",
-    "allowagentforwarding": "allowagentforwarding no",
-    "permituserenvironment": "permituserenvironment no",
-    "permitemptypasswords": "permitemptypasswords no",
-    "root-authorized-keys-empty": "0",
-    "ufw-limit-ssh": "2223/tcp                   LIMIT       Anywhere",
-    "web-ports-not-world-open": "",
-    "unattended-upgrades-active": "active",
-    "only-intended-ports": "",
-    "env-file-perms": "600 agent",
-    "git-remote-no-token": "origin\thttps://github.com/Tanya301/field-record-1 (fetch)",
-    "ss-listeners": "LISTEN 0 128 0.0.0.0:2223 0.0.0.0:*\nLISTEN 0 511 0.0.0.0:80 0.0.0.0:*\nLISTEN 0 511 0.0.0.0:443 0.0.0.0:*",
-    "fail2ban-jail": "Status for the jail: sshd",
-    "service-crash-loop": "Started field-record.service.",
-    "failed-auth-burst": "Accepted publickey",
-    "sudo-failures": "Accepted publickey",
-    "fail2ban-ban-spike": "Total banned: 3",
-    "rls-nonsuperuser": "f",
-    "pg-localhost": "LISTEN 0 128 127.0.0.1:5432 0.0.0.0:*",
-    "app-health": "200",
-  };
-  return `<<<SAMOHOST_AUDIT:${id}}>>>\n${body[id] ?? ""}`;
-}).join("\n");
+// ALL_PASS_OUTPUT was defined here for reference during test authoring (unused in assertions).
 
 function passRunner(overrides: Record<string, string> = {}): RemoteRunner {
   return (_vm, script) => {

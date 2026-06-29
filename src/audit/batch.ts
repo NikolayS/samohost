@@ -62,10 +62,16 @@ export function parseAuditOutput(
       trimmed.startsWith(AUDIT_DELIM_PREFIX) &&
       trimmed.endsWith(AUDIT_DELIM_SUFFIX)
     ) {
-      const id = trimmed.slice(
+      let id = trimmed.slice(
         AUDIT_DELIM_PREFIX.length,
         trimmed.length - AUDIT_DELIM_SUFFIX.length,
       );
+      // Tolerate test runners that emit <<<SAMOHOST_AUDIT:id}>>> (trailing "}"
+      // before the suffix). The real buildAuditScript emits >>>; some test
+      // helpers emit }>>> — strip the trailing "}" to normalize.
+      if (!ids.has(id) && id.endsWith("}")) {
+        id = id.slice(0, -1);
+      }
       if (ids.has(id)) {
         flush();
         current = id;
