@@ -1361,10 +1361,125 @@ function mainEnvPort(app: AppRecord): number {
 }
 
 /**
+ * Generate the firewall section lines for the host-prep script.
+ *
+ * Returns an array of bash lines (no trailing newline / blank — the caller
+ * appends an empty string to produce the separator blank line).
+ *
+ * Security posture:
+ * - Never emit `ufw allow 443/tcp` or `ufw allow 80/tcp` (world-open forms).
+ * - :443 rules are source-restricted to Cloudflare IP ranges, fetched at
+ *   host-prep execution time from the canonical Cloudflare HTTPS endpoints.
+ *   Fetching inside the generated bash (not at TS build time) means the list
+ *   is current when the operator actually runs the script, and keeps this
+ *   module side-effect-free (no network I/O in the builder).
+ * - :80 rule (when controlPlaneIp is provided) is source-restricted to the
+ *   single control-plane IP/CIDR.
+ */
+function buildFirewallLines(
+  isStatic: boolean,
+  sshUser: string,
+  opts?: HostPrepFirewallOpts,
+): string[] {
+  const allowCfHttps = opts?.allowCfHttps ?? true;
+  const { controlPlaneIp } = opts ?? {};
+  const stepNum = isStatic ? "4" : "5";
+
+  const lines: string[] = [
+    `# ${stepNum}. Firewall: source-restricted rules so the origin only answers`,
+    `#    requests arriving from expected sources (Cloudflare edge / control-plane).`,
+    `#    /usr/sbin/ufw is the canonical path on Ubuntu 22.04/24.04.`,
+    `#    Run directly (this whole script is the ONE-TIME root host-prep), so NO`,
+    `#    NOPASSWD sudoers grant for ufw is added above: the env create/destroy`,
+    `#    scripts (run later as the non-root ${sshUser} user) never call ufw —`,
+    `#    rules are opened once here, not per env.`,
+  ];
+
+  if (allowCfHttps) {
+    lines.push(
+      `#`,
+      `#    :443 — Allow ONLY from Cloudflare IP ranges. Fetches the current`,
+      `#    published ranges at host-prep time (https://www.cloudflare.com/ips-v4`,
+      `#    and ips-v6 are the canonical sources; updated infrequently with advance`,
+      `#    notice). Re-run host-prep after a CF range update to pick up new CIDRs.`,
+      `#    Each range rule is idempotent (ufw deduplicates). If curl fails (no`,
+      `#    internet at host-prep time), the loop body never runs and no :443 rules`,
+      `#    are added — the host will reject CF edge connections until host-prep is`,
+      `#    re-run with connectivity. '|| true' prevents script abort on curl failure.`,
+      `for _cf4 in $(curl -fsS --max-time 15 https://www.cloudflare.com/ips-v4 2>/dev/null || true); do`,
+      `  /usr/sbin/ufw allow from "$_cf4" to any port 443/tcp`,
+      `done`,
+      `for _cf6 in $(curl -fsS --max-time 15 https://www.cloudflare.com/ips-v6 2>/dev/null || true); do`,
+      `  /usr/sbin/ufw allow from "$_cf6" to any port 443/tcp`,
+      `done`,
+    );
+  }
+
+  if (controlPlaneIp !== undefined) {
+    lines.push(
+      `#`,
+      `#    :80 — Allow ONLY from the control-plane IP (CF→control-plane→VM:80`,
+      `#    internal leg). World-open :80 is never emitted.`,
+      `/usr/sbin/ufw allow from '${controlPlaneIp}' to any port 80/tcp`,
+    );
+  }
+
+  return lines;
+}
+
+/**
+ * Firewall options for {@link buildHostPrepScript}.
+ *
+ * The fleet has two distinct serving shapes:
+ *
+ * 1. **CF-direct** (preview envs / static sites): CF edge → VM:443 directly.
+ *    Use the default `allowCfHttps: true` — the generated script fetches the
+ *    Cloudflare published IP ranges at host-prep time and emits one
+ *    source-restricted allow rule per CIDR.  This avoids pinning a stale list
+ *    in code and requires no build-time dependency.
+ *
+ * 2. **Control-plane-fronted** (prod app envs): CF → control-plane → VM:80.
+ *    Pass `controlPlaneIp` to emit a source-restricted `:80` rule.  Set
+ *    `allowCfHttps: false` when the VM never receives direct CF ingress on
+ *    `:443` (e.g. the control-plane terminates TLS, and only forwards HTTP).
+ */
+export interface HostPrepFirewallOpts {
+  /**
+   * For the CF→control-plane→VM:80 serving shape: IP or CIDR of the control
+   * plane whose requests must reach the VM on port 80 (plain HTTP, internal
+   * leg).  When set, the generated script emits:
+   *   /usr/sbin/ufw allow from '<controlPlaneIp>' to any port 80/tcp
+   * Absent: no :80 rule is emitted (VM:80 stays blocked — correct for
+   * CF-direct VMs where CF terminates TLS at the VM itself).
+   */
+  controlPlaneIp?: string;
+
+  /**
+   * For the CF→VM:443 direct serving shape (preview envs / static sites).
+   * When `true` (the default), the generated script fetches CF IP ranges at
+   * runtime from https://www.cloudflare.com/ips-v4 and ips-v6 and emits a
+   * source-restricted allow rule per CIDR:
+   *   /usr/sbin/ufw allow from '<cidr>' to any port 443/tcp
+   * Set to `false` only for control-plane-fronted VMs that never receive
+   * direct CF ingress on :443.
+   *
+   * @default true
+   */
+  allowCfHttps?: boolean;
+}
+
+/**
  * Render the ONE-TIME host preparation an operator with root must review and
  * apply before `env create` can run on a (vm, app): the Caddy sites.d include,
  * the durable main-env vhost (when {@link AppRecord.mainHost} is set), the
- * exact-path sudoers grants the env scripts rely on, and the ufw 443 rule.
+ * exact-path sudoers grants the env scripts rely on, and the firewall rules.
+ *
+ * Firewall posture (see {@link HostPrepFirewallOpts}):
+ * - :443 rules are source-restricted to Cloudflare IP ranges (fetched at
+ *   host-prep time) — NOT world-open.  The old `ufw allow 443/tcp` form is
+ *   intentionally absent; every :443 allow carries an explicit `from <CIDR>`.
+ * - :80 rules are emitted only when `controlPlaneIp` is provided, and are
+ *   similarly source-restricted to that single IP/CIDR.
  *
  * When `app.kind === "static"` (issue #36): the systemd template unit, the
  * env-template-file step, and the DB sudoers grants are OMITTED (a static env
@@ -1374,7 +1489,11 @@ function mainEnvPort(app: AppRecord): number {
  * This script is NOT meant to be piped to bash by samohost — it is printed
  * for human review (`samohost env plan --host-prep`).
  */
-export function buildHostPrepScript(app: AppRecord, sshUser: string): string {
+export function buildHostPrepScript(
+  app: AppRecord,
+  sshUser: string,
+  firewallOpts?: HostPrepFirewallOpts,
+): string {
   const isStatic = app.kind === "static";
   const root = envsRoot(app);
   const unit = app.serviceUnit;
@@ -1550,22 +1669,13 @@ export function buildHostPrepScript(app: AppRecord, sshUser: string): string {
     "",
     ...sudoersLines,
     "",
-    `# ${isStatic ? "4" : "5"}. Firewall: allow 443/tcp so the origin answers HTTPS.`,
-    `#    Without this the browser (or Cloudflare edge) gets a TCP-refused`,
-    `#    connection → Cloudflare 522. /usr/sbin/ufw is the canonical path on`,
-    `#    Ubuntu 22.04/24.04; ufw allow is naturally idempotent.`,
-    `#    Run directly (this whole script is the ONE-TIME root host-prep), so NO`,
-    `#    NOPASSWD sudoers grant for ufw is added above: the env create/destroy`,
-    `#    scripts (run later as the non-root ${sshUser} user) never call ufw —`,
-    `#    443 is opened once here, not per env. Adding a /usr/sbin/ufw NOPASSWD`,
-    `#    grant would needlessly widen the env user's privilege surface.`,
-    `/usr/sbin/ufw allow 443/tcp`,
+    ...buildFirewallLines(isStatic, sshUser, firewallOpts),
     "",
     `# ${isStatic ? "5" : "6"}. DNS (one-time, per-preview): samohost's DNS step (Gap #2) creates an`,
     `#    UNPROXIED A record for each per-preview hostname → this VM's IP.`,
     `#    Being UNPROXIED lets Caddy complete the ACME HTTP-01 challenge`,
     `#    directly and obtain a real Let's Encrypt cert (no browser warning).`,
-    `#    ufw 443 above is required for the TLS handshake to succeed.`,
+    `#    The firewall rules above (step ${isStatic ? "4" : "5"}) must be in place for the TLS handshake to succeed.`,
     "",
   ].join("\n");
 }

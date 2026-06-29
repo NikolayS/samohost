@@ -197,9 +197,18 @@ describe("HOST-PREP CONTRACT: buildHostPrepScript() generic platform invariants"
   // Without this the reverse-proxy path fails with a Cloudflare 522 (TCP-reset
   // connection refused at origin). ufw allow is naturally idempotent.
 
-  test("opens /usr/sbin/ufw allow 443/tcp for HTTPS origin answer", () => {
+  test("opens :443 via source-restricted CF-IP ranges (not world-open) for HTTPS origin answer", () => {
+    // World-open `ufw allow 443/tcp` exposes the origin to every IP, not just
+    // Cloudflare. Source-restricted rules (one per CF CIDR) are the correct
+    // posture: only CF edge IPs can reach :443 on the origin VM.
     const s = buildHostPrepScript(app(), "agent");
-    expect(s).toContain("/usr/sbin/ufw allow 443/tcp");
+    // CF ranges are fetched at host-prep time (inside the generated bash script).
+    expect(s).toContain("https://www.cloudflare.com/ips-v4");
+    expect(s).toContain("https://www.cloudflare.com/ips-v6");
+    // Source-restricted form must be present.
+    expect(s).toMatch(/ufw allow from .* to any port 443\/tcp/);
+    // World-open form must be absent.
+    expect(s).not.toMatch(/\/usr\/sbin\/ufw allow 443(\/tcp)?(\s|$)/m);
   });
 
   test("NO NOPASSWD sudoers grant for ufw (443 opened once by root, not per-env)", () => {
