@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { spawnSync } from "node:child_process";
 import { buildDeployScript } from "../src/app/script.ts";
 import type { AppRecord } from "../src/types.ts";
 
@@ -232,5 +233,122 @@ describe("buildDeployScript hard-won behaviors", () => {
     expect(script).toContain("npm ci --include=dev");
     // Bare unguarded npm ci (fails on lockfile-less apps) must be gone.
     expect(script).not.toContain("if npm ci --include=dev; then");
+  });
+});
+
+// ============================================================================
+// Phase B: buildDeployScript — static site path (kind='static')
+//
+// All tests in this describe block are RED until the static branch is added
+// to src/app/script.ts. The backward-compat guard at the end must stay GREEN.
+// ============================================================================
+
+function staticApp(overrides: Partial<AppRecord> = {}): AppRecord {
+  return {
+    id: "app-static-0001",
+    vmId: "vm-aaaa-bbbb-cccc",
+    name: "my-static-site",
+    kind: "static",
+    repo: "Tanya301/my-static-site",
+    branch: "main",
+    appDir: "/opt/my-static-site/app",
+    buildCmd: "npm run build",
+    healthUrl: "https://my-static-site.example.com/",
+    serviceUnit: "my-static-site",
+    mainHost: "my-static-site.example.com",
+    ...overrides,
+  };
+}
+
+const STATIC_TARGET = { sha: "abc1234def5678901234567890abcdef12345678" };
+
+describe("buildDeployScript — static path (kind='static')", () => {
+  test("static deploy script is valid bash", () => {
+    // The generated script must be syntactically valid bash (bash -n).
+    // This passes today (the output is syntactically valid even though semantically wrong).
+    const script = buildDeployScript(staticApp(), STATIC_TARGET);
+    const res = spawnSync("bash", ["-n"], { input: script, encoding: "utf8" });
+    expect(res.status).toBe(0);
+  });
+
+  test("static deploy does NOT emit npm ci, npm install, or npm run build", () => {
+    // FAILS today: buildDeployScript unconditionally emits install+build phases.
+    const script = buildDeployScript(staticApp(), STATIC_TARGET);
+    expect(script).not.toContain("npm ci");
+    expect(script).not.toContain("npm install");
+    expect(script).not.toContain("npm run build");
+  });
+
+  test("static deploy does NOT emit systemctl restart (no unit to restart for a static site)", () => {
+    // FAILS today: buildDeployScript line 285 always emits systemctl restart.
+    const script = buildDeployScript(staticApp(), STATIC_TARGET);
+    const codeLines = script.split("\n").filter((l) => !l.trimStart().startsWith("#"));
+    for (const l of codeLines) {
+      expect(l).not.toMatch(/systemctl\s+restart/);
+    }
+  });
+
+  test("static deploy emits caddy reload as the reload step (NOT systemctl restart)", () => {
+    // FAILS today: no caddy-reload step exists in buildDeployScript.
+    // The exact form should be `sudo /usr/bin/systemctl reload caddy`
+    // (full-path sudo, consistent with header note 3 in app/script.ts).
+    const script = buildDeployScript(staticApp(), STATIC_TARGET);
+    expect(script).toContain("reload caddy");
+    // The caddy-reload phase marker must be present.
+    expect(script).toContain("<<<SAMOHOST_PHASE:caddy-reload:start>>>");
+  });
+
+  test("static rollback uses git reset + caddy reload, NOT systemctl restart", () => {
+    // FAILS today: rollback() at src/app/script.ts:198 always calls systemctl restart.
+    const script = buildDeployScript(staticApp(), STATIC_TARGET);
+    expect(script).toContain('git reset --hard "${PRE_DEPLOY_SHA}"');
+    // Rollback must reload caddy, not restart a non-existent unit.
+    const rollbackStart = script.indexOf("rollback() {");
+    const rollbackEnd = script.indexOf("\n}", rollbackStart);
+    const rollbackBody = script.slice(rollbackStart, rollbackEnd);
+    expect(rollbackBody).toContain("reload caddy");
+    expect(rollbackBody).not.toMatch(/systemctl\s+restart/);
+  });
+
+  test("static deploy does NOT emit install/build/migrate/assert-rls/seed phase markers", () => {
+    // FAILS today: install, build markers are emitted unconditionally.
+    const script = buildDeployScript(staticApp(), STATIC_TARGET);
+    expect(script).not.toContain("<<<SAMOHOST_PHASE:install:");
+    expect(script).not.toContain("<<<SAMOHOST_PHASE:build:");
+    expect(script).not.toContain("<<<SAMOHOST_PHASE:migrate:");
+    expect(script).not.toContain("<<<SAMOHOST_PHASE:assert-rls:");
+    expect(script).not.toContain("<<<SAMOHOST_PHASE:seed:");
+  });
+
+  test("static deploy DOES emit fetch, checkpoint, checkout, caddy-reload, health phase markers", () => {
+    // FAILS today: caddy-reload phase does not exist.
+    // fetch/checkpoint/checkout/health are already emitted but caddy-reload is missing.
+    const script = buildDeployScript(staticApp(), STATIC_TARGET);
+    expect(script).toContain("<<<SAMOHOST_PHASE:fetch:start>>>");
+    expect(script).toContain("<<<SAMOHOST_PHASE:checkpoint:start>>>");
+    expect(script).toContain("<<<SAMOHOST_PHASE:checkout:start>>>");
+    expect(script).toContain("<<<SAMOHOST_PHASE:caddy-reload:start>>>");
+    expect(script).toContain("<<<SAMOHOST_PHASE:health:start>>>");
+  });
+
+  test("static deploy health probe passes -k to tolerate tls internal self-signed cert", () => {
+    // FAILS today: health curl in buildDeployScript does not pass -k.
+    const script = buildDeployScript(staticApp(), STATIC_TARGET);
+    const healthStart = script.indexOf("<<<SAMOHOST_PHASE:health:start>>>");
+    const healthOk = script.indexOf("<<<SAMOHOST_PHASE:health:ok>>>");
+    expect(healthStart).toBeGreaterThan(-1);
+    const healthSection = script.slice(healthStart, Math.max(healthOk + 50, healthStart + 200));
+    expect(healthSection).toContain("-k");
+  });
+
+  test("node path unchanged: still emits install, restart, rollback with systemctl restart", () => {
+    // Backward-compat guard. PASSES today; must continue to pass after the static
+    // branch is added.
+    const script = buildDeployScript(fieldRecord(), TARGET);
+    expect(script).toContain("<<<SAMOHOST_PHASE:install:start>>>");
+    expect(script).toContain("<<<SAMOHOST_PHASE:restart:start>>>");
+    expect(script).toContain("sudo /usr/bin/systemctl restart");
+    expect(script).not.toContain("reload caddy");
+    expect(script).not.toContain("caddy-reload");
   });
 });

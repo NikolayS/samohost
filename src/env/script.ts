@@ -1376,7 +1376,7 @@ function mainEnvPort(app: AppRecord): number {
  * - :80 rule (when controlPlaneIp is provided) is source-restricted to the
  *   single control-plane IP/CIDR.
  */
-function buildFirewallLines(
+export function buildFirewallLines(
   isStatic: boolean,
   sshUser: string,
   opts?: HostPrepFirewallOpts,

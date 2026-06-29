@@ -72,6 +72,7 @@
  */
 
 import type { AppRecord } from "../types.ts";
+import { buildFirewallLines, type HostPrepFirewallOpts } from "../env/script.ts";
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -92,14 +93,31 @@ export interface HostBootstrapOptions {
   appUser: string;
 
   /**
-   * PR-A2 REQUIRED — the database name to create on the host.
+   * PR-A2 — the database name to create on the host.
    *
-   * MUST be passed explicitly. Do NOT derive from app.name.
-   * The critic flagged: 'field-record-1'.replace(/-/g,'_') = 'field_record_1'
-   * but the live box's DB is 'field_record'. The production DB name is opaque
-   * to samohost and must always be supplied by the operator.
+   * REQUIRED for non-static apps (`app.kind !== 'static'`). Must be passed
+   * explicitly — never derived from app.name (the production DB name is opaque
+   * to samohost). The critic flagged: 'field-record-1'.replace(/-/g,'_') =
+   * 'field_record_1' but the live box's DB is 'field_record'.
+   *
+   * Optional for static apps (`app.kind === 'static'`): static sites have no
+   * database; passing `dbName` when absent will cause the builder to throw with
+   * a clear error for non-static apps. Static calls should simply omit this field.
    */
-  dbName: string;
+  dbName?: string;
+
+  /**
+   * Firewall options for the generated firewall rules section (static apps only).
+   *
+   * When set, the bootstrap script includes source-restricted ufw rules:
+   *  - `:443` open ONLY to Cloudflare IP ranges (fetched at runtime; default true)
+   *  - `:80` open ONLY to the single `controlPlaneIp` (when provided)
+   *
+   * For non-static apps the firewall section is omitted (the host-prep script
+   * owns the firewall for node apps). For static apps a basic CF-direct firewall
+   * is always emitted; this option lets callers opt-in to the control-plane :80 rule.
+   */
+  firewallOpts?: HostPrepFirewallOpts;
 
   /**
    * Base directory for the app on the host (e.g. /opt/field-record).
@@ -194,8 +212,21 @@ export function buildHostBootstrapScript(
   app: AppRecord,
   opts: HostBootstrapOptions,
 ): string {
+  const isStatic = app.kind === "static";
+
+  // Guard: dbName is required for non-static apps (node apps need a database).
+  // Static apps have no database — callers MUST omit dbName for static and
+  // MUST supply it for node apps. Failing loudly here prevents a silent
+  // undefined-propagation bug that would produce a broken script.
+  if (!isStatic && opts.dbName === undefined) {
+    throw new Error(
+      `buildHostBootstrapScript: dbName is required for non-static apps (app.kind is '${app.kind ?? "node"}', not 'static'). ` +
+        `Pass dbName explicitly via HostBootstrapOptions — never derive it from app.name.`,
+    );
+  }
+
   const appUser = opts.appUser;
-  const dbName = opts.dbName; // REQUIRED — never derived from app.name
+  const dbName = opts.dbName; // required for non-static (guarded above); undefined for static
   const nodeMajor = opts.nodeMajor ?? 22;
   const pgMajor = opts.pgMajor ?? 18;
   const execStart = opts.execStart ?? "/usr/bin/node dist/server.js";
@@ -286,17 +317,21 @@ export function buildHostBootstrapScript(
   );
 
   // ---- section 1: base packages + NodeSource --------------------------------
-  push(
-    `# ---------------------------------------------------------------------------`,
-    `# §1. Base packages + Node.js ${nodeMajor} (NodeSource) — idempotent guards.`,
-    `# ---------------------------------------------------------------------------`,
-    "",
-    "# 1a. Base tools (idempotent: apt is idempotent on already-installed packages).",
-    "apt-get update -qq",
-    "apt-get install -y --no-install-recommends \\",
-    "  git build-essential openssl ca-certificates curl gnupg",
-    "",
-    `# 1b. Node.js ${nodeMajor} via NodeSource (skip if already at target major).`,
+  // Static apps skip Node.js: they are served directly by Caddy file_server and
+  // need no Node runtime on the host. Base tools (git, curl, gnupg) are still
+  // installed because they are used by §12 (clone) and the operator toolchain.
+  if (!isStatic) {
+    push(
+      `# ---------------------------------------------------------------------------`,
+      `# §1. Base packages + Node.js ${nodeMajor} (NodeSource) — idempotent guards.`,
+      `# ---------------------------------------------------------------------------`,
+      "",
+      "# 1a. Base tools (idempotent: apt is idempotent on already-installed packages).",
+      "apt-get update -qq",
+      "apt-get install -y --no-install-recommends \\",
+      "  git build-essential openssl ca-certificates curl gnupg",
+      "",
+      `# 1b. Node.js ${nodeMajor} via NodeSource (skip if already at target major).`,
     `if command -v node >/dev/null 2>&1 \\`,
     `   && [[ "$(node --version 2>/dev/null | cut -d. -f1 | tr -d v)" == "${nodeMajor}" ]]; then`,
     `  echo "Node.js ${nodeMajor} already present — skipping NodeSource install."`,
@@ -308,8 +343,24 @@ export function buildHostBootstrapScript(
     `echo "node version: $(node --version)"`,
     "",
   );
+  } else {
+    // Static §1: base tools only (no NodeSource).
+    push(
+      `# ---------------------------------------------------------------------------`,
+      `# §1. Base packages (static site — Node.js NOT installed; not needed for file_server).`,
+      `# ---------------------------------------------------------------------------`,
+      "",
+      "# Base tools (idempotent: apt is idempotent on already-installed packages).",
+      "apt-get update -qq",
+      "apt-get install -y --no-install-recommends \\",
+      "  git build-essential openssl ca-certificates curl gnupg",
+      "",
+    );
+  }
 
   // ---- section 2: PostgreSQL via PGDG with PG_FALLBACK ----------------------
+  // Static apps skip PostgreSQL entirely: they have no database.
+  if (!isStatic) {
   push(
     `# ---------------------------------------------------------------------------`,
     `# §2. PostgreSQL ${pgMajor} via PGDG (idempotent; PG_FALLBACK if major unavailable).`,
@@ -368,6 +419,7 @@ export function buildHostBootstrapScript(
     "fi",
     "",
   );
+  } // end if (!isStatic) for §2
 
   // ---- section 3: Caddy via official apt repo -------------------------------
   push(
@@ -436,30 +488,56 @@ export function buildHostBootstrapScript(
   );
 
   // ---- section 6: deploy sudoers --------------------------------------------
-  push(
-    `# ---------------------------------------------------------------------------`,
-    `# §6. Deploy sudoers ${sudoersFile}`,
-    `#     Defaults use_pty assumed in effect; every grant is an EXACT full path`,
-    `#     (Defaults use_pty + exact-path NOPASSWD — issue #99).`,
-    `#     samohost is push-based (no timer); no timer/path-deploy grants here.`,
-    `# ---------------------------------------------------------------------------`,
-    "",
-    `cat > ${sq(sudoersFile)} <<SUDOERS`,
-    `${appUser} ALL=(root) NOPASSWD: /usr/bin/systemctl daemon-reload`,
-    `${appUser} ALL=(root) NOPASSWD: /usr/bin/systemctl enable ${unit}`,
-    `${appUser} ALL=(root) NOPASSWD: /usr/bin/systemctl start ${unit}`,
-    `${appUser} ALL=(root) NOPASSWD: /usr/bin/systemctl stop ${unit}`,
-    `${appUser} ALL=(root) NOPASSWD: /usr/bin/systemctl restart ${unit}`,
-    `${appUser} ALL=(postgres) NOPASSWD: /usr/bin/psql`,
-    `${appUser} ALL=(root) NOPASSWD: /usr/bin/journalctl *`,
-    "SUDOERS",
-    `chmod 440 ${sq(sudoersFile)}`,
-    `visudo -cf ${sq(sudoersFile)}`,
-    `echo "Sudoers: ${sudoersFile} written and validated."`,
-    "",
-  );
+  // Static apps get a reduced sudoers: no unit-specific grants (the main unit
+  // does not exist), no psql grant (no DB). Only daemon-reload and journalctl
+  // are retained (daemon-reload is needed for caddy reload; journalctl for logs).
+  if (isStatic) {
+    push(
+      `# ---------------------------------------------------------------------------`,
+      `# §6. Deploy sudoers ${sudoersFile} (static app — no unit grants).`,
+      `#     Defaults use_pty assumed in effect; every grant is an EXACT full path`,
+      `#     (Defaults use_pty + exact-path NOPASSWD — issue #99).`,
+      `# ---------------------------------------------------------------------------`,
+      "",
+      `cat > ${sq(sudoersFile)} <<SUDOERS`,
+      `${appUser} ALL=(root) NOPASSWD: /usr/bin/systemctl daemon-reload`,
+      `${appUser} ALL=(root) NOPASSWD: /usr/bin/systemctl reload caddy`,
+      `${appUser} ALL=(root) NOPASSWD: /usr/bin/journalctl *`,
+      "SUDOERS",
+      `chmod 440 ${sq(sudoersFile)}`,
+      `visudo -cf ${sq(sudoersFile)}`,
+      `echo "Sudoers: ${sudoersFile} written and validated (static — no unit grants)."`,
+      "",
+    );
+  } else {
+    push(
+      `# ---------------------------------------------------------------------------`,
+      `# §6. Deploy sudoers ${sudoersFile}`,
+      `#     Defaults use_pty assumed in effect; every grant is an EXACT full path`,
+      `#     (Defaults use_pty + exact-path NOPASSWD — issue #99).`,
+      `#     samohost is push-based (no timer); no timer/path-deploy grants here.`,
+      `# ---------------------------------------------------------------------------`,
+      "",
+      `cat > ${sq(sudoersFile)} <<SUDOERS`,
+      `${appUser} ALL=(root) NOPASSWD: /usr/bin/systemctl daemon-reload`,
+      `${appUser} ALL=(root) NOPASSWD: /usr/bin/systemctl enable ${unit}`,
+      `${appUser} ALL=(root) NOPASSWD: /usr/bin/systemctl start ${unit}`,
+      `${appUser} ALL=(root) NOPASSWD: /usr/bin/systemctl stop ${unit}`,
+      `${appUser} ALL=(root) NOPASSWD: /usr/bin/systemctl restart ${unit}`,
+      `${appUser} ALL=(postgres) NOPASSWD: /usr/bin/psql`,
+      `${appUser} ALL=(root) NOPASSWD: /usr/bin/journalctl *`,
+      "SUDOERS",
+      `chmod 440 ${sq(sudoersFile)}`,
+      `visudo -cf ${sq(sudoersFile)}`,
+      `echo "Sudoers: ${sudoersFile} written and validated."`,
+      "",
+    );
+  }
 
   // ---- section 7: MAIN systemd service unit ---------------------------------
+  // Static apps have no systemd unit: Caddy serves the checkout directly via
+  // file_server. Skip this section entirely for static apps.
+  if (!isStatic) {
   push(
     `# ---------------------------------------------------------------------------`,
     `# §7. MAIN systemd unit /etc/systemd/system/${unit}.service`,
@@ -490,6 +568,7 @@ export function buildHostBootstrapScript(
     `echo "Unit /etc/systemd/system/${unit}.service written, enabled (start deferred to first deploy)."`,
     "",
   );
+  } // end if (!isStatic) for §7
 
   // ---- section 8: sshd AllowUsers 09- drop-in --------------------------------
   push(
@@ -538,7 +617,65 @@ export function buildHostBootstrapScript(
     "",
   );
 
+  // ---- static-only: production Caddy file_server vhost block ----------------
+  // For static apps: write a file_server Caddy site block serving the app
+  // checkout directory. Uses `tls internal` (self-signed origin cert) so that
+  // CF Full-mode proxying works without an ACME challenge — ACME cannot complete
+  // behind CF-locked :443, matching buildStaticEnvCreateScript's rationale.
+  if (isStatic && app.mainHost !== undefined) {
+    const caddySitePath = `/etc/caddy/sites.d/00-main-${app.name}.caddy`;
+    push(
+      `# ---------------------------------------------------------------------------`,
+      `# §9b. Production Caddy file_server vhost for ${sq(app.mainHost)}.`,
+      `#      tls internal: CF Full-mode proxying; ACME cannot complete behind CF :443.`,
+      `#      file_server: serves the static checkout at ${sq(app.appDir)} directly.`,
+      `#      Idempotent: overwrite with deterministic content.`,
+      `# ---------------------------------------------------------------------------`,
+      "",
+      `cat > ${sq(caddySitePath)} <<'CADDY_SITE'`,
+      `${app.mainHost} {`,
+      `  root * ${app.appDir}`,
+      `  file_server`,
+      `  tls internal`,
+      `}`,
+      `CADDY_SITE`,
+      `caddy validate --config /etc/caddy/Caddyfile`,
+      `/usr/bin/systemctl reload caddy || /usr/bin/systemctl restart caddy`,
+      `echo "Caddy: static file_server vhost ${app.mainHost} -> ${app.appDir} written."`,
+      "",
+    );
+  }
+
+  // ---- static-only: firewall rules ------------------------------------------
+  // For static apps, emit source-restricted ufw rules. The app is served
+  // directly by Caddy on :443 (CF Full-mode origin): only Cloudflare edge IPs
+  // may reach :443. Optionally, :80 is opened only to the control-plane IP.
+  // This mirrors buildFirewallLines from env/script.ts — reused here so the
+  // same CF-range-fetch logic is not duplicated.
+  if (isStatic) {
+    const fwLines = buildFirewallLines(true, appUser, opts.firewallOpts);
+    push(
+      `# ---------------------------------------------------------------------------`,
+      `# §9c. Firewall (static app — source-restricted; world-open ufw allow NEVER emitted).`,
+      `#      Mirrors buildFirewallLines (env/script.ts). CF ranges fetched at run time.`,
+      `# ---------------------------------------------------------------------------`,
+      "",
+      ...fwLines,
+      "",
+    );
+  }
+
   // ---- section 10 (PR-A2-d): PostgreSQL DB bootstrap ------------------------
+  // Static apps skip §10 and §11 entirely: they have no database and no env file.
+  if (!isStatic) {
+  // The outer guard (~line 221) already throws when !isStatic && dbName===undefined,
+  // but TypeScript cannot carry that narrowing through the `const dbName` assignment.
+  // This guard is the TS-visible narrowing point: after it dbName is `string`.
+  if (dbName === undefined) {
+    throw new Error(
+      "buildHostBootstrapScript: dbName is required for non-static apps (internal invariant violated)",
+    );
+  }
   push(
     `# ---------------------------------------------------------------------------`,
     `# §10. DB bootstrap (PR-A2-d): enable postgresql, wait-for-ready,`,
@@ -663,6 +800,7 @@ export function buildHostBootstrapScript(
     `echo "$ENV_FILE: written (600, ${appUser}). [secret values not logged]"`,
     "",
   );
+  } // end if (!isStatic) for §10 + §11
 
   // ---- section 12 (PR-A2-f): full token-safe repo clone --------------------
   push(
@@ -725,78 +863,126 @@ export function buildHostBootstrapScript(
   );
 
   // ---- section 13: extended self-check PASS/FAIL table (A1 + A2 rows) ------
-  push(
-    `# ---------------------------------------------------------------------------`,
-    `# §13. Self-check PASS/FAIL table (OS-level + A2 items; exits 1 on FAIL).`,
-    `# ---------------------------------------------------------------------------`,
-    "",
-    `echo ""`,
-    `echo "=== samohost host-bootstrap self-check for ${app.name} ==="`,
-    `FAILED=0`,
-    "",
-    `# Helper: print PASS/FAIL and accumulate failures.`,
-    `chk() {`,
-    `  local label="$1" ok="$2"`,
-    `  if [[ "$ok" == "1" ]]; then`,
-    `    printf "  PASS  %s\\n" "$label"`,
-    `  else`,
-    `    printf "  FAIL  %s\\n" "$label" >&2`,
-    `    FAILED=$(( FAILED + 1 ))`,
-    `  fi`,
-    `}`,
-    "",
-    `# node version`,
-    `node_ok=0`,
-    `if command -v node >/dev/null 2>&1; then node_ok=1; fi`,
-    `chk "node $(node --version 2>/dev/null || echo '(not found)')" "$node_ok"`,
-    "",
-    `# caddy active`,
-    `caddy_ok=0`,
-    `/usr/bin/systemctl is-active caddy >/dev/null 2>&1 && caddy_ok=1 || true`,
-    `chk "caddy active" "$caddy_ok"`,
-    "",
-    `# sudo grant count for ${appUser} (expect >=7: daemon-reload + enable/start/stop/restart + psql + journalctl)`,
-    `sudo_count=$(grep -c ${sq(`NOPASSWD`)} ${sq(sudoersFile)} 2>/dev/null || echo 0)`,
-    `sudo_ok=0`,
-    `if [[ "$sudo_count" -ge 7 ]]; then sudo_ok=1; fi`,
-    `chk "sudoers grants count: $sudo_count (expect >=7)" "$sudo_ok"`,
-    "",
-    `# service unit enabled`,
-    `unit_ok=0`,
-    `/usr/bin/systemctl is-enabled ${sq(unit)} >/dev/null 2>&1 && unit_ok=1 || true`,
-    `chk "unit ${unit} enabled" "$unit_ok"`,
-    "",
-    `# postgres ready (PR-A2)`,
-    `pg_ok=0`,
-    `sudo -u postgres psql -p 5432 -qAtc 'select 1' >/dev/null 2>&1 && pg_ok=1 || true`,
-    `chk "postgres ready on 5432" "$pg_ok"`,
-    "",
-    `# database present (PR-A2)`,
-    `db_ok=0`,
-    `sudo -u postgres psql -p 5432 -qAtc "SELECT 1 FROM pg_database WHERE datname='${dbName}'" \\`,
-    `  2>/dev/null | grep -q 1 && db_ok=1 || true`,
-    `chk "db ${dbName} present" "$db_ok"`,
-    "",
-    `# staging.env present and 600 (PR-A2)`,
-    `env_ok=0`,
-    `if [[ -f "$ENV_FILE" ]] && [[ "$(stat -c '%a' "$ENV_FILE" 2>/dev/null || echo 0)" == "600" ]]; then`,
-    `  env_ok=1`,
-    `fi`,
-    `chk "staging.env 600 at $ENV_FILE" "$env_ok"`,
-    "",
-    `# app clone present (PR-A2)`,
-    `clone_ok=0`,
-    `if [[ -d "$APP_DIR/.git" ]]; then clone_ok=1; fi`,
-    `chk "app clone at $APP_DIR/.git" "$clone_ok"`,
-    "",
-    `echo "==="`,
-    `if [[ "$FAILED" -gt 0 ]]; then`,
-    `  echo "FAIL: $FAILED check(s) failed. Resolve above before proceeding." >&2`,
-    `  exit 1`,
-    `fi`,
-    `echo "All checks PASS — host bootstrap complete for ${app.name} (db: ${dbName})."`,
-    "",
-  );
+  // §13 self-check is kind-aware: static apps omit node/pg/unit/db rows.
+  if (isStatic) {
+    push(
+      `# ---------------------------------------------------------------------------`,
+      `# §13. Self-check PASS/FAIL table (static app — no node/pg/unit/db rows).`,
+      `# ---------------------------------------------------------------------------`,
+      "",
+      `echo ""`,
+      `echo "=== samohost host-bootstrap self-check for ${app.name} (static) ==="`,
+      `FAILED=0`,
+      "",
+      `# Helper: print PASS/FAIL and accumulate failures.`,
+      `chk() {`,
+      `  local label="$1" ok="$2"`,
+      `  if [[ "$ok" == "1" ]]; then`,
+      `    printf "  PASS  %s\\n" "$label"`,
+      `  else`,
+      `    printf "  FAIL  %s\\n" "$label" >&2`,
+      `    FAILED=$(( FAILED + 1 ))`,
+      `  fi`,
+      `}`,
+      "",
+      `# caddy active (required for file_server)`,
+      `caddy_ok=0`,
+      `/usr/bin/systemctl is-active caddy >/dev/null 2>&1 && caddy_ok=1 || true`,
+      `chk "caddy active" "$caddy_ok"`,
+      "",
+      `# sudo grant count for ${appUser} (static: expect >=3: daemon-reload + reload caddy + journalctl)`,
+      `sudo_count=$(grep -c ${sq(`NOPASSWD`)} ${sq(sudoersFile)} 2>/dev/null || echo 0)`,
+      `sudo_ok=0`,
+      `if [[ "$sudo_count" -ge 3 ]]; then sudo_ok=1; fi`,
+      `chk "sudoers grants count: $sudo_count (expect >=3)" "$sudo_ok"`,
+      "",
+      `# app clone present`,
+      `clone_ok=0`,
+      `if [[ -d "$APP_DIR/.git" ]]; then clone_ok=1; fi`,
+      `chk "app clone at $APP_DIR/.git" "$clone_ok"`,
+      "",
+      `echo "==="`,
+      `if [[ "$FAILED" -gt 0 ]]; then`,
+      `  echo "FAIL: $FAILED check(s) failed. Resolve above before proceeding." >&2`,
+      `  exit 1`,
+      `fi`,
+      `echo "All checks PASS — host bootstrap complete for ${app.name} (static)."`,
+      "",
+    );
+  } else {
+    push(
+      `# ---------------------------------------------------------------------------`,
+      `# §13. Self-check PASS/FAIL table (OS-level + A2 items; exits 1 on FAIL).`,
+      `# ---------------------------------------------------------------------------`,
+      "",
+      `echo ""`,
+      `echo "=== samohost host-bootstrap self-check for ${app.name} ==="`,
+      `FAILED=0`,
+      "",
+      `# Helper: print PASS/FAIL and accumulate failures.`,
+      `chk() {`,
+      `  local label="$1" ok="$2"`,
+      `  if [[ "$ok" == "1" ]]; then`,
+      `    printf "  PASS  %s\\n" "$label"`,
+      `  else`,
+      `    printf "  FAIL  %s\\n" "$label" >&2`,
+      `    FAILED=$(( FAILED + 1 ))`,
+      `  fi`,
+      `}`,
+      "",
+      `# node version`,
+      `node_ok=0`,
+      `if command -v node >/dev/null 2>&1; then node_ok=1; fi`,
+      `chk "node $(node --version 2>/dev/null || echo '(not found)')" "$node_ok"`,
+      "",
+      `# caddy active`,
+      `caddy_ok=0`,
+      `/usr/bin/systemctl is-active caddy >/dev/null 2>&1 && caddy_ok=1 || true`,
+      `chk "caddy active" "$caddy_ok"`,
+      "",
+      `# sudo grant count for ${appUser} (expect >=7: daemon-reload + enable/start/stop/restart + psql + journalctl)`,
+      `sudo_count=$(grep -c ${sq(`NOPASSWD`)} ${sq(sudoersFile)} 2>/dev/null || echo 0)`,
+      `sudo_ok=0`,
+      `if [[ "$sudo_count" -ge 7 ]]; then sudo_ok=1; fi`,
+      `chk "sudoers grants count: $sudo_count (expect >=7)" "$sudo_ok"`,
+      "",
+      `# service unit enabled`,
+      `unit_ok=0`,
+      `/usr/bin/systemctl is-enabled ${sq(unit)} >/dev/null 2>&1 && unit_ok=1 || true`,
+      `chk "unit ${unit} enabled" "$unit_ok"`,
+      "",
+      `# postgres ready (PR-A2)`,
+      `pg_ok=0`,
+      `sudo -u postgres psql -p 5432 -qAtc 'select 1' >/dev/null 2>&1 && pg_ok=1 || true`,
+      `chk "postgres ready on 5432" "$pg_ok"`,
+      "",
+      `# database present (PR-A2)`,
+      `db_ok=0`,
+      `sudo -u postgres psql -p 5432 -qAtc "SELECT 1 FROM pg_database WHERE datname='${dbName}'" \\`,
+      `  2>/dev/null | grep -q 1 && db_ok=1 || true`,
+      `chk "db ${dbName} present" "$db_ok"`,
+      "",
+      `# staging.env present and 600 (PR-A2)`,
+      `env_ok=0`,
+      `if [[ -f "$ENV_FILE" ]] && [[ "$(stat -c '%a' "$ENV_FILE" 2>/dev/null || echo 0)" == "600" ]]; then`,
+      `  env_ok=1`,
+      `fi`,
+      `chk "staging.env 600 at $ENV_FILE" "$env_ok"`,
+      "",
+      `# app clone present (PR-A2)`,
+      `clone_ok=0`,
+      `if [[ -d "$APP_DIR/.git" ]]; then clone_ok=1; fi`,
+      `chk "app clone at $APP_DIR/.git" "$clone_ok"`,
+      "",
+      `echo "==="`,
+      `if [[ "$FAILED" -gt 0 ]]; then`,
+      `  echo "FAIL: $FAILED check(s) failed. Resolve above before proceeding." >&2`,
+      `  exit 1`,
+      `fi`,
+      `echo "All checks PASS — host bootstrap complete for ${app.name} (db: ${dbName})."`,
+      "",
+    );
+  }
 
   return lines.join("\n");
 }

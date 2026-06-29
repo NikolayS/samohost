@@ -1216,3 +1216,191 @@ describe("buildHostBootstrapScript (PG-PAM fix) — postgres user pre-created be
     }
   });
 });
+
+// ============================================================================
+// Phase B: buildHostBootstrapScript — static site path (kind='static')
+//
+// All tests in this describe block are RED until the static branch is added to
+// src/app/bootstrap.ts. The backward-compat guard at the end must stay GREEN.
+//
+// NOTE: staticOpts() intentionally omits dbName — static apps have no database.
+// The type cast is required because the current HostBootstrapOptions type marks
+// dbName as required; the implementation change will make it optional with a
+// kind-aware guard.
+// ============================================================================
+
+function staticRecord(overrides: Partial<AppRecord> = {}): AppRecord {
+  return {
+    id: "app-static-0001",
+    vmId: "vm-aaaa-0001",
+    name: "my-static-site",
+    kind: "static",
+    repo: "Tanya301/my-static-site",
+    branch: "main",
+    appDir: "/opt/my-static-site/app",
+    buildCmd: "npm run build",
+    healthUrl: "https://my-static-site.example.com/",
+    serviceUnit: "my-static-site",
+    mainHost: "my-static-site.example.com",
+    ...overrides,
+  };
+}
+
+// staticOpts intentionally omits dbName (static apps have no database).
+// Cast required because current type marks dbName as required.
+function staticOpts(overrides: Record<string, unknown> = {}): HostBootstrapOptions {
+  return {
+    appUser: "agent",
+    ...overrides,
+  } as HostBootstrapOptions;
+}
+
+describe("buildHostBootstrapScript — static path (kind='static')", () => {
+  test("static bootstrap is valid bash", () => {
+    // The script is syntactically valid bash even if semantically wrong today.
+    // This test passes today; remains a contract lock after the static branch is added.
+    const script = buildHostBootstrapScript(staticRecord(), staticOpts());
+    expect(bashSyntaxOk(script)).toBe(true);
+  });
+
+  test("static bootstrap does NOT install Node.js (no NodeSource, no apt nodejs)", () => {
+    // FAILS today: src/app/bootstrap.ts:289-309 always emits §1 NodeSource install.
+    const script = buildHostBootstrapScript(staticRecord(), staticOpts());
+    expect(script).not.toMatch(/nodesource|NodeSource/i);
+    expect(script).not.toMatch(/apt-get install.*nodejs/);
+  });
+
+  test("static bootstrap does NOT install PostgreSQL (no PGDG, no apt postgresql)", () => {
+    // FAILS today: src/app/bootstrap.ts:313-370 always emits §2 PGDG install.
+    const script = buildHostBootstrapScript(staticRecord(), staticOpts());
+    expect(script).not.toMatch(/pgdg|postgresql/i);
+    expect(script).not.toMatch(/apt-get install.*postgresql/i);
+  });
+
+  test("static bootstrap does NOT write a MAIN systemd unit (no ExecStart, no .service file)", () => {
+    // FAILS today: src/app/bootstrap.ts:462-492 always emits §7 unit.
+    const script = buildHostBootstrapScript(staticRecord(), staticOpts());
+    expect(script).not.toContain("ExecStart");
+    expect(script).not.toContain("/etc/systemd/system/my-static-site.service");
+  });
+
+  test("static bootstrap does NOT emit DB bootstrap (no PG_SUPER_PW, no createdb, no DATABASE_URL=)", () => {
+    // FAILS today: src/app/bootstrap.ts:541-600 always emits §10 DB bootstrap.
+    const script = buildHostBootstrapScript(staticRecord(), staticOpts());
+    expect(script).not.toContain("PG_SUPER_PW");
+    expect(script).not.toContain("createdb");
+    // The env-file write must not leak DATABASE_URL= into the generated script.
+    expect(script).not.toContain("DATABASE_URL=");
+  });
+
+  test("static bootstrap DOES install Caddy via official apt repo", () => {
+    // Caddy is the server for a static site. §3 is already unconditional so
+    // this passes today — remains a contract lock for the static path.
+    const script = buildHostBootstrapScript(staticRecord(), staticOpts());
+    expect(script).toContain("caddy");
+    expect(script).toMatch(/apt-get install.*caddy/i);
+  });
+
+  test("static bootstrap writes a file_server production Caddy site block when mainHost is set", () => {
+    // FAILS today: no file_server block is emitted by buildHostBootstrapScript.
+    const script = buildHostBootstrapScript(staticRecord(), staticOpts());
+    expect(script).toContain("file_server");
+    expect(script).toContain("my-static-site.example.com");
+    // Block must include tls internal (CF Full-mode; ACME cannot complete behind
+    // CF-locked :443 — same rationale as buildStaticEnvCreateScript).
+    expect(script).toContain("tls internal");
+  });
+
+  test("static bootstrap firewall: source-restricts :443 to CF IP ranges, NEVER world-open", () => {
+    // FAILS today: buildHostBootstrapScript has no firewall section at all.
+    const script = buildHostBootstrapScript(staticRecord(), staticOpts());
+    // CF range fetch loops (same pattern as buildFirewallLines in env/script.ts:1409-1413).
+    expect(script).toContain("https://www.cloudflare.com/ips-v4");
+    expect(script).toContain("https://www.cloudflare.com/ips-v6");
+    // Source-restricted rule emitted per CIDR.
+    expect(script).toContain("to any port 443/tcp");
+    // World-open forms must NEVER appear.
+    expect(script).not.toMatch(/ufw allow 443/);
+    expect(script).not.toMatch(/ufw allow 80/);
+  });
+
+  test("static bootstrap firewall: emits source-restricted :80 rule when controlPlaneIp is set", () => {
+    // FAILS today: no firewall section.
+    const script = buildHostBootstrapScript(
+      staticRecord(),
+      staticOpts({ firewallOpts: { controlPlaneIp: "10.0.0.1" } }),
+    );
+    expect(script).toContain("10.0.0.1");
+    expect(script).toContain("to any port 80/tcp");
+    // Must be source-restricted, not world-open.
+    expect(script).toContain("from '10.0.0.1'");
+  });
+
+  test("static bootstrap self-check omits node/postgres/unit/db rows", () => {
+    // FAILS today: §13 self-check always emits all rows including
+    // node_ok, pg_ok, unit_ok, db_ok.
+    const script = buildHostBootstrapScript(staticRecord(), staticOpts());
+    expect(script).not.toContain("node_ok=");
+    expect(script).not.toContain("pg_ok=");
+    expect(script).not.toContain("unit_ok=");
+    expect(script).not.toContain("db_ok=");
+  });
+
+  test("static bootstrap self-check validates caddy active and clone present", () => {
+    // caddy_ok and clone_ok are present in the current self-check too,
+    // so this PASSES today — remains a contract lock for the static path.
+    const script = buildHostBootstrapScript(staticRecord(), staticOpts());
+    expect(script).toContain("caddy_ok=");
+    expect(script).toContain("clone_ok=");
+  });
+
+  test("static bootstrap sudoers: omits systemctl restart/stop/start grants for the main unit", () => {
+    // FAILS today: src/app/bootstrap.ts:448-460 always emits all five grants.
+    const script = buildHostBootstrapScript(staticRecord(), staticOpts());
+    // Find the sudoers heredoc block.
+    const sudoStart = script.indexOf("cat > '/etc/sudoers.d/");
+    const sudoEnd = script.indexOf("\nSUDOERS\n", sudoStart) + 8;
+    const sudoBlock = sudoStart >= 0 ? script.slice(sudoStart, sudoEnd) : "";
+    expect(sudoBlock).not.toContain("systemctl start my-static-site");
+    expect(sudoBlock).not.toContain("systemctl stop my-static-site");
+    expect(sudoBlock).not.toContain("systemctl restart my-static-site");
+    expect(sudoBlock).not.toContain("systemctl enable my-static-site");
+  });
+
+  test("static bootstrap does NOT throw when dbName is absent (static apps have no database)", () => {
+    // After the fix: calling with no dbName on a static app must succeed.
+    // FAILS today: function runs (no throw), but the script contains 'undefined'
+    // strings from opts.dbName being undefined — which is its own failure mode.
+    // This test asserts the positive (no throw) and that the output doesn't
+    // contain raw 'undefined' strings.
+    let script: string | undefined;
+    expect(() => {
+      script = buildHostBootstrapScript(staticRecord(), staticOpts());
+    }).not.toThrow();
+    expect(script).toBeDefined();
+    expect(script).not.toContain("undefined");
+  });
+
+  test("static bootstrap throws when dbName is absent on a non-static (node) app", () => {
+    // Guard: making dbName optional must not silently allow a node app to omit it.
+    // FAILS today: the function does NOT throw — it just uses dbName=undefined and
+    // produces a script with 'undefined' in it (no throw, so this assertion fails).
+    expect(() =>
+      buildHostBootstrapScript(
+        fieldRecord(),  // kind unset = node
+        { appUser: "agent" } as HostBootstrapOptions,  // no dbName
+      ),
+    ).toThrow(/dbName.*required|dbName.*static/i);
+  });
+
+  test("node path unchanged: still installs Node+PostgreSQL, emits ExecStart and DB bootstrap", () => {
+    // Backward-compat guard. PASSES today; must continue to pass after the static
+    // branch is added.
+    const script = buildHostBootstrapScript(fieldRecord(), defaultOpts());
+    expect(script).toMatch(/nodesource|NodeSource/i);
+    expect(script).toMatch(/postgresql/i);
+    expect(script).toContain("ExecStart");
+    expect(script).toContain("PG_SUPER_PW");
+    expect(script).toContain("DATABASE_URL=");
+  });
+});
