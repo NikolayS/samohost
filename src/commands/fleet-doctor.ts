@@ -38,12 +38,21 @@ export interface FleetVmResult {
 }
 
 export interface FleetDoctorReport {
-  at: string;         // ISO-8601
+  at: string;          // ISO-8601
   vms: FleetVmResult[];
-  totalVms: number;   // VMs attempted (lifecycleState in {ready,adopted})
-  failingVms: number; // VMs with ≥1 fail (group !== core-suspicious)
-  errorVms: number;   // VMs where probeError is set
-  findingVms: number; // VMs with ≥1 suspicious finding
+  totalVms: number;    // VMs attempted (lifecycleState in {ready,adopted})
+  failingVms: number;  // VMs with ≥1 fail check (group !== core-suspicious)
+  errorVms: number;    // VMs where probeError is set (SSH unreachable)
+  findingVms: number;  // VMs with ≥1 suspicious finding
+  /**
+   * VMs that have ≥1 "unknown" check AND 0 "fail" checks.
+   * These are typically no-sudo hosts where requiresSudo probes return
+   * permission-denied instead of a real value — they look alarming when lumped
+   * into samo_doctor_fleet_vms_failing but are not actually broken.
+   * Emitted as a separate Prometheus series (samo_doctor_fleet_vms_unknown)
+   * so dashboards can distinguish "needs sudo grants" from "truly failing".
+   */
+  unknownVms: number;
   /** Populated only when opts.remediate is true. */
   remediations?: FleetRemediationResult[];
 }
@@ -64,6 +73,7 @@ function buildAlertBody(report: FleetDoctorReport): string {
   lines.push(
     `**${report.totalVms}** VM(s) checked — ` +
     `**${report.failingVms}** failing, ` +
+    `**${report.unknownVms}** unknown (no-sudo), ` +
     `**${report.errorVms}** unreachable, ` +
     `**${report.findingVms}** with suspicious findings.`,
   );
@@ -132,6 +142,7 @@ function formatFleetReport(report: FleetDoctorReport): string {
   lines.push(
     `${report.totalVms} VM(s) checked | ` +
     `${report.failingVms} failing | ` +
+    `${report.unknownVms} unknown (no-sudo) | ` +
     `${report.errorVms} unreachable | ` +
     `${report.findingVms} with suspicious findings`,
   );
@@ -216,6 +227,18 @@ export async function runFleetDoctor(
     (v) =>
       v.checks !== undefined &&
       v.checks.some((c) => (c.findings?.length ?? 0) > 0),
+  ).length;
+
+  // unknownVms: VMs that have ≥1 unknown check AND 0 fail checks (excluding
+  // core-suspicious from both sides). These are hosts where sudo-gated probes
+  // returned permission-denied — a capability gap, not a hardening failure.
+  // Separating this counter from failingVms stops no-sudo hosts from inflating
+  // the samo_doctor_fleet_vms_failing dashboard alert.
+  const unknownVms = results.filter(
+    (v) =>
+      v.checks !== undefined &&
+      !v.checks.some((c) => c.status === "fail" && c.group !== "core-suspicious") &&
+      v.checks.some((c) => c.status === "unknown"),
   ).length;
 
   // ---------------------------------------------------------------------------
@@ -320,6 +343,7 @@ export async function runFleetDoctor(
     failingVms,
     errorVms,
     findingVms,
+    unknownVms,
     ...(remediations !== undefined ? { remediations } : {}),
   };
 

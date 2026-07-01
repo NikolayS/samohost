@@ -304,9 +304,13 @@ const auditChecks: AuditCheck[] = [
   },
   {
     id: "sysctl-rpfilter",
-    description: "reverse path filtering enabled",
+    // Accept value 1 (strict) or 2 (loose). Value 0 = disabled = fail.
+    // Some kernels/distros default to "loose" (2) for multi-homed or
+    // container-bridge hosts; both strict and loose block source-spoofed
+    // packets, so both are acceptable as a passing control.
+    description: "reverse path filtering enabled (strict=1 or loose=2)",
     probeCommand: "sysctl -n net.ipv4.conf.all.rp_filter",
-    expect: "1",
+    expect: /^[12]$/m,
   },
   {
     id: "sysctl-syncookies",

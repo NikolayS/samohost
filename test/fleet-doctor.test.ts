@@ -593,3 +593,114 @@ describe("F. Fleet alert body — no client data, no raw log lines", () => {
     expect(outStr).toMatch(/finding|suspicious/i);
   });
 });
+
+// ===========================================================================
+// G. BUG — samo_doctor_fleet_vms_failing conflates fail+unknown+skip.
+//    FleetDoctorReport must emit separate unknownVms count so no-sudo
+//    "unknown" checks aren't lumped in with real failures on the dashboard.
+//
+// RED: FleetDoctorReport.unknownVms field does not exist yet.
+// ===========================================================================
+describe("G. BUG fleet metric split: unknownVms distinct from failingVms", () => {
+  test("G1 — FleetDoctorReport includes unknownVms field", async () => {
+    // RED: unknownVms is not in FleetDoctorReport yet.
+    let outStr = "";
+    await runFleetDoctor(
+      { json: true },
+      store,
+      appStore,
+      (s) => { outStr += s; },
+      () => {},
+      passRunner(),
+    );
+    const report = JSON.parse(outStr) as FleetDoctorReport;
+    // Must exist and be a number (even when 0 VMs in the fleet).
+    expect(typeof report.unknownVms).toBe("number");
+  });
+
+  test("G2 — VMs with only unknown checks appear in unknownVms, not failingVms", async () => {
+    // RED: unknownVms does not exist, cannot be distinguished from failingVms.
+    const vm = makeVm({ lifecycleState: "ready" });
+    store.upsert(vm);
+    // Return permission-denied for all requiresSudo probes → many unknowns, 0 real fails.
+    // Use the all-pass runner with requiresSudo checks returning permission denied.
+    const sudoBlockedRunner: RemoteRunner = (_vm, script) => {
+      const ids: string[] = [];
+      const re = /echo\s+"<<<SAMOHOST_AUDIT:([^>]+)>>>"/g;
+      let m: RegExpExecArray | null;
+      while ((m = re.exec(script)) !== null) ids.push(m[1]!);
+      // All probes return permission denied (simulates no-sudo user).
+      const permDenied = "ERROR: You need to be root to run this script";
+      const bodies: Record<string, string> = {
+        // Non-sudo probes that would pass normally:
+        "fail2ban-active": "active",
+        "sysctl-rpfilter": "1",
+        "sysctl-syncookies": "1",
+        "sysctl-redirects": "0",
+        "unattended-upgrades-active": "active",
+        "ss-listeners": "LISTEN 0 128 0.0.0.0:2223 0.0.0.0:*\nLISTEN 0 511 0.0.0.0:80 0.0.0.0:*\nLISTEN 0 511 0.0.0.0:443 0.0.0.0:*",
+        "caddy-serving": "LISTEN 0 511 0.0.0.0:80 0.0.0.0:*\nLISTEN 0 511 0.0.0.0:443 0.0.0.0:*",
+        "fail2ban-jail": "Status for the jail: sshd",
+        "failed-auth-burst": "Accepted publickey",
+        "sudo-failures": "Accepted publickey",
+        "fail2ban-ban-spike": "Total banned: 3",
+        "only-intended-ports": "",
+        // Sudo-gated probes: return permission denied → unknown
+        "ssh-port": permDenied,
+        "ufw-active": permDenied,
+        "apparmor-enforced": permDenied,
+        "permitrootlogin": permDenied,
+        "passwordauth": permDenied,
+        "allowusers": permDenied,
+        "maxauthtries": permDenied,
+        "clientalive": permDenied,
+        "x11forwarding": permDenied,
+        "allowagentforwarding": permDenied,
+        "permituserenvironment": permDenied,
+        "permitemptypasswords": permDenied,
+        "root-authorized-keys-empty": permDenied,
+        "ufw-limit-ssh": permDenied,
+        "web-ports-not-world-open": permDenied,
+        "service-crash-loop": permDenied,
+      };
+      const stdout = ids
+        .map((id) => `<<<SAMOHOST_AUDIT:${id}}>>>\n${bodies[id] ?? ""}`)
+        .join("\n");
+      return Promise.resolve({ code: 0, stdout, stderr: "" });
+    };
+    let outStr = "";
+    const code = await runFleetDoctor(
+      { json: true },
+      store,
+      appStore,
+      (s) => { outStr += s; },
+      () => {},
+      sudoBlockedRunner,
+    );
+    const report = JSON.parse(outStr) as FleetDoctorReport;
+    // The VM has no actual fail checks (just unknowns from no-sudo).
+    expect(report.failingVms).toBe(0);
+    // But it should register as an unknownVms VM.
+    expect(report.unknownVms).toBeGreaterThan(0);
+    // No probe errors.
+    expect(report.errorVms).toBe(0);
+    // Exit 0 because no real failures.
+    expect(code).toBe(0);
+  });
+
+  test("G3 — all-pass fleet → unknownVms is 0", async () => {
+    // All checks pass → no unknowns → unknownVms = 0.
+    store.upsert(makeVm({ lifecycleState: "ready" }));
+    let outStr = "";
+    await runFleetDoctor(
+      { json: true },
+      store,
+      appStore,
+      (s) => { outStr += s; },
+      () => {},
+      passRunner(),
+    );
+    const report = JSON.parse(outStr) as FleetDoctorReport;
+    expect(report.unknownVms).toBe(0);
+  });
+});
