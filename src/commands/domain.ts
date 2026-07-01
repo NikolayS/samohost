@@ -586,6 +586,105 @@ export async function runDomainRm(
 }
 
 // ---------------------------------------------------------------------------
+// search — RDAP-based domain availability checker
+// ---------------------------------------------------------------------------
+
+/**
+ * Input for `domain search <fqdn>`.
+ * Only the FQDN is needed — availability is a pure network lookup.
+ */
+export interface DomainSearchInput {
+  fqdn: string;
+}
+
+/**
+ * Injectable fetch for RDAP queries (so tests run offline).
+ * Defaults to `globalThis.fetch` at runtime via {@link defaultDomainSearchDeps}.
+ */
+export interface DomainSearchDeps {
+  fetch: (url: string, init?: RequestInit) => Promise<Response>;
+}
+
+export type DomainAvailability = "available" | "taken" | "unknown";
+
+export interface DomainSearchReport {
+  fqdn: string;
+  status: DomainAvailability;
+  /** Human-readable explanation of the status. */
+  reason: string;
+}
+
+const RDAP_BASE = "https://rdap.org/domain/";
+/** Wall-clock limit for a single RDAP probe (10 s). */
+const RDAP_TIMEOUT_MS = 10_000;
+
+/**
+ * Probe RDAP for domain availability.
+ *
+ * Protocol:
+ *   HTTP 404 → not registered    → "available"
+ *   HTTP 200 → domain exists     → "taken"
+ *   any other status             → "unknown"  (TLD has no RDAP, or proxy error)
+ *   fetch throws (timeout/net)   → "unknown"
+ */
+export async function runDomainSearch(
+  input: DomainSearchInput,
+  opts: { json: boolean },
+  deps: DomainSearchDeps,
+  out: (s: string) => void,
+  err: (s: string) => void,
+): Promise<number> {
+  const url = `${RDAP_BASE}${encodeURIComponent(input.fqdn)}`;
+  let status: DomainAvailability;
+  let reason: string;
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), RDAP_TIMEOUT_MS);
+
+  try {
+    const res = await deps.fetch(url, { signal: controller.signal });
+    clearTimeout(timer);
+
+    if (res.status === 404) {
+      status = "available";
+      reason = "RDAP: 404 — domain not found in registry";
+    } else if (res.status === 200) {
+      status = "taken";
+      reason = "RDAP: 200 — domain is registered";
+    } else {
+      status = "unknown";
+      reason = `RDAP not supported / inconclusive (HTTP ${res.status})`;
+    }
+  } catch (e) {
+    clearTimeout(timer);
+    const msg = e instanceof Error ? e.message : String(e);
+    status = "unknown";
+    reason = `RDAP not supported / inconclusive (network error: ${msg})`;
+    err(`warning: RDAP probe failed for ${input.fqdn}: ${msg}`);
+  }
+
+  const report: DomainSearchReport = {
+    fqdn: input.fqdn,
+    status,
+    reason,
+  };
+
+  if (opts.json) {
+    out(JSON.stringify(report, null, 2));
+  } else {
+    out(`${input.fqdn}: ${status}`);
+    out(reason);
+  }
+
+  return 0;
+}
+
+/** Default search deps — wires global fetch. */
+export function defaultDomainSearchDeps(): DomainSearchDeps {
+  return { fetch: globalThis.fetch.bind(globalThis) };
+}
+
+// ---------------------------------------------------------------------------
 // Production dependency wiring (not exercised by unit tests)
 // ---------------------------------------------------------------------------
 
