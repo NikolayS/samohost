@@ -524,10 +524,27 @@ export async function auditVm(
   // Derive serveKind from the app record (for caddy-serving liveness check).
   const serveKind = app?.kind;
 
+  // Static apps (kind="static") have no runtime env file and no database.
+  // Running env-file-perms / rls-nonsuperuser / pg-localhost against a static
+  // app produces fabricated failures:
+  //   env-file-perms:    stat on a non-existent path → empty stdout → fail
+  //   rls-nonsuperuser:  env file not sourced, $DATABASE_URL unbound (set -u) → fail
+  //   pg-localhost:      no local postgres on a static host → unknown/fail
+  // The fix is to skip these three checks when app.kind === "static".
+  // git-remote-no-token and app-health remain evaluated (git remote exists;
+  // Caddy can still serve a 200 on the healthUrl).
+  const STATIC_APP_SKIP_IDS = new Set([
+    "env-file-perms",
+    "rls-nonsuperuser",
+    "pg-localhost",
+  ]);
+  const isStaticApp = app?.kind === "static";
+
   // Evaluate each check.
   const results: DoctorResult[] = checks.map((check) => {
     const isAppScoped = check.appScoped === true;
-    const skip = isAppScoped && skipAppDb;
+    const isStaticSkip = isStaticApp && STATIC_APP_SKIP_IDS.has(check.id);
+    const skip = (isAppScoped && skipAppDb) || isStaticSkip;
 
     // For pg-localhost and caddy-serving: use ssListenersOutput as a fallback
     // when the dedicated section is absent or empty (both probe ss -ltnH; same
