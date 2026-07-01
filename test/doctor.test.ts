@@ -1089,6 +1089,82 @@ describe("17. BUG sysctl-rpfilter loose mode", () => {
 });
 
 // ===========================================================================
+// 18. BUG — static apps should skip env/DB checks.
+//     kind: "static" apps have no runtime env file and no database, so
+//     env-file-perms / rls-nonsuperuser / pg-localhost false-fail (seen on
+//     game-changers: `env-file-perms` → empty stdout, `rls-nonsuperuser`
+//     → "DATABASE_URL: unbound variable" because the env file doesn't exist).
+//     Fix: when app.kind === "static", skip those checks.
+//
+// RED: no static-app skip guard exists yet.
+// ===========================================================================
+describe("18. BUG static app env/DB checks must be skip", () => {
+  test("BUG6: static app → env-file-perms, rls-nonsuperuser, pg-localhost are skip", async () => {
+    // RED: no guard for static apps; checks run, fail with unbound variable.
+    store.upsert(rec());
+    // Register a static app (no env file, no DB).
+    appStore.upsert(appRec("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee", { kind: "static" }));
+    // Simulate what prod returns for a static app:
+    // - env-file-perms: stat on non-existent env file → empty output
+    // - rls-nonsuperuser: env file not sourced → DATABASE_URL unbound
+    const remote = makePassRunner({
+      "env-file-perms": "", // stat returns nothing (file absent)
+      "rls-nonsuperuser": "bash: line 64: DATABASE_URL: unbound variable",
+      "pg-localhost": "", // no postgres on static host
+    });
+    const c = capture();
+    const code = await runDoctor(
+      { target: "test-vm", infra: false },
+      { json: true },
+      store,
+      appStore,
+      c.out,
+      c.err,
+      remote,
+    );
+    const parsed = JSON.parse(c.o);
+    const byId = Object.fromEntries(
+      parsed.checks.map((r: { id: string; status: string }) => [r.id, r.status]),
+    );
+    // Static apps have no env file or DB — these must be skip, not fail.
+    expect(byId["env-file-perms"]).toBe("skip");
+    expect(byId["rls-nonsuperuser"]).toBe("skip");
+    expect(byId["pg-localhost"]).toBe("skip");
+    // Non-db app-scoped checks still run (git remote check is still valid).
+    expect(byId["git-remote-no-token"]).not.toBe("skip");
+    // Exit 0 because skipped checks don't fail.
+    expect(code).toBe(0);
+  });
+
+  test("BUG6: node app → env-file-perms, rls-nonsuperuser still evaluated", async () => {
+    // Regression: node apps (default kind) must still evaluate these checks.
+    store.upsert(rec());
+    appStore.upsert(appRec("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")); // default kind (node)
+    const remote = makePassRunner({
+      "env-file-perms": "600 agent",
+      "rls-nonsuperuser": "f",
+    });
+    const c = capture();
+    await runDoctor(
+      { target: "test-vm", infra: false },
+      { json: true },
+      store,
+      appStore,
+      c.out,
+      c.err,
+      remote,
+    );
+    const parsed = JSON.parse(c.o);
+    const byId = Object.fromEntries(
+      parsed.checks.map((r: { id: string; status: string }) => [r.id, r.status]),
+    );
+    // Node apps have env files and databases — must not be skipped.
+    expect(byId["env-file-perms"]).not.toBe("skip");
+    expect(byId["rls-nonsuperuser"]).not.toBe("skip");
+  });
+});
+
+// ===========================================================================
 // E2E (CLI subprocess) — satisfies the Playwright/E2E requirement for a CLI.
 // No browser involved; this tests the real wired binary path end-to-end.
 // ===========================================================================
