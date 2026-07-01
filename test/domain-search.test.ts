@@ -113,9 +113,94 @@ describe("runDomainSearch — text mode", () => {
 
     expect(code).toBe(0);
     expect(outLines.join("\n")).toMatch(/unknown/i);
-    // No uncaught error — err output is optional but if present must not be
-    // a thrown exception (just a warning line)
-    expect(errLines.length).toBeLessThanOrEqual(1);
+    // Exactly one warning line on stderr, containing the expected prefix.
+    expect(errLines.length).toBe(1);
+    expect(errLines[0]).toContain("RDAP probe failed");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// note field — rdap.org false-positive caveat (Finding 1)
+// ---------------------------------------------------------------------------
+
+describe("runDomainSearch — note field", () => {
+  test("available result carries a note about the rdap.org false-positive risk", async () => {
+    // KNOWN LIMITATION: rdap.org returns HTTP 404 both for genuinely-unregistered
+    // domains AND for TLDs whose registries have no RDAP support. The two cases are
+    // runtime-indistinguishable — we cannot tell them apart from the HTTP response
+    // alone. The `note` field surfaces this caveat so callers can warn users.
+    const { outLines, out, err } = makeOutput();
+    const deps: DomainSearchDeps = { fetch: fakeFetch(404) };
+    const input: DomainSearchInput = { fqdn: "zzq-rdap-false-positive.xyz" };
+
+    await runDomainSearch(input, { json: false }, deps, out, err);
+
+    const text = outLines.join("\n");
+    expect(text).toMatch(/rdap\.org/i);
+    expect(text).toMatch(/registrar/i);
+  });
+
+  test("taken result does NOT carry a note (no false-positive risk for HTTP 200)", async () => {
+    const { outLines, out, err } = makeOutput();
+    const deps: DomainSearchDeps = { fetch: fakeFetch(200, '{"ldhName":"taken.com"}') };
+    const input: DomainSearchInput = { fqdn: "taken.com" };
+
+    await runDomainSearch(input, { json: false }, deps, out, err);
+
+    const text = outLines.join("\n");
+    // Taken results are unambiguous; no caveat note should appear.
+    expect(text).not.toMatch(/registrar/i);
+  });
+
+  test("unknown result does NOT carry a note", async () => {
+    const { outLines, out, err } = makeOutput();
+    const deps: DomainSearchDeps = { fetch: fakeFetch(503) };
+    const input: DomainSearchInput = { fqdn: "example.de" };
+
+    await runDomainSearch(input, { json: false }, deps, out, err);
+
+    const text = outLines.join("\n");
+    expect(text).not.toMatch(/registrar/i);
+  });
+
+  test("--json available result includes 'note' field with caveat text", async () => {
+    const { outLines, out, err } = makeOutput();
+    const deps: DomainSearchDeps = { fetch: fakeFetch(404) };
+    const input: DomainSearchInput = { fqdn: "zzq-rdap-json-note.xyz" };
+
+    await runDomainSearch(input, { json: true }, deps, out, err);
+
+    const report = JSON.parse(outLines.join("")) as {
+      fqdn: string;
+      status: string;
+      note?: string;
+    };
+    expect(report.status).toBe("available");
+    expect(typeof report.note).toBe("string");
+    expect(report.note).toContain("rdap.org");
+    expect(report.note).toContain("registrar");
+  });
+
+  test("--json taken result omits 'note' field", async () => {
+    const { outLines, out, err } = makeOutput();
+    const deps: DomainSearchDeps = { fetch: fakeFetch(200, '{"ldhName":"google.com"}') };
+    const input: DomainSearchInput = { fqdn: "google.com" };
+
+    await runDomainSearch(input, { json: true }, deps, out, err);
+
+    const report = JSON.parse(outLines.join("")) as Record<string, unknown>;
+    expect("note" in report).toBe(false);
+  });
+
+  test("--json unknown result omits 'note' field", async () => {
+    const { outLines, out, err } = makeOutput();
+    const deps: DomainSearchDeps = { fetch: fakeFetch(503) };
+    const input: DomainSearchInput = { fqdn: "example.de" };
+
+    await runDomainSearch(input, { json: true }, deps, out, err);
+
+    const report = JSON.parse(outLines.join("")) as Record<string, unknown>;
+    expect("note" in report).toBe(false);
   });
 });
 
