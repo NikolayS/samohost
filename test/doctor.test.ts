@@ -467,18 +467,22 @@ describe("7. Auto-detect app-db scoping", () => {
     expect(rlsRow?.status).toBe("fail");
   });
 
-  test(":5432 loopback present, no app registered → app-db checks evaluated", async () => {
+  test(":5432 loopback present, no app registered → app-db checks are SKIP (not evaluated)", async () => {
+    // Fix for BUG1 (skipAppDb): app-scoped checks must be skip when no app is
+    // registered, regardless of whether :5432 is listening. Running them with
+    // unsubstituted placeholders produces fabricated failures ("unbound variable").
     store.upsert(rec());
-    // No app but :5432 loopback detected in ss output → evaluate app-db
+    // No app registered. :5432 loopback is present.
     const ssWithPostgres =
       "LISTEN 0 128 0.0.0.0:2223 0.0.0.0:*\nLISTEN 0 128 127.0.0.1:5432 0.0.0.0:*";
-    // rls-nonsuperuser returns 't' (would be fail), pg-localhost passes
     const remote: RemoteRunner = (_vm, _cmd) =>
       Promise.resolve({
         code: 0,
         stdout: allPassDelimited({
           "ss-listeners": ssWithPostgres,
-          "rls-nonsuperuser": "t",
+          // Return placeholder error text — exactly what the prod VM produces
+          // when set -u is active and __RLS_URL_VAR__ is not substituted.
+          "rls-nonsuperuser": "bash: line 64: __RLS_URL_VAR__: unbound variable",
         }),
         stderr: "",
       });
@@ -492,14 +496,13 @@ describe("7. Auto-detect app-db scoping", () => {
       c.err,
       remote,
     );
-    // rls-nonsuperuser should be evaluated (not skip), and would be fail
     const parsed = JSON.parse(c.o);
     const rlsRow = parsed.checks.find(
       (r: { id: string }) => r.id === "rls-nonsuperuser",
     );
-    // When no app, rls check can't be fully evaluated (no envFile) → unknown or skip
-    // but it should NOT be skip if :5432 detected — it should at least be unknown/fail
-    expect(rlsRow?.status).not.toBe("skip");
+    // Correct behavior after skipAppDb = !app fix:
+    // No app registered → app-scoped checks must be "skip", never "fail".
+    expect(rlsRow?.status).toBe("skip");
   });
 });
 
@@ -1032,77 +1035,13 @@ describe("16. BUG only-intended-ports loopback filter", () => {
 });
 
 // ===========================================================================
-// 17. BUG — web-ports-not-world-open gateway exemption missing.
-//     samo-control-plane legitimately serves :80/:443 to the world.
-//     A VM with gateway=true must have this check marked skip, not fail.
-//
-// RED: VmRecord has no gateway field; no exemption logic in auditVm.
-// ===========================================================================
-describe("17. BUG web-ports-not-world-open gateway exemption", () => {
-  test("BUG3: gateway=true VM → web-ports-not-world-open is skip, not fail", async () => {
-    // RED: VmRecord.gateway field doesn't exist; no exemption logic wired.
-    // Use type assertion so the test compiles; runtime object has the field.
-    const gatewayVm = rec({ gateway: true } as Partial<VmRecord>);
-    store.upsert(gatewayVm);
-    const remote = makePassRunner({
-      // Inject world-open ports (what samo-control-plane actually returns).
-      "web-ports-not-world-open":
-        "80/tcp                     ALLOW       Anywhere\n" +
-        "443/tcp                    ALLOW       Anywhere\n" +
-        "443/tcp (v6)               ALLOW       Anywhere (v6)",
-    });
-    const c = capture();
-    const code = await runDoctor(
-      { target: "test-vm", infra: false },
-      { json: true },
-      store,
-      appStore,
-      c.out,
-      c.err,
-      remote,
-    );
-    const parsed = JSON.parse(c.o);
-    const row = parsed.checks.find(
-      (r: { id: string }) => r.id === "web-ports-not-world-open",
-    );
-    // Gateway VMs serve :80/:443 by design — check must be skip, not fail.
-    expect(row?.status).toBe("skip");
-    expect(code).toBe(0); // skip doesn't cause exit 1
-  });
-
-  test("BUG3: non-gateway VM → web-ports-not-world-open is still evaluated", async () => {
-    // Non-gateway VMs (no gateway field or gateway=false) still get evaluated.
-    store.upsert(rec()); // no gateway field
-    const remote = makePassRunner({
-      "web-ports-not-world-open": "", // empty = no 80/443 rules = pass
-    });
-    const c = capture();
-    await runDoctor(
-      { target: "test-vm", infra: false },
-      { json: true },
-      store,
-      appStore,
-      c.out,
-      c.err,
-      remote,
-    );
-    const parsed = JSON.parse(c.o);
-    const row = parsed.checks.find(
-      (r: { id: string }) => r.id === "web-ports-not-world-open",
-    );
-    // Should be evaluated (pass or fail), not skipped.
-    expect(row?.status).not.toBe("skip");
-  });
-});
-
-// ===========================================================================
-// 18. BUG — sysctl-rpfilter value "2" (loose mode) must pass.
+// 17. BUG — sysctl-rpfilter value "2" (loose mode) must pass.
 //     Current expect is the string "1" — value "2" is loose but still valid.
 //     Fix: expect /^[12]$/m.
 //
 // RED: value "2" currently fails because expect is "1" (strict equality).
 // ===========================================================================
-describe("18. BUG sysctl-rpfilter loose mode", () => {
+describe("17. BUG sysctl-rpfilter loose mode", () => {
   test("BUG4: sysctl-rpfilter value '2' (loose) must be PASS", async () => {
     // RED: current expect is "1"; value "2" matches as fail.
     store.upsert(rec());

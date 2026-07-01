@@ -273,18 +273,6 @@ export function parseWebPortsNotWorldOpenOutput(
 }
 
 // ---------------------------------------------------------------------------
-// Detect :5432 loopback from ss output (for auto-detect scoping).
-// ---------------------------------------------------------------------------
-
-function detectPostgresLoopback(ssOutput: string): boolean {
-  const lines = ssOutput.split("\n").map((l) => l.trim()).filter(Boolean);
-  const pg5432Lines = lines.filter((l) => /:5432/.test(l));
-  // Has a :5432 listener and at least one is on loopback
-  if (pg5432Lines.length === 0) return false;
-  return pg5432Lines.some((l) => /127\.0\.0\.1:5432|\[::1\]:5432/.test(l));
-}
-
-// ---------------------------------------------------------------------------
 // Evaluate a single DoctorCheck against its observed output.
 // ---------------------------------------------------------------------------
 
@@ -521,12 +509,17 @@ export async function auditVm(
   // Extract ss-listeners output for: liveness, pg-localhost, auto-detect.
   const ssListenersOutput = sections.get("ss-listeners") ?? "";
 
-  // Determine if Postgres is on loopback (for auto-detect scoping).
-  const pgLoopback = detectPostgresLoopback(ssListenersOutput);
-
   // Determine whether app-db checks should be skipped.
-  // Skip when: no app AND no :5432 loopback. (infra flag is handled in runDoctor.)
-  const skipAppDb = !app && !pgLoopback;
+  // Skip when: no app is registered. The presence of a :5432 loopback listener
+  // alone is NOT sufficient to evaluate app-scoped checks: those checks use
+  // app-specific parameters (envFile, rlsUrlVar, healthUrl, appDir) that are
+  // only available when an AppRecord exists. Without an app, the probe commands
+  // retain unsubstituted placeholders (__RLS_URL_VAR__, __ENV_FILE__, etc.);
+  // the audit script runs with set -u, so "$__RLS_URL_VAR__" triggers
+  // "unbound variable" and the check evaluates as "fail" — a fabricated result.
+  // Root-cause fix: gate on !app only; pgLoopback was never a valid substitute
+  // for a registered app record.
+  const skipAppDb = !app;
 
   // Derive serveKind from the app record (for caddy-serving liveness check).
   const serveKind = app?.kind;
