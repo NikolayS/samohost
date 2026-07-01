@@ -612,6 +612,14 @@ export interface DomainSearchReport {
   status: DomainAvailability;
   /** Human-readable explanation of the status. */
   reason: string;
+  /**
+   * Present ONLY when `status === "available"`.
+   *
+   * rdap.org returns HTTP 404 both for genuinely-unregistered domains and for
+   * TLDs whose registries have no RDAP support. The two cases are
+   * runtime-indistinguishable. Callers should surface this caveat to users.
+   */
+  note?: string;
 }
 
 const RDAP_BASE = "https://rdap.org/domain/";
@@ -622,10 +630,13 @@ const RDAP_TIMEOUT_MS = 10_000;
  * Probe RDAP for domain availability.
  *
  * Protocol:
- *   HTTP 404 → not registered    → "available"
- *   HTTP 200 → domain exists     → "taken"
- *   any other status             → "unknown"  (TLD has no RDAP, or proxy error)
- *   fetch throws (timeout/net)   → "unknown"
+ *   HTTP 404 → "available" — domain not found in registry.
+ *              CAVEAT: rdap.org also returns 404 for TLDs with no RDAP
+ *              support, so this result can be a false-positive. The report
+ *              includes a `note` field to surface this to callers.
+ *   HTTP 200 → "taken"    — domain is registered
+ *   any other status      → "unknown"  (proxy error, non-RDAP redirect, etc.)
+ *   fetch throws          → "unknown"  (timeout / network error)
  */
 export async function runDomainSearch(
   input: DomainSearchInput,
@@ -663,10 +674,15 @@ export async function runDomainSearch(
     err(`warning: RDAP probe failed for ${input.fqdn}: ${msg}`);
   }
 
+  const AVAILABLE_NOTE =
+    "note: rdap.org may return 404 for TLDs without RDAP support — " +
+    "verify with the registrar if uncertain";
+
   const report: DomainSearchReport = {
     fqdn: input.fqdn,
     status,
     reason,
+    ...(status === "available" ? { note: AVAILABLE_NOTE } : {}),
   };
 
   if (opts.json) {
@@ -674,6 +690,9 @@ export async function runDomainSearch(
   } else {
     out(`${input.fqdn}: ${status}`);
     out(reason);
+    if (report.note !== undefined) {
+      out(report.note);
+    }
   }
 
   return 0;

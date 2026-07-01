@@ -360,9 +360,13 @@ domain options (custom client domains via Cloudflare for SaaS):
             Queries https://rdap.org/domain/<fqdn> (redirects to authoritative
             RDAP server automatically). No credentials required.
             Results: available / taken / unknown
-              available — HTTP 404: domain not found in registry
+              available — HTTP 404: domain not found in registry.
+                          CAVEAT: rdap.org returns 404 both for unregistered
+                          domains and for TLDs with no RDAP support; the two
+                          cases are indistinguishable at runtime. A note is
+                          printed; verify with the registrar if uncertain.
               taken     — HTTP 200: domain is registered
-              unknown   — RDAP not supported for this TLD, or network error
+              unknown   — any other HTTP status, or network/timeout error
             No pricing information; availability only.
   add     — create a CF-for-SaaS Custom Hostname for the client FQDN, write
             a Caddy vhost snippet on the app VM, and print CNAME + DCV
