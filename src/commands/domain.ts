@@ -17,7 +17,7 @@
  *
  * CF entitlement GATE (see docs/setup-checklist.md):
  *   CF-for-SaaS Custom Hostnames require the SaaS entitlement on the SaaS zone
- *   and a token with SSL and Certificates:Edit scope (`CLOUDFLARE_CUSTOM_HOSTNAMES`).
+ *   and a token with SSL and Certificates:Edit scope (`CLOUDFLARE_SAMOTEAM`).
  *   The existing CLOUDFLARE_SAMOCAT token is DNS-only and CANNOT create custom
  *   hostnames. When the token is absent, `add`/`check`/`rm` degrade cleanly
  *   (warn, still write vhost + state), identical to the DNS_DEGRADE_WARNING
@@ -54,9 +54,9 @@ import type { AppRecord, DomainRecord, VmRecord } from "../types.ts";
 
 const CUSTOM_HOSTNAME_TARGET_DEFAULT = "cname.samo.team";
 
-/** Warning printed when CLOUDFLARE_CUSTOM_HOSTNAMES token is absent (GATE). */
+/** Warning printed when CLOUDFLARE_SAMOTEAM token is absent (GATE). */
 const CF_DEGRADE_WARNING =
-  "samohost: CLOUDFLARE_CUSTOM_HOSTNAMES not set — " +
+  "samohost: CLOUDFLARE_SAMOTEAM not set — " +
   "skipping Cloudflare Custom Hostname creation (CF-for-SaaS entitlement + " +
   "SSL:Edit token required); Caddy vhost and state record will be created " +
   "but the domain will not be validated by Cloudflare until the token is set";
@@ -104,7 +104,7 @@ export type RemoteScriptRunner = (
 
 export interface DomainDeps {
   /**
-   * Cloudflare for SaaS client; `undefined` when CLOUDFLARE_CUSTOM_HOSTNAMES
+   * Cloudflare for SaaS client; `undefined` when CLOUDFLARE_SAMOTEAM
    * is absent (GATE degrade — the command still writes vhost + state).
    *
    * Typed as the narrow {@link CustomHostnameClient} port so tests can inject
@@ -629,7 +629,7 @@ function defaultRemoteScriptRunner(): RemoteScriptRunner {
 
 /** Default domain deps — wires CF client from env, real DNS, real SSH. */
 export function defaultDomainDeps(): DomainDeps {
-  const token = process.env["CLOUDFLARE_CUSTOM_HOSTNAMES"];
+  const token = process.env["CLOUDFLARE_SAMOTEAM"];
   const zoneId = process.env["SAMOHOST_SAAS_ZONE_ID"];
   const zoneName = process.env["SAMOHOST_SAAS_ZONE"] ?? "samo.team";
 

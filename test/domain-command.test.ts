@@ -231,7 +231,7 @@ describe("runDomainAdd", () => {
 
     // Warn about missing token
     const allErr = errLines.join("\n");
-    expect(allErr).toContain("CLOUDFLARE_CUSTOM_HOSTNAMES");
+    expect(allErr).toContain("CLOUDFLARE_SAMOTEAM");
 
     // Record still persisted (without CF ids)
     const stored = domainStore.get("myapp.com");
@@ -646,7 +646,7 @@ describe("runDomainRm", () => {
     // Record still removed
     expect(domainStore.get("myapp.com")).toBeUndefined();
     // Warn about missing CF
-    expect(errLines.join("\n")).toContain("CLOUDFLARE_CUSTOM_HOSTNAMES");
+    expect(errLines.join("\n")).toContain("CLOUDFLARE_SAMOTEAM");
     expect(outLines.join("\n")).toContain("myapp.com");
   });
 

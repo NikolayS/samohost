@@ -354,7 +354,7 @@ domain options (custom client domains via Cloudflare for SaaS):
 
   add     — create a CF-for-SaaS Custom Hostname for the client FQDN, write
             a Caddy vhost snippet on the app VM, and print CNAME + DCV
-            instructions. Requires CLOUDFLARE_CUSTOM_HOSTNAMES (SSL:Edit token).
+            instructions. Requires CLOUDFLARE_SAMOTEAM (SSL:Edit token).
             Degrades cleanly when the token is absent (warn; still writes vhost).
   check   — refresh CF ssl.status + hostname status, probe public DNS CNAME.
             Exit 0 only when both are "active". Exit 1 while still pending.
@@ -364,7 +364,7 @@ domain options (custom client domains via Cloudflare for SaaS):
             --yes         skip typed confirmation
 
   GATE: CF-for-SaaS Custom Hostnames require the SaaS entitlement on the zone
-  and a token with SSL and Certificates:Edit scope (CLOUDFLARE_CUSTOM_HOSTNAMES).
+  and a token with SSL and Certificates:Edit scope (CLOUDFLARE_SAMOTEAM).
   The CLOUDFLARE_SAMOCAT token is DNS-only and cannot create custom hostnames.
   Set SAMOHOST_SAAS_ZONE_ID or SAMOHOST_SAAS_ZONE (default: samo.team).
   Set SAMOHOST_CUSTOM_HOSTNAME_TARGET (default: cname.samo.team).

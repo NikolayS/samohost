@@ -191,7 +191,7 @@ export interface CustomHostnameClient {
  * NOTE — gate: Custom Hostnames require (a) the CF-for-SaaS entitlement on
  * the SaaS zone and (b) a token with SSL and Certificates:Edit scope.
  * The CLOUDFLARE_SAMOCAT token is DNS-only and CANNOT create custom hostnames.
- * A separate CLOUDFLARE_CUSTOM_HOSTNAMES token must be provisioned.
+ * A separate CLOUDFLARE_SAMOTEAM token must be provisioned (SSL:Edit on samo.team).
  * See docs/setup-checklist.md for the GATE flag.
  */
 export interface CustomHostname {
@@ -336,7 +336,7 @@ export class CloudflareDns implements DnsProviderPort {
   // These methods use the same `call()` helper (zone-id prefixed, authenticated,
   // envelope-unwrapped) so no extra plumbing is needed beyond the method bodies.
   //
-  // GATE: requires CLOUDFLARE_CUSTOM_HOSTNAMES token (SSL:Edit scope) and the
+  // GATE: requires CLOUDFLARE_SAMOTEAM token (SSL:Edit scope on samo.team) and the
   // CF-for-SaaS entitlement on the zone. See docs/setup-checklist.md.
 
   /**
