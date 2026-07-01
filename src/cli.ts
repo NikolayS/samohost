@@ -91,6 +91,18 @@ import {
 import { runDestroy, defaultConfirm, type DestroyInput } from "./commands/destroy.ts";
 import { runDoctor } from "./commands/doctor.ts";
 import { runFleetDoctor } from "./commands/fleet-doctor.ts";
+import {
+  runDomainAdd,
+  runDomainCheck,
+  runDomainList,
+  runDomainRm,
+  defaultDomainDeps,
+  type DomainAddInput,
+  type DomainCheckInput,
+  type DomainListInput,
+  type DomainRmInput,
+} from "./commands/domain.ts";
+import { DomainStore } from "./state/domains.ts";
 import { HetznerProvider } from "./providers/hetzner.ts";
 import { StateStore } from "./state/store.ts";
 import type { EnvDbBackend } from "./types.ts";
@@ -333,6 +345,29 @@ trigger run options (samo-level auto-deploy poller — replaces per-client on-bo
   runAppDeploy; the trigger adds only the iteration/scheduler layer).
   Exit 0 when every candidate ended in {deployed, up-to-date, known-bad,
   skipped, would-deploy}; exit 1 when any deploy returned non-zero or threw.
+
+domain options (custom client domains via Cloudflare for SaaS):
+  samohost domain add   <app> <fqdn> [--dcv http|txt] [--json]
+  samohost domain check <fqdn> [--json]
+  samohost domain list  [--app <name>] [--json]
+  samohost domain rm    <fqdn> [--yes] [--json]
+
+  add     — create a CF-for-SaaS Custom Hostname for the client FQDN, write
+            a Caddy vhost snippet on the app VM, and print CNAME + DCV
+            instructions. Requires CLOUDFLARE_CUSTOM_HOSTNAMES (SSL:Edit token).
+            Degrades cleanly when the token is absent (warn; still writes vhost).
+  check   — refresh CF ssl.status + hostname status, probe public DNS CNAME.
+            Exit 0 only when both are "active". Exit 1 while still pending.
+  list    — table of stored custom domain → app mappings (no network).
+            --app <name>  narrow to one app
+  rm      — delete CF Custom Hostname, remove Caddy snippet, drop state record.
+            --yes         skip typed confirmation
+
+  GATE: CF-for-SaaS Custom Hostnames require the SaaS entitlement on the zone
+  and a token with SSL and Certificates:Edit scope (CLOUDFLARE_CUSTOM_HOSTNAMES).
+  The CLOUDFLARE_SAMOCAT token is DNS-only and cannot create custom hostnames.
+  Set SAMOHOST_SAAS_ZONE_ID or SAMOHOST_SAAS_ZONE (default: samo.team).
+  Set SAMOHOST_CUSTOM_HOSTNAME_TARGET (default: cname.samo.team).
 `;
 
 export interface ParsedPreview {
@@ -495,6 +530,30 @@ export interface ParsedTriggerRun {
   json: boolean;
 }
 
+export interface ParsedDomainAdd {
+  kind: "domain-add";
+  input: DomainAddInput;
+  json: boolean;
+}
+
+export interface ParsedDomainCheck {
+  kind: "domain-check";
+  input: DomainCheckInput;
+  json: boolean;
+}
+
+export interface ParsedDomainList {
+  kind: "domain-list";
+  input: DomainListInput;
+  json: boolean;
+}
+
+export interface ParsedDomainRm {
+  kind: "domain-rm";
+  input: DomainRmInput;
+  json: boolean;
+}
+
 export type ParsedCommand =
   | ParsedPreview
   | ParsedPreviewRebuild
@@ -521,6 +580,10 @@ export type ParsedCommand =
   | ParsedDnsStatus
   | ParsedDoctor
   | ParsedTriggerRun
+  | ParsedDomainAdd
+  | ParsedDomainCheck
+  | ParsedDomainList
+  | ParsedDomainRm
   | { kind: "help" }
   | { kind: "version" };
 
@@ -586,6 +649,9 @@ export function parseArgs(
   }
   if (first === "trigger") {
     return parseTrigger(argv.slice(1));
+  }
+  if (first === "domain") {
+    return parseDomain(argv.slice(1));
   }
 
   // A bare --help/--version may also appear after an (absent) command.
@@ -1837,6 +1903,124 @@ function parseTriggerRun(args: string[]): ParsedTriggerRun {
   return { kind: "trigger-run", input, json };
 }
 
+// ---------------------------------------------------------------------------
+// domain group
+// ---------------------------------------------------------------------------
+
+type DomainSub = "add" | "check" | "list" | "rm";
+
+const DOMAIN_SUBS: readonly DomainSub[] = ["add", "check", "list", "rm"];
+
+function parseDomain(args: string[]): ParsedCommand {
+  const sub = args[0];
+  if (sub === undefined) {
+    throw new UsageError(
+      `domain requires a subcommand: ${DOMAIN_SUBS.join(" | ")}`,
+    );
+  }
+  if (!(DOMAIN_SUBS as readonly string[]).includes(sub)) {
+    throw new UsageError(`unknown domain subcommand: ${sub}`);
+  }
+  const rest = args.slice(1);
+  switch (sub as DomainSub) {
+    case "add":
+      return parseDomainAdd(rest);
+    case "check":
+      return parseDomainCheck(rest);
+    case "list":
+      return parseDomainList(rest);
+    case "rm":
+      return parseDomainRm(rest);
+  }
+}
+
+function parseDomainAdd(args: string[]): ParsedDomainAdd {
+  let app: string | undefined;
+  let fqdn: string | undefined;
+  let dcv: "http" | "txt" = "http";
+  let json = false;
+
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i]!;
+    if (a === "--dcv") {
+      const v = takeValue(args, i, a);
+      if (v !== "http" && v !== "txt") {
+        throw new UsageError(`invalid --dcv value: ${v} (http|txt)`);
+      }
+      dcv = v;
+      i++;
+      continue;
+    }
+    if (a === "--json") { json = true; continue; }
+    if (a.startsWith("-")) throw new UsageError(`unknown flag: ${a}`);
+    if (app === undefined) { app = a; continue; }
+    if (fqdn === undefined) { fqdn = a; continue; }
+    throw new UsageError(`unexpected extra argument: ${a}`);
+  }
+
+  if (app === undefined) throw new UsageError("domain add requires <app> <fqdn>");
+  if (fqdn === undefined) throw new UsageError("domain add requires <app> <fqdn>");
+
+  return {
+    kind: "domain-add",
+    input: { app, fqdn, dcv },
+    json,
+  };
+}
+
+function parseDomainCheck(args: string[]): ParsedDomainCheck {
+  let fqdn: string | undefined;
+  let json = false;
+
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i]!;
+    if (a === "--json") { json = true; continue; }
+    if (a.startsWith("-")) throw new UsageError(`unknown flag: ${a}`);
+    if (fqdn === undefined) { fqdn = a; continue; }
+    throw new UsageError(`unexpected extra argument: ${a}`);
+  }
+
+  if (fqdn === undefined) throw new UsageError("domain check requires <fqdn>");
+  return { kind: "domain-check", input: { fqdn }, json };
+}
+
+function parseDomainList(args: string[]): ParsedDomainList {
+  let app: string | undefined;
+  let json = false;
+
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i]!;
+    if (a === "--app") { app = takeValue(args, i, a); i++; continue; }
+    if (a === "--json") { json = true; continue; }
+    if (a.startsWith("-")) throw new UsageError(`unknown flag: ${a}`);
+    throw new UsageError(`unexpected extra argument: ${a}`);
+  }
+
+  return {
+    kind: "domain-list",
+    input: { ...(app !== undefined ? { app } : {}) },
+    json,
+  };
+}
+
+function parseDomainRm(args: string[]): ParsedDomainRm {
+  let fqdn: string | undefined;
+  let yes = false;
+  let json = false;
+
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i]!;
+    if (a === "--yes") { yes = true; continue; }
+    if (a === "--json") { json = true; continue; }
+    if (a.startsWith("-")) throw new UsageError(`unknown flag: ${a}`);
+    if (fqdn === undefined) { fqdn = a; continue; }
+    throw new UsageError(`unexpected extra argument: ${a}`);
+  }
+
+  if (fqdn === undefined) throw new UsageError("domain rm requires <fqdn>");
+  return { kind: "domain-rm", input: { fqdn, yes }, json };
+}
+
 /** Entry point. Returns the process exit code. */
 export async function main(
   argv: string[],
@@ -2077,6 +2261,45 @@ export async function main(
         new StateStore(),
         defaultAppStore(),
         defaultTriggerDeps(),
+        out,
+        err,
+      );
+    case "domain-add":
+      return runDomainAdd(
+        cmd.input,
+        { json: cmd.json },
+        new StateStore(),
+        defaultAppStore(),
+        new DomainStore(),
+        defaultDomainDeps(),
+        out,
+        err,
+      );
+    case "domain-check":
+      return runDomainCheck(
+        cmd.input,
+        { json: cmd.json },
+        new DomainStore(),
+        defaultDomainDeps(),
+        out,
+        err,
+      );
+    case "domain-list":
+      return runDomainList(
+        cmd.input,
+        { json: cmd.json },
+        new DomainStore(),
+        out,
+        err,
+      );
+    case "domain-rm":
+      return runDomainRm(
+        cmd.input,
+        { json: cmd.json },
+        new StateStore(),
+        defaultAppStore(),
+        new DomainStore(),
+        defaultDomainDeps(),
         out,
         err,
       );

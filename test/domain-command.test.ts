@@ -122,20 +122,6 @@ const CH_ACTIVE: CustomHostname = {
   },
 };
 
-function makeCf(responses: CustomHostname[]) {
-  let idx = 0;
-  return {
-    createCustomHostname: async (_hostname: string, _method?: "http" | "txt") =>
-      responses[idx++] ?? CH_PENDING,
-    getCustomHostname: async (_id: string) => responses[idx++] ?? CH_PENDING,
-    listCustomHostnames: async (_hostname?: string) => responses[idx++] !== undefined ? [responses[idx - 1]!] : [],
-    deleteCustomHostname: async (_id: string) => {
-      idx++;
-      return { id: "ch-abc123" };
-    },
-  };
-}
-
 function makeDeps(overrides: Partial<DomainDeps> = {}): DomainDeps {
   return {
     cf: undefined,
@@ -196,7 +182,6 @@ describe("runDomainAdd", () => {
       vmStore,
       appStore,
       domainStore,
-      // @ts-expect-error - we pass a plain mock, not a real CloudflareDns instance
       makeDeps({ cf: cfMock }),
       out,
       err,
@@ -328,7 +313,6 @@ describe("runDomainAdd", () => {
       vmStore,
       appStore,
       domainStore,
-      // @ts-expect-error - plain mock
       makeDeps({ cf: cfMock }),
       out,
       err,
@@ -381,7 +365,6 @@ describe("runDomainCheck", () => {
       input,
       { json: false },
       domainStore,
-      // @ts-expect-error - plain mock
       makeDeps({ cf: cfMock }),
       out,
       err,
@@ -416,7 +399,6 @@ describe("runDomainCheck", () => {
       input,
       { json: false },
       domainStore,
-      // @ts-expect-error - plain mock
       makeDeps({
         cf: cfMock,
         resolveCname: async () => ["cname.samo.team"],
@@ -622,7 +604,6 @@ describe("runDomainRm", () => {
       vmStore,
       appStore,
       domainStore,
-      // @ts-expect-error - plain mock
       makeDeps({
         cf: cfMock,
         remote: async (_vm, _script) => {
