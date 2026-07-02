@@ -21,6 +21,7 @@ import {
   type DomainCheckInput,
   type DomainListInput,
   type DomainRmInput,
+  type ControlPlaneScriptRunner,
 } from "../src/commands/domain.ts";
 import { DomainStore } from "../src/state/domains.ts";
 import { AppStore } from "../src/state/apps.ts";
@@ -126,6 +127,7 @@ function makeDeps(overrides: Partial<DomainDeps> = {}): DomainDeps {
   return {
     cf: undefined,
     remote: async (_vm, _script) => ({ code: 0, stdout: "ok", stderr: "" }),
+    controlPlane: async (_script) => ({ code: 0, stdout: "ok", stderr: "" }),
     resolveCname: async (_fqdn) => ["cname.samo.team"],
     now: () => FIXED_NOW,
     uuid: () => FIXED_UUID,
@@ -324,6 +326,71 @@ describe("runDomainAdd", () => {
     expect(report.fqdn).toBe("myapp.com");
     expect(report.appName).toBe("field-record");
     expect(report.customHostnameId).toBe("ch-abc123");
+  });
+
+  test("calls controlPlane runner with the control-plane Caddy routing snippet", async () => {
+    // Root-cause fix: domain add must write a Caddy block on the CONTROL PLANE
+    // (not just on the app VM) because CF-for-SaaS routes custom-hostname traffic
+    // to the control-plane origin (cname.samo.team → 91.99.233.145), so the CP
+    // Caddy must have a block routing <custom-domain> → <app VM ip:80>.
+    const { vmStore, appStore, domainStore } = makeStores();
+    const { out, err } = makeOutput();
+
+    let cpScriptReceived: string | undefined;
+    const controlPlane: ControlPlaneScriptRunner = async (script) => {
+      cpScriptReceived = script;
+      return { code: 0, stdout: "ok", stderr: "" };
+    };
+
+    const input: DomainAddInput = { app: "field-record", fqdn: "myapp.com", dcv: "http" };
+    const code = await runDomainAdd(
+      input,
+      { json: false },
+      vmStore,
+      appStore,
+      domainStore,
+      makeDeps({ controlPlane }),
+      out,
+      err,
+    );
+
+    expect(code).toBe(0);
+    // controlPlane runner MUST have been called
+    expect(cpScriptReceived).toBeDefined();
+    // Script must route myapp.com on the control plane
+    expect(cpScriptReceived).toContain("myapp.com");
+    // Script must proxy to the app VM IP (1.2.3.4 from VM fixture)
+    expect(cpScriptReceived).toContain("1.2.3.4");
+    // Script must reload Caddy
+    expect(cpScriptReceived).toContain("systemctl reload caddy");
+    // Script must NOT use 'caddy validate' (hardened-VM NOPASSWD bug)
+    expect(cpScriptReceived).not.toContain("caddy validate");
+  });
+
+  test("errors when controlPlane runner fails", async () => {
+    const { vmStore, appStore, domainStore } = makeStores();
+    const { errLines, out, err } = makeOutput();
+
+    const controlPlane: ControlPlaneScriptRunner = async (_script) => ({
+      code: 1,
+      stdout: "",
+      stderr: "permission denied",
+    });
+
+    const input: DomainAddInput = { app: "field-record", fqdn: "myapp.com", dcv: "http" };
+    const code = await runDomainAdd(
+      input,
+      { json: false },
+      vmStore,
+      appStore,
+      domainStore,
+      makeDeps({ controlPlane }),
+      out,
+      err,
+    );
+
+    expect(code).toBe(1);
+    expect(errLines.join("\n")).toContain("control-plane");
   });
 });
 
@@ -622,6 +689,38 @@ describe("runDomainRm", () => {
     expect(outLines.join("\n")).toContain("myapp.com");
 
     // Record removed from store
+    expect(domainStore.get("myapp.com")).toBeUndefined();
+  });
+
+  test("calls controlPlane runner to remove the control-plane routing snippet on rm", async () => {
+    const { vmStore, appStore, domainStore } = makeStores();
+    seedDomain(domainStore);
+    const { out, err } = makeOutput();
+
+    let cpRemoveScriptReceived: string | undefined;
+    const controlPlane: ControlPlaneScriptRunner = async (script) => {
+      cpRemoveScriptReceived = script;
+      return { code: 0, stdout: "ok", stderr: "" };
+    };
+
+    const input: DomainRmInput = { fqdn: "myapp.com", yes: true };
+    const code = await runDomainRm(
+      input,
+      { json: false },
+      vmStore,
+      appStore,
+      domainStore,
+      makeDeps({ controlPlane }),
+      out,
+      err,
+    );
+
+    expect(code).toBe(0);
+    // controlPlane runner MUST have been called for removal
+    expect(cpRemoveScriptReceived).toBeDefined();
+    expect(cpRemoveScriptReceived).toContain("myapp.com");
+    expect(cpRemoveScriptReceived).toContain("systemctl reload caddy");
+    // State removed
     expect(domainStore.get("myapp.com")).toBeUndefined();
   });
 
