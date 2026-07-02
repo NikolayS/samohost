@@ -165,6 +165,57 @@ export async function lookupWildcardRecord(
   };
 }
 
+/**
+ * Port interface for CF-for-SaaS Custom Hostname operations.
+ *
+ * Narrow interface so tests can inject plain mock objects without
+ * constructing a full `CloudflareDns` instance (mirrors `DnsProviderPort`).
+ */
+export interface CustomHostnameClient {
+  createCustomHostname(
+    hostname: string,
+    method?: "http" | "txt",
+  ): Promise<CustomHostname>;
+  getCustomHostname(id: string): Promise<CustomHostname>;
+  listCustomHostnames(hostname?: string): Promise<CustomHostname[]>;
+  deleteCustomHostname(id: string): Promise<{ id: string }>;
+}
+
+/**
+ * A Cloudflare for SaaS Custom Hostname object as returned by the
+ * `/zones/<id>/custom_hostnames` endpoint.
+ *
+ * Field names exactly match the Cloudflare API (snake_case) so they can be
+ * used directly with `result` unwrapped from the CF envelope by `call()`.
+ *
+ * NOTE — gate: Custom Hostnames require (a) the CF-for-SaaS entitlement on
+ * the SaaS zone and (b) a token with SSL and Certificates:Edit scope.
+ * The CLOUDFLARE_SAMOCAT token is DNS-only and CANNOT create custom hostnames.
+ * A separate CLOUDFLARE_SAMOTEAM token must be provisioned (SSL:Edit on samo.team).
+ * See docs/setup-checklist.md for the GATE flag.
+ */
+export interface CustomHostname {
+  id: string;
+  hostname: string;
+  /** "pending" | "active" | "blocked" | "deleted" | ... */
+  status: string;
+  ssl: {
+    id?: string;
+    /** "pending_validation" | "pending_issuance" | "pending_deployment" | "active" | ... */
+    status: string;
+    /** "http" | "txt" */
+    method?: string;
+    validation_records?: Array<{
+      http_url?: string;
+      http_body?: string;
+      txt_name?: string;
+      txt_value?: string;
+    }>;
+  };
+  ownership_verification?: { type: string; name: string; value: string };
+  verification_errors?: string[];
+}
+
 export class CloudflareDns implements DnsProviderPort {
   private readonly token: string;
   private readonly fetchFn: FetchFn;
@@ -277,5 +328,57 @@ export class CloudflareDns implements DnsProviderPort {
       await this.call<unknown>("DELETE", `/dns_records/${rec.id}`);
     }
     return existing.length;
+  }
+
+  // ---------------------------------------------------------------------------
+  // Cloudflare for SaaS — Custom Hostnames
+  // ---------------------------------------------------------------------------
+  // These methods use the same `call()` helper (zone-id prefixed, authenticated,
+  // envelope-unwrapped) so no extra plumbing is needed beyond the method bodies.
+  //
+  // GATE: requires CLOUDFLARE_SAMOTEAM token (SSL:Edit scope on samo.team) and the
+  // CF-for-SaaS entitlement on the zone. See docs/setup-checklist.md.
+
+  /**
+   * Create a Custom Hostname on this zone, triggering DCV validation for the
+   * client-owned FQDN. The result carries `ssl.validation_records` /
+   * `ownership_verification` which the caller surfaces to the client.
+   *
+   * @param hostname  Client FQDN (e.g. "myapp.com")
+   * @param method    DCV method: "http" (default) or "txt"
+   */
+  async createCustomHostname(
+    hostname: string,
+    method: "http" | "txt" = "http",
+  ): Promise<CustomHostname> {
+    return this.call<CustomHostname>("POST", "/custom_hostnames", {
+      hostname,
+      ssl: {
+        method,
+        type: "dv",
+        settings: { min_tls_version: "1.2" },
+      },
+    });
+  }
+
+  /** Fetch one Custom Hostname by its CF id (use for polling ssl.status). */
+  async getCustomHostname(id: string): Promise<CustomHostname> {
+    return this.call<CustomHostname>("GET", `/custom_hostnames/${id}`);
+  }
+
+  /**
+   * List Custom Hostnames on this zone, optionally filtered by the client FQDN.
+   * Useful for recovering `customHostnameId` when it is absent from state.
+   */
+  async listCustomHostnames(hostname?: string): Promise<CustomHostname[]> {
+    const q = hostname
+      ? `?hostname=${encodeURIComponent(hostname)}`
+      : "";
+    return this.call<CustomHostname[]>("GET", `/custom_hostnames${q}`);
+  }
+
+  /** Delete a Custom Hostname by its CF id. Returns `{ id }`. */
+  async deleteCustomHostname(id: string): Promise<{ id: string }> {
+    return this.call<{ id: string }>("DELETE", `/custom_hostnames/${id}`);
   }
 }

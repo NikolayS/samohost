@@ -292,3 +292,52 @@ describe("main (exit codes & output)", () => {
     expect(err).toContain("error:");
   });
 });
+
+// ---------------------------------------------------------------------------
+// parseDomainSearch — UsageError paths and --json flag (Finding 3)
+// ---------------------------------------------------------------------------
+
+describe("parseDomainSearch via parseArgs", () => {
+  test("missing fqdn throws UsageError", () => {
+    expect(() => parseArgs(["domain", "search"])).toThrow(UsageError);
+    expect(() => parseArgs(["domain", "search"])).toThrow(
+      "domain search requires <fqdn>",
+    );
+  });
+
+  test("unknown flag throws UsageError", () => {
+    expect(() =>
+      parseArgs(["domain", "search", "--bad-flag"]),
+    ).toThrow(UsageError);
+    expect(() =>
+      parseArgs(["domain", "search", "--bad-flag"]),
+    ).toThrow("unknown flag");
+  });
+
+  test("extra positional argument throws UsageError", () => {
+    expect(() =>
+      parseArgs(["domain", "search", "a.com", "b.com"]),
+    ).toThrow(UsageError);
+    expect(() =>
+      parseArgs(["domain", "search", "a.com", "b.com"]),
+    ).toThrow("unexpected extra argument");
+  });
+
+  test("--json flag sets json:true in parsed result", () => {
+    const cmd = parseArgs(["domain", "search", "a.com", "--json"]);
+    expect(cmd.kind).toBe("domain-search");
+    if (cmd.kind === "domain-search") {
+      expect(cmd.json).toBe(true);
+      expect(cmd.input.fqdn).toBe("a.com");
+    }
+  });
+
+  test("without --json flag, json is false", () => {
+    const cmd = parseArgs(["domain", "search", "example.com"]);
+    expect(cmd.kind).toBe("domain-search");
+    if (cmd.kind === "domain-search") {
+      expect(cmd.json).toBe(false);
+      expect(cmd.input.fqdn).toBe("example.com");
+    }
+  });
+});

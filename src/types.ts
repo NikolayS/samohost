@@ -319,6 +319,30 @@ export interface EnvRecord {
 }
 
 /**
+ * A persisted custom-domain mapping: a client-owned FQDN bound to one of
+ * our apps via a Cloudflare for SaaS Custom Hostname + a Caddy vhost snippet.
+ * Stored in `~/.samohost/domains.json` (override: SAMOHOST_DOMAINS env).
+ * Natural identity: `fqdn` (globally unique across all apps and VMs).
+ */
+export interface DomainRecord {
+  id: string;
+  /** Client domain, natural identity (e.g. "myapp.com"). */
+  fqdn: string;
+  /** Name of the AppRecord this domain routes to. */
+  appName: string;
+  /** Id of the VmRecord the app runs on. */
+  vmId: string;
+  /** Cloudflare Custom Hostname id (absent until CF create succeeds). */
+  customHostnameId?: string;
+  /** Last-observed CF ssl.status (e.g. "pending_validation", "active"). */
+  sslStatus?: string;
+  /** Last-observed CF hostname status (e.g. "pending", "active"). */
+  hostnameStatus?: string;
+  createdAt: string;
+  updatedAt?: string;
+}
+
+/**
  * A persisted VM record in the local state store (SPEC §4/§5).
  */
 export interface VmRecord {
