@@ -360,6 +360,63 @@ describe("5. requiresSudo → UNKNOWN, exit 0", () => {
     expect(byId["ufw-active"]).toBe("unknown");
     expect(byId["apparmor-enforced"]).toBe("unknown");
   });
+
+  test("D1-sudo-n: sudo without NOPASSWD ('a password is required') → unknown not fail", async () => {
+    // RED: PERMISSION_RE does not match "sudo: a password is required" so when
+    // sudo -n is used on a host where NOPASSWD is not configured the probe
+    // output ("sudo: a password is required") falls through to the expect match
+    // which fails → "fail" instead of "unknown".
+    //
+    // Fix needed: extend PERMISSION_RE to cover "password is required" and
+    // "terminal is required" (the two messages sudo emits when it can't read a
+    // password in a non-interactive session).
+    store.upsert(rec());
+    const SUDO_NOPASSWD_ERR = "sudo: a password is required";
+    const SUDO_NOTTY_ERR    = "sudo: a terminal is required to read the password; either use the -S option to read from standard input or configure an askpass helper.";
+    const remote: RemoteRunner = (_vm, _cmd) =>
+      Promise.resolve({
+        code: 0,
+        stdout: allPassDelimited({
+          "ufw-active":         SUDO_NOPASSWD_ERR,
+          "apparmor-enforced":  SUDO_NOTTY_ERR,
+        }),
+        stderr: "",
+      });
+    const c = capture();
+    const code = await runDoctor(
+      { target: "test-vm", infra: false },
+      { json: true },
+      store,
+      appStore,
+      c.out,
+      c.err,
+      remote,
+    );
+    // Sudo without NOPASSWD = unverifiable, not a security failure.
+    expect(code).toBe(0);
+    const parsed = JSON.parse(c.o);
+    const byId = Object.fromEntries(
+      parsed.checks.map((r: { id: string; status: string }) => [r.id, r.status]),
+    );
+    expect(byId["ufw-active"]).toBe("unknown");
+    expect(byId["apparmor-enforced"]).toBe("unknown");
+  });
+
+  test("D1-probe-commands: ssh-port / ufw-active / apparmor-enforced use sudo -n (non-interactive)", () => {
+    // RED: current probe commands use plain "sudo" without -n.
+    // Without -n, sudo attempts to prompt for a password via the TTY.
+    // In a non-interactive SSH session (no PTY), this gives:
+    //   "sudo: a terminal is required to read the password"
+    // which is NOT caught by PERMISSION_RE → evaluates as "fail" (wrong).
+    // With -n, sudo immediately exits with "sudo: a password is required"
+    // if NOPASSWD is not configured — a message we can add to PERMISSION_RE.
+    const sshPortCheck = hardeningModule.auditChecks.find(c => c.id === "ssh-port");
+    const ufwCheck     = hardeningModule.auditChecks.find(c => c.id === "ufw-active");
+    const aaCheck      = hardeningModule.auditChecks.find(c => c.id === "apparmor-enforced");
+    expect(sshPortCheck!.probeCommand).toMatch(/^sudo\s+-n\s/);
+    expect(ufwCheck!.probeCommand).toMatch(/^sudo\s+-n\s/);
+    expect(aaCheck!.probeCommand).toMatch(/^sudo\s+-n\s/);
+  });
 });
 
 // ===========================================================================
