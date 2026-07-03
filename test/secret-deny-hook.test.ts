@@ -11,7 +11,7 @@
  * subprocess e2e (Bun.spawn) satisfies the integration requirement per the
  * doctor.test.ts precedent in this repo.
  */
-import { afterAll, describe, expect, test } from "bun:test";
+import { describe, expect, test } from "bun:test";
 import { existsSync } from "node:fs";
 import { join } from "node:path";
 
