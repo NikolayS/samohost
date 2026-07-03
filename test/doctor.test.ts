@@ -1165,6 +1165,63 @@ describe("18. BUG static app env/DB checks must be skip", () => {
 });
 
 // ===========================================================================
+// 19. BUG (D1) — hardening probes for ssh-port / ufw-active / apparmor-enforced
+//     lack a sudo prefix, so they always produce empty output or "permission
+//     denied" on hardened hosts where the admin user has no root-equivalent
+//     shell session.  The result is that these three checks always show as
+//     "unknown" regardless of the actual host configuration.
+//
+//     Fix: prefix each probeCommand with sudo (full path for sshd):
+//       ssh-port:         sudo /usr/sbin/sshd -T 2>/dev/null | grep '^port '
+//       ufw-active:       sudo ufw status verbose
+//       apparmor-enforced: sudo aa-status
+//
+//     Requires corresponding NOPASSWD sudoers entries — that is tracked as
+//     a separate infra follow-up (D2) and is NOT part of this fix.
+//
+// RED: current probeCommand strings have NO sudo prefix.
+// ===========================================================================
+describe("19. BUG (D1) hardening probe commands must include sudo prefix", () => {
+  test("D1a: ssh-port probeCommand starts with 'sudo'", () => {
+    // RED: currently "sshd -T 2>/dev/null | grep '^port '" — no sudo.
+    const sshPortCheck = hardeningModule.auditChecks.find(
+      (c) => c.id === "ssh-port",
+    );
+    expect(sshPortCheck).toBeDefined();
+    expect(sshPortCheck!.probeCommand).toMatch(/^sudo\s/);
+  });
+
+  test("D1b: ufw-active probeCommand starts with 'sudo'", () => {
+    // RED: currently "ufw status verbose" — no sudo.
+    const ufwCheck = hardeningModule.auditChecks.find(
+      (c) => c.id === "ufw-active",
+    );
+    expect(ufwCheck).toBeDefined();
+    expect(ufwCheck!.probeCommand).toMatch(/^sudo\s/);
+  });
+
+  test("D1c: apparmor-enforced probeCommand starts with 'sudo'", () => {
+    // RED: currently "aa-status" — no sudo.
+    const aaCheck = hardeningModule.auditChecks.find(
+      (c) => c.id === "apparmor-enforced",
+    );
+    expect(aaCheck).toBeDefined();
+    expect(aaCheck!.probeCommand).toMatch(/^sudo\s/);
+  });
+
+  test("D1d: ssh-port probeCommand uses full path /usr/sbin/sshd (avoids PATH resolution)", () => {
+    // The admin user's PATH may not include /usr/sbin; specifying the full path
+    // ensures the command resolves without relying on shell PATH.
+    // RED: currently calls bare "sshd" — no full path.
+    const sshPortCheck = hardeningModule.auditChecks.find(
+      (c) => c.id === "ssh-port",
+    );
+    expect(sshPortCheck).toBeDefined();
+    expect(sshPortCheck!.probeCommand).toContain("/usr/sbin/sshd");
+  });
+});
+
+// ===========================================================================
 // E2E (CLI subprocess) — satisfies the Playwright/E2E requirement for a CLI.
 // No browser involved; this tests the real wired binary path end-to-end.
 // ===========================================================================
