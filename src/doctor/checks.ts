@@ -375,7 +375,14 @@ export function buildDoctorChecks(
     id: "only-intended-ports",
     description: `no unexpected non-loopback listeners (allowed: ${sshPort}, 80, 443)`,
     // We re-use ss -ltnH output; this probe is a no-op (parsed from ss-listeners).
-    probeCommand: `ss -ltnH | grep -vE '127\\.0\\.0\\.1:|\\[::1\\]:|\\[::ffff:127\\.0\\.0\\.1\\]:' | awk '{print $4}' | grep -vE ':${sshPort}$|:80$|:443$' || true`,
+    // Loopback exclusion covers the full 127.0.0.0/8 range (not just 127.0.0.1):
+    //   - 127.x.x.x[%iface]:  matches systemd-resolved on 127.0.0.53/127.0.0.54
+    //     The [^:]* after the octet group absorbs the optional %lo interface suffix
+    //     that ss appends (e.g. "127.0.0.53%lo:53").
+    //   - [::1]:               IPv6 loopback
+    //   - [::ffff:127.x.x.x]: IPv4-mapped loopback in IPv6
+    //   - 172.(16-31).x.x:    RFC1918 docker bridge range (172.16.0.0/12)
+    probeCommand: `ss -ltnH | grep -vE '127\\.[0-9]+\\.[0-9]+\\.[0-9]+[^:]*:|\\[::1\\]:|\\[::ffff:127\\.[0-9]+\\.[0-9]+\\.[0-9]+\\]:|172\\.(1[6-9]|2[0-9]|3[01])\\.[0-9]+\\.[0-9]+:' | awk '{print $4}' | grep -vE ':${sshPort}$|:80$|:443$' || true`,
     expect: /^$/, // empty output = no unexpected listeners = pass
     group: "core-host",
     kind: "match",

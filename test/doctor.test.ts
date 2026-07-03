@@ -31,6 +31,7 @@ import {
   parseWebPortsNotWorldOpenOutput,
 } from "../src/commands/doctor.ts";
 import { hardeningModule } from "../src/cloudinit/hardening.ts";
+import { buildDoctorChecks } from "../src/doctor/checks.ts";
 import { StateStore } from "../src/state/store.ts";
 import { AppStore } from "../src/state/apps.ts";
 import type { VmRecord, AppRecord } from "../src/types.ts";
@@ -466,18 +467,22 @@ describe("7. Auto-detect app-db scoping", () => {
     expect(rlsRow?.status).toBe("fail");
   });
 
-  test(":5432 loopback present, no app registered → app-db checks evaluated", async () => {
+  test(":5432 loopback present, no app registered → app-db checks are SKIP (not evaluated)", async () => {
+    // Fix for BUG1 (skipAppDb): app-scoped checks must be skip when no app is
+    // registered, regardless of whether :5432 is listening. Running them with
+    // unsubstituted placeholders produces fabricated failures ("unbound variable").
     store.upsert(rec());
-    // No app but :5432 loopback detected in ss output → evaluate app-db
+    // No app registered. :5432 loopback is present.
     const ssWithPostgres =
       "LISTEN 0 128 0.0.0.0:2223 0.0.0.0:*\nLISTEN 0 128 127.0.0.1:5432 0.0.0.0:*";
-    // rls-nonsuperuser returns 't' (would be fail), pg-localhost passes
     const remote: RemoteRunner = (_vm, _cmd) =>
       Promise.resolve({
         code: 0,
         stdout: allPassDelimited({
           "ss-listeners": ssWithPostgres,
-          "rls-nonsuperuser": "t",
+          // Return placeholder error text — exactly what the prod VM produces
+          // when set -u is active and __RLS_URL_VAR__ is not substituted.
+          "rls-nonsuperuser": "bash: line 64: __RLS_URL_VAR__: unbound variable",
         }),
         stderr: "",
       });
@@ -491,14 +496,13 @@ describe("7. Auto-detect app-db scoping", () => {
       c.err,
       remote,
     );
-    // rls-nonsuperuser should be evaluated (not skip), and would be fail
     const parsed = JSON.parse(c.o);
     const rlsRow = parsed.checks.find(
       (r: { id: string }) => r.id === "rls-nonsuperuser",
     );
-    // When no app, rls check can't be fully evaluated (no envFile) → unknown or skip
-    // but it should NOT be skip if :5432 detected — it should at least be unknown/fail
-    expect(rlsRow?.status).not.toBe("skip");
+    // Correct behavior after skipAppDb = !app fix:
+    // No app registered → app-scoped checks must be "skip", never "fail".
+    expect(rlsRow?.status).toBe("skip");
   });
 });
 
@@ -919,6 +923,244 @@ describe("14. web-ports-not-world-open", () => {
       "80/tcp                     LIMIT       Anywhere",
     );
     expect(result.status).toBe("fail");
+  });
+});
+
+// ===========================================================================
+// 15. BUG — skipAppDb false-positive: no app + :5432 loopback → placeholder
+//     commands run, producing fabricated rls-nonsuperuser / env-file-perms
+//     failures. Fix: skipAppDb = !app (ignore pgLoopback for skip decision).
+//
+// RED: currently fails because skipAppDb = !app && !pgLoopback, and with
+// :5432 loopback present but no app, the app-scoped checks are NOT skipped.
+// The probe command contains unsubstituted __RLS_URL_VAR__ / __ENV_FILE__
+// placeholders. set -u in the audit script causes "unbound variable" error,
+// which the check evaluates as "fail" instead of "skip".
+// ===========================================================================
+describe("15. BUG skipAppDb placeholder false-positive", () => {
+  // Helper: extract probe IDs from an audit script.
+  function extractIds(script: string): string[] {
+    const ids: string[] = [];
+    const re = /echo\s+"<<<SAMOHOST_AUDIT:([^>]+)>>>"/g;
+    let m: RegExpExecArray | null;
+    while ((m = re.exec(script)) !== null) ids.push(m[1]!);
+    return ids;
+  }
+
+  test("BUG1: no app + :5432 loopback → rls-nonsuperuser must be skip (not fail)", async () => {
+    // RED: currently rls-nonsuperuser = "fail" due to __RLS_URL_VAR__ unbound variable.
+    store.upsert(rec());
+    // No app registered — appStore is empty.
+    const ssWithPostgres =
+      "LISTEN 0 200 127.0.0.1:5432 0.0.0.0:*\n" +
+      "LISTEN 0 128 0.0.0.0:2223 0.0.0.0:*\n" +
+      "LISTEN 0 511 0.0.0.0:80 0.0.0.0:*\n" +
+      "LISTEN 0 511 0.0.0.0:443 0.0.0.0:*";
+    // Simulate what prod actually returns: set -u makes __RLS_URL_VAR__ unbound.
+    const remote: RemoteRunner = (_vm, script) => {
+      const ids = extractIds(script);
+      const bodies: Record<string, string> = {
+        "ss-listeners": ssWithPostgres,
+        "rls-nonsuperuser": "bash: line 64: __RLS_URL_VAR__: unbound variable",
+        "env-file-perms": "", // stat on __ENV_FILE__ literal path fails silently
+        ...Object.fromEntries(
+          [
+            "ssh-port", "ufw-active", "fail2ban-active", "sysctl-rpfilter",
+            "sysctl-syncookies", "sysctl-redirects", "apparmor-enforced",
+            "permitrootlogin", "passwordauth", "allowusers", "maxauthtries",
+            "clientalive", "x11forwarding", "allowagentforwarding",
+            "permituserenvironment", "permitemptypasswords",
+            "root-authorized-keys-empty", "ufw-limit-ssh",
+            "web-ports-not-world-open", "unattended-upgrades-active",
+            "only-intended-ports", "git-remote-no-token",
+            "caddy-serving", "fail2ban-jail", "service-crash-loop",
+            "failed-auth-burst", "sudo-failures", "fail2ban-ban-spike",
+            "pg-localhost", "app-health",
+          ].map((id) => [id, ALL_PASS_BODIES[id] ?? ""]),
+        ),
+      };
+      const sections = ids
+        .map((id) => `<<<SAMOHOST_AUDIT:${id}}>>>\n${bodies[id] ?? ""}`)
+        .join("\n");
+      return Promise.resolve({ code: 0, stdout: sections, stderr: "" });
+    };
+    const c = capture();
+    await runDoctor(
+      { target: "test-vm", infra: false },
+      { json: true },
+      store,
+      appStore,
+      c.out,
+      c.err,
+      remote,
+    );
+    const parsed = JSON.parse(c.o);
+    const rlsRow = parsed.checks.find((r: { id: string }) => r.id === "rls-nonsuperuser");
+    const envRow = parsed.checks.find((r: { id: string }) => r.id === "env-file-perms");
+    // CORRECT behavior: both must be "skip" because no app is registered.
+    // Bug: currently "fail" because __RLS_URL_VAR__ is unbound in the probe.
+    expect(rlsRow?.status).toBe("skip");
+    expect(envRow?.status).toBe("skip");
+  });
+});
+
+// ===========================================================================
+// 16. BUG — only-intended-ports loopback filter too narrow.
+//     Current grep excludes only 127.0.0.1; systemd-resolved on 127.0.0.53
+//     and docker bridge 172.18.0.1 cause false FAILs.
+//     Fix: extend exclusion to full 127.0.0.0/8 + RFC1918 docker bridge range.
+//
+// RED: probe command string does not contain a digit-class wildcard for the
+// loopback range or the docker bridge range.
+// ===========================================================================
+describe("16. BUG only-intended-ports loopback filter", () => {
+  test("BUG2: probe command must exclude full 127.0.0.0/8 range (not just 127.0.0.1)", () => {
+    // RED: current probe has '127\\.0\\.0\\.1:' literal — no digit class for .53/.54.
+    const checks = buildDoctorChecks(2223, undefined);
+    const portCheck = checks.find((c) => c.id === "only-intended-ports");
+    expect(portCheck).toBeDefined();
+    // Fixed probe must handle arbitrary 127.x.x.x addresses (e.g. 127.0.0.53).
+    // The grep pattern must use a character class like [0-9]+ rather than literal octets.
+    expect(portCheck!.probeCommand).toContain("[0-9]");
+  });
+
+  test("BUG2: probe command must exclude docker bridge range 172.16-31.x.x", () => {
+    // RED: current probe has no 172.x.x.x exclusion at all.
+    const checks = buildDoctorChecks(2223, undefined);
+    const portCheck = checks.find((c) => c.id === "only-intended-ports");
+    expect(portCheck).toBeDefined();
+    // Fixed probe must exclude RFC1918 docker bridge range 172.16.0.0/12.
+    expect(portCheck!.probeCommand).toMatch(/172.*1\[6-9\]/);
+  });
+});
+
+// ===========================================================================
+// 17. BUG — sysctl-rpfilter value "2" (loose mode) must pass.
+//     Current expect is the string "1" — value "2" is loose but still valid.
+//     Fix: expect /^[12]$/m.
+//
+// RED: value "2" currently fails because expect is "1" (strict equality).
+// ===========================================================================
+describe("17. BUG sysctl-rpfilter loose mode", () => {
+  test("BUG4: sysctl-rpfilter value '2' (loose) must be PASS", async () => {
+    // RED: current expect is "1"; value "2" matches as fail.
+    store.upsert(rec());
+    const remote = makePassRunner({ "sysctl-rpfilter": "2" });
+    const c = capture();
+    const code = await runDoctor(
+      { target: "test-vm", infra: false },
+      { json: true },
+      store,
+      appStore,
+      c.out,
+      c.err,
+      remote,
+    );
+    const parsed = JSON.parse(c.o);
+    const row = parsed.checks.find(
+      (r: { id: string }) => r.id === "sysctl-rpfilter",
+    );
+    // Value 2 = loose reverse-path filtering — valid, must pass.
+    expect(row?.status).toBe("pass");
+    expect(code).toBe(0);
+  });
+
+  test("BUG4: sysctl-rpfilter value '0' still fails", async () => {
+    // Regression guard: value "0" (disabled) must still fail.
+    store.upsert(rec());
+    const remote = makePassRunner({ "sysctl-rpfilter": "0" });
+    const c = capture();
+    const code = await runDoctor(
+      { target: "test-vm", infra: false },
+      { json: true },
+      store,
+      appStore,
+      c.out,
+      c.err,
+      remote,
+    );
+    const parsed = JSON.parse(c.o);
+    const row = parsed.checks.find(
+      (r: { id: string }) => r.id === "sysctl-rpfilter",
+    );
+    expect(row?.status).toBe("fail");
+    expect(code).toBe(1);
+  });
+});
+
+// ===========================================================================
+// 18. BUG — static apps should skip env/DB checks.
+//     kind: "static" apps have no runtime env file and no database, so
+//     env-file-perms / rls-nonsuperuser / pg-localhost false-fail (seen on
+//     game-changers: `env-file-perms` → empty stdout, `rls-nonsuperuser`
+//     → "DATABASE_URL: unbound variable" because the env file doesn't exist).
+//     Fix: when app.kind === "static", skip those checks.
+//
+// RED: no static-app skip guard exists yet.
+// ===========================================================================
+describe("18. BUG static app env/DB checks must be skip", () => {
+  test("BUG6: static app → env-file-perms, rls-nonsuperuser, pg-localhost are skip", async () => {
+    // RED: no guard for static apps; checks run, fail with unbound variable.
+    store.upsert(rec());
+    // Register a static app (no env file, no DB).
+    appStore.upsert(appRec("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee", { kind: "static" }));
+    // Simulate what prod returns for a static app:
+    // - env-file-perms: stat on non-existent env file → empty output
+    // - rls-nonsuperuser: env file not sourced → DATABASE_URL unbound
+    const remote = makePassRunner({
+      "env-file-perms": "", // stat returns nothing (file absent)
+      "rls-nonsuperuser": "bash: line 64: DATABASE_URL: unbound variable",
+      "pg-localhost": "", // no postgres on static host
+    });
+    const c = capture();
+    const code = await runDoctor(
+      { target: "test-vm", infra: false },
+      { json: true },
+      store,
+      appStore,
+      c.out,
+      c.err,
+      remote,
+    );
+    const parsed = JSON.parse(c.o);
+    const byId = Object.fromEntries(
+      parsed.checks.map((r: { id: string; status: string }) => [r.id, r.status]),
+    );
+    // Static apps have no env file or DB — these must be skip, not fail.
+    expect(byId["env-file-perms"]).toBe("skip");
+    expect(byId["rls-nonsuperuser"]).toBe("skip");
+    expect(byId["pg-localhost"]).toBe("skip");
+    // Non-db app-scoped checks still run (git remote check is still valid).
+    expect(byId["git-remote-no-token"]).not.toBe("skip");
+    // Exit 0 because skipped checks don't fail.
+    expect(code).toBe(0);
+  });
+
+  test("BUG6: node app → env-file-perms, rls-nonsuperuser still evaluated", async () => {
+    // Regression: node apps (default kind) must still evaluate these checks.
+    store.upsert(rec());
+    appStore.upsert(appRec("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")); // default kind (node)
+    const remote = makePassRunner({
+      "env-file-perms": "600 agent",
+      "rls-nonsuperuser": "f",
+    });
+    const c = capture();
+    await runDoctor(
+      { target: "test-vm", infra: false },
+      { json: true },
+      store,
+      appStore,
+      c.out,
+      c.err,
+      remote,
+    );
+    const parsed = JSON.parse(c.o);
+    const byId = Object.fromEntries(
+      parsed.checks.map((r: { id: string; status: string }) => [r.id, r.status]),
+    );
+    // Node apps have env files and databases — must not be skipped.
+    expect(byId["env-file-perms"]).not.toBe("skip");
+    expect(byId["rls-nonsuperuser"]).not.toBe("skip");
   });
 });
 
