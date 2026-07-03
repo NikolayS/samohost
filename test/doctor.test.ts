@@ -360,6 +360,63 @@ describe("5. requiresSudo → UNKNOWN, exit 0", () => {
     expect(byId["ufw-active"]).toBe("unknown");
     expect(byId["apparmor-enforced"]).toBe("unknown");
   });
+
+  test("D1-sudo-n: sudo without NOPASSWD ('a password is required') → unknown not fail", async () => {
+    // RED: PERMISSION_RE does not match "sudo: a password is required" so when
+    // sudo -n is used on a host where NOPASSWD is not configured the probe
+    // output ("sudo: a password is required") falls through to the expect match
+    // which fails → "fail" instead of "unknown".
+    //
+    // Fix needed: extend PERMISSION_RE to cover "password is required" and
+    // "terminal is required" (the two messages sudo emits when it can't read a
+    // password in a non-interactive session).
+    store.upsert(rec());
+    const SUDO_NOPASSWD_ERR = "sudo: a password is required";
+    const SUDO_NOTTY_ERR    = "sudo: a terminal is required to read the password; either use the -S option to read from standard input or configure an askpass helper.";
+    const remote: RemoteRunner = (_vm, _cmd) =>
+      Promise.resolve({
+        code: 0,
+        stdout: allPassDelimited({
+          "ufw-active":         SUDO_NOPASSWD_ERR,
+          "apparmor-enforced":  SUDO_NOTTY_ERR,
+        }),
+        stderr: "",
+      });
+    const c = capture();
+    const code = await runDoctor(
+      { target: "test-vm", infra: false },
+      { json: true },
+      store,
+      appStore,
+      c.out,
+      c.err,
+      remote,
+    );
+    // Sudo without NOPASSWD = unverifiable, not a security failure.
+    expect(code).toBe(0);
+    const parsed = JSON.parse(c.o);
+    const byId = Object.fromEntries(
+      parsed.checks.map((r: { id: string; status: string }) => [r.id, r.status]),
+    );
+    expect(byId["ufw-active"]).toBe("unknown");
+    expect(byId["apparmor-enforced"]).toBe("unknown");
+  });
+
+  test("D1-probe-commands: ssh-port / ufw-active / apparmor-enforced use sudo -n (non-interactive)", () => {
+    // RED: current probe commands use plain "sudo" without -n.
+    // Without -n, sudo attempts to prompt for a password via the TTY.
+    // In a non-interactive SSH session (no PTY), this gives:
+    //   "sudo: a terminal is required to read the password"
+    // which is NOT caught by PERMISSION_RE → evaluates as "fail" (wrong).
+    // With -n, sudo immediately exits with "sudo: a password is required"
+    // if NOPASSWD is not configured — a message we can add to PERMISSION_RE.
+    const sshPortCheck = hardeningModule.auditChecks.find(c => c.id === "ssh-port");
+    const ufwCheck     = hardeningModule.auditChecks.find(c => c.id === "ufw-active");
+    const aaCheck      = hardeningModule.auditChecks.find(c => c.id === "apparmor-enforced");
+    expect(sshPortCheck!.probeCommand).toMatch(/^sudo\s+-n\s/);
+    expect(ufwCheck!.probeCommand).toMatch(/^sudo\s+-n\s/);
+    expect(aaCheck!.probeCommand).toMatch(/^sudo\s+-n\s/);
+  });
 });
 
 // ===========================================================================
@@ -1161,6 +1218,63 @@ describe("18. BUG static app env/DB checks must be skip", () => {
     // Node apps have env files and databases — must not be skipped.
     expect(byId["env-file-perms"]).not.toBe("skip");
     expect(byId["rls-nonsuperuser"]).not.toBe("skip");
+  });
+});
+
+// ===========================================================================
+// 19. BUG (D1) — hardening probes for ssh-port / ufw-active / apparmor-enforced
+//     lack a sudo prefix, so they always produce empty output or "permission
+//     denied" on hardened hosts where the admin user has no root-equivalent
+//     shell session.  The result is that these three checks always show as
+//     "unknown" regardless of the actual host configuration.
+//
+//     Fix: prefix each probeCommand with sudo (full path for sshd):
+//       ssh-port:         sudo /usr/sbin/sshd -T 2>/dev/null | grep '^port '
+//       ufw-active:       sudo ufw status verbose
+//       apparmor-enforced: sudo aa-status
+//
+//     Requires corresponding NOPASSWD sudoers entries — that is tracked as
+//     a separate infra follow-up (D2) and is NOT part of this fix.
+//
+// RED: current probeCommand strings have NO sudo prefix.
+// ===========================================================================
+describe("19. BUG (D1) hardening probe commands must include sudo prefix", () => {
+  test("D1a: ssh-port probeCommand starts with 'sudo'", () => {
+    // RED: currently "sshd -T 2>/dev/null | grep '^port '" — no sudo.
+    const sshPortCheck = hardeningModule.auditChecks.find(
+      (c) => c.id === "ssh-port",
+    );
+    expect(sshPortCheck).toBeDefined();
+    expect(sshPortCheck!.probeCommand).toMatch(/^sudo\s/);
+  });
+
+  test("D1b: ufw-active probeCommand starts with 'sudo'", () => {
+    // RED: currently "ufw status verbose" — no sudo.
+    const ufwCheck = hardeningModule.auditChecks.find(
+      (c) => c.id === "ufw-active",
+    );
+    expect(ufwCheck).toBeDefined();
+    expect(ufwCheck!.probeCommand).toMatch(/^sudo\s/);
+  });
+
+  test("D1c: apparmor-enforced probeCommand starts with 'sudo'", () => {
+    // RED: currently "aa-status" — no sudo.
+    const aaCheck = hardeningModule.auditChecks.find(
+      (c) => c.id === "apparmor-enforced",
+    );
+    expect(aaCheck).toBeDefined();
+    expect(aaCheck!.probeCommand).toMatch(/^sudo\s/);
+  });
+
+  test("D1d: ssh-port probeCommand uses full path /usr/sbin/sshd (avoids PATH resolution)", () => {
+    // The admin user's PATH may not include /usr/sbin; specifying the full path
+    // ensures the command resolves without relying on shell PATH.
+    // RED: currently calls bare "sshd" — no full path.
+    const sshPortCheck = hardeningModule.auditChecks.find(
+      (c) => c.id === "ssh-port",
+    );
+    expect(sshPortCheck).toBeDefined();
+    expect(sshPortCheck!.probeCommand).toContain("/usr/sbin/sshd");
   });
 });
 
