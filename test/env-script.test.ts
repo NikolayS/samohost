@@ -8,6 +8,10 @@ import {
   buildEnvCreateScript,
   buildEnvDestroyScript,
   buildHostPrepScript,
+  buildCustomDomainVhostScript,
+  buildCustomDomainVhostRemoveScript,
+  buildControlPlaneCustomDomainVhostScript,
+  buildControlPlaneCustomDomainVhostRemoveScript,
   envsRoot,
   type EnvScriptTarget,
 } from "../src/env/script.ts";
@@ -3197,5 +3201,166 @@ describe("#101: envfile phase runs all env-dir writes as appUser (complete whack
     // defines it with SAMOHOST_DB_NAME and SAMOHOST_ENV_DB_VARS from the db phase).
     expect(block).toContain("samohost_rewire_db_vars");
     expect(bashSyntaxOk(s)).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Custom-domain vhost scripts (domain add / domain rm)
+// ---------------------------------------------------------------------------
+
+describe("buildCustomDomainVhostScript", () => {
+  const nodeApp = (): AppRecord => ({
+    id: "app-1",
+    vmId: "vm-1",
+    name: "field-record",
+    repo: "Tanya301/field-record-1",
+    branch: "main",
+    appDir: "/opt/field-record/app",
+    buildCmd: "npm run build",
+    healthUrl: "http://localhost:3000/api/version",
+    serviceUnit: "field-record",
+  });
+
+  const staticApp = (): AppRecord => ({
+    ...nodeApp(),
+    kind: "static",
+    healthUrl: "http://localhost:80/",
+  });
+
+  test("node app vhost uses http:// scheme (HTTP-only) not tls internal", () => {
+    // Root cause: the vhost is hit by the CONTROL PLANE over HTTP (:80), so it
+    // must NOT use 'tls internal' (which would redirect :80 → :443, breaking
+    // the control-plane → app-VM hop).
+    const s = buildCustomDomainVhostScript(nodeApp(), "myapp.com");
+    expect(s).toContain("http://myapp.com");
+    expect(s).not.toContain("tls internal");
+    expect(bashSyntaxOk(s)).toBe(true);
+  });
+
+  test("static app vhost uses http:// scheme and file_server (not tls internal)", () => {
+    const s = buildCustomDomainVhostScript(staticApp(), "myapp.com");
+    expect(s).toContain("http://myapp.com");
+    expect(s).not.toContain("tls internal");
+    expect(s).toContain("file_server");
+    expect(bashSyntaxOk(s)).toBe(true);
+  });
+
+  test("snippet path is sites.d/10-domain-<label>.caddy (dots replaced with dashes)", () => {
+    const s = buildCustomDomainVhostScript(nodeApp(), "myapp.com");
+    expect(s).toContain("10-domain-myapp-com.caddy");
+  });
+
+  test("reload caddy via systemctl (not 'caddy validate' — hardened-VM NOPASSWD bug)", () => {
+    const s = buildCustomDomainVhostScript(nodeApp(), "myapp.com");
+    expect(s).toContain("systemctl reload caddy");
+    expect(s).not.toContain("caddy validate");
+  });
+});
+
+describe("buildCustomDomainVhostRemoveScript", () => {
+  test("removes sites.d snippet and reloads Caddy", () => {
+    const s = buildCustomDomainVhostRemoveScript("myapp.com");
+    expect(s).toContain("10-domain-myapp-com.caddy");
+    expect(s).toContain("systemctl reload caddy");
+    expect(bashSyntaxOk(s)).toBe(true);
+  });
+});
+
+describe("buildControlPlaneCustomDomainVhostScript", () => {
+  test("snippet routes custom domain → app VM IP:80 with tls internal", () => {
+    // Control-plane block: CF → CP:443 (tls internal) → app VM:80 (HTTP)
+    const s = buildControlPlaneCustomDomainVhostScript(
+      "myapp.com",
+      "1.2.3.4",
+      "field-record-1.samo.team",
+    );
+    // Must include the custom domain as the vhost name
+    expect(s).toContain("myapp.com");
+    // Must use tls internal (CF Full mode accepts self-signed on the origin)
+    expect(s).toContain("tls internal");
+    // Must proxy to the app VM IP on port 80
+    expect(s).toContain("1.2.3.4:80");
+    // Valid bash
+    expect(bashSyntaxOk(s)).toBe(true);
+  });
+
+  test("uses mainHost as the upstream Host header when provided", () => {
+    const s = buildControlPlaneCustomDomainVhostScript(
+      "myapp.com",
+      "1.2.3.4",
+      "field-record-1.samo.team",
+    );
+    // Rewrites Host header to the mainHost so the app VM routes via its
+    // existing mainHost HTTP vhost (no new app-VM vhost required).
+    expect(s).toContain("field-record-1.samo.team");
+    // header_up Host <mainHost> must be present (not {host} in this case)
+    expect(s).toContain("header_up");
+  });
+
+  test("when httpHost equals fqdn (no mainHost available), still passes Host header", () => {
+    // When the caller passes fqdn as httpHost (no mainHost), the snippet should
+    // still include a header_up directive (can be 'header_up Host {host}' or
+    // 'header_up Host myapp.com' — either is correct and both route correctly).
+    const s = buildControlPlaneCustomDomainVhostScript(
+      "myapp.com",
+      "1.2.3.4",
+      "myapp.com",  // httpHost === fqdn
+    );
+    expect(s).toContain("header_up");
+    expect(s).toContain("1.2.3.4:80");
+    expect(bashSyntaxOk(s)).toBe(true);
+  });
+
+  test("snippet is written to sites.d/ on the control plane with correct path", () => {
+    const s = buildControlPlaneCustomDomainVhostScript(
+      "myapp.com",
+      "1.2.3.4",
+      "field-record-1.samo.team",
+    );
+    // Snippet goes into /etc/caddy/sites.d/
+    expect(s).toContain("/etc/caddy/sites.d/");
+    // Named 10-domain-myapp-com.caddy
+    expect(s).toContain("10-domain-myapp-com.caddy");
+  });
+
+  test("ensures sites.d/ exists and adds import to Caddyfile (idempotent)", () => {
+    const s = buildControlPlaneCustomDomainVhostScript(
+      "myapp.com",
+      "1.2.3.4",
+      "field-record-1.samo.team",
+    );
+    // Creates sites.d if missing
+    expect(s).toContain("mkdir");
+    expect(s).toContain("sites.d");
+    // Appends 'import sites.d/*.caddy' to Caddyfile if not already present
+    expect(s).toContain("import sites.d");
+    expect(s).toContain("Caddyfile");
+  });
+
+  test("reloads Caddy via systemctl (not 'caddy validate')", () => {
+    const s = buildControlPlaneCustomDomainVhostScript(
+      "myapp.com",
+      "1.2.3.4",
+      "field-record-1.samo.team",
+    );
+    expect(s).toContain("systemctl reload caddy");
+    expect(s).not.toContain("caddy validate");
+  });
+});
+
+describe("buildControlPlaneCustomDomainVhostRemoveScript", () => {
+  test("removes sites.d snippet on the control plane and reloads Caddy", () => {
+    const s = buildControlPlaneCustomDomainVhostRemoveScript("myapp.com");
+    expect(s).toContain("10-domain-myapp-com.caddy");
+    expect(s).toContain("sites.d");
+    expect(s).toContain("systemctl reload caddy");
+    expect(bashSyntaxOk(s)).toBe(true);
+  });
+
+  test("does not remove the Caddyfile import (only the per-domain snippet)", () => {
+    const s = buildControlPlaneCustomDomainVhostRemoveScript("myapp.com");
+    // import line is NOT removed — it's persistent infrastructure
+    expect(s).not.toContain("sed");
+    expect(s).not.toContain("grep -v");
   });
 });

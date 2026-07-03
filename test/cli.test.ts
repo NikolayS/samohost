@@ -292,3 +292,85 @@ describe("main (exit codes & output)", () => {
     expect(err).toContain("error:");
   });
 });
+
+// ---------------------------------------------------------------------------
+// parseDomainSearch — UsageError paths and --json flag (Finding 3)
+// ---------------------------------------------------------------------------
+
+describe("parseDomainSearch via parseArgs", () => {
+  test("missing fqdn throws UsageError", () => {
+    expect(() => parseArgs(["domain", "search"])).toThrow(UsageError);
+    expect(() => parseArgs(["domain", "search"])).toThrow(
+      "domain search requires <fqdn>",
+    );
+  });
+
+  test("unknown flag throws UsageError", () => {
+    expect(() =>
+      parseArgs(["domain", "search", "--bad-flag"]),
+    ).toThrow(UsageError);
+    expect(() =>
+      parseArgs(["domain", "search", "--bad-flag"]),
+    ).toThrow("unknown flag");
+  });
+
+  test("extra positional argument throws UsageError", () => {
+    expect(() =>
+      parseArgs(["domain", "search", "a.com", "b.com"]),
+    ).toThrow(UsageError);
+    expect(() =>
+      parseArgs(["domain", "search", "a.com", "b.com"]),
+    ).toThrow("unexpected extra argument");
+  });
+
+  test("--json flag sets json:true in parsed result", () => {
+    const cmd = parseArgs(["domain", "search", "a.com", "--json"]);
+    expect(cmd.kind).toBe("domain-search");
+    if (cmd.kind === "domain-search") {
+      expect(cmd.json).toBe(true);
+      expect(cmd.input.fqdn).toBe("a.com");
+    }
+  });
+
+  test("without --json flag, json is false", () => {
+    const cmd = parseArgs(["domain", "search", "example.com"]);
+    expect(cmd.kind).toBe("domain-search");
+    if (cmd.kind === "domain-search") {
+      expect(cmd.json).toBe(false);
+      expect(cmd.input.fqdn).toBe("example.com");
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// parseDomainAdd — default DCV method must be txt (bug #114)
+// ---------------------------------------------------------------------------
+
+describe("parseDomainAdd via parseArgs — DCV default", () => {
+  test("without --dcv flag, dcv defaults to txt (not http)", () => {
+    // Root cause: our control plane serves HTTPS-only, so http-DCV stalls
+    // and the cert never issues. Default must be txt so the CNAME delegation
+    // path is used instead of the unreachable /.well-known/ path.
+    const cmd = parseArgs(["domain", "add", "field-record", "myapp.com"]);
+    expect(cmd.kind).toBe("domain-add");
+    if (cmd.kind === "domain-add") {
+      expect(cmd.input.dcv).toBe("txt");
+    }
+  });
+
+  test("--dcv http explicit override still works", () => {
+    const cmd = parseArgs(["domain", "add", "field-record", "myapp.com", "--dcv", "http"]);
+    expect(cmd.kind).toBe("domain-add");
+    if (cmd.kind === "domain-add") {
+      expect(cmd.input.dcv).toBe("http");
+    }
+  });
+
+  test("--dcv txt explicit still works", () => {
+    const cmd = parseArgs(["domain", "add", "field-record", "myapp.com", "--dcv", "txt"]);
+    expect(cmd.kind).toBe("domain-add");
+    if (cmd.kind === "domain-add") {
+      expect(cmd.input.dcv).toBe("txt");
+    }
+  });
+});

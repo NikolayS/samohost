@@ -96,11 +96,14 @@ import {
   runDomainCheck,
   runDomainList,
   runDomainRm,
+  runDomainSearch,
   defaultDomainDeps,
+  defaultDomainSearchDeps,
   type DomainAddInput,
   type DomainCheckInput,
   type DomainListInput,
   type DomainRmInput,
+  type DomainSearchInput,
 } from "./commands/domain.ts";
 import { DomainStore } from "./state/domains.ts";
 import { HetznerProvider } from "./providers/hetzner.ts";
@@ -347,15 +350,32 @@ trigger run options (samo-level auto-deploy poller — replaces per-client on-bo
   skipped, would-deploy}; exit 1 when any deploy returned non-zero or threw.
 
 domain options (custom client domains via Cloudflare for SaaS):
-  samohost domain add   <app> <fqdn> [--dcv http|txt] [--json]
+  samohost domain search <fqdn> [--json]
+  samohost domain add   <app> <fqdn> [--dcv txt|http] [--json]
   samohost domain check <fqdn> [--json]
   samohost domain list  [--app <name>] [--json]
   samohost domain rm    <fqdn> [--yes] [--json]
 
+  search  — check domain availability via RDAP (modern WHOIS).
+            Queries https://rdap.org/domain/<fqdn> (redirects to authoritative
+            RDAP server automatically). No credentials required.
+            Results: available / taken / unknown
+              available — HTTP 404: domain not found in registry.
+                          CAVEAT: rdap.org returns 404 both for unregistered
+                          domains and for TLDs with no RDAP support; the two
+                          cases are indistinguishable at runtime. A note is
+                          printed; verify with the registrar if uncertain.
+              taken     — HTTP 200: domain is registered
+              unknown   — any other HTTP status, or network/timeout error
+            No pricing information; availability only.
   add     — create a CF-for-SaaS Custom Hostname for the client FQDN, write
             a Caddy vhost snippet on the app VM, and print CNAME + DCV
-            instructions. Requires CLOUDFLARE_CUSTOM_HOSTNAMES (SSL:Edit token).
+            instructions. Requires CLOUDFLARE_SAMOTEAM (SSL:Edit token).
             Degrades cleanly when the token is absent (warn; still writes vhost).
+            --dcv txt  (default) DCV via CNAME delegation (_acme-challenge.<fqdn>
+                       → dcv_delegation_records target). Works on HTTPS-only CPs.
+            --dcv http explicit override: serve /.well-known/pki-validation/ on
+                       port 80. Stalls on our control plane (HTTPS-only).
   check   — refresh CF ssl.status + hostname status, probe public DNS CNAME.
             Exit 0 only when both are "active". Exit 1 while still pending.
   list    — table of stored custom domain → app mappings (no network).
@@ -364,7 +384,7 @@ domain options (custom client domains via Cloudflare for SaaS):
             --yes         skip typed confirmation
 
   GATE: CF-for-SaaS Custom Hostnames require the SaaS entitlement on the zone
-  and a token with SSL and Certificates:Edit scope (CLOUDFLARE_CUSTOM_HOSTNAMES).
+  and a token with SSL and Certificates:Edit scope (CLOUDFLARE_SAMOTEAM).
   The CLOUDFLARE_SAMOCAT token is DNS-only and cannot create custom hostnames.
   Set SAMOHOST_SAAS_ZONE_ID or SAMOHOST_SAAS_ZONE (default: samo.team).
   Set SAMOHOST_CUSTOM_HOSTNAME_TARGET (default: cname.samo.team).
@@ -554,6 +574,12 @@ export interface ParsedDomainRm {
   json: boolean;
 }
 
+export interface ParsedDomainSearch {
+  kind: "domain-search";
+  input: DomainSearchInput;
+  json: boolean;
+}
+
 export type ParsedCommand =
   | ParsedPreview
   | ParsedPreviewRebuild
@@ -584,6 +610,7 @@ export type ParsedCommand =
   | ParsedDomainCheck
   | ParsedDomainList
   | ParsedDomainRm
+  | ParsedDomainSearch
   | { kind: "help" }
   | { kind: "version" };
 
@@ -1907,9 +1934,9 @@ function parseTriggerRun(args: string[]): ParsedTriggerRun {
 // domain group
 // ---------------------------------------------------------------------------
 
-type DomainSub = "add" | "check" | "list" | "rm";
+type DomainSub = "add" | "check" | "list" | "rm" | "search";
 
-const DOMAIN_SUBS: readonly DomainSub[] = ["add", "check", "list", "rm"];
+const DOMAIN_SUBS: readonly DomainSub[] = ["add", "check", "list", "rm", "search"];
 
 function parseDomain(args: string[]): ParsedCommand {
   const sub = args[0];
@@ -1931,13 +1958,33 @@ function parseDomain(args: string[]): ParsedCommand {
       return parseDomainList(rest);
     case "rm":
       return parseDomainRm(rest);
+    case "search":
+      return parseDomainSearch(rest);
   }
+}
+
+function parseDomainSearch(args: string[]): ParsedDomainSearch {
+  let fqdn: string | undefined;
+  let json = false;
+
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i]!;
+    if (a === "--json") { json = true; continue; }
+    if (a.startsWith("-")) throw new UsageError(`unknown flag: ${a}`);
+    if (fqdn === undefined) { fqdn = a; continue; }
+    throw new UsageError(`unexpected extra argument: ${a}`);
+  }
+
+  if (fqdn === undefined) throw new UsageError("domain search requires <fqdn>");
+  return { kind: "domain-search", input: { fqdn }, json };
 }
 
 function parseDomainAdd(args: string[]): ParsedDomainAdd {
   let app: string | undefined;
   let fqdn: string | undefined;
-  let dcv: "http" | "txt" = "http";
+  // Default is txt: our control plane serves HTTPS-only, so http-DCV stalls.
+  // txt-DCV uses a CNAME record at _acme-challenge.<fqdn> (always resolvable).
+  let dcv: "http" | "txt" = "txt";
   let json = false;
 
   for (let i = 0; i < args.length; i++) {
@@ -2300,6 +2347,14 @@ export async function main(
         defaultAppStore(),
         new DomainStore(),
         defaultDomainDeps(),
+        out,
+        err,
+      );
+    case "domain-search":
+      return runDomainSearch(
+        cmd.input,
+        { json: cmd.json },
+        defaultDomainSearchDeps(),
         out,
         err,
       );

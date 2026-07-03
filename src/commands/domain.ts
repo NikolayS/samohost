@@ -17,7 +17,7 @@
  *
  * CF entitlement GATE (see docs/setup-checklist.md):
  *   CF-for-SaaS Custom Hostnames require the SaaS entitlement on the SaaS zone
- *   and a token with SSL and Certificates:Edit scope (`CLOUDFLARE_CUSTOM_HOSTNAMES`).
+ *   and a token with SSL and Certificates:Edit scope (`CLOUDFLARE_SAMOTEAM`).
  *   The existing CLOUDFLARE_SAMOCAT token is DNS-only and CANNOT create custom
  *   hostnames. When the token is absent, `add`/`check`/`rm` degrade cleanly
  *   (warn, still write vhost + state), identical to the DNS_DEGRADE_WARNING
@@ -36,6 +36,8 @@ import {
 import {
   buildCustomDomainVhostScript,
   buildCustomDomainVhostRemoveScript,
+  buildControlPlaneCustomDomainVhostScript,
+  buildControlPlaneCustomDomainVhostRemoveScript,
 } from "../env/script.ts";
 import { AppStore } from "../state/apps.ts";
 import { DomainStore } from "../state/domains.ts";
@@ -54,9 +56,9 @@ import type { AppRecord, DomainRecord, VmRecord } from "../types.ts";
 
 const CUSTOM_HOSTNAME_TARGET_DEFAULT = "cname.samo.team";
 
-/** Warning printed when CLOUDFLARE_CUSTOM_HOSTNAMES token is absent (GATE). */
+/** Warning printed when CLOUDFLARE_SAMOTEAM token is absent (GATE). */
 const CF_DEGRADE_WARNING =
-  "samohost: CLOUDFLARE_CUSTOM_HOSTNAMES not set — " +
+  "samohost: CLOUDFLARE_SAMOTEAM not set — " +
   "skipping Cloudflare Custom Hostname creation (CF-for-SaaS entitlement + " +
   "SSL:Edit token required); Caddy vhost and state record will be created " +
   "but the domain will not be validated by Cloudflare until the token is set";
@@ -70,7 +72,7 @@ export interface DomainAddInput {
   app: string;
   /** Client FQDN (e.g. "myapp.com"). */
   fqdn: string;
-  /** DCV method for CF custom hostname: "http" (default) or "txt". */
+  /** DCV method for CF custom hostname: "txt" (default) or "http" (explicit override). */
   dcv: "http" | "txt";
 }
 
@@ -98,21 +100,39 @@ export type RemoteScriptRunner = (
   script: string,
 ) => Promise<SpawnResult>;
 
+/**
+ * Run a bash script locally on the control plane (`bash -s` with script on
+ * stdin).  Unlike {@link RemoteScriptRunner} this does not take a VmRecord —
+ * the control plane is always the local machine where samohost runs.
+ */
+export type ControlPlaneScriptRunner = (script: string) => Promise<SpawnResult>;
+
 // ---------------------------------------------------------------------------
 // DomainDeps — injectable for offline tests
 // ---------------------------------------------------------------------------
 
 export interface DomainDeps {
   /**
-   * Cloudflare for SaaS client; `undefined` when CLOUDFLARE_CUSTOM_HOSTNAMES
+   * Cloudflare for SaaS client; `undefined` when CLOUDFLARE_SAMOTEAM
    * is absent (GATE degrade — the command still writes vhost + state).
    *
    * Typed as the narrow {@link CustomHostnameClient} port so tests can inject
    * plain mock objects without constructing a full `CloudflareDns` instance.
    */
   cf: CustomHostnameClient | undefined;
-  /** Run a bash script remotely over the pinned SSH runner. */
+  /** Run a bash script remotely over the pinned SSH runner (app VM side). */
   remote: RemoteScriptRunner;
+  /**
+   * Run a bash script locally on the control plane.
+   *
+   * The root-cause fix (PR #114): CF-for-SaaS routes custom-hostname traffic
+   * to the control-plane origin (cname.samo.team → 91.99.233.145), not the
+   * app VM.  Without a matching Caddy block on the control plane the custom
+   * domain goes CF-active but returns a CF error page because the CP Caddy has
+   * no route for the domain.  `domain add` MUST write the routing snippet on
+   * the control plane; `domain rm` MUST remove it.
+   */
+  controlPlane: ControlPlaneScriptRunner;
   /** DNS CNAME lookup — injected so tests run offline. */
   resolveCname: (fqdn: string) => Promise<string[]>;
   now: () => Date;
@@ -154,9 +174,18 @@ function buildDnsInstructions(
 
   if (ch !== undefined) {
     const validationRecords = ch.ssl.validation_records ?? [];
+    const dcvDelegationRecords = ch.ssl.dcv_delegation_records ?? [];
     const ownershipVerification = ch.ownership_verification;
-    if (validationRecords.length > 0 || ownershipVerification !== undefined) {
+
+    const hasRecords =
+      validationRecords.length > 0 ||
+      dcvDelegationRecords.length > 0 ||
+      ownershipVerification !== undefined;
+
+    if (hasRecords) {
       lines.push("Verify ownership (until SSL shows active):");
+
+      // http-DCV: serve challenge file on port 80 (explicit --dcv http override)
       for (const r of validationRecords) {
         if (r.http_url !== undefined) {
           lines.push(`  HTTP: serve ${JSON.stringify(r.http_body ?? "")} at ${r.http_url}`);
@@ -165,6 +194,17 @@ function buildDnsInstructions(
           lines.push(`  TXT:  ${r.txt_name} = ${r.txt_value ?? ""}`);
         }
       }
+
+      // txt-DCV: CNAME delegation record so CF can complete ACME DCV via DNS.
+      // This is the primary required record when method=txt (default).
+      // _acme-challenge.<fqdn> CNAME → <hash>.dcv.cloudflare.com
+      for (const d of dcvDelegationRecords) {
+        lines.push(
+          `  DCV CNAME: ${d.cname}  →  ${d.cname_target}`,
+        );
+      }
+
+      // Ownership TXT: always required regardless of DCV method
       if (ownershipVerification !== undefined) {
         lines.push(
           `  Ownership TXT: ${ownershipVerification.name} = ${ownershipVerification.value}`,
@@ -266,7 +306,9 @@ export async function runDomainAdd(
     err(CF_DEGRADE_WARNING);
   }
 
-  // ---- push Caddy vhost snippet over SSH -----------------------------------
+  // ---- push Caddy vhost snippet over SSH to the app VM --------------------
+  // The app VM vhost uses http:// (plain HTTP) so the control-plane hop on
+  // :80 is accepted without a TLS redirect.
   try {
     const script = buildCustomDomainVhostScript(app, input.fqdn);
     const result = await deps.remote(vm, script);
@@ -280,6 +322,39 @@ export async function runDomainAdd(
   } catch (e) {
     err(
       `error: remote vhost script connection failed: ` +
+        `${e instanceof Error ? e.message : String(e)}`,
+    );
+    return 1;
+  }
+
+  // ---- write control-plane routing snippet (root-cause fix) ----------------
+  // CF-for-SaaS routes custom-hostname traffic to the control-plane origin
+  // (cname.samo.team → 91.99.233.145).  The CP Caddy must have a block that
+  // routes <fqdn> → <app VM ip>:80.  Without this block the domain goes
+  // CF-active but returns a CF error page (app VM is never hit).
+  //
+  // httpHost: prefer app.mainHost (the existing HTTP vhost on the app VM that
+  // the CP can route to without writing a new app-VM vhost for the custom
+  // domain).  Fall back to the custom FQDN itself (the app VM HTTP vhost for
+  // the custom domain written above handles it in that case).
+  try {
+    const httpHost = app.mainHost ?? input.fqdn;
+    const cpScript = buildControlPlaneCustomDomainVhostScript(
+      input.fqdn,
+      vm.ip,
+      httpHost,
+    );
+    const cpResult = await deps.controlPlane(cpScript);
+    if (cpResult.code !== 0) {
+      err(
+        `error: control-plane vhost script failed (exit ${cpResult.code}): ` +
+          cpResult.stderr,
+      );
+      return 1;
+    }
+  } catch (e) {
+    err(
+      `error: control-plane vhost script failed: ` +
         `${e instanceof Error ? e.message : String(e)}`,
     );
     return 1;
@@ -552,7 +627,7 @@ export async function runDomainRm(
     ? vmStore.list().find((v) => v.id === stored.vmId)
     : undefined;
 
-  // ---- push vhost removal script -------------------------------------------
+  // ---- push vhost removal script to app VM ---------------------------------
   if (vm !== undefined) {
     try {
       const script = buildCustomDomainVhostRemoveScript(input.fqdn);
@@ -573,6 +648,28 @@ export async function runDomainRm(
     }
   }
 
+  // ---- remove control-plane routing snippet --------------------------------
+  // Mirror of domain add: always attempt to remove the CP snippet even if the
+  // app VM removal failed (non-fatal path above).  CP removal failure is also
+  // non-fatal (continue to remove state), matching the app-VM behaviour.
+  try {
+    const cpScript = buildControlPlaneCustomDomainVhostRemoveScript(input.fqdn);
+    const cpResult = await deps.controlPlane(cpScript);
+    if (cpResult.code !== 0) {
+      err(
+        `warning: control-plane vhost-remove script failed (exit ${cpResult.code}): ` +
+          cpResult.stderr +
+          ` — continuing to remove state`,
+      );
+    }
+  } catch (e) {
+    err(
+      `warning: control-plane vhost-remove script failed: ` +
+        `${e instanceof Error ? e.message : String(e)} — ` +
+        `continuing to remove state`,
+    );
+  }
+
   // ---- remove state --------------------------------------------------------
   domainStore.remove(input.fqdn);
 
@@ -583,6 +680,124 @@ export async function runDomainRm(
   }
 
   return 0;
+}
+
+// ---------------------------------------------------------------------------
+// search — RDAP-based domain availability checker
+// ---------------------------------------------------------------------------
+
+/**
+ * Input for `domain search <fqdn>`.
+ * Only the FQDN is needed — availability is a pure network lookup.
+ */
+export interface DomainSearchInput {
+  fqdn: string;
+}
+
+/**
+ * Injectable fetch for RDAP queries (so tests run offline).
+ * Defaults to `globalThis.fetch` at runtime via {@link defaultDomainSearchDeps}.
+ */
+export interface DomainSearchDeps {
+  fetch: (url: string, init?: RequestInit) => Promise<Response>;
+}
+
+export type DomainAvailability = "available" | "taken" | "unknown";
+
+export interface DomainSearchReport {
+  fqdn: string;
+  status: DomainAvailability;
+  /** Human-readable explanation of the status. */
+  reason: string;
+  /**
+   * Present ONLY when `status === "available"`.
+   *
+   * rdap.org returns HTTP 404 both for genuinely-unregistered domains and for
+   * TLDs whose registries have no RDAP support. The two cases are
+   * runtime-indistinguishable. Callers should surface this caveat to users.
+   */
+  note?: string;
+}
+
+const RDAP_BASE = "https://rdap.org/domain/";
+/** Wall-clock limit for a single RDAP probe (10 s). */
+const RDAP_TIMEOUT_MS = 10_000;
+
+/**
+ * Probe RDAP for domain availability.
+ *
+ * Protocol:
+ *   HTTP 404 → "available" — domain not found in registry.
+ *              CAVEAT: rdap.org also returns 404 for TLDs with no RDAP
+ *              support, so this result can be a false-positive. The report
+ *              includes a `note` field to surface this to callers.
+ *   HTTP 200 → "taken"    — domain is registered
+ *   any other status      → "unknown"  (proxy error, non-RDAP redirect, etc.)
+ *   fetch throws          → "unknown"  (timeout / network error)
+ */
+export async function runDomainSearch(
+  input: DomainSearchInput,
+  opts: { json: boolean },
+  deps: DomainSearchDeps,
+  out: (s: string) => void,
+  err: (s: string) => void,
+): Promise<number> {
+  const url = `${RDAP_BASE}${encodeURIComponent(input.fqdn)}`;
+  let status: DomainAvailability;
+  let reason: string;
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), RDAP_TIMEOUT_MS);
+
+  try {
+    const res = await deps.fetch(url, { signal: controller.signal });
+    clearTimeout(timer);
+
+    if (res.status === 404) {
+      status = "available";
+      reason = "RDAP: 404 — domain not found in registry";
+    } else if (res.status === 200) {
+      status = "taken";
+      reason = "RDAP: 200 — domain is registered";
+    } else {
+      status = "unknown";
+      reason = `RDAP not supported / inconclusive (HTTP ${res.status})`;
+    }
+  } catch (e) {
+    clearTimeout(timer);
+    const msg = e instanceof Error ? e.message : String(e);
+    status = "unknown";
+    reason = `RDAP not supported / inconclusive (network error: ${msg})`;
+    err(`warning: RDAP probe failed for ${input.fqdn}: ${msg}`);
+  }
+
+  const AVAILABLE_NOTE =
+    "note: rdap.org may return 404 for TLDs without RDAP support — " +
+    "verify with the registrar if uncertain";
+
+  const report: DomainSearchReport = {
+    fqdn: input.fqdn,
+    status,
+    reason,
+    ...(status === "available" ? { note: AVAILABLE_NOTE } : {}),
+  };
+
+  if (opts.json) {
+    out(JSON.stringify(report, null, 2));
+  } else {
+    out(`${input.fqdn}: ${status}`);
+    out(reason);
+    if (report.note !== undefined) {
+      out(report.note);
+    }
+  }
+
+  return 0;
+}
+
+/** Default search deps — wires global fetch. */
+export function defaultDomainSearchDeps(): DomainSearchDeps {
+  return { fetch: globalThis.fetch.bind(globalThis) };
 }
 
 // ---------------------------------------------------------------------------
@@ -627,9 +842,25 @@ function defaultRemoteScriptRunner(): RemoteScriptRunner {
   };
 }
 
+/** Run a bash script locally (stdin pipe, no SSH) — for the control plane. */
+function defaultControlPlaneScriptRunner(): ControlPlaneScriptRunner {
+  return async (script: string): Promise<SpawnResult> => {
+    const res = spawnSync("bash", ["-s"], {
+      encoding: "utf8",
+      input: script,
+      maxBuffer: 16 * 1024 * 1024,
+    });
+    return {
+      code: typeof res.status === "number" ? res.status : 255,
+      stdout: res.stdout ?? "",
+      stderr: res.stderr ?? (res.error ? String(res.error.message) : ""),
+    };
+  };
+}
+
 /** Default domain deps — wires CF client from env, real DNS, real SSH. */
 export function defaultDomainDeps(): DomainDeps {
-  const token = process.env["CLOUDFLARE_CUSTOM_HOSTNAMES"];
+  const token = process.env["CLOUDFLARE_SAMOTEAM"];
   const zoneId = process.env["SAMOHOST_SAAS_ZONE_ID"];
   const zoneName = process.env["SAMOHOST_SAAS_ZONE"] ?? "samo.team";
 
@@ -645,6 +876,7 @@ export function defaultDomainDeps(): DomainDeps {
   return {
     cf,
     remote: defaultRemoteScriptRunner(),
+    controlPlane: defaultControlPlaneScriptRunner(),
     resolveCname: async (fqdn: string) => {
       const { resolveCname } = await import("node:dns/promises");
       return resolveCname(fqdn);
