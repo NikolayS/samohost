@@ -123,6 +123,33 @@ const CH_ACTIVE: CustomHostname = {
   },
 };
 
+// Prod-shaped fixture for txt DCV (what CF returns when method=txt).
+// dcv_delegation_records only appears when method=txt; the cname_target
+// is the value the operator must set for _acme-challenge.<fqdn>.
+const CH_PENDING_TXT: CustomHostname = {
+  id: "ch-abc123",
+  hostname: "myapp.com",
+  status: "pending",
+  ssl: {
+    id: "ssl-xyz",
+    status: "pending_validation",
+    method: "txt",
+    validation_records: [],
+    dcv_delegation_records: [
+      {
+        cname: "_acme-challenge.myapp.com",
+        cname_target: "abc123.dcv.cloudflare.com",
+      },
+    ],
+  },
+  ownership_verification: {
+    type: "txt",
+    name: "_cf-custom-hostname.myapp.com",
+    value: "ownership-token-abc",
+  },
+  verification_errors: [],
+};
+
 function makeDeps(overrides: Partial<DomainDeps> = {}): DomainDeps {
   return {
     cf: undefined,
@@ -391,6 +418,56 @@ describe("runDomainAdd", () => {
 
     expect(code).toBe(1);
     expect(errLines.join("\n")).toContain("control-plane");
+  });
+
+  test("txt DCV: DNS instructions include ownership TXT and DCV delegation CNAME", async () => {
+    // Root-cause fix for #114: when method=txt the CF response carries
+    // dcv_delegation_records[].{cname, cname_target}.  The operator must set:
+    //   1. Ownership TXT: _cf-custom-hostname.<fqdn> = <value>   (always present)
+    //   2. DCV delegation CNAME: _acme-challenge.<fqdn> → <cname_target>  (txt only)
+    //   3. Routing CNAME: <fqdn> → cname.samo.team
+    // Without the delegation CNAME the cert never issues even with method=txt.
+    const { vmStore, appStore, domainStore } = makeStores();
+    const { outLines, errLines, out, err } = makeOutput();
+
+    const cfMock = {
+      createCustomHostname: async (_hostname: string, _method?: "http" | "txt") => CH_PENDING_TXT,
+      getCustomHostname: async (_id: string) => CH_PENDING_TXT,
+      listCustomHostnames: async () => [] as CustomHostname[],
+      deleteCustomHostname: async (_id: string) => ({ id: "ch-abc123" }),
+    };
+
+    const input: DomainAddInput = {
+      app: "field-record",
+      fqdn: "myapp.com",
+      dcv: "txt",
+    };
+    const code = await runDomainAdd(
+      input,
+      { json: false },
+      vmStore,
+      appStore,
+      domainStore,
+      makeDeps({ cf: cfMock }),
+      out,
+      err,
+    );
+
+    expect(code).toBe(0);
+    expect(errLines).toHaveLength(0);
+
+    const allOut = outLines.join("\n");
+
+    // Ownership TXT record must be emitted
+    expect(allOut).toContain("_cf-custom-hostname.myapp.com");
+    expect(allOut).toContain("ownership-token-abc");
+
+    // DCV delegation CNAME must be emitted (key new requirement for txt DCV)
+    expect(allOut).toContain("_acme-challenge.myapp.com");
+    expect(allOut).toContain("abc123.dcv.cloudflare.com");
+
+    // Routing CNAME must still be emitted
+    expect(allOut).toContain("cname.samo.team");
   });
 });
 

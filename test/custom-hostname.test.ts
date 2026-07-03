@@ -111,11 +111,14 @@ describe("CloudflareDns.createCustomHostname", () => {
     });
   });
 
-  test("defaults DCV method to 'http'", async () => {
+  test("defaults DCV method to 'txt' (not http — CP serves HTTPS-only, http-DCV stalls)", async () => {
+    // Bug #114: http-DCV requires serving a token at /.well-known/pki-validation/
+    // on plain HTTP port 80. Our control plane is HTTPS-only, so http-DCV
+    // permanently stalls. Default must be txt so the CNAME delegation path is used.
     const f = fakeFetch([ok(CH_PENDING)]);
     await dns(f.fn).createCustomHostname("myapp.com");
     expect(f.calls[0]!.body).toMatchObject({
-      ssl: { method: "http" },
+      ssl: { method: "txt" },
     });
   });
 
