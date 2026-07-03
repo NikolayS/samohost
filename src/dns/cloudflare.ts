@@ -211,6 +211,15 @@ export interface CustomHostname {
       txt_name?: string;
       txt_value?: string;
     }>;
+    /**
+     * Present only when method=txt. Each entry is the CNAME the client must
+     * set so Cloudflare can complete ACME DCV:
+     *   cname: "_acme-challenge.<fqdn>"
+     *   cname_target: "<hash>.dcv.cloudflare.com"
+     *
+     * Without this record the cert never issues even when method=txt is set.
+     */
+    dcv_delegation_records?: Array<{ cname: string; cname_target: string }>;
   };
   ownership_verification?: { type: string; name: string; value: string };
   verification_errors?: string[];
@@ -341,15 +350,21 @@ export class CloudflareDns implements DnsProviderPort {
 
   /**
    * Create a Custom Hostname on this zone, triggering DCV validation for the
-   * client-owned FQDN. The result carries `ssl.validation_records` /
+   * client-owned FQDN. The result carries `ssl.dcv_delegation_records` /
    * `ownership_verification` which the caller surfaces to the client.
    *
    * @param hostname  Client FQDN (e.g. "myapp.com")
-   * @param method    DCV method: "http" (default) or "txt"
+   * @param method    DCV method: "txt" (default) or "http"
+   *
+   * Default is "txt" because our control plane serves HTTPS-only — http-DCV
+   * requires serving a challenge file on plain HTTP port 80, which permanently
+   * stalls on our setup. With method=txt the operator sets a CNAME record at
+   * _acme-challenge.<fqdn> → dcv_delegation_records[].cname_target, which CF
+   * can validate via DNS regardless of whether HTTP port 80 is reachable.
    */
   async createCustomHostname(
     hostname: string,
-    method: "http" | "txt" = "http",
+    method: "http" | "txt" = "txt",
   ): Promise<CustomHostname> {
     return this.call<CustomHostname>("POST", "/custom_hostnames", {
       hostname,

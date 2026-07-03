@@ -351,7 +351,7 @@ trigger run options (samo-level auto-deploy poller — replaces per-client on-bo
 
 domain options (custom client domains via Cloudflare for SaaS):
   samohost domain search <fqdn> [--json]
-  samohost domain add   <app> <fqdn> [--dcv http|txt] [--json]
+  samohost domain add   <app> <fqdn> [--dcv txt|http] [--json]
   samohost domain check <fqdn> [--json]
   samohost domain list  [--app <name>] [--json]
   samohost domain rm    <fqdn> [--yes] [--json]
@@ -372,6 +372,10 @@ domain options (custom client domains via Cloudflare for SaaS):
             a Caddy vhost snippet on the app VM, and print CNAME + DCV
             instructions. Requires CLOUDFLARE_SAMOTEAM (SSL:Edit token).
             Degrades cleanly when the token is absent (warn; still writes vhost).
+            --dcv txt  (default) DCV via CNAME delegation (_acme-challenge.<fqdn>
+                       → dcv_delegation_records target). Works on HTTPS-only CPs.
+            --dcv http explicit override: serve /.well-known/pki-validation/ on
+                       port 80. Stalls on our control plane (HTTPS-only).
   check   — refresh CF ssl.status + hostname status, probe public DNS CNAME.
             Exit 0 only when both are "active". Exit 1 while still pending.
   list    — table of stored custom domain → app mappings (no network).
@@ -1978,7 +1982,9 @@ function parseDomainSearch(args: string[]): ParsedDomainSearch {
 function parseDomainAdd(args: string[]): ParsedDomainAdd {
   let app: string | undefined;
   let fqdn: string | undefined;
-  let dcv: "http" | "txt" = "http";
+  // Default is txt: our control plane serves HTTPS-only, so http-DCV stalls.
+  // txt-DCV uses a CNAME record at _acme-challenge.<fqdn> (always resolvable).
+  let dcv: "http" | "txt" = "txt";
   let json = false;
 
   for (let i = 0; i < args.length; i++) {

@@ -72,7 +72,7 @@ export interface DomainAddInput {
   app: string;
   /** Client FQDN (e.g. "myapp.com"). */
   fqdn: string;
-  /** DCV method for CF custom hostname: "http" (default) or "txt". */
+  /** DCV method for CF custom hostname: "txt" (default) or "http" (explicit override). */
   dcv: "http" | "txt";
 }
 
@@ -174,9 +174,18 @@ function buildDnsInstructions(
 
   if (ch !== undefined) {
     const validationRecords = ch.ssl.validation_records ?? [];
+    const dcvDelegationRecords = ch.ssl.dcv_delegation_records ?? [];
     const ownershipVerification = ch.ownership_verification;
-    if (validationRecords.length > 0 || ownershipVerification !== undefined) {
+
+    const hasRecords =
+      validationRecords.length > 0 ||
+      dcvDelegationRecords.length > 0 ||
+      ownershipVerification !== undefined;
+
+    if (hasRecords) {
       lines.push("Verify ownership (until SSL shows active):");
+
+      // http-DCV: serve challenge file on port 80 (explicit --dcv http override)
       for (const r of validationRecords) {
         if (r.http_url !== undefined) {
           lines.push(`  HTTP: serve ${JSON.stringify(r.http_body ?? "")} at ${r.http_url}`);
@@ -185,6 +194,17 @@ function buildDnsInstructions(
           lines.push(`  TXT:  ${r.txt_name} = ${r.txt_value ?? ""}`);
         }
       }
+
+      // txt-DCV: CNAME delegation record so CF can complete ACME DCV via DNS.
+      // This is the primary required record when method=txt (default).
+      // _acme-challenge.<fqdn> CNAME → <hash>.dcv.cloudflare.com
+      for (const d of dcvDelegationRecords) {
+        lines.push(
+          `  DCV CNAME: ${d.cname}  →  ${d.cname_target}`,
+        );
+      }
+
+      // Ownership TXT: always required regardless of DCV method
       if (ownershipVerification !== undefined) {
         lines.push(
           `  Ownership TXT: ${ownershipVerification.name} = ${ownershipVerification.value}`,
