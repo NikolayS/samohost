@@ -286,8 +286,11 @@ const auditChecks: AuditCheck[] = [
     description: "sshd is listening on the hardened port",
     // Full path (/usr/sbin/sshd) avoids PATH resolution issues when sudo
     // is invoked from a restricted environment (PATH may exclude /usr/sbin).
+    // -n (non-interactive): if NOPASSWD is not configured sudo exits
+    // immediately with "sudo: a password is required" (caught by
+    // PERMISSION_RE → "unknown") rather than hanging waiting for a TTY.
     // Requires NOPASSWD sudoers entry — tracked as infra follow-up D2.
-    probeCommand: "sudo /usr/sbin/sshd -T 2>/dev/null | grep '^port '",
+    probeCommand: "sudo -n /usr/sbin/sshd -T 2>/dev/null | grep '^port '",
     // Concrete port is validated against the spec at audit time; presence here.
     expect: /^port \d+$/m,
     requiresSudo: true,
@@ -295,8 +298,9 @@ const auditChecks: AuditCheck[] = [
   {
     id: "ufw-active",
     description: "ufw is active and default-deny incoming",
-    // Requires NOPASSWD sudoers entry — tracked as infra follow-up D2.
-    probeCommand: "sudo ufw status verbose",
+    // -n non-interactive: exits cleanly with PERMISSION_RE-matchable output
+    // when NOPASSWD is not configured.  Requires NOPASSWD — tracked as D2.
+    probeCommand: "sudo -n ufw status verbose",
     expect: /Status: active/,
     requiresSudo: true,
   },
@@ -331,8 +335,9 @@ const auditChecks: AuditCheck[] = [
   {
     id: "apparmor-enforced",
     description: "AppArmor is enabled with profiles in enforce mode",
-    // Requires NOPASSWD sudoers entry — tracked as infra follow-up D2.
-    probeCommand: "sudo aa-status",
+    // -n non-interactive: exits cleanly with PERMISSION_RE-matchable output
+    // when NOPASSWD is not configured.  Requires NOPASSWD — tracked as D2.
+    probeCommand: "sudo -n aa-status",
     expect: /profiles are in enforce mode/,
     requiresSudo: true,
   },
