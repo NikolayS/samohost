@@ -81,8 +81,9 @@ else
 fi
 
 # --- build ---
+# subshell + cd: a buildCmd that cd's must not leak its cwd into later phases (issue #122).
 echo "<<<SAMOHOST_PHASE:build:start>>>"
-if npm run build; then
+if (cd "$SAMOHOST_APP_DIR" && npm run build); then
   echo "<<<SAMOHOST_PHASE:build:ok>>>"
 else
   echo "<<<SAMOHOST_PHASE:build:fail>>>"
@@ -90,8 +91,9 @@ else
 fi
 
 # --- migrate: apply DB migrations before the new code boots ---
+# subshell + cd: always runs from the app dir, whatever buildCmd cd'd into (issue #122).
 echo "<<<SAMOHOST_PHASE:migrate:start>>>"
-if node --import tsx/esm src/migration-runner-cli.ts; then
+if (cd "$SAMOHOST_APP_DIR" && node --import tsx/esm src/migration-runner-cli.ts); then
   echo "<<<SAMOHOST_PHASE:migrate:ok>>>"
 else
   echo "<<<SAMOHOST_PHASE:migrate:fail>>>"
@@ -142,8 +144,9 @@ else
 fi
 
 # --- seed: idempotent post-deploy seed (only after healthy deploy) ---
+# subshell + cd: always runs from the app dir, whatever earlier commands cd'd into (issue #122).
 echo "<<<SAMOHOST_PHASE:seed:start>>>"
-if npm run db:seed; then
+if (cd "$SAMOHOST_APP_DIR" && npm run db:seed); then
   echo "<<<SAMOHOST_PHASE:seed:ok>>>"
 else
   echo "<<<SAMOHOST_PHASE:seed:fail>>>"
