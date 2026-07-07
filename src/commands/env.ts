@@ -1122,6 +1122,36 @@ export function defaultEnvExecDeps(): EnvExecDeps {
       const detail = res.stderr?.trim() || `exit ${code}`;
       throw new Error(`git ls-remote failed (exit ${code}): ${detail}`);
     },
+    // DBLab engine preflight for the env-create honesty gate (issue #128).
+    //
+    // Runs the full DBLAB_PROBES audit script over ONE pinned SSH connection
+    // (same fail2ban-safety requirement as all audit probes). Reuses
+    // evaluateDblabPreflight for the verdict so the gate and `env preflight`
+    // cannot diverge.
+    //
+    // Returns:
+    //   "READY"   — healthz answers on :2345 AND the dblab CLI resolves.
+    //   "BLOCKED" — healthz dead or CLI missing (engine not running/installed).
+    //   "UNKNOWN" — SSH connection failed or probe output was empty.
+    //
+    // THROWS only on hard SSH setup errors (bad known_hosts, etc.); routine
+    // connection failures (host unreachable, timeout) are caught and returned
+    // as "UNKNOWN" so runEnvCreate can surface a clear message rather than an
+    // unhandled exception.
+    dblabPreflight: async (vm: import("../types.ts").VmRecord): Promise<"READY" | "BLOCKED" | "UNKNOWN"> => {
+      const script = buildAuditScript(DBLAB_PROBES);
+      const runner = defaultRemoteScriptRunner(remoteTimeoutMs);
+      let result: SpawnResult;
+      try {
+        result = await runner(vm, script);
+      } catch {
+        // SSH connection / setup failure → cannot determine engine state.
+        return "UNKNOWN";
+      }
+      const sections = parseAuditOutput(result.stdout, DBLAB_PROBES);
+      const { engine } = evaluateDblabPreflight(sections);
+      return engine;
+    },
   };
 }
 

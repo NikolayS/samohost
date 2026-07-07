@@ -121,14 +121,56 @@ const DBLAB_STARTUP_SH = [
 ].join("\n");
 
 /**
- * /root/.dblab/engine/configs/server.yml — DBLab v4.1.3 engine config.
+ * Options for the DBLab provisioning module factory.
  *
- * Key settings (#127 minimal profile):
- *   port=2345, ARC cap applied separately via modprobe.d, clone cap 2,
- *   per-clone shared_buffers 128 MB, container memory 1 GB,
- *   portPool 6000-6099, source = host PG via Docker bridge, logical retrieval.
+ * All fields are optional: the factory works with zero options (the defaults
+ * produce a server.yml with placeholder variables that the operator must fill
+ * in after provisioning). Providing `sourceDb` bakes the database name into
+ * the generated server.yml at provisioning time so the engine initialises with
+ * the correct source on first boot.
  */
-const DBLAB_SERVER_YML = `# Managed by samohost dblab module — DBLab Engine v${DBLAB_VERSION} config
+export interface DblabModuleOptions {
+  /**
+   * Source database name for the logicalDump retrieval job.
+   *
+   * IMPORTANT: Preview envs MUST use `<app>_template`, NOT `<app>_prod`.
+   * Samograph's live incident (task wdgv5zs85) proved that pointing the
+   * retrieval source at the production DB (`samograph_prod`) prevents the
+   * snapshot from initialising correctly; the template DB
+   * (`samograph_template`) is the correct source for DBLab logical retrieval.
+   *
+   * When provided: baked as a YAML literal (e.g. `dbname: "samograph_template"`).
+   * When absent: a `${DBLAB_SOURCE_DB}` shell placeholder is left in server.yml;
+   *   the operator must replace it before starting the engine.
+   */
+  sourceDb?: string;
+}
+
+/**
+ * Build /root/.dblab/engine/configs/server.yml content.
+ *
+ * Fix 1: poolManager.preSnapshotSuffix: "_pre" is REQUIRED.
+ *   Without it DBLab v4 runs `zfs list ... | grep -v ''`; BusyBox grep (Alpine
+ *   base image) rejects an empty -v pattern with exit 2 → "no available pools"
+ *   → the engine cannot see the ZFS pool → zero clones. This was root-caused
+ *   and fixed live on samograph (task wdgv5zs85).
+ *
+ * Fix 2: poolManager.selectedPool (correct yaml struct tag).
+ *   The old key `pool:` was silently ignored by DBLab — the engine started but
+ *   never attached to the ZFS pool. `selectedPool:` is the correct tag per the
+ *   DBLab v4.1.3 config schema.
+ *
+ * Fix 3: source dbname is config-driven via opts.sourceDb.
+ *   Preview envs connect to <app>_template, not <app>_prod. When sourceDb is
+ *   provided it is baked in directly; otherwise a shell placeholder is left for
+ *   the operator to fill in.
+ */
+function buildServerYml(opts: DblabModuleOptions = {}): string {
+  const dbnameValue = opts.sourceDb !== undefined
+    ? `"${opts.sourceDb}"`
+    : `"\${DBLAB_SOURCE_DB}"`;
+
+  return `# Managed by samohost dblab module — DBLab Engine v${DBLAB_VERSION} config
 # Issue #127: verified minimal profile (cx22, loopback ZFS pool).
 server:
   verificationToken: "\${DBLAB_VERIFICATION_TOKEN}"
@@ -137,7 +179,8 @@ server:
 
 poolManager:
   mountDir: /var/lib/dblab
-  pool: dblab
+  selectedPool: dblab
+  preSnapshotSuffix: "_pre"
 
 provision:
   portPool:
@@ -169,12 +212,13 @@ retrieval:
               connection:
                 host: "${DOCKER_BRIDGE_GW}"
                 port: 5432
-                dbname: "\${DBLAB_SOURCE_DB}"
+                dbname: ${dbnameValue}
                 username: "\${DBLAB_SOURCE_USER}"
       - logicalRestore:
           options: {}
       - logicalSnapshot: {}
 `;
+}
 
 // ---------------------------------------------------------------------------
 // Postgresql pg_hba.conf entry for Docker bridge access
@@ -193,7 +237,7 @@ const PG_HBA_ENTRY =
 // cloud-init fragment builder
 // ---------------------------------------------------------------------------
 
-function buildFragment(spec: ProvisionSpec): CloudInitFragment {
+function buildFragment(spec: ProvisionSpec, opts: DblabModuleOptions = {}): CloudInitFragment {
   const { adminUser } = spec;
 
   const packages: string[] = [
@@ -224,7 +268,7 @@ function buildFragment(spec: ProvisionSpec): CloudInitFragment {
     },
     {
       path: "/root/.dblab/engine/configs/server.yml",
-      content: DBLAB_SERVER_YML,
+      content: buildServerYml(opts),
       permissions: "0600",
       owner: "root:root",
     },
@@ -369,14 +413,40 @@ const auditChecks: AuditCheck[] = [
 // Module export
 // ---------------------------------------------------------------------------
 
-/** DBLab Engine provisioning module (issue #127). */
-export const dblabModule: Module = {
-  name: "dblab",
-  validate(_spec: ProvisionSpec): string[] {
-    // The module is valid for any spec; no required fields beyond what
-    // the hardening baseline already validates.
-    return [];
-  },
-  cloudInitFragment: buildFragment,
-  auditChecks,
-};
+/**
+ * Factory for the DBLab Engine provisioning module (#128).
+ *
+ * Accepts {@link DblabModuleOptions} to configure the generated server.yml at
+ * provisioning time. Providing `sourceDb` bakes the correct retrieval source
+ * database into the YAML (e.g. `"samograph_template"` for preview envs).
+ * When absent, a `${DBLAB_SOURCE_DB}` placeholder is left for the operator.
+ *
+ * Usage:
+ *   // Preview env — uses the template DB (not prod):
+ *   const mod = makeDblabModule({ sourceDb: "samograph_template" });
+ *
+ *   // Operator fills in source DB post-provisioning (back-compat):
+ *   const mod = makeDblabModule({});
+ */
+export function makeDblabModule(opts: DblabModuleOptions = {}): Module {
+  return {
+    name: "dblab",
+    validate(_spec: ProvisionSpec): string[] {
+      // The module is valid for any spec; no required fields beyond what
+      // the hardening baseline already validates.
+      return [];
+    },
+    cloudInitFragment: (spec: ProvisionSpec) => buildFragment(spec, opts),
+    auditChecks,
+  };
+}
+
+/**
+ * Default DBLab Engine provisioning module (issue #127).
+ *
+ * Uses a `${DBLAB_SOURCE_DB}` placeholder for the retrieval source database —
+ * the operator must replace it in /root/.dblab/engine/configs/server.yml before
+ * starting the engine. Use `makeDblabModule({ sourceDb: "<app>_template" })`
+ * when provisioning via samohost to bake the correct DB name in at build time.
+ */
+export const dblabModule: Module = makeDblabModule({});
