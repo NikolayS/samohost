@@ -1,8 +1,6 @@
 /**
  * tests for `samohost onboard <org/repo>` (issue #127 — client-onboarding package)
  *
- * RED commit: all assertions written; src/commands/onboard.ts does not exist yet.
- *
  * Coverage:
  *   - parseArgs: `onboard <repo> --vm <name>` parses to {kind:"onboard", input}
  *   - parseArgs: missing <repo> positional → UsageError
@@ -15,23 +13,36 @@
  *   - template rendering: ci.yml runner-tag placeholder substituted
  *   - template rendering: CLAUDE.md contains both sync-block markers
  *   - template rendering: staging.env.example exists and has non-empty content
+ *   - exit-code honesty: non-zero when appRegistered=false or triggerCovered=false
+ *   - ci.yml template: NO #117 / AppArmor / host-PG markers (real content check)
+ *   - ci.yml template: comment is correct (scaffold-time substitution, not repo variable)
+ *   - ci.yml template: default runs-on has no duplicate self-hosted label
+ *   - re-onboard clobber: existing .samohost.toml is never overwritten
+ *   - findPr: surfaces non-200 GitHub API errors instead of silently returning null
  */
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
-import { parseArgs, UsageError } from "../src/cli.ts";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
+import { parseArgs, UsageError, main } from "../src/cli.ts";
 import {
   runOnboard,
   renderTemplate,
   TEMPLATE_FILES,
+  defaultOnboardDeps,
   type OnboardInput,
   type OnboardDeps,
 } from "../src/commands/onboard.ts";
 import { AppStore } from "../src/state/apps.ts";
 import { StateStore } from "../src/state/store.ts";
 import type { VmRecord } from "../src/types.ts";
+
+const TEMPLATES_DIR = join(
+  dirname(fileURLToPath(import.meta.url)),
+  "../templates/client-repo",
+);
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -399,8 +410,140 @@ describe("renderTemplate", () => {
 
   test("ci.yml template has no #117 AppArmor workaround markers", () => {
     // The raw ci.yml template content must not reference issue #117 or
-    // AppArmor or 'host-PG fallback' — those are field-record-1 one-offs.
-    const ciContent = TEMPLATE_FILES; // we just verify the constant is exported
-    expect(Array.isArray(ciContent)).toBe(true);
+    // AppArmor or host-PG markers — those are field-record-1 one-offs.
+    const ciContent = readFileSync(
+      join(TEMPLATES_DIR, ".github/workflows/ci.yml"),
+      "utf8",
+    );
+    expect(ciContent).not.toContain("#117");
+    expect(ciContent).not.toContain("AppArmor");
+    expect(ciContent).not.toContain("apparmor");
+    expect(ciContent).not.toContain("host-PG");
+    expect(ciContent).not.toContain("host_pg");
+  });
+
+  test("ci.yml template comment is correct: scaffold-time substitution, NOT a repository variable", () => {
+    const ciContent = readFileSync(
+      join(TEMPLATES_DIR, ".github/workflows/ci.yml"),
+      "utf8",
+    );
+    // The comment must NOT claim RUNNER_TAG is a "repository variable" — it is a
+    // scaffold-time {{RUNNER_TAG}} substitution performed by `samohost onboard`.
+    expect(ciContent).not.toContain("repository variable");
+  });
+
+  test("ci.yml default runs-on has no duplicate self-hosted label", () => {
+    const ciContent = readFileSync(
+      join(TEMPLATES_DIR, ".github/workflows/ci.yml"),
+      "utf8",
+    );
+    // When rendered with the default RUNNER_TAG="self-hosted", the runs-on line
+    // must not produce [self-hosted, "self-hosted"] (a duplicate label).
+    const rendered = renderTemplate(ciContent, {});
+    expect(rendered).not.toContain('[self-hosted, "self-hosted"]');
+    expect(rendered).not.toContain("[self-hosted, 'self-hosted']");
+    // The rendered output must still reference self-hosted
+    expect(rendered).toContain("self-hosted");
+  });
+});
+
+// Note: exit-code honesty tests live in test/onboard-exit-code.test.ts
+// (separate file so an import-level failure doesn't suppress other tests).
+
+// ---------------------------------------------------------------------------
+// RE-ONBOARD CLOBBER GUARD: existing .samohost.toml must not be overwritten
+// ---------------------------------------------------------------------------
+
+describe("re-onboard clobber guard", () => {
+  let tmpDir: string;
+  let vmStore: StateStore;
+  let appStore: AppStore;
+
+  beforeEach(() => {
+    tmpDir = mkdtempSync(join(tmpdir(), "samohost-clobber-"));
+    vmStore = new StateStore(join(tmpDir, "state.json"));
+    appStore = new AppStore(join(tmpDir, "apps.json"));
+    vmStore.upsert({
+      id: "vm-clob-1",
+      provider: "hetzner",
+      providerId: "999003",
+      name: "samo-we-acme",
+      ip: "1.2.3.6",
+      sshKeyPath: "/home/fixture/.ssh/id_ed25519",
+      sshPort: 2223,
+      sshUser: "agent",
+      hostKeyFingerprint: "SHA256:" + "D".repeat(43),
+      region: "nbg1",
+      type: "cx22",
+      modules: [],
+      lifecycleState: "adopted",
+      createdAt: "2026-01-01T00:00:00.000Z",
+      updatedAt: "2026-01-01T00:00:00.000Z",
+    });
+  });
+
+  afterEach(() => {
+    rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  test("re-onboard when .samohost.toml already exists → scaffoldFile NOT called for .samohost.toml", async () => {
+    const customToml = SAMPLE_TOML + "\n# client-customized: do not overwrite\n";
+    let samoTomlScaffoldCalls = 0;
+    const deps = fakeDeps({
+      // Repo already has a .samohost.toml — return custom content for that path
+      fetchRepoFile: async (_repo, path) => {
+        if (path === ".samohost.toml") return customToml;
+        return null;
+      },
+      scaffoldFile: async (_repo, _branch, path, _content) => {
+        if (path === ".samohost.toml") {
+          samoTomlScaffoldCalls++;
+        }
+      },
+    });
+    const c = capture();
+    const report = await runOnboard(
+      { repo: "acme-org/acme-web", vm: "samo-we-acme" },
+      deps,
+      vmStore,
+      appStore,
+      c.out,
+      c.err,
+    );
+
+    // The onboard must succeed
+    expect(report.status).not.toBe("error");
+    // .samohost.toml must NOT be scaffolded when it already exists in the repo
+    expect(samoTomlScaffoldCalls).toBe(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// findPr: must surface non-200 GitHub API errors
+// ---------------------------------------------------------------------------
+
+describe("defaultOnboardDeps().findPr surfaces API errors", () => {
+  test("findPr throws on non-200 response instead of silently returning null", async () => {
+    const originalFetch = globalThis.fetch;
+    // Temporarily set a valid token so ghHeaders() doesn't throw
+    const originalToken = process.env["GITHUB_TOKEN"];
+    process.env["GITHUB_TOKEN"] = "test-token-placeholder";
+    try {
+      globalThis.fetch = async () =>
+        new Response("Internal Server Error", { status: 500 });
+      const deps = defaultOnboardDeps();
+      // findPr must throw on a 500 (transient API error), not silently return null.
+      // Returning null routes incorrectly to createPr, risking duplicate PRs.
+      await expect(
+        deps.findPr("acme-org/acme-web", "samohost-onboarding"),
+      ).rejects.toThrow();
+    } finally {
+      globalThis.fetch = originalFetch;
+      if (originalToken === undefined) {
+        delete process.env["GITHUB_TOKEN"];
+      } else {
+        process.env["GITHUB_TOKEN"] = originalToken;
+      }
+    }
   });
 });
