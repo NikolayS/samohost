@@ -1,5 +1,12 @@
 import { describe, expect, test } from "bun:test";
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  writeFileSync,
+} from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
 import { buildDeployScript } from "../src/app/script.ts";
@@ -350,5 +357,114 @@ describe("buildDeployScript — static path (kind='static')", () => {
     expect(script).toContain("sudo /usr/bin/systemctl restart");
     expect(script).not.toContain("reload caddy");
     expect(script).not.toContain("caddy-reload");
+  });
+});
+
+// ============================================================================
+// Issue #122: deploy-script cwd leak between phases.
+//
+// The generated script runs build + migrate (+ restart/health) in ONE bash
+// session. A buildCmd that ends inside a subdirectory (e.g. "cd apps/web &&
+// ... bun run build" — a completely normal monorepo build) leaves the shell
+// cwd inside apps/web, so a RELATIVE migrateCmd like
+// "bun packages/shared/db/migrate.ts" resolves against apps/web and dies with
+// "Module not found". This forced samograph's prod cutover to be done by hand.
+//
+// Contract pinned here: EVERY phase that runs an app-supplied command (build,
+// migrate, seed) executes from SAMOHOST_APP_DIR regardless of where the
+// previous phase's command cd'd to.
+//
+// NO MOCKING: the test slices the actual build+migrate phases out of the
+// generated script and executes them in a real bash against a real temp
+// directory tree, exactly as `ssh ... bash -s` would.
+// ============================================================================
+describe("issue #122: per-phase cwd — build's cd must not leak into migrate", () => {
+  /** Slice the generated script between two phase-comment anchors. */
+  function slicePhases(script: string, from: string, to: string): string {
+    const start = script.indexOf(from);
+    const end = script.indexOf(to);
+    expect(start).toBeGreaterThan(-1);
+    expect(end).toBeGreaterThan(start);
+    return script.slice(start, end);
+  }
+
+  test("relative migrateCmd resolves from the app dir even when buildCmd cd's into a subdir (real bash execution)", () => {
+    // Real app-dir layout: a monorepo with apps/web (build cd's here) and a
+    // migration entrypoint addressed RELATIVE to the app root.
+    const appDir = mkdtempSync(join(tmpdir(), "samohost-122-"));
+    mkdirSync(join(appDir, "apps", "web"), { recursive: true });
+    mkdirSync(join(appDir, "packages", "shared", "db"), { recursive: true });
+    writeFileSync(
+      join(appDir, "packages", "shared", "db", "migrate.sh"),
+      'echo "MIGRATIONS_APPLIED"\n',
+    );
+
+    const app = fieldRecord({
+      appDir,
+      // samograph-shaped commands: build ends inside apps/web; migrate is
+      // relative to the app root (prod shape that broke the cutover).
+      buildCmd: "cd apps/web && echo built",
+      migrateCmd: "bash packages/shared/db/migrate.sh",
+      seedCmd: undefined,
+      assertions: undefined,
+      envFile: undefined,
+    });
+    const script = buildDeployScript(app, TARGET);
+
+    // Execute exactly the build+migrate phase code the remote shell would run
+    // (fetch/checkout/install need a VM; the cwd contract doesn't).
+    const phases = slicePhases(script, "# --- build ---", "# --- restart");
+    const harness = [
+      "#!/usr/bin/env bash",
+      "set -euo pipefail",
+      `SAMOHOST_APP_DIR='${appDir}'`,
+      'cd "$SAMOHOST_APP_DIR"',
+      phases,
+    ].join("\n");
+
+    const run = spawnSync("bash", ["-s"], { input: harness, encoding: "utf8" });
+
+    expect(run.stdout).toContain("<<<SAMOHOST_PHASE:build:ok>>>");
+    // The whole point: migrate must succeed from the app dir, not from
+    // wherever buildCmd's `cd apps/web` left the shell.
+    expect(run.stdout).toContain("MIGRATIONS_APPLIED");
+    expect(run.stdout).toContain("<<<SAMOHOST_PHASE:migrate:ok>>>");
+    expect(run.stdout).not.toContain("<<<SAMOHOST_PHASE:migrate:fail>>>");
+    expect(run.status).toBe(0);
+  });
+
+  test("build's cd does not leak into seed either (real bash execution)", () => {
+    const appDir = mkdtempSync(join(tmpdir(), "samohost-122-seed-"));
+    mkdirSync(join(appDir, "apps", "web"), { recursive: true });
+    writeFileSync(join(appDir, "seed.sh"), 'echo "SEEDED"\n');
+
+    const app = fieldRecord({
+      appDir,
+      buildCmd: "cd apps/web && echo built",
+      migrateCmd: undefined,
+      seedCmd: "bash seed.sh",
+      assertions: undefined,
+      envFile: undefined,
+    });
+    const script = buildDeployScript(app, TARGET);
+
+    // Run build, then jump straight to seed (restart/health need a VM; their
+    // commands are absolute-path/cwd-independent).
+    const build = slicePhases(script, "# --- build ---", "# --- restart");
+    const seed = slicePhases(script, "# --- seed", 'echo "deploy complete');
+    const harness = [
+      "#!/usr/bin/env bash",
+      "set -euo pipefail",
+      `SAMOHOST_APP_DIR='${appDir}'`,
+      'cd "$SAMOHOST_APP_DIR"',
+      build,
+      seed,
+    ].join("\n");
+
+    const run = spawnSync("bash", ["-s"], { input: harness, encoding: "utf8" });
+
+    expect(run.stdout).toContain("SEEDED");
+    expect(run.stdout).toContain("<<<SAMOHOST_PHASE:seed:ok>>>");
+    expect(run.status).toBe(0);
   });
 });

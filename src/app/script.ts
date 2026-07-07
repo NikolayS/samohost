@@ -331,10 +331,18 @@ export function buildDeployScript(app: AppRecord, target: DeployTarget): string 
     );
 
     // ----- build -------------------------------------------------------------
+    // Subshell + cd (issue #122): app-supplied commands may themselves cd
+    // (e.g. "cd apps/web && bun run build" in a monorepo). Without the
+    // subshell, that cd LEAKS into every later phase in this single shell
+    // session, so a relative migrateCmd resolved against apps/web and died
+    // with "Module not found" (broke samograph's prod cutover). Each
+    // app-supplied command therefore runs in its own subshell, started from
+    // SAMOHOST_APP_DIR — phases can no longer see each other's cwd.
     push(
       "# --- build ---",
+      "# subshell + cd: a buildCmd that cd's must not leak its cwd into later phases (issue #122).",
       marker("build", "start"),
-      `if ${app.buildCmd}; then`,
+      `if (cd "$SAMOHOST_APP_DIR" && ${app.buildCmd}); then`,
       `  ${marker("build", "ok")}`,
       "else",
       `  ${marker("build", "fail")}`,
@@ -347,8 +355,9 @@ export function buildDeployScript(app: AppRecord, target: DeployTarget): string 
     if (app.migrateCmd) {
       push(
         "# --- migrate: apply DB migrations before the new code boots ---",
+        "# subshell + cd: always runs from the app dir, whatever buildCmd cd'd into (issue #122).",
         marker("migrate", "start"),
-        `if ${app.migrateCmd}; then`,
+        `if (cd "$SAMOHOST_APP_DIR" && ${app.migrateCmd}); then`,
         `  ${marker("migrate", "ok")}`,
         "else",
         `  ${marker("migrate", "fail")}`,
@@ -448,8 +457,9 @@ export function buildDeployScript(app: AppRecord, target: DeployTarget): string 
     if (app.seedCmd) {
       push(
         "# --- seed: idempotent post-deploy seed (only after healthy deploy) ---",
+        "# subshell + cd: always runs from the app dir, whatever earlier commands cd'd into (issue #122).",
         marker("seed", "start"),
-        `if ${app.seedCmd}; then`,
+        `if (cd "$SAMOHOST_APP_DIR" && ${app.seedCmd}); then`,
         `  ${marker("seed", "ok")}`,
         "else",
         `  ${marker("seed", "fail")}`,
