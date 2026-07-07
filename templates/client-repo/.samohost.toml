@@ -1,0 +1,34 @@
+# .samohost.toml — samohost app manifest
+#
+# Describes this repo to samohost so it can be registered, deployed, and have
+# PR previews managed automatically.  Commit this file in your repo root.
+#
+# After editing, run on the control plane:
+#   samohost app register <vm> --from-toml .samohost.toml
+#
+# All fields map 1:1 to the AppSpec interface.  Unknown keys are REJECTED.
+# Secrets never belong here — they live in the server-side env file.
+
+# ---- required fields -------------------------------------------------------
+name        = "{{APP_NAME}}"                        # unique app name per VM
+repo        = "{{REPO}}"                            # GitHub owner/name
+branch      = "main"                                # tracked branch (deploy source)
+appDir      = "/opt/{{APP_NAME}}/app"              # checkout dir on the VM
+buildCmd    = "npm run build"                       # build command run on deploy
+healthUrl   = "http://127.0.0.1:3000/api/version"  # post-deploy health URL
+serviceUnit = "{{APP_NAME}}"                        # systemd unit restarted on deploy
+
+# ---- optional fields -------------------------------------------------------
+# migrateCmd     = "npm run migrate"
+# seedCmd        = "npm run db:seed"
+# mainHost       = "{{APP_NAME}}.samo.team"         # public hostname for Caddy vhost
+# envFile        = "/opt/{{APP_NAME}}/staging.env"  # server-side env file (read-only)
+# rlsUrlVar      = "APP_DATABASE_URL"               # non-superuser URL var for RLS gate
+# envDbVars      = ["DATABASE_URL"]                 # vars rewritten per preview env
+# rlsNonSuperuser = true                            # enforce non-superuser RLS gate
+# kind           = "node"                           # "node" (default) or "static"
+
+# ---- provision (reserved for future provision --from-toml) -----------------
+# [provision]
+# serverType = "cx22"
+# location   = "nbg1"
