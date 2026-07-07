@@ -184,17 +184,35 @@ function buildServerYml(opts: DblabModuleOptions = {}, adminUser = "samo"): stri
     ? `"${opts.sourceDb}"`
     : `"\${DBLAB_SOURCE_DB}"`;
 
+  // Databases entry: only present when sourceDb is provided.
+  const databasesEntry = opts.sourceDb !== undefined
+    ? `\n        databases:\n          ${opts.sourceDb}: {}`
+    : "";
+
   return `# Managed by samohost dblab module — DBLab Engine v${DBLAB_VERSION} config
-# Issue #127: verified minimal profile (cx22, loopback ZFS pool).
+# Issue #127/#128: verified minimal profile (cx22, loopback ZFS pool).
+# Structure verified against samograph live working config (ssh -p 2223 samo@116.203.249.135).
 server:
   verificationToken: "\${DBLAB_VERIFICATION_TOKEN}"
   port: ${DBLAB_API_PORT}
   enableTelemetry: false
 
 poolManager:
-  mountDir: /var/lib/dblab
-  selectedPool: dblab
+  mountDir: "/var/lib/dblab"
+  selectedPool: "dblab_pool"
+  dataSubDir: "data"
+  clonesMountSubDir: "clones"
   preSnapshotSuffix: "_pre"
+
+databaseContainer:
+  dockerImage: "${DBLAB_PG_IMAGE}"
+  containerConfig:
+    shm-size: "128mb"
+    memory: "${DBLAB_CONTAINER_MEMORY_BYTES}"
+
+databaseConfigs:
+  configs:
+    shared_buffers: "${DBLAB_SHARED_BUFFERS}"
 
 provision:
   portPool:
@@ -203,14 +221,6 @@ provision:
   dockerImage: "${DBLAB_PG_IMAGE}"
   cloneAccessAddresses: "127.0.0.1"
   maxIdleMinutes: ${DBLAB_MAX_IDLE_MINUTES}
-
-databaseConfigs:
-  configs:
-    shared_buffers: "${DBLAB_SHARED_BUFFERS}"
-
-containerConfig:
-  containerResources:
-    memory: ${DBLAB_CONTAINER_MEMORY_BYTES}
 
 cloning:
   maxCloneCount: ${DBLAB_MAX_CLONES}
@@ -225,16 +235,32 @@ retrieval:
   spec:
     logicalDump:
       options:
+        dockerImage: "${DBLAB_PG_IMAGE}"
+        containerConfig:
+          shm-size: "64mb"
+          memory: "${DBLAB_CONTAINER_MEMORY_BYTES}"
+        dumpLocation: "/var/lib/dblab/dblab_pool/dump"
         source:
+          type: remote
           connection:
             host: "${DOCKER_BRIDGE_GW}"
             port: 5432
             dbname: ${dbnameValue}
             username: "${adminUser}"
+            password: ""${databasesEntry}
     logicalRestore:
-      options: {}
+      options:
+        dockerImage: "${DBLAB_PG_IMAGE}"
+        containerConfig:
+          shm-size: "128mb"
+          memory: "${DBLAB_CONTAINER_MEMORY_BYTES}"
+        dumpLocation: "/var/lib/dblab/dblab_pool/dump"
     logicalSnapshot:
-      options: {}
+      options:
+        dockerImage: "${DBLAB_PG_IMAGE}"
+        containerConfig:
+          shm-size: "128mb"
+          memory: "${DBLAB_CONTAINER_MEMORY_BYTES}"
 `;
 }
 
@@ -356,6 +382,15 @@ function buildFragment(spec: ProvisionSpec, opts: DblabModuleOptions = {}): Clou
     // Also ensure listen_addresses covers the bridge gateway.
     "for conf in /etc/postgresql/*/main/postgresql.conf; do grep -q \"listen_addresses.*172.17.0.1\" \"$conf\" || echo \"listen_addresses = 'localhost,172.17.0.1'\" >> \"$conf\"; done 2>/dev/null || true",
     "systemctl reload postgresql 2>/dev/null || true",
+
+    // ---- UFW: allow Docker bridge subnet to reach clone ports + host PG (step 11b) ----
+    // Ground truth: samograph UFW rule 17 (6000:6099/tcp ALLOW IN 172.16.0.0/12).
+    // Without this rule, UFW default-deny blocks the engine's health probes on clone
+    // ports. 100 ports × ~3s TCP timeout = ~5 min stall; the engine never becomes
+    // healthy. Source-restrict to the Docker bridge subnet — never world-open.
+    `ufw allow proto tcp from ${DOCKER_BRIDGE_SUBNET} to any port ${DBLAB_PORT_POOL_FROM}:${DBLAB_PORT_POOL_TO} comment 'dblab clone ports Docker bridge'`,
+    // Allow the dblab_server container (Docker bridge) to reach the host PG on 5432.
+    `ufw allow proto tcp from ${DOCKER_BRIDGE_SUBNET} to any port 5432 comment 'PG from Docker bridge (dblab)'`,
 
     // ---- Run the engine (step 12) ----
     `docker run --name dblab_server --label dblab_control --privileged ` +

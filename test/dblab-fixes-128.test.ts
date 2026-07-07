@@ -73,9 +73,15 @@ describe('dblab module — poolManager.preSnapshotSuffix: "_pre" (BusyBox grep f
 // the DBLab v4.1.3 schema. This is a harmless but correct fix.
 
 describe("dblab module — poolManager.selectedPool struct tag (not pool:)", () => {
-  test("server.yml contains selectedPool: dblab", () => {
+  test("server.yml contains selectedPool: \"dblab_pool\" (dataset name, not ZFS pool name)", () => {
     const out = buildFull();
-    expect(out).toContain("selectedPool: dblab");
+    // The value must be the dataset subdirectory name "dblab_pool" (under mountDir
+    // /var/lib/dblab). DBLab v4 looks for /var/lib/dblab/<selectedPool>; using the
+    // ZFS pool name "dblab" instead of the dataset name "dblab_pool" causes
+    // "no available pools". Verified against samograph ZFS: dblab/dblab_pool at
+    // /var/lib/dblab/dblab_pool. This assertion uses a quoted literal to avoid the
+    // substring false-positive (toContain("selectedPool: dblab") matches both).
+    expect(out).toContain('selectedPool: "dblab_pool"');
   });
 
   test("server.yml does NOT contain bare 'pool: dblab' (wrong yaml struct tag)", () => {
