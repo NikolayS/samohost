@@ -31,9 +31,8 @@ const makeDblabModule = (DblabModuleNs as Record<string, unknown>)[
 function extractServerYml(mod: Module): string {
   const spec = makeSpec({ trustedIps: [], adminUser: "samo" });
   const fragment = mod.cloudInitFragment(spec);
-  const file = fragment.writeFiles.find((f) =>
-    f.path.endsWith("server.yml"),
-  );
+  const files = fragment.writeFiles ?? [];
+  const file = files.find((f) => f.path.endsWith("server.yml"));
   if (!file) throw new Error("server.yml not found in writeFiles");
   return file.content;
 }
@@ -179,7 +178,7 @@ describe("cloud-init runcmd — losetup -f --show (BUG-3)", () => {
     if (!makeDblabModule) throw new Error("makeDblabModule not exported — RED");
     const spec = makeSpec({ trustedIps: [], adminUser: "samo" });
     const fragment = makeDblabModule({}).cloudInitFragment(spec);
-    const runcmd = fragment.runcmd.join("\n");
+    const runcmd = (fragment.runcmd ?? []).join("\n");
     expect(runcmd).toContain("losetup -f --show");
   });
 
@@ -188,7 +187,7 @@ describe("cloud-init runcmd — losetup -f --show (BUG-3)", () => {
     const spec = makeSpec({ trustedIps: [], adminUser: "samo" });
     const fragment = makeDblabModule({}).cloudInitFragment(spec);
     // The initial losetup command must NOT hardcode loop0
-    const losetupLines = fragment.runcmd.filter(
+    const losetupLines = (fragment.runcmd ?? []).filter(
       (c) => c.startsWith("losetup") && c.includes("dblab.img"),
     );
     for (const line of losetupLines) {
@@ -206,7 +205,7 @@ describe("server.yml — DBLAB_SOURCE_USER substituted (BUG-4)", () => {
     if (!makeDblabModule) throw new Error("makeDblabModule not exported — RED");
     const spec = makeSpec({ trustedIps: [], adminUser: "samo" });
     const fragment = makeDblabModule({ sourceDb: "myapp_template" }).cloudInitFragment(spec);
-    const serverYmlFile = fragment.writeFiles.find((f) => f.path.endsWith("server.yml"));
+    const serverYmlFile = (fragment.writeFiles ?? []).find((f) => f.path.endsWith("server.yml"));
     expect(serverYmlFile).toBeDefined();
     // Must not leave the placeholder literal in the written file
     expect(serverYmlFile!.content).not.toContain("${DBLAB_SOURCE_USER}");
@@ -216,7 +215,7 @@ describe("server.yml — DBLAB_SOURCE_USER substituted (BUG-4)", () => {
     if (!makeDblabModule) throw new Error("makeDblabModule not exported — RED");
     const spec = makeSpec({ trustedIps: [], adminUser: "samo" });
     const fragment = makeDblabModule({ sourceDb: "myapp_template" }).cloudInitFragment(spec);
-    const serverYmlFile = fragment.writeFiles.find((f) => f.path.endsWith("server.yml"));
+    const serverYmlFile = (fragment.writeFiles ?? []).find((f) => f.path.endsWith("server.yml"));
     const parsed = parseServerYml(serverYmlFile!.content);
     const conn = parsed?.retrieval?.spec?.logicalDump?.options?.source?.connection;
     expect(conn?.username).toBe("samo");
@@ -229,8 +228,8 @@ describe("server.yml — DBLAB_SOURCE_USER substituted (BUG-4)", () => {
     const modOpts = { sourceDb: "app_template" };
     const fragA = makeDblabModule(modOpts).cloudInitFragment(specA);
     const fragB = makeDblabModule(modOpts).cloudInitFragment(specB);
-    const fileA = fragA.writeFiles.find((f) => f.path.endsWith("server.yml"))!;
-    const fileB = fragB.writeFiles.find((f) => f.path.endsWith("server.yml"))!;
+    const fileA = (fragA.writeFiles ?? []).find((f) => f.path.endsWith("server.yml"))!;
+    const fileB = (fragB.writeFiles ?? []).find((f) => f.path.endsWith("server.yml"))!;
     const parsedA = parseServerYml(fileA.content);
     const parsedB = parseServerYml(fileB.content);
     expect(
