@@ -84,6 +84,10 @@ const ZFS_MODPROBE_CONF = [
  * /etc/systemd/system/dblab-loopback.service — re-attaches the loopback
  * device on every boot, BEFORE zfs-import.target and docker.service attempt
  * to use the pool or start containers that depend on it.
+ *
+ * Uses `losetup -j` to check if the image is already attached, then attaches
+ * to the next free device via `losetup -f` (avoids snapd-occupied loop0-2 on
+ * Ubuntu 24.04).
  */
 const DBLAB_LOOPBACK_SERVICE = [
   "# Managed by samohost dblab module — loopback ZFS persistence",
@@ -95,7 +99,7 @@ const DBLAB_LOOPBACK_SERVICE = [
   "[Service]",
   "Type=oneshot",
   "RemainAfterExit=yes",
-  "ExecStart=/bin/sh -c 'test -b /dev/loop0 || losetup /dev/loop0 /var/lib/dblab-pool/dblab.img'",
+  "ExecStart=/bin/sh -c 'losetup -j /var/lib/dblab-pool/dblab.img | grep -q . || losetup -f /var/lib/dblab-pool/dblab.img'",
   "",
   "[Install]",
   "WantedBy=basic.target",
@@ -164,8 +168,18 @@ export interface DblabModuleOptions {
  *   Preview envs connect to <app>_template, not <app>_prod. When sourceDb is
  *   provided it is baked in directly; otherwise a shell placeholder is left for
  *   the operator to fill in.
+ *
+ * Fix 4 (#128 smoke-test regressions):
+ *   - cloneAccessAddresses must be a SCALAR string, not a YAML sequence.
+ *     DBLab v4.1.3 expects a string; a list causes "[FATAL] failed to parse config".
+ *   - retrieval structure corrected to match the working samograph server.yml:
+ *       retrieval.refresh.skipStartRefresh  (was: retrieval.spec.skipStartRefresh)
+ *       retrieval.jobs: [logicalDump, ...]  (was: retrieval.spec.jobs with inline opts)
+ *       retrieval.spec.<job>.options        (job options under retrieval.spec, not in jobs list)
+ *   - ${DBLAB_SOURCE_USER} substituted with the adminUser from ProvisionSpec at
+ *     build time; leaving an unresolved placeholder caused silent refresh failure.
  */
-function buildServerYml(opts: DblabModuleOptions = {}): string {
+function buildServerYml(opts: DblabModuleOptions = {}, adminUser = "samo"): string {
   const dbnameValue = opts.sourceDb !== undefined
     ? `"${opts.sourceDb}"`
     : `"\${DBLAB_SOURCE_DB}"`;
@@ -187,8 +201,8 @@ provision:
     from: ${DBLAB_PORT_POOL_FROM}
     to: ${DBLAB_PORT_POOL_TO}
   dockerImage: "${DBLAB_PG_IMAGE}"
-  cloneAccessAddresses:
-    - "127.0.0.1"
+  cloneAccessAddresses: "127.0.0.1"
+  maxIdleMinutes: ${DBLAB_MAX_IDLE_MINUTES}
 
 databaseConfigs:
   configs:
@@ -200,23 +214,27 @@ containerConfig:
 
 cloning:
   maxCloneCount: ${DBLAB_MAX_CLONES}
-  maxIdleMinutes: ${DBLAB_MAX_IDLE_MINUTES}
 
 retrieval:
-  spec:
+  refresh:
     skipStartRefresh: true
-    jobs:
-      - logicalDump:
-          options:
-            source:
-              connection:
-                host: "${DOCKER_BRIDGE_GW}"
-                port: 5432
-                dbname: ${dbnameValue}
-                username: "\${DBLAB_SOURCE_USER}"
-      - logicalRestore:
-          options: {}
-      - logicalSnapshot: {}
+  jobs:
+    - logicalDump
+    - logicalRestore
+    - logicalSnapshot
+  spec:
+    logicalDump:
+      options:
+        source:
+          connection:
+            host: "${DOCKER_BRIDGE_GW}"
+            port: 5432
+            dbname: ${dbnameValue}
+            username: "${adminUser}"
+    logicalRestore:
+      options: {}
+    logicalSnapshot:
+      options: {}
 `;
 }
 
@@ -268,7 +286,7 @@ function buildFragment(spec: ProvisionSpec, opts: DblabModuleOptions = {}): Clou
     },
     {
       path: "/root/.dblab/engine/configs/server.yml",
-      content: buildServerYml(opts),
+      content: buildServerYml(opts, adminUser),
       permissions: "0600",
       owner: "root:root",
     },
@@ -306,12 +324,14 @@ function buildFragment(spec: ProvisionSpec, opts: DblabModuleOptions = {}): Clou
     "update-initramfs -u -k all 2>/dev/null || true",
 
     // ---- Sparse 10G loopback file (step 4) ----
+    // Use losetup -f --show to pick the next free loop device dynamically;
+    // Ubuntu 24.04 + snapd typically occupy loop0-2, so hardcoding loop0 fails.
     "mkdir -p /var/lib/dblab-pool",
     `fallocate -l ${DBLAB_POOL_SIZE_GB}G /var/lib/dblab-pool/dblab.img`,
-    "losetup /dev/loop0 /var/lib/dblab-pool/dblab.img",
+    "LOOP_DEV=$(losetup -f --show /var/lib/dblab-pool/dblab.img)",
 
     // ---- ZFS pool + dataset (steps 6-7) ----
-    "zpool create dblab /dev/loop0",
+    "zpool create dblab $LOOP_DEV",
     "zfs create dblab/dblab_pool",
     "zfs set compression=on atime=off logbias=throughput mountpoint=/var/lib/dblab/dblab_pool dblab/dblab_pool",
 
