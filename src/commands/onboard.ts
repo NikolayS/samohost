@@ -263,7 +263,12 @@ export function defaultOnboardDeps(): OnboardDeps {
         `${GH_API}/repos/${repo}/pulls?head=${repo.split("/")[0]}:${branch}&state=open`,
         { headers: ghHeaders() },
       );
-      if (!res.ok) return null;
+      if (!res.ok) {
+        // Surface transient API errors instead of silently routing to createPr.
+        // Returning null here would incorrectly call createPr and risk creating
+        // a duplicate PR when an existing one is already open.
+        throw new Error(`GitHub API error ${res.status} listing PRs for ${repo}: ${res.statusText}`);
+      }
       const data = (await res.json()) as Array<{ html_url: string }>;
       return data[0]?.html_url ?? null;
     },
@@ -313,6 +318,10 @@ export async function runOnboard(
   }
 
   // ---- 2. Read .samohost.toml ----------------------------------------------
+  // Track whether .samohost.toml already exists in the target repo so we can
+  // skip-if-exists in step 6.  "exists in repo" = fetched from GitHub (not from
+  // a local --toml-path and not synthesised from the template).
+  let samoTomlAlreadyInRepo = false;
   let tomlText: string;
   if (tomlPath) {
     try {
@@ -334,6 +343,7 @@ export async function runOnboard(
       });
     } else {
       tomlText = fetched;
+      samoTomlAlreadyInRepo = true;
     }
   }
 
@@ -367,6 +377,14 @@ export async function runOnboard(
   // ---- 6. Scaffold template files ------------------------------------------
   const scaffoldedFiles: string[] = [];
   for (const templatePath of TEMPLATE_FILES) {
+    // Never clobber an existing .samohost.toml — it is the client's source of
+    // truth and may have been customised after the initial onboard.  Use the
+    // real manifest (already fetched in step 2) for registration; just skip
+    // re-scaffolding it on the onboarding branch.
+    if (templatePath === ".samohost.toml" && samoTomlAlreadyInRepo) {
+      out(`info: .samohost.toml already exists in ${repo} — preserving existing manifest (not overwriting)`);
+      continue;
+    }
     const rawContent = loadTemplate(templatePath);
     const rendered = renderTemplate(rawContent, vars);
     await deps.scaffoldFile(repo, ONBOARD_BRANCH, templatePath, rendered);

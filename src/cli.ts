@@ -113,7 +113,25 @@ import {
   runOnboard,
   defaultOnboardDeps,
   type OnboardInput,
+  type OnboardReport,
 } from "./commands/onboard.ts";
+
+/**
+ * Compute the CLI exit code for an onboard run.
+ *
+ * Exits 0 ONLY when the onboard fully succeeded:
+ *   - status is not "error"
+ *   - appRegistered is true  (app registration did not fail)
+ *   - triggerCovered is true (app visible to the trigger poller)
+ *
+ * Any partial failure exits 1 so automation callers see a non-zero shell
+ * status and do not proceed assuming the app will auto-deploy.
+ */
+export function computeOnboardExitCode(report: OnboardReport): number {
+  return report.status === "error" || !report.appRegistered || !report.triggerCovered
+    ? 1
+    : 0;
+}
 
 export const VERSION = "0.1.0";
 
@@ -2443,7 +2461,7 @@ export async function main(
         out,
         err,
       );
-      return report.status === "error" ? 1 : 0;
+      return computeOnboardExitCode(report);
     }
   }
 }

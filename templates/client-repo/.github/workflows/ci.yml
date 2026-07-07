@@ -8,10 +8,10 @@ on:
 jobs:
   test:
     name: Unit + Integration + E2E
-    # SAMOHOST_RUNNER_TAG is a repository variable set during onboarding.
-    # Set it to the label(s) on your self-hosted runner, e.g. "my-app-runner".
-    # Falls back to "self-hosted" if the variable is absent.
-    runs-on: [self-hosted, "{{RUNNER_TAG}}"]
+    # RUNNER_TAG is substituted at scaffold time by `samohost onboard --runner-tag <tag>`.
+    # It becomes the runs-on label for this repo's self-hosted runner.
+    # Default (no --runner-tag supplied): "self-hosted" (any self-hosted runner).
+    runs-on: "{{RUNNER_TAG}}"
 
     services:
       postgres:

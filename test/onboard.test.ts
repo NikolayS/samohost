@@ -26,7 +26,7 @@ import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { parseArgs, UsageError, main } from "../src/cli.ts";
+import { parseArgs, UsageError } from "../src/cli.ts";
 import {
   runOnboard,
   renderTemplate,
@@ -91,13 +91,20 @@ serviceUnit = "acme-web"
 mainHost    = "acme.example.com"
 `.trim();
 
-/** Builds a minimal OnboardDeps that never makes real network calls. */
+/** Builds a minimal OnboardDeps that never makes real network calls.
+ *
+ * Default behaviour: the target repo does NOT yet have a .samohost.toml
+ * (fetchRepoFile returns null) — simulating the initial onboard scenario.
+ * `runOnboard` will render the template toml from the repo name in this case.
+ * For re-onboard / clobber-guard tests, override fetchRepoFile to return the
+ * existing toml content.
+ */
 function fakeDeps(overrides: Partial<OnboardDeps> = {}): OnboardDeps {
   const scaffolded: Record<string, string> = {};
   let prCreated = false;
 
   return {
-    fetchRepoFile: async (_repo: string, _path: string) => SAMPLE_TOML,
+    fetchRepoFile: async (_repo: string, _path: string) => null,
     getDefaultBranch: async (_repo: string) => "main",
     branchExists: async (_repo: string, _branch: string) => false,
     createBranch: async (_repo: string, _branch: string, _base: string) => { /* no-op */ },
@@ -529,8 +536,8 @@ describe("defaultOnboardDeps().findPr surfaces API errors", () => {
     const originalToken = process.env["GITHUB_TOKEN"];
     process.env["GITHUB_TOKEN"] = "test-token-placeholder";
     try {
-      globalThis.fetch = async () =>
-        new Response("Internal Server Error", { status: 500 });
+      globalThis.fetch = (async () =>
+        new Response("Internal Server Error", { status: 500 })) as unknown as typeof fetch;
       const deps = defaultOnboardDeps();
       // findPr must throw on a 500 (transient API error), not silently return null.
       // Returning null routes incorrectly to createPr, risking duplicate PRs.
