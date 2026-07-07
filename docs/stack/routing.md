@@ -9,7 +9,7 @@ Every SAMO VM uses Caddy. No nginx, no HAProxy. Configuration pattern:
 /etc/caddy/sites.d/           — per-vhost snippets (written by samohost)
 ```
 
-Sources: `field-record-1:deploy/setup-vm.sh`, `src/commands/bootstrap.ts`
+Sources: `field-record-1:deploy/setup-vm.sh`, `src/app/bootstrap.ts`
 (Caddy sites.d pattern, `tlsMode='acme'` default).
 
 TLS: Caddy handles ACME (Let's Encrypt) on project VMs by default. The control
@@ -31,7 +31,7 @@ Preview URL pattern: `{app}-{branch-label}.samo.cat`
 `docs/dns-preview-authority.md`). Per-preview A records are written by
 `samohost env create` via the `CLOUDFLARE_SAMOCAT` token.
 
-## Cloudflare tokens — two are required, never combined
+## Cloudflare tokens — three in total, never combined
 
 ### Token 1: `CLOUDFLARE_SAMOCAT` (DNS only)
 
@@ -46,8 +46,9 @@ Preview URL pattern: `{app}-{branch-label}.samo.cat`
 - Used by: `bunx wrangler deploy` for the preview banner Worker
 - See `docs/edge-preview-banner.md`
 
-Mixing these two tokens causes CF error `10000` (DNS token hitting Workers
-endpoint) or silent Worker deploy failures. Keep them physically separate.
+Mixing Token 1 and Token 2 causes CF error `10000` (DNS token hitting Workers
+endpoint) or silent Worker deploy failures. Keep all three tokens physically
+separate.
 Source: `docs/setup-checklist.md` "Two distinct Cloudflare tokens."
 
 ### Token 3: `CLOUDFLARE_SAMOTEAM` (CF-for-SaaS custom domains)

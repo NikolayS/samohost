@@ -4,8 +4,9 @@
 
 The ZFS pool is always named `tank`. This is enforced across all deployments
 and referenced by the PG data dir path, DBLab mountDir, and backup targets.
-Source: `samo.team/infra/zfs/pool.ts` (renders pool creation commands with
-`tank` hardcoded).
+Source: `samo.team/infra/cloud-init/template.ts` line 503 — `poolName: "tank"`
+(the call site hardcodes the name; `infra/zfs/pool.ts` itself is parameterized
+and accepts any pool name via `ZpoolCreateSpec.poolName`).
 
 ## Two pool shapes
 
@@ -47,6 +48,14 @@ zpool create -o ashift=12 -O compression=lz4 -O atime=off \
 ```
 
 Used by DBLab only. Pool is named `tank` regardless of shape.
+
+**Caveat on cx23 as the standard baseline:** the cx23 loopback profile has
+been measured and proven working on samograph (2026-07-07), but has NOT yet
+been formally blessed by Nik as the platform default. Nik's runbook targets
+8 GB+ VMs (CX33/CX41 class). The loopback fit on a 3.7 GB CX23 is a
+measured comparison result — do not treat it as the mandatory baseline until
+the owner gives explicit sign-off. When in doubt, use CX33 with an attached
+volume.
 
 Source: samograph deployment, verified 2026-07-07.
 

@@ -16,7 +16,8 @@ DBLab Engine v4.1.3 runs as a Docker container (`postgresai/dblab-server:4.1.3`)
 on each project VM. It maintains its own copy of the database under a ZFS
 dataset and serves thin, copy-on-write clones per preview environment.
 
-- Each clone is a Docker container (`postgresai/extended-postgres:18-0.6.2`)
+- Each clone is a Docker container (`postgresai/extended-postgres:18-0.6.2`,
+  tag verified published on Docker Hub 2026-07-07)
 - API endpoint: `http://127.0.0.1:2345/healthz`
 - Clone IDs = environment names (e.g. `pr-42-feature-foo`)
 - Lease default: 20160 min (14 days) — source: `src/env/script.ts`
@@ -65,8 +66,15 @@ Measured footprint on a 3.7 GB RAM CX23:
 | Swap | 2 GB swapfile |
 | Incremental cost | ~EUR 0 (no added volume) |
 
-**The cx33 + 50 GiB volume plan is ~100x over-provisioned for typical client
-projects.** The loopback profile fits on the existing VM's root disk.
+For comparison, a CX33 + 50 GiB Hetzner volume costs ~EUR 12/month for a
+resource pool that is roughly 100x the measured footprint above. The loopback
+profile fits on the existing VM's root disk at no incremental cost.
+
+**Caveat:** the cx23 loopback profile has been measured and proven on samograph
+but has NOT been formally blessed by Nik as the platform standard. Nik's
+runbook targets 8 GB+ VMs. Treat cx23 as a verified option pending owner
+sign-off — not as the mandated baseline. When in doubt, use CX33 with an
+attached volume (Nik's blessed sizing).
 
 ZFS ARC cap is mandatory on CX23. Without it, ARC defaults to ~50% of 3.7 GB
 = ~1.85 GB, leaving almost nothing for the app. Set via `/etc/modprobe.d/zfs.conf`:
@@ -79,16 +87,17 @@ Source: footprint measured 2026-07-06, samograph production verified 2026-07-07.
 ## Platform gap — DBLab is not auto-installed by cloud-init
 
 As of 2026-07-07, `samohost app bootstrap` does NOT auto-install Docker, ZFS,
-or DBLab. The optional-module registry is empty:
-`src/commands/preview.ts` lines 19-24 — "v0.1 ships no concrete optional module
+or DBLab. The optional-module registry contains no working modules:
+`src/commands/preview.ts` line 20 — "v0.1 ships no concrete optional module
 implementation yet."
 
 DBLab is currently a **manual operator runbook** + read-only preflight check.
-Every freshly provisioned CX23 client VM is NOT dblab-ready out of the box.
+Every freshly provisioned client VM is NOT dblab-ready out of the box.
 
-The fix (a dblab cloud-init module baked into the provisioning flow) is a
-platform decision tracked in issue #127. Do not assume DBLab is running on a
-VM unless the operator has confirmed the runbook was completed and
+A dblab cloud-init provisioning module (`src/cloudinit/dblab.ts`) is in
+progress in PR #128, which is HELD on a fresh-VM engine blocker. Do not
+assume the module is registered or merged into main. Do not assume DBLab is
+running on a VM unless the operator has confirmed the runbook was completed and
 `curl -s http://127.0.0.1:2345/healthz` returns healthy.
 
 ## samohost preflight
@@ -119,12 +128,12 @@ retrieval:
 
 `preSnapshotSuffix: '_pre'` is required in the retrieval config. Its absence
 caused the samograph DBLab to fail with wrong pool mode detection (fixed
-2026-07-07, issue #128).
+manually on samograph 2026-07-07; fix being tracked in PR #128).
 
 ## Current fleet state
 
 | VM | DBLab state | Notes |
 |---|---|---|
 | samo-we-field-record | RUNNING | volume-backed, tank, verified 2026-06-12 |
-| samograph | RUNNING | loopback ZFS, fixed 2026-07-07 (issue #128) |
+| samograph | RUNNING | loopback ZFS, fixed manually 2026-07-07 (PR #128 in progress) |
 | samo.team control plane | NOT installed | auth only, no client DBs |

@@ -58,9 +58,11 @@ Supabase appears only in `SPEC.md §8 Roadmap / Deferred (post-v0.1)`.
 
 ## What agents must do
 
-- Do NOT wire `ANTHROPIC_API_KEY`, `SUPABASE_URL`, or Supabase client libraries
-  into client apps unless the owner has explicitly enabled the Supabase stack
-  for that project.
+- **`ANTHROPIC_API_KEY` is unconditionally banned** in all samohost code and
+  client apps. All LLM calls go through `claude -p` OAuth subprocess. There is
+  no condition (Supabase-enabled or otherwise) under which this key is wired in.
+- Do NOT wire `SUPABASE_URL` or Supabase client libraries into client apps
+  unless the owner has explicitly enabled the Supabase stack for that project.
 - Do NOT reserve GoTrue table names (`users`, `sessions`, `identities`,
   `refresh_tokens`, `audit_log_entries`, `schema_migrations`, `mfa_factors`,
   `flow_state`) in new client app migrations. GoTrue is not running on project

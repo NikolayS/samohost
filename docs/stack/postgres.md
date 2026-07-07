@@ -7,13 +7,15 @@
 Sources (all verified 2026-07-07):
 
 - `samohost app bootstrap` defaults to PG 18:
-  `src/commands/bootstrap.ts` — `const pgMajor = opts.pgMajor ?? 18`
+  `src/app/bootstrap.ts` — `const pgMajor = opts.pgMajor ?? 18`
 - field-record-1 VM runs PG 18 on `/tank/postgresql/18/main` (live, verified
   per `docs/dblab-install-runbook.md` and VM handoff 2026-06-12)
 - samo.team SPEC.md §7.1 targets PG 18: "Every project runs PostgreSQL 18
   (targeting GA release in Q3 2025; using PG17 during beta period with upgrade
   path)" (SPEC.md lines 762-764)
-- DBLab clone images already use `postgresai/extended-postgres:18-0.6.2`
+- DBLab clone images use `postgresai/extended-postgres:18-0.6.2` (tag verified
+  published on Docker Hub 2026-07-07; the runbook's earlier "UNVERIFIED" note
+  is now resolved)
 
 ## Known gap: samo.team control plane runs PG 17
 
@@ -44,7 +46,7 @@ VMs.**
 
 | Deployment | PG version | Source |
 |---|---|---|
-| samohost bootstrap default | **18** | `src/commands/bootstrap.ts:pgMajor??18` |
+| samohost bootstrap default | **18** | `src/app/bootstrap.ts:pgMajor??18` |
 | field-record-1 VM | **18** | `docs/dblab-install-runbook.md`, VM handoff 2026-06-12 |
 | samo.team SPEC target | **18** | `SPEC.md §7.1 lines 762-764` |
 | DBLab clone image | **18** | `postgresai/extended-postgres:18-0.6.2` |
