@@ -7,7 +7,13 @@
 
 import { buildCloudInit } from "../cloudinit/builder.ts";
 import { hardeningModule } from "../cloudinit/hardening.ts";
+import { dblabModule } from "../cloudinit/dblab.ts";
 import type { Module, ProvisionSpec } from "../types.ts";
+
+/** All optional modules registered by name. Add new modules here. */
+const MODULE_REGISTRY: Record<string, Module> = {
+  [dblabModule.name]: dblabModule,
+};
 
 /** Resolve module names to Module objects. Hardening is implicit in the builder. */
 export function resolveModules(names: string[]): {
@@ -17,10 +23,13 @@ export function resolveModules(names: string[]): {
   const errors: string[] = [];
   const modules: Module[] = [];
   for (const name of names) {
-    // v0.1 ships no concrete optional module implementation yet; the postgres
-    // module is scaffolded for a later sprint. Unknown names are reported.
     if (name === hardeningModule.name) continue; // implicit, ignore if listed
-    errors.push(`unknown module: ${name}`);
+    const mod = MODULE_REGISTRY[name];
+    if (mod === undefined) {
+      errors.push(`unknown module: ${name}`);
+    } else {
+      modules.push(mod);
+    }
   }
   return { modules, errors };
 }
