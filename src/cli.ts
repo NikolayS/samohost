@@ -109,6 +109,11 @@ import { DomainStore } from "./state/domains.ts";
 import { HetznerProvider } from "./providers/hetzner.ts";
 import { StateStore } from "./state/store.ts";
 import type { EnvDbBackend } from "./types.ts";
+import {
+  runOnboard,
+  defaultOnboardDeps,
+  type OnboardInput,
+} from "./commands/onboard.ts";
 
 export const VERSION = "0.1.0";
 
@@ -580,6 +585,11 @@ export interface ParsedDomainSearch {
   json: boolean;
 }
 
+export interface ParsedOnboard {
+  kind: "onboard";
+  input: OnboardInput;
+}
+
 export type ParsedCommand =
   | ParsedPreview
   | ParsedPreviewRebuild
@@ -611,6 +621,7 @@ export type ParsedCommand =
   | ParsedDomainList
   | ParsedDomainRm
   | ParsedDomainSearch
+  | ParsedOnboard
   | { kind: "help" }
   | { kind: "version" };
 
@@ -679,6 +690,9 @@ export function parseArgs(
   }
   if (first === "domain") {
     return parseDomain(argv.slice(1));
+  }
+  if (first === "onboard") {
+    return parseOnboard(argv.slice(1));
   }
 
   // A bare --help/--version may also appear after an (absent) command.
@@ -1934,6 +1948,68 @@ function parseTriggerRun(args: string[]): ParsedTriggerRun {
 // domain group
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// onboard
+// ---------------------------------------------------------------------------
+
+function parseOnboard(args: string[]): ParsedOnboard {
+  // Usage: onboard <org/repo> --vm <name> [--runner-tag <tag>] [--toml-path <path>]
+  const repo = args[0];
+  if (repo === undefined || repo.startsWith("-")) {
+    throw new UsageError(
+      "onboard requires a positional <org/repo> argument, e.g. `samohost onboard acme-org/acme-web --vm samo-we-acme`",
+    );
+  }
+  if (!repo.includes("/")) {
+    throw new UsageError(
+      `onboard: <org/repo> must contain a slash (got: ${repo}). Example: acme-org/acme-web`,
+    );
+  }
+
+  let vm: string | undefined;
+  let runnerTag: string | undefined;
+  let tomlPath: string | undefined;
+
+  const next = (i: number, flag: string): string => {
+    const v = args[i + 1];
+    if (v === undefined) throw new UsageError(`missing value for ${flag}`);
+    return v;
+  };
+
+  for (let i = 1; i < args.length; i++) {
+    const a = args[i]!;
+    switch (a) {
+      case "--vm":
+        vm = next(i, a);
+        i++;
+        break;
+      case "--runner-tag":
+        runnerTag = next(i, a);
+        i++;
+        break;
+      case "--toml-path":
+        tomlPath = next(i, a);
+        i++;
+        break;
+      default:
+        throw new UsageError(`onboard: unknown flag: ${a}`);
+    }
+  }
+
+  if (!vm) {
+    throw new UsageError("onboard: --vm <name> is required");
+  }
+
+  return {
+    kind: "onboard",
+    input: { repo, vm, runnerTag, tomlPath },
+  };
+}
+
+// ---------------------------------------------------------------------------
+// domain
+// ---------------------------------------------------------------------------
+
 type DomainSub = "add" | "check" | "list" | "rm" | "search";
 
 const DOMAIN_SUBS: readonly DomainSub[] = ["add", "check", "list", "rm", "search"];
@@ -2358,6 +2434,17 @@ export async function main(
         out,
         err,
       );
+    case "onboard": {
+      const report = await runOnboard(
+        cmd.input,
+        defaultOnboardDeps(),
+        new StateStore(),
+        defaultAppStore(),
+        out,
+        err,
+      );
+      return report.status === "error" ? 1 : 0;
+    }
   }
 }
 

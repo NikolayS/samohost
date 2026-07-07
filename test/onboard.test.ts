@@ -28,7 +28,6 @@ import {
   TEMPLATE_FILES,
   type OnboardInput,
   type OnboardDeps,
-  type OnboardReport,
 } from "../src/commands/onboard.ts";
 import { AppStore } from "../src/state/apps.ts";
 import { StateStore } from "../src/state/store.ts";
@@ -249,8 +248,8 @@ describe("runOnboard scaffold", () => {
     await runOnboard(input, deps, vmStore, appStore, c.out, c.err);
 
     const raw = (deps as unknown as { _scaffolded: Record<string, string> })._scaffolded;
-    expect(raw["staging.env.example"]).toBeDefined();
-    expect(raw["staging.env.example"].trim().length).toBeGreaterThan(0);
+    const stagingEnv = raw["staging.env.example"] ?? "";
+    expect(stagingEnv.length).toBeGreaterThan(0);
   });
 
   test("PR URL appears in the report", async () => {

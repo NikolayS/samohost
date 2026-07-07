@@ -1,0 +1,65 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  test:
+    name: Unit + Integration + E2E
+    # SAMOHOST_RUNNER_TAG is a repository variable set during onboarding.
+    # Set it to the label(s) on your self-hosted runner, e.g. "my-app-runner".
+    # Falls back to "self-hosted" if the variable is absent.
+    runs-on: [self-hosted, "{{RUNNER_TAG}}"]
+
+    services:
+      postgres:
+        image: postgres:18
+        env:
+          POSTGRES_USER: ci_user
+          POSTGRES_PASSWORD: citestpassword
+          POSTGRES_DB: ci_db
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+        ports:
+          - 5432:5432
+
+    env:
+      DATABASE_URL: postgresql://ci_user:citestpassword@127.0.0.1:5432/ci_db
+      # APP_DATABASE_URL: non-superuser connection for RLS enforcement.
+      # Uncomment and adjust when your app enforces row-level security.
+      # APP_DATABASE_URL: postgresql://app_user:app_password@127.0.0.1:5432/ci_db
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run migrations
+        run: npm run migrate
+
+      - name: Run unit + integration tests
+        run: npm test
+
+      - name: Build TypeScript
+        run: npm run build
+
+      - name: Run deploy gate tests
+        # Verify the compiled output and any deploy-gate scripts pass.
+        # Adjust or remove if your project has no deploy-gate.sh.
+        run: |
+          if [ -f test/deploy-gate.sh ]; then
+            bash test/deploy-gate.sh
+          fi
