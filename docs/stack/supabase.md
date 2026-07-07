@@ -49,7 +49,7 @@ reserved in practice.
 ### 3. samohost — Supabase in the deferred roadmap only
 
 The optional-module registry is empty:
-`src/commands/preview.ts` lines 19-24 — "v0.1 ships no concrete optional module
+`src/commands/preview.ts` line 20 — "v0.1 ships no concrete optional module
 implementation yet."
 
 Supabase appears only in `SPEC.md §8 Roadmap / Deferred (post-v0.1)`.

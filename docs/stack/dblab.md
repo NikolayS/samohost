@@ -22,7 +22,7 @@ dataset and serves thin, copy-on-write clones per preview environment.
 - Clone IDs = environment names (e.g. `pr-42-feature-foo`)
 - Lease default: 20160 min (14 days) — source: `src/env/script.ts`
   (`DBLAB_LEASE_DEFAULT_MINUTES=20160`)
-- State tracked in `~/.samohost/` via `infra/dblab/clone-registry.ts`
+- State tracked in `~/.samohost/envs.json` via `src/state/envs.ts` (class `EnvStore`)
 
 Full operator install steps: [`docs/dblab-install-runbook.md`](../dblab-install-runbook.md)
 

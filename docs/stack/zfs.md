@@ -5,7 +5,7 @@
 The ZFS pool is always named `tank`. This is enforced across all deployments
 and referenced by the PG data dir path, DBLab mountDir, and backup targets.
 Source: `samo.team/infra/cloud-init/template.ts` line 503 — `poolName: "tank"`
-(the call site hardcodes the name; `infra/zfs/pool.ts` itself is parameterized
+(the call site hardcodes the name; `samo.team/infra/zfs/pool.ts` itself is parameterized
 and accepts any pool name via `ZpoolCreateSpec.poolName`).
 
 ## Two pool shapes

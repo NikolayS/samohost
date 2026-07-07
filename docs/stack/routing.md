@@ -36,19 +36,23 @@ Preview URL pattern: `{app}-{branch-label}.samo.cat`
 ### Token 1: `CLOUDFLARE_SAMOCAT` (DNS only)
 
 - Scope: `Zone:DNS:Edit` + `Zone:Zone:Read`, zone-scoped to `samo.cat`
-- Used by: `env create` (writes per-preview A record), `dns status`
+- Used by: `env create` (writes per-preview A record) — `src/commands/env.ts:1010`
 - Do NOT add Workers scope to this token
 
-### Token 2: `CLOUDFLARE_API_TOKEN` (Workers deploy only)
+### Token 2: `CLOUDFLARE_API_TOKEN` (dns status + Workers deploy)
 
-- Scope: `Account > Workers Scripts: Edit` + `Zone > Workers Routes: Edit`
-  (account + `samo.cat` zone)
-- Used by: `bunx wrangler deploy` for the preview banner Worker
-- See `docs/edge-preview-banner.md`
+- Used by **two separate operations with different required scopes:**
+  1. `dns status` — presence check + read-only CF API origin verify
+     (`src/commands/dns.ts:81`: `deps.env["CLOUDFLARE_API_TOKEN"]`). For this
+     use only DNS read scope is needed.
+  2. `bunx wrangler deploy` — preview banner Worker deploy (`wrangler.toml`).
+     For this use the required scope is `Account > Workers Scripts: Edit` +
+     `Zone > Workers Routes: Edit` (account + `samo.cat` zone).
+     See `docs/edge-preview-banner.md`.
+- Because `dns status` and `wrangler deploy` share this env-var name, a
+  Workers-scoped token satisfies both. Do NOT reuse `CLOUDFLARE_SAMOCAT` for
+  this var — a DNS-only token succeeds at `dns status` but fails at `wrangler`.
 
-Mixing Token 1 and Token 2 causes CF error `10000` (DNS token hitting Workers
-endpoint) or silent Worker deploy failures. Keep all three tokens physically
-separate.
 Source: `docs/setup-checklist.md` "Two distinct Cloudflare tokens."
 
 ### Token 3: `CLOUDFLARE_SAMOTEAM` (CF-for-SaaS custom domains)
@@ -67,7 +71,7 @@ request to the corresponding project VM. No CF DNS API token is needed for
 this routing; Cloudflare handles the wildcard DNS record to the control plane
 IP.
 
-Source: SPEC.md, memory `project_samo_mvp_no_cloudflare_token.md`.
+Source: `samo.team/SPEC.md` (line 522 diagram), memory `project_samo_mvp_no_cloudflare_token.md`.
 
 ## samohost vhost template caveat
 
