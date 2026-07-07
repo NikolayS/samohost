@@ -240,3 +240,116 @@ describe("server.yml — DBLAB_SOURCE_USER substituted (BUG-4)", () => {
     ).toBe("bob");
   });
 });
+
+// ---------------------------------------------------------------------------
+// GAP-1 (fresh-VM smoke): poolManager.selectedPool MUST be "dblab_pool"
+// ---------------------------------------------------------------------------
+// Ground truth: samograph ZFS layout —
+//   zpool create dblab $LOOP_DEV
+//   zfs create dblab/dblab_pool
+//   zfs set ... mountpoint=/var/lib/dblab/dblab_pool dblab/dblab_pool
+//   poolManager.mountDir = /var/lib/dblab
+//
+// DBLab v4 scans mountDir for pool subdirectories. The subdirectory is
+// "dblab_pool", so selectedPool MUST be "dblab_pool" — not the ZFS pool name
+// "dblab". Using "dblab" causes the engine to look for /var/lib/dblab/dblab
+// (which does not exist) → engine logs "no available pools" and loops forever.
+//
+// NOTE: the existing test `expect(out).toContain("selectedPool: dblab")` is a
+// false-positive — the string "selectedPool: dblab" is a substring of
+// "selectedPool: dblab_pool", so it passes regardless of the value suffix.
+// This test uses YAML parsing to assert the exact string value.
+
+describe("server.yml — poolManager.selectedPool MUST equal 'dblab_pool' (GAP-1)", () => {
+  test("poolManager.selectedPool parsed value is exactly 'dblab_pool'", () => {
+    if (!makeDblabModule) throw new Error("makeDblabModule not exported — RED");
+    const parsed = parseServerYml(extractServerYml(makeDblabModule({})));
+    expect(parsed?.poolManager?.selectedPool).toBe("dblab_pool");
+  });
+
+  test("poolManager.selectedPool is NOT the bare ZFS pool name 'dblab'", () => {
+    if (!makeDblabModule) throw new Error("makeDblabModule not exported — RED");
+    const parsed = parseServerYml(extractServerYml(makeDblabModule({})));
+    // Must be the dataset/subdirectory name, NOT the ZFS pool name.
+    expect(parsed?.poolManager?.selectedPool).not.toBe("dblab");
+  });
+
+  test("dblabModule (default export) selectedPool is also 'dblab_pool'", () => {
+    const { dblabModule } = DblabModuleNs as Record<string, unknown> as {
+      dblabModule: import("../src/types.ts").Module;
+    };
+    const spec = makeSpec({ trustedIps: [], adminUser: "samo" });
+    const fragment = dblabModule.cloudInitFragment(spec);
+    const file = (fragment.writeFiles ?? []).find((f) => f.path.endsWith("server.yml"));
+    if (!file) throw new Error("server.yml not found");
+    const parsed = parseServerYml(file.content);
+    expect(parsed?.poolManager?.selectedPool).toBe("dblab_pool");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// GAP-2 (fresh-VM smoke): UFW must allow Docker bridge → clone ports 6000-6099
+// ---------------------------------------------------------------------------
+// Ground truth: samograph UFW rules (verified live):
+//   ufw allow proto tcp from 172.16.0.0/12 to any port 6000:6099
+//   (rule 17: "6000:6099/tcp ALLOW IN 172.16.0.0/12 # dblab clone ports Docker")
+//
+// Without this rule, UFW's default-deny policy blocks the engine's health probes
+// on clone ports. Each blocked port causes a ~3s TCP timeout; 100 ports (6000-6099)
+// = ~5 min stall. The engine health loop never sees healthy clones and stays
+// in the "no available pools" loop indefinitely.
+//
+// The DOCKER_BRIDGE_SUBNET constant ("172.17.0.0/16") covers the Docker default
+// bridge; we assert that at minimum this subnet (or broader) is allowed.
+
+describe("cloud-init runcmd — UFW allows Docker bridge subnet to clone ports 6000-6099 (GAP-2)", () => {
+  test("runcmd contains a ufw allow rule for Docker bridge subnet to port range 6000:6099", () => {
+    if (!makeDblabModule) throw new Error("makeDblabModule not exported — RED");
+    const spec = makeSpec({ trustedIps: [], adminUser: "samo" });
+    const fragment = makeDblabModule({}).cloudInitFragment(spec);
+    const runcmd = (fragment.runcmd ?? []).join("\n");
+    // Must contain a UFW allow rule for some Docker bridge CIDR → clone port range.
+    // Accepts 172.17.0.0/16 (default bridge) or broader 172.16.0.0/12.
+    expect(runcmd).toMatch(
+      /ufw.*allow.*proto tcp.*from 172\.(1[67]|16|17)\.[0-9.]+\/[0-9]+.*port 6000:6099/,
+    );
+  });
+
+  test("ufw rule covers ports 6000 through 6099 (full clone pool range)", () => {
+    if (!makeDblabModule) throw new Error("makeDblabModule not exported — RED");
+    const spec = makeSpec({ trustedIps: [], adminUser: "samo" });
+    const fragment = makeDblabModule({}).cloudInitFragment(spec);
+    const runcmd = (fragment.runcmd ?? []).join("\n");
+    expect(runcmd).toContain("6000:6099");
+  });
+
+  test("ufw rule does NOT world-open clone ports (must be source-restricted to Docker bridge)", () => {
+    if (!makeDblabModule) throw new Error("makeDblabModule not exported — RED");
+    const spec = makeSpec({ trustedIps: [], adminUser: "samo" });
+    const fragment = makeDblabModule({}).cloudInitFragment(spec);
+    const runcmd = (fragment.runcmd ?? []).join("\n");
+    // World-open form (no source restriction on clone ports) must never appear.
+    expect(runcmd).not.toMatch(/ufw allow 6000:6099/);
+  });
+
+  test("fail2ban is still enabled — dblab module does not disable it (GAP-2 regression guard)", () => {
+    if (!makeDblabModule) throw new Error("makeDblabModule not exported — RED");
+    const spec = makeSpec({ trustedIps: [], adminUser: "samo" });
+    const fragment = makeDblabModule({}).cloudInitFragment(spec);
+    const runcmd = (fragment.runcmd ?? []).join("\n");
+    // Must not stop or disable fail2ban.
+    expect(runcmd).not.toContain("fail2ban stop");
+    expect(runcmd).not.toContain("fail2ban disable");
+    expect(runcmd).not.toMatch(/systemctl\s+(stop|disable)\s+fail2ban/);
+  });
+
+  test("control-plane SSH rule is preserved — dblab module does not remove UFW SSH allow", () => {
+    if (!makeDblabModule) throw new Error("makeDblabModule not exported — RED");
+    const spec = makeSpec({ trustedIps: [], adminUser: "samo" });
+    const fragment = makeDblabModule({}).cloudInitFragment(spec);
+    const runcmd = (fragment.runcmd ?? []).join("\n");
+    // Must not issue `ufw delete` for the ssh port.
+    expect(runcmd).not.toMatch(/ufw delete.*2223/);
+    expect(runcmd).not.toMatch(/ufw delete.*ssh/);
+  });
+});
