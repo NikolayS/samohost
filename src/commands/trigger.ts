@@ -34,8 +34,10 @@ import { StateStore } from "../state/store.ts";
 import {
   runAppDeploy,
   defaultAppDeployDeps,
+  defaultResolveLatestTag,
   type AppDeployInput,
   type RefResolver,
+  type LatestTagResolver,
 } from "./app.ts";
 import { checkCiGreen } from "../app/cigate.ts";
 import type { DeployOutcome } from "../app/parse.ts";
@@ -203,6 +205,14 @@ export type TriggerDeploy = (
 export interface TriggerDeps {
   /** Resolve repo + branch → full SHA (the same RefResolver type as in app.ts). */
   resolveRef: RefResolver;
+  /**
+   * OPTIONAL: resolve repo + release-tag glob → latest matching tag's commit
+   * sha (issue #132 / SPEC-DELTA §8). Used ONLY for apps with
+   * `releaseTagPattern` set; when that app has a pattern but this dep is
+   * absent, the branch-HEAD path is taken unchanged. OPTIONAL so all existing
+   * `{resolveRef, deploy, fetch, now}` test fixtures continue to compile.
+   */
+  resolveLatestTag?: LatestTagResolver;
   /** CURRIED runAppDeploy — AppDeployDeps already bound inside. */
   deploy: TriggerDeploy;
   /**
@@ -407,8 +417,35 @@ export async function runTriggerRun(
     }
 
     try {
-      // Resolve the current SHA for the tracked branch
-      const resolvedSha = await deps.resolveRef(app.repo, app.branch);
+      // Resolve the target SHA. Prod (main-env) tracks either the tracked
+      // branch HEAD (default, unchanged) or — when the app opts into the
+      // release-tag production channel (issue #132) — the LATEST git tag
+      // matching app.releaseTagPattern. Everything downstream (up-to-date,
+      // known-bad, CI gate, deploy) is ref-agnostic and reused verbatim.
+      let resolvedSha: string;
+      if (
+        app.releaseTagPattern !== undefined &&
+        deps.resolveLatestTag !== undefined
+      ) {
+        const latest = await deps.resolveLatestTag(
+          app.repo,
+          app.releaseTagPattern,
+        );
+        if (latest === null) {
+          // "Tag ≠ ship": no matching tag → prod stays put. NEVER fall back to
+          // the branch HEAD (that is the preview channel, PR2).
+          results.push({
+            app: app.name,
+            vm: vmName,
+            action: "skipped",
+            reason: "no-matching-tag",
+          });
+          continue;
+        }
+        resolvedSha = latest.sha;
+      } else {
+        resolvedSha = await deps.resolveRef(app.repo, app.branch);
+      }
 
       // up-to-date check
       if (app.deployedSha !== undefined && resolvedSha === app.deployedSha) {
@@ -963,6 +1000,9 @@ export function defaultTriggerDeps(opts: TriggerDepsOpts = {}): TriggerDeps {
     // Reuse the same resolver the deploy path uses (no new resolver code).
     // Tests may inject a fast mock via opts.resolveRef to avoid real GitHub API calls.
     resolveRef: opts.resolveRef ?? appDeployDeps.resolveRef,
+
+    // Release-tag production channel (issue #132): latest matching tag → sha.
+    resolveLatestTag: defaultResolveLatestTag(),
 
     // Curried: AppDeployDeps already captured in closure.
     deploy: (input, opts, vmStore, appStore, out, err) =>

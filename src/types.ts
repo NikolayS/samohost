@@ -243,7 +243,6 @@ export interface AppSpec {
    * fallback to `"template"`; any non-dblab backend must be stated explicitly here.
    */
   previewDbBackend?: EnvDbBackend;
-
   // ---- Multi-service spec model (additive; absent = legacy single-service) --
 
   /**
@@ -274,9 +273,8 @@ export interface AppSpec {
    * Optional glob pattern (e.g. `"v*"`) that the client repo carries to declare
    * which git tags correspond to release events.
    *
-   * IMPORTANT — accepted + persisted; the tag-gated deploy behavior is a
-   * separate, not-yet-shipped feature — prod deploys on main SHA + CI-green
-   * regardless of this value.
+   * When set, production tracks the latest matching stable semver tag instead
+   * of the branch head. The tag commit must still pass the ordinary CI gate.
    */
   releaseTagPattern?: string;
 

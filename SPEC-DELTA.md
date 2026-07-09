@@ -455,3 +455,94 @@ manual on-box setup. With `trigger run`, registering a new `AppRecord` (one
 offline write to `~/.samohost/apps.json`) is sufficient — the next poll
 cycle picks it up automatically. The poller scales horizontally across any
 number of registered apps with zero per-app configuration.
+
+### 8. Release-tag production channel
+
+Driving issue: **#132** ("release-tag → production deploy channel").
+
+#### The "every push ships prod" problem
+
+Today the `trigger` poller (§7) tracks a single ref per app — the configured
+`branch` HEAD — for BOTH the production main-env and (soon) branch previews.
+That conflates two different release cadences: previews want *every* branch
+push, but production wants to ship only on a deliberate, human-cut **release
+tag**. Without a separate channel, any merge to `main` immediately deploys to
+production the moment CI goes green.
+
+#### The channel
+
+A new OPTIONAL `AppSpec.releaseTagPattern?: string` (mirrored in the
+`.samohost.toml` manifest and `app register`) opts an app into a **release-tag
+production channel**:
+
+- **ABSENT (default)** — behavior is byte-for-byte unchanged: production tracks
+  `branch` HEAD via the existing `resolveRef(repo, branch)` path. Every existing
+  `AppRecord` is untouched.
+- **SET** — production tracks the **latest git tag matching the glob** instead
+  of `branch` HEAD. Branch/`main` keep driving previews (PR2); prod ships ONLY
+  on a new matching tag ("Tag ≠ ship" honored — a tag that does not advance the
+  resolved sha is a no-op).
+
+**Validation:** when `releaseTagPattern` is set, `mainHost` is REQUIRED (the
+prod channel needs the durable main vhost from §3/ITEM C to be provisioned
+state, not a hand-applied edit). Enforced at BOTH the TOML parse layer
+(`parseSamohostToml`) and the `app register` layer (`runAppRegister`). A
+non-string `releaseTagPattern` is rejected with a type error.
+
+#### Tag resolution (`resolveLatestTag`)
+
+A new GitHub client `resolveLatestTag(repo, pattern): Promise<{tag, sha} | null>`
+(in `src/commands/app.ts`, beside `defaultRefResolver`):
+
+1. Lists tags via `gh api --paginate repos/<repo>/tags`.
+2. Filters names by the glob (`*`, `?`, `[...]` supported).
+3. Sorts survivors by **SEMVER DESCENDING** — a leading `v` is stripped, so
+   `v1.10.0 > v1.9.0 > v1.2.0` (numeric, not lexical). **Prereleases**
+   (`-rc.1`, …) are EXCLUDED unless the pattern opts in (contains a `-`).
+4. Takes the greatest, then **DEREFERENCES to a COMMIT sha** via
+   `gh api repos/<repo>/commits/<tag>` — this resolves both lightweight AND
+   annotated tags to the target commit (an annotated tag's own object sha is
+   never returned).
+5. Returns `{tag, sha}`, or `null` if no tag matches. **NEVER a branch-HEAD
+   fallback.**
+
+The selection logic is factored into a pure `selectLatestTag(names, pattern)`
+and an IO-injected `makeResolveLatestTag(ghTagIo)` so semver ordering,
+prerelease policy, and annotated-tag deref are unit-tested fully offline.
+
+#### Trigger wiring (surgical; downstream reused verbatim)
+
+`TriggerDeps` gains an OPTIONAL `resolveLatestTag?` (wired in
+`defaultTriggerDeps` from the `app.ts` sibling; optional keeps every existing
+test fixture valid). At the single resolve step in `runTriggerRun`:
+
+- If `app.releaseTagPattern` is set AND `deps.resolveLatestTag` is wired →
+  resolve the latest tag. `null` → record `action=skipped`, `reason=no-matching-tag`
+  and continue (prod stays put; no branch fallback, no CI round-trip). Otherwise
+  use its sha.
+- Else → the existing `resolveRef(repo, branch)` branch-HEAD path, EXACTLY as
+  before.
+
+Everything downstream — the `deployedSha` up-to-date compare, the `failedSha`
+known-bad short-circuit, `--dry-run`, `checkCiGreen` on the resolved sha, and
+`runAppDeploy` — is REUSED UNCHANGED and already ref-agnostic.
+
+#### Acceptance criteria (each traces to a red test in `test/release-tag.test.ts`)
+
+- **§8 #1** semver ordering — `selectLatestTag` picks `v1.10.0` over `v1.9.0`
+  over `v1.2.0` (numeric, not lexical).
+- **§8 #2** prereleases excluded by a plain glob; included only when the glob
+  opts in (contains `-`).
+- **§8 #3** annotated-tag deref — the resolved sha is the COMMIT sha, obtained
+  by dereferencing the winning tag NAME (not the tag-object sha).
+- **§8 #4** no matching tag → `action=skipped`, `reason=no-matching-tag`, NO
+  branch fallback (`resolveRef` never called), no CI call, prod `deployedSha`
+  unchanged.
+- **§8 #5** an app WITHOUT `releaseTagPattern` is byte-for-byte unchanged — the
+  branch-HEAD path runs and `resolveLatestTag` is never consulted.
+- **§8 #6** a new latest tag advances prod (`action=deployed`, deploy called
+  once with the tag's sha); a tag already at `deployedSha` → `up-to-date`.
+- **§8 #7** a failed tag deploy sets `failedSha`, which the known-bad
+  short-circuit honors on the next cycle (no re-deploy, no CI round-trip).
+- **§8 #8** `releaseTagPattern` without `mainHost` → validation error at both
+  the TOML parse and `app register` layers.

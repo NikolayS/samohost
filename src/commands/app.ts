@@ -78,6 +78,13 @@ export interface AppRegisterInput {
    */
   previewDbBackend?: EnvDbBackend;
   /**
+   * Glob selecting the git tags that drive the PRODUCTION deploy channel
+   * (issue #132). When set, prod tracks the latest matching semver tag instead
+   * of `branch` HEAD; requires {@link mainHost}. Absent → unchanged (branch
+   * HEAD). Mirrors {@link AppSpec.releaseTagPattern}.
+   */
+  releaseTagPattern?: string;
+  /**
    * OS user that owns the production app checkout and the envs root (created
    * by `samohost app bootstrap --app-user <user>`). When set, env-create runs
    * all git operations as this user via `sudo -u <appUser> GIT_CONFIG_GLOBAL=...`.
@@ -235,6 +242,13 @@ export function runAppRegister(
     }
   }
 
+  // issue #132: the release-tag prod channel needs a durable main vhost, so
+  // mainHost is required whenever releaseTagPattern is set.
+  if (input.releaseTagPattern !== undefined && input.mainHost === undefined) {
+    err(`error: releaseTagPattern requires mainHost to be set`);
+    return 1;
+  }
+
   const spec: AppSpec = {
     name: input.name,
     repo: input.repo,
@@ -257,6 +271,7 @@ export function runAppRegister(
       : {}),
     ...(input.dbBackend !== undefined ? { dbBackend: input.dbBackend } : {}),
     ...(input.previewDbBackend !== undefined ? { previewDbBackend: input.previewDbBackend } : {}),
+    ...(input.releaseTagPattern !== undefined ? { releaseTagPattern: input.releaseTagPattern } : {}),
     ...(input.appUser !== undefined ? { appUser: input.appUser } : {}),
     // Multi-service spec model (additive; absent = legacy single-service)
     ...(input.services !== undefined ? { services: input.services } : {}),
@@ -368,6 +383,7 @@ export function runAppRegisterFromToml(
     ...(app.envDbVars !== undefined ? { envDbVars: app.envDbVars } : {}),
     ...(app.dbBackend !== undefined ? { dbBackend: app.dbBackend } : {}),
     ...(app.previewDbBackend !== undefined ? { previewDbBackend: app.previewDbBackend } : {}),
+    ...(app.releaseTagPattern !== undefined ? { releaseTagPattern: app.releaseTagPattern } : {}),
     ...(app.appUser !== undefined ? { appUser: app.appUser } : {}),
     // Multi-service spec model (additive; absent = legacy single-service)
     ...(app.services !== undefined ? { services: app.services } : {}),
@@ -793,6 +809,208 @@ function defaultRefResolver(): RefResolver {
     }
     return Promise.resolve((res.stdout ?? "").trim());
   };
+}
+
+// ---------------------------------------------------------------------------
+// Release-tag production channel (issue #132 / SPEC-DELTA §8)
+// ---------------------------------------------------------------------------
+
+/** A resolved release tag: the tag name plus the COMMIT sha it points at. */
+export interface TagRef {
+  tag: string;
+  sha: string;
+}
+
+/**
+ * Resolve the LATEST release tag matching `pattern` for `repo` → its commit
+ * sha, or `null` when no tag matches. NEVER falls back to a branch HEAD.
+ * The same type is injected into the trigger as `resolveLatestTag`.
+ */
+export type LatestTagResolver = (
+  repo: string,
+  pattern: string,
+) => Promise<TagRef | null>;
+
+/**
+ * Low-level GitHub IO for the tag resolver, split out so the selection logic
+ * ({@link selectLatestTag}) and the deref/list orchestration are unit-tested
+ * offline with a fake, while prod wires `gh api`.
+ */
+export interface GhTagIo {
+  /** List every tag name in the repo (e.g. `gh api --paginate repos/<r>/tags`). */
+  listTags: (repo: string) => Promise<string[]>;
+  /**
+   * Dereference a tag ref to its target COMMIT sha. `gh api
+   * repos/<r>/commits/<ref>` resolves BOTH lightweight and annotated tags to
+   * the underlying commit (an annotated tag's own object sha is NOT returned).
+   */
+  resolveCommitSha: (repo: string, ref: string) => Promise<string>;
+}
+
+/** Parsed semver components; `prerelease` empty ⇒ a final release. */
+interface Semver {
+  major: number;
+  minor: number;
+  patch: number;
+  prerelease: string[];
+  raw: string;
+}
+
+/** Convert a shell-style glob (`*`, `?`, `[...]`) into an anchored RegExp. */
+export function tagGlobToRegExp(glob: string): RegExp {
+  let re = "^";
+  let i = 0;
+  while (i < glob.length) {
+    const c = glob[i]!;
+    if (c === "*") {
+      re += ".*";
+      i++;
+    } else if (c === "?") {
+      re += ".";
+      i++;
+    } else if (c === "[") {
+      // Character class: copy through the matching ']'.
+      let j = i + 1;
+      let cls = "[";
+      if (glob[j] === "!" || glob[j] === "^") {
+        cls += "^";
+        j++;
+      }
+      if (glob[j] === "]") {
+        cls += "\\]";
+        j++;
+      }
+      while (j < glob.length && glob[j] !== "]") {
+        cls += glob[j] === "\\" ? "\\\\" : glob[j];
+        j++;
+      }
+      if (j >= glob.length) {
+        // Unterminated '[' → treat as a literal '['.
+        re += "\\[";
+        i++;
+        continue;
+      }
+      re += cls + "]";
+      i = j + 1;
+    } else {
+      re += c.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      i++;
+    }
+  }
+  return new RegExp(re + "$");
+}
+
+/** Parse a (possibly `v`-prefixed) tag name into semver parts, or null. */
+function parseSemver(name: string): Semver | null {
+  const s = name.replace(/^v/, "");
+  const m = /^(\d+)(?:\.(\d+))?(?:\.(\d+))?(?:-([0-9A-Za-z.-]+))?/.exec(s);
+  if (m === null) return null;
+  return {
+    major: Number(m[1]),
+    minor: m[2] !== undefined ? Number(m[2]) : 0,
+    patch: m[3] !== undefined ? Number(m[3]) : 0,
+    prerelease: m[4] !== undefined ? m[4].split(".") : [],
+    raw: name,
+  };
+}
+
+/** Semver precedence (SemVer §11): negative if a < b, positive if a > b. */
+function compareSemver(a: Semver, b: Semver): number {
+  if (a.major !== b.major) return a.major - b.major;
+  if (a.minor !== b.minor) return a.minor - b.minor;
+  if (a.patch !== b.patch) return a.patch - b.patch;
+  const ap = a.prerelease;
+  const bp = b.prerelease;
+  // A final release outranks any prerelease of the same core version.
+  if (ap.length === 0 && bp.length === 0) return 0;
+  if (ap.length === 0) return 1;
+  if (bp.length === 0) return -1;
+  const n = Math.min(ap.length, bp.length);
+  for (let i = 0; i < n; i++) {
+    const x = ap[i]!;
+    const y = bp[i]!;
+    const xn = /^\d+$/.test(x);
+    const yn = /^\d+$/.test(y);
+    if (xn && yn) {
+      const d = Number(x) - Number(y);
+      if (d !== 0) return d;
+    } else if (xn) {
+      return -1; // numeric identifiers rank lower than alphanumeric
+    } else if (yn) {
+      return 1;
+    } else if (x !== y) {
+      return x < y ? -1 : 1;
+    }
+  }
+  return ap.length - bp.length;
+}
+
+/**
+ * From `names`, keep those matching the glob `pattern` that parse as semver,
+ * EXCLUDE prereleases unless the pattern opts in (contains a `-`), and return
+ * the greatest by semver precedence — or `null` if none qualify. Pure.
+ */
+export function selectLatestTag(
+  names: string[],
+  pattern: string,
+): string | null {
+  const re = tagGlobToRegExp(pattern);
+  const allowPrerelease = pattern.includes("-");
+  let best: Semver | null = null;
+  for (const name of names) {
+    if (!re.test(name)) continue;
+    const sv = parseSemver(name);
+    if (sv === null) continue;
+    if (!allowPrerelease && sv.prerelease.length > 0) continue;
+    if (best === null || compareSemver(sv, best) > 0) best = sv;
+  }
+  return best === null ? null : best.raw;
+}
+
+/**
+ * Build a {@link LatestTagResolver} over an injected {@link GhTagIo}: list
+ * tags, pick the latest matching semver ({@link selectLatestTag}), then deref
+ * that tag to its commit sha. Returns null (no branch fallback) when nothing
+ * matches.
+ */
+export function makeResolveLatestTag(io: GhTagIo): LatestTagResolver {
+  return async (repo, pattern) => {
+    const names = await io.listTags(repo);
+    const latest = selectLatestTag(names, pattern);
+    if (latest === null) return null;
+    const sha = (await io.resolveCommitSha(repo, latest)).trim();
+    return { tag: latest, sha };
+  };
+}
+
+/** Prod {@link GhTagIo}: `gh api` (single short-lived process per call). */
+function defaultGhTagIo(): GhTagIo {
+  return {
+    listTags: (repo) => {
+      const res = spawnSync(
+        "gh",
+        ["api", "--paginate", `repos/${repo}/tags`, "--jq", ".[].name"],
+        { encoding: "utf8", maxBuffer: 8 * 1024 * 1024 },
+      );
+      if (res.status !== 0) {
+        const msg = (res.stderr || res.error?.message || "gh api failed").trim();
+        return Promise.reject(new Error(msg));
+      }
+      const names = (res.stdout ?? "")
+        .split("\n")
+        .map((s) => s.trim())
+        .filter((s) => s.length > 0);
+      return Promise.resolve(names);
+    },
+    // Reuses the SAME endpoint as defaultRefResolver: commits/<ref> resolves an
+    // annotated tag to the target commit (not the tag object).
+    resolveCommitSha: defaultRefResolver(),
+  };
+}
+
+/** Resolve the latest matching release tag → commit sha via `gh api`. */
+export function defaultResolveLatestTag(): LatestTagResolver {
+  return makeResolveLatestTag(defaultGhTagIo());
 }
 
 /** Default production deploy deps. */
