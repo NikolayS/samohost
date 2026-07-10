@@ -1,0 +1,26 @@
+# PROD vhost for samograph.samo.team — control-plane Caddy (91.99.233.145)
+# reverse-proxies this host to VM:80 with Host preserved. Mirrors the
+# samograph-main.caddy handle structure at the PROD ports.
+http://samograph.samo.team:80 {
+	@stream path_regexp ^/calls/[^/]+/stream$
+	@transcript path_regexp ^/calls/[^/]+/transcript
+	handle @stream {
+		reverse_proxy localhost:8888
+	}
+	handle /webhook* {
+		reverse_proxy localhost:8189
+	}
+	handle @transcript {
+		reverse_proxy localhost:8888
+	}
+	handle /__dev* {
+		respond "not found" 404
+	}
+	handle {
+		reverse_proxy localhost:3000
+	}
+	log {
+		output file /var/log/caddy/samograph-prod.log
+		format json
+	}
+}
