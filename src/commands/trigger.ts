@@ -893,6 +893,28 @@ export interface TriggerDepsOpts {
    * Production: absent (undefined) → batchedVmCycle spawns `gh pr list`.
    */
   listOpenPrs?: (repo: string) => Promise<Array<{ number: number; headRef: string; headSha: string }>>;
+  /**
+   * Injectable ensurePreviewDns function (for integration tests).
+   *
+   * When provided, batchedVmCycle calls this for each NEW PR preview (where
+   * no existing env record exists) to create the per-preview Cloudflare A
+   * record before the batch SSH so ACME HTTP-01 can resolve.
+   *
+   * Production: absent → batchedVmCycle uses CloudflareDns from
+   * CLOUDFLARE_SAMOCAT env var. If the var is also absent, falls back to
+   * the DNS-degrade warning (wildcard reliance).
+   */
+  ensurePreviewDns?: (vhost: string, ip: string) => Promise<void>;
+  /**
+   * Injectable external HTTPS probe (for integration tests — avoids real
+   * network calls). When provided, batchedVmCycle calls this after a
+   * successful batch run for each PR item before stamping lastDeployedSha
+   * and posting the preview-ready comment.
+   *
+   * Production: absent → batchedVmCycle uses the system curl probe
+   * (buildCurlProbeArgs / parseCurlProbeResult), same as runEnvCreate.
+   */
+  httpProbe?: (url: string) => Promise<{ status: number; ok: boolean }>;
 }
 
 /**
