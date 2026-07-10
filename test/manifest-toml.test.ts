@@ -652,7 +652,11 @@ describe("runAppRegisterFromToml — dbBackend/previewDbBackend threading (#88)"
 
   test("reg-db-3: manifest with previewDbBackend='template' yields AppRecord.previewDbBackend='template'", () => {
     // Also dropped: previewDbBackend is not threaded from AppManifest to AppRegisterInput.
-    const tomlPath = writeToml('previewDbBackend = "template"');
+    // Updated (PR secrets+databaseUrlEnv): previewDbBackend='template' is explicitly
+    // DB-backed → databaseUrlEnv is now required; add it to satisfy the new rule.
+    const tomlPath = writeToml(
+      'previewDbBackend = "template"\ndatabaseUrlEnv = "DATABASE_URL"',
+    );
     const c = capture();
     const code = runAppRegisterFromToml(
       { vm: "samo-we-field-record", tomlPath },
@@ -665,13 +669,17 @@ describe("runAppRegisterFromToml — dbBackend/previewDbBackend threading (#88)"
     expect(code).toBe(0);
     const rec = appStore.get("vm-1111", "samohost-fixture");
     expect(rec).toBeDefined();
-    // Fails today: rec.previewDbBackend is undefined (dropped)
     expect(rec?.previewDbBackend).toBe("template");
+    expect(rec?.databaseUrlEnv).toBe("DATABASE_URL");
   });
 
   test("reg-db-4: manifest with both dbBackend='none' and previewDbBackend='dblab' → both persisted", () => {
     // Explicit previewDbBackend must override the dbBackend='none' fallback.
-    const tomlPath = writeToml('dbBackend = "none"\npreviewDbBackend = "dblab"');
+    // Updated (PR secrets+databaseUrlEnv): previewDbBackend='dblab' is explicitly
+    // DB-backed → databaseUrlEnv is now required; add it to satisfy the new rule.
+    const tomlPath = writeToml(
+      'dbBackend = "none"\npreviewDbBackend = "dblab"\ndatabaseUrlEnv = "DATABASE_URL"',
+    );
     const c = capture();
     const code = runAppRegisterFromToml(
       { vm: "samo-we-field-record", tomlPath },
@@ -685,6 +693,7 @@ describe("runAppRegisterFromToml — dbBackend/previewDbBackend threading (#88)"
     const rec = appStore.get("vm-1111", "samohost-fixture");
     expect(rec?.dbBackend).toBe("none");
     expect(rec?.previewDbBackend).toBe("dblab");
+    expect(rec?.databaseUrlEnv).toBe("DATABASE_URL");
     // previewDbBackend explicit value wins
     expect(previewDbBackendFor(rec!)).toBe("dblab");
   });
@@ -1926,5 +1935,307 @@ describe("runAppRegisterFromToml — releaseTagPattern threaded to AppRecord", (
     const rec = appStore.get("vm-1111", "rtp-fixture");
     expect(rec).toBeDefined();
     expect(rec?.releaseTagPattern).toBeUndefined();
+  });
+});
+
+// ===========================================================================
+// secrets[] + databaseUrlEnv — schema + validation (PR: declare secrets[] +
+// databaseUrlEnv). RED: all assertions below fail on current code because the
+// fields do not exist yet (unknown-key rejection or no DB-backed check).
+// GREEN: after adding both fields to types.ts, toml.ts, commands/app.ts.
+//
+// DB-backed predicate used by the parser (mirrors previewDbBackendFor() but
+// only for EXPLICITLY stored values — absent fields exempt legacy apps):
+//   isExplicitlyDbBacked =
+//     (previewDbBackend !== undefined && previewDbBackend !== "none")
+//     || (previewDbBackend === undefined && dbBackend !== undefined && dbBackend !== "none")
+// ===========================================================================
+
+/** Re-usable minimal valid TOML builder for secrets tests. */
+function minimalForSecrets(extra = ""): string {
+  return [
+    'name        = "my-app"',
+    'repo        = "owner/my-app"',
+    'branch      = "main"',
+    'appDir      = "/opt/my-app/app"',
+    'buildCmd    = "npm run build"',
+    'healthUrl   = "http://localhost:3000/health"',
+    'serviceUnit = "my-app"',
+    extra,
+  ].filter(Boolean).join("\n");
+}
+
+// ---------------------------------------------------------------------------
+// sec-parse: secrets + databaseUrlEnv field parsing
+// ---------------------------------------------------------------------------
+
+describe("parseSamohostToml — secrets[] + databaseUrlEnv parse", () => {
+  // sec-1: valid values → parse ok, values land in AppManifest
+  test("sec-1: valid secrets + databaseUrlEnv parse ok and land in AppManifest", () => {
+    // RED: currently fails — 'secrets' and 'databaseUrlEnv' are unknown keys.
+    const toml = minimalForSecrets([
+      'secrets = ["JWT_SECRET", "SESSION_SECRET"]',
+      'databaseUrlEnv = "DATABASE_URL"',
+      'dbBackend = "dblab"',  // make it explicitly DB-backed so databaseUrlEnv is not flagged missing
+    ].join("\n"));
+    const result = parseSamohostToml(toml);
+    if (!result.ok) throw new Error("expected ok=true; errors: " + result.errors.join(", "));
+    expect(result.app.secrets).toEqual(["JWT_SECRET", "SESSION_SECRET"]);
+    expect(result.app.databaseUrlEnv).toBe("DATABASE_URL");
+  });
+
+  // sec-2: bad secret name charset → error naming the bad value
+  test("sec-2: secrets entry with hyphen (bad charset) → error naming the bad value", () => {
+    // RED: currently the error is "unknown key: secrets"; after fix the error
+    // must name the bad value "bad-name", not just reject the key.
+    const toml = minimalForSecrets('secrets = ["GOOD_NAME", "bad-name"]');
+    const result = parseSamohostToml(toml);
+    expect(result.ok).toBe(false);
+    if (result.ok) throw new Error("expected ok=false");
+    // Must mention the bad value — "unknown key: secrets" does NOT satisfy this.
+    expect(result.errors.some((e) => e.includes("bad-name"))).toBe(true);
+  });
+
+  // sec-3: bad databaseUrlEnv charset → error naming the bad value
+  test("sec-3: databaseUrlEnv with hyphen (bad charset) → error naming the bad value", () => {
+    // RED: currently "unknown key: databaseUrlEnv"; after fix the error must
+    // mention the bad value "bad-db-url".
+    const toml = minimalForSecrets('databaseUrlEnv = "bad-db-url"');
+    const result = parseSamohostToml(toml);
+    expect(result.ok).toBe(false);
+    if (result.ok) throw new Error("expected ok=false");
+    // Must mention the bad value — "unknown key: databaseUrlEnv" does NOT satisfy.
+    expect(result.errors.some((e) => e.includes("bad-db-url"))).toBe(true);
+  });
+
+  // sec-4: duplicate secret names → error mentioning "duplicate"
+  test("sec-4: duplicate secret names → collected error", () => {
+    // RED: currently "unknown key: secrets"; after fix must say "duplicate".
+    const toml = minimalForSecrets('secrets = ["JWT_SECRET", "JWT_SECRET"]');
+    const result = parseSamohostToml(toml);
+    expect(result.ok).toBe(false);
+    if (result.ok) throw new Error("expected ok=false");
+    expect(result.errors.some((e) => e.toLowerCase().includes("duplicate") && e.includes("JWT_SECRET"))).toBe(true);
+  });
+
+  // sec-5: DB-backed (explicit dbBackend=dblab) without databaseUrlEnv → hard error
+  test("sec-5: explicit dbBackend=dblab without databaseUrlEnv → hard error", () => {
+    // RED: currently ok=true (no such check exists); after fix must fail.
+    const toml = minimalForSecrets('dbBackend = "dblab"');
+    const result = parseSamohostToml(toml);
+    expect(result.ok).toBe(false);
+    if (result.ok) throw new Error("expected ok=false");
+    expect(result.errors.some((e) =>
+      e.toLowerCase().includes("databaseurlenv") && e.toLowerCase().includes("required"),
+    )).toBe(true);
+  });
+
+  // sec-6: explicit previewDbBackend=dblab without databaseUrlEnv → hard error
+  test("sec-6: explicit previewDbBackend=dblab without databaseUrlEnv → hard error", () => {
+    // RED: currently ok=true; after fix must fail.
+    const toml = minimalForSecrets('previewDbBackend = "dblab"');
+    const result = parseSamohostToml(toml);
+    expect(result.ok).toBe(false);
+    if (result.ok) throw new Error("expected ok=false");
+    expect(result.errors.some((e) =>
+      e.toLowerCase().includes("databaseurlenv") && e.toLowerCase().includes("required"),
+    )).toBe(true);
+  });
+
+  // sec-7: explicit previewDbBackend=template without databaseUrlEnv → hard error
+  test("sec-7: explicit previewDbBackend=template without databaseUrlEnv → hard error", () => {
+    // RED: currently ok=true; after fix must fail.
+    const toml = minimalForSecrets('previewDbBackend = "template"');
+    const result = parseSamohostToml(toml);
+    expect(result.ok).toBe(false);
+    if (result.ok) throw new Error("expected ok=false");
+    expect(result.errors.some((e) =>
+      e.toLowerCase().includes("databaseurlenv") && e.toLowerCase().includes("required"),
+    )).toBe(true);
+  });
+
+  // sec-8: explicit dbBackend=none without databaseUrlEnv → ok (non-DB app)
+  test("sec-8: explicit dbBackend=none without databaseUrlEnv → ok", () => {
+    // Regression guard: this must already pass and must keep passing after the fix.
+    const toml = minimalForSecrets('dbBackend = "none"');
+    const result = parseSamohostToml(toml);
+    if (!result.ok) throw new Error("expected ok=true; errors: " + result.errors.join(", "));
+    expect(result.app.databaseUrlEnv).toBeUndefined();
+  });
+
+  // sec-9: explicit previewDbBackend=none without databaseUrlEnv → ok
+  test("sec-9: explicit previewDbBackend=none without databaseUrlEnv → ok", () => {
+    // Regression guard: previewDbBackend=none means no DB clone; exempt.
+    const toml = minimalForSecrets('previewDbBackend = "none"');
+    const result = parseSamohostToml(toml);
+    if (!result.ok) throw new Error("expected ok=true; errors: " + result.errors.join(", "));
+    expect(result.app.databaseUrlEnv).toBeUndefined();
+  });
+
+  // sec-10: legacy manifest (neither secrets nor databaseUrlEnv nor dbBackend) → unchanged
+  test("sec-10: legacy manifest (no new fields, no explicit dbBackend) → ok, fields absent", () => {
+    // CRITICAL regression guard: the default 'dblab' backend is not stored per-app;
+    // legacy apps without explicit dbBackend/previewDbBackend must NOT be required to
+    // declare databaseUrlEnv. This is the "legacy manifests → unchanged" guarantee.
+    const result = parseSamohostToml(minimalForSecrets());
+    if (!result.ok) throw new Error("expected ok=true; errors: " + result.errors.join(", "));
+    expect(result.app.secrets).toBeUndefined();
+    expect(result.app.databaseUrlEnv).toBeUndefined();
+  });
+
+  // sec-11: secrets = [] (empty array) → ok, stored as empty array
+  test("sec-11: secrets = [] (empty array) → ok, field is empty array", () => {
+    // RED: currently fails — 'secrets' is an unknown key.
+    const toml = minimalForSecrets('secrets = []');
+    const result = parseSamohostToml(toml);
+    if (!result.ok) throw new Error("expected ok=true; errors: " + result.errors.join(", "));
+    expect(result.app.secrets).toEqual([]);
+  });
+
+  // sec-12: secrets with underscore-prefixed name → valid charset
+  test("sec-12: secrets entry _SESSION_KEY (underscore prefix) → accepted", () => {
+    // RED: currently fails — 'secrets' is an unknown key.
+    const toml = minimalForSecrets([
+      'secrets = ["_SESSION_KEY"]',
+      'databaseUrlEnv = "DATABASE_URL"',
+      'dbBackend = "dblab"',
+    ].join("\n"));
+    const result = parseSamohostToml(toml);
+    if (!result.ok) throw new Error("expected ok=true; errors: " + result.errors.join(", "));
+    expect(result.app.secrets).toEqual(["_SESSION_KEY"]);
+  });
+
+  // sec-13: secrets entry starting with digit → bad charset error
+  test("sec-13: secrets entry starting with digit → bad charset error", () => {
+    const toml = minimalForSecrets('secrets = ["1BAD_SECRET"]');
+    const result = parseSamohostToml(toml);
+    expect(result.ok).toBe(false);
+    if (result.ok) throw new Error("expected ok=false");
+    expect(result.errors.some((e) => e.includes("1BAD_SECRET"))).toBe(true);
+  });
+
+  // sec-14: databaseUrlEnv with lowercase → bad charset error
+  test("sec-14: databaseUrlEnv with lowercase → bad charset error", () => {
+    const toml = minimalForSecrets('databaseUrlEnv = "database_url"');
+    const result = parseSamohostToml(toml);
+    expect(result.ok).toBe(false);
+    if (result.ok) throw new Error("expected ok=false");
+    expect(result.errors.some((e) => e.includes("database_url"))).toBe(true);
+  });
+
+  // sec-15: databaseUrlEnv wrong type (integer) → type error
+  test("sec-15: databaseUrlEnv = 123 (wrong type) → type error", () => {
+    const toml = minimalForSecrets('databaseUrlEnv = 123');
+    const result = parseSamohostToml(toml);
+    expect(result.ok).toBe(false);
+    if (result.ok) throw new Error("expected ok=false");
+    expect(result.errors.some((e) => e.toLowerCase().includes("databaseurlenv"))).toBe(true);
+  });
+
+  // sec-16: secrets wrong type (not an array) → type error
+  test("sec-16: secrets = 'JWT_SECRET' (string, not array) → type error", () => {
+    const toml = minimalForSecrets('secrets = "JWT_SECRET"');
+    const result = parseSamohostToml(toml);
+    expect(result.ok).toBe(false);
+    if (result.ok) throw new Error("expected ok=false");
+    expect(result.errors.some((e) => e.toLowerCase().includes("secrets"))).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// sec-int: integration — secrets + databaseUrlEnv thread from TOML to AppRecord
+// ---------------------------------------------------------------------------
+
+describe("runAppRegisterFromToml — secrets + databaseUrlEnv threaded to AppRecord", () => {
+  let dir: string;
+  let vmStore: StateStore;
+  let appStore: AppStore;
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), "samohost-secrets-"));
+    vmStore = new StateStore(join(dir, "state.json"));
+    appStore = new AppStore(join(dir, "apps.json"));
+    vmStore.upsert(vm());
+  });
+
+  afterEach(() => rmSync(dir, { recursive: true, force: true }));
+
+  function writeSecretsToml(extra: string): string {
+    const path = join(dir, "test.toml");
+    writeFileSync(path, [
+      'name        = "secrets-app"',
+      'repo        = "owner/secrets-app"',
+      'branch      = "main"',
+      'appDir      = "/opt/secrets-app/app"',
+      'buildCmd    = "npm run build"',
+      'healthUrl   = "http://localhost:3000/api/version"',
+      'serviceUnit = "secrets-app"',
+      extra,
+    ].filter(Boolean).join("\n"));
+    return path;
+  }
+
+  // sec-int-1: both fields land on AppRecord
+  test("sec-int-1: secrets + databaseUrlEnv land on AppRecord after --from-toml", () => {
+    // RED: currently fails — 'secrets'/'databaseUrlEnv' are unknown keys.
+    const tomlPath = writeSecretsToml([
+      'secrets        = ["JWT_SECRET", "SESSION_SECRET"]',
+      'databaseUrlEnv = "DATABASE_URL"',
+      'dbBackend      = "dblab"',
+    ].join("\n"));
+    const c = capture();
+    const code = runAppRegisterFromToml(
+      { vm: "samo-we-field-record", tomlPath },
+      { json: false },
+      vmStore,
+      appStore,
+      c.out,
+      c.err,
+    );
+    expect(code).toBe(0);
+    const rec = appStore.get("vm-1111", "secrets-app");
+    expect(rec).toBeDefined();
+    expect(rec?.secrets).toEqual(["JWT_SECRET", "SESSION_SECRET"]);
+    expect(rec?.databaseUrlEnv).toBe("DATABASE_URL");
+  });
+
+  // sec-int-2: legacy manifest (no new fields) → ok, fields absent on AppRecord
+  test("sec-int-2: legacy manifest (no secrets, no databaseUrlEnv, no dbBackend) → ok, fields absent", () => {
+    const tomlPath = writeSecretsToml("");
+    const c = capture();
+    const code = runAppRegisterFromToml(
+      { vm: "samo-we-field-record", tomlPath },
+      { json: false },
+      vmStore,
+      appStore,
+      c.out,
+      c.err,
+    );
+    expect(code).toBe(0);
+    const rec = appStore.get("vm-1111", "secrets-app");
+    expect(rec).toBeDefined();
+    // Legacy apps are byte-identical: no new keys should appear.
+    expect(rec?.secrets).toBeUndefined();
+    expect(rec?.databaseUrlEnv).toBeUndefined();
+  });
+
+  // sec-int-3: dbBackend=none → no databaseUrlEnv required; AppRecord.dbBackend=none
+  test("sec-int-3: dbBackend=none without databaseUrlEnv → ok, no new key on AppRecord", () => {
+    const tomlPath = writeSecretsToml('dbBackend = "none"');
+    const c = capture();
+    const code = runAppRegisterFromToml(
+      { vm: "samo-we-field-record", tomlPath },
+      { json: false },
+      vmStore,
+      appStore,
+      c.out,
+      c.err,
+    );
+    expect(code).toBe(0);
+    const rec = appStore.get("vm-1111", "secrets-app");
+    expect(rec).toBeDefined();
+    expect(rec?.dbBackend).toBe("none");
+    expect(rec?.databaseUrlEnv).toBeUndefined();
+    expect(rec?.secrets).toBeUndefined();
   });
 });

@@ -153,7 +153,10 @@ serviceUnit = "samohost-fixture"
   });
 
   test("toml-2: dbBackend='dblab' is accepted", () => {
-    const result = parseSamohostToml(minimalToml + `\ndbBackend = "dblab"\n`);
+    // Updated (PR secrets+databaseUrlEnv): explicit dbBackend='dblab' requires databaseUrlEnv.
+    const result = parseSamohostToml(
+      minimalToml + `\ndbBackend = "dblab"\ndatabaseUrlEnv = "DATABASE_URL"\n`,
+    );
     if (!result.ok) {
       throw new Error("expected ok=true; errors: " + result.errors.join(", "));
     }
@@ -161,7 +164,10 @@ serviceUnit = "samohost-fixture"
   });
 
   test("toml-3: dbBackend='template' is accepted", () => {
-    const result = parseSamohostToml(minimalToml + `\ndbBackend = "template"\n`);
+    // Updated (PR secrets+databaseUrlEnv): explicit dbBackend='template' requires databaseUrlEnv.
+    const result = parseSamohostToml(
+      minimalToml + `\ndbBackend = "template"\ndatabaseUrlEnv = "DATABASE_URL"\n`,
+    );
     if (!result.ok) {
       throw new Error("expected ok=true; errors: " + result.errors.join(", "));
     }
@@ -208,7 +214,10 @@ serviceUnit = "samohost-fixture"
   });
 
   test("toml-prev-2: previewDbBackend='dblab' is accepted", () => {
-    const result = parseSamohostToml(minimalToml + `\npreviewDbBackend = "dblab"\n`);
+    // Updated (PR secrets+databaseUrlEnv): explicit previewDbBackend='dblab' requires databaseUrlEnv.
+    const result = parseSamohostToml(
+      minimalToml + `\npreviewDbBackend = "dblab"\ndatabaseUrlEnv = "DATABASE_URL"\n`,
+    );
     if (!result.ok) {
       throw new Error("expected ok=true; errors: " + result.errors.join(", "));
     }

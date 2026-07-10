@@ -103,6 +103,19 @@ export interface AppRegisterInput {
    * regardless of this value.
    */
   releaseTagPattern?: string;
+
+  /**
+   * App-level secret env-var NAMES to auto-generate per preview env (PR-B).
+   * Each entry must match ^[A-Z_][A-Z0-9_]*$. No duplicates.
+   * Mirrors {@link AppSpec.secrets}.
+   */
+  secrets?: string[];
+
+  /**
+   * Env-var name holding the DB connection URL (e.g. "DATABASE_URL").
+   * Required for explicitly DB-backed apps. Mirrors {@link AppSpec.databaseUrlEnv}.
+   */
+  databaseUrlEnv?: string;
 }
 
 /**
@@ -253,6 +266,10 @@ export function runAppRegister(
     // accepted + persisted; the tag-gated deploy behavior is a separate,
     // not-yet-shipped feature — prod deploys on main SHA + CI-green regardless of this value.
     ...(input.releaseTagPattern !== undefined ? { releaseTagPattern: input.releaseTagPattern } : {}),
+    // PR-B/PR-C schema: accepted + persisted; secret generation and DB URL rewriting
+    // are separate, not-yet-shipped features.
+    ...(input.secrets !== undefined ? { secrets: input.secrets } : {}),
+    ...(input.databaseUrlEnv !== undefined ? { databaseUrlEnv: input.databaseUrlEnv } : {}),
   };
 
   const existing = appStore.get(vm.id, input.name);
@@ -358,6 +375,8 @@ export function runAppRegisterFromToml(
     ...(app.defaultListener !== undefined ? { defaultListener: app.defaultListener } : {}),
     ...(app.mainListen !== undefined ? { mainListen: app.mainListen } : {}),
     ...(app.releaseTagPattern !== undefined ? { releaseTagPattern: app.releaseTagPattern } : {}),
+    ...(app.secrets !== undefined ? { secrets: app.secrets } : {}),
+    ...(app.databaseUrlEnv !== undefined ? { databaseUrlEnv: app.databaseUrlEnv } : {}),
   };
 
   return runAppRegister(registerInput, opts, vmStore, appStore, out, err);

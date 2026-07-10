@@ -279,6 +279,28 @@ export interface AppSpec {
    * regardless of this value.
    */
   releaseTagPattern?: string;
+
+  /**
+   * App-level secret env-var NAMES samohost will auto-generate per preview env
+   * (PR-B). Each entry must match ^[A-Z_][A-Z0-9_]*$ (standard uppercase
+   * env-var name). No duplicates. Absent = no auto-generated secrets.
+   *
+   * SCHEMA ONLY — secret generation is not yet implemented (that is PR-B).
+   * This field declares WHICH secrets an app needs; the values are generated
+   * later, not here.
+   */
+  secrets?: string[];
+
+  /**
+   * The env-var name holding the DB connection URL (e.g. "DATABASE_URL").
+   * Must match ^[A-Z_][A-Z0-9_]*$. Required for apps whose preview DB backend
+   * is explicitly stated as "dblab" or "template" (PR-C will rewrite this URL
+   * per env; it must know which var to target). Absent on legacy AppRecords and
+   * on apps with no database (dbBackend/previewDbBackend = "none").
+   *
+   * SCHEMA ONLY — DB URL rewriting is not yet implemented (that is PR-C).
+   */
+  databaseUrlEnv?: string;
 }
 
 /**

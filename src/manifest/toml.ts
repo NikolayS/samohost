@@ -89,6 +89,21 @@ export interface AppManifest {
    * regardless of this value.
    */
   releaseTagPattern?: string;
+
+  /**
+   * App-level secret env-var NAMES samohost will auto-generate per preview env
+   * (PR-B). Each entry must match ^[A-Z_][A-Z0-9_]*$. No duplicates.
+   * Absent = no auto-generated secrets. Maps to {@link AppSpec.secrets}.
+   */
+  secrets?: string[];
+
+  /**
+   * Env-var name holding the DB connection URL (e.g. "DATABASE_URL").
+   * Must match ^[A-Z_][A-Z0-9_]*$. Required for explicitly DB-backed apps
+   * (dbBackend or previewDbBackend set to "dblab" or "template") because PR-C
+   * needs to know which var to rewrite. Maps to {@link AppSpec.databaseUrlEnv}.
+   */
+  databaseUrlEnv?: string;
 }
 
 /**
@@ -151,6 +166,10 @@ const APP_KEYS = new Set<string>([
   // accepted + persisted; the tag-gated deploy behavior is a separate,
   // not-yet-shipped feature — prod deploys on main SHA + CI-green regardless of this value.
   "releaseTagPattern",
+  // PR-B/PR-C: secrets and databaseUrlEnv are schema-only in this PR.
+  // Secret generation (PR-B) and DB URL rewriting (PR-C) are separate.
+  "secrets",
+  "databaseUrlEnv",
 ]);
 
 const PROVISION_KEYS = new Set<string>([
@@ -765,6 +784,103 @@ export function parseSamohostToml(text: string): ParseTomlResult {
     }
   }
 
+  // ---- 4b. Validate secrets[] and databaseUrlEnv (PR-B/PR-C schema) --------
+
+  // Parse secrets (optional array of uppercase env-var names, no duplicates).
+  let secrets: string[] | undefined;
+  {
+    const rawSecrets = raw["secrets"];
+    if (rawSecrets !== undefined) {
+      if (!isArray(rawSecrets)) {
+        errors.push(`field secrets must be an array of strings (got ${typeof rawSecrets})`);
+      } else {
+        const parsed: string[] = [];
+        let hasError = false;
+        for (let i = 0; i < rawSecrets.length; i++) {
+          const elem = rawSecrets[i];
+          if (typeof elem !== "string") {
+            errors.push(`field secrets[${i}] must be a string (got ${typeof elem})`);
+            hasError = true;
+          } else if (!PORTENV_RE.test(elem)) {
+            errors.push(
+              `secrets[${i}] "${elem}" must match ^[A-Z_][A-Z0-9_]*$ ` +
+                `(uppercase env-var name — will be generated per preview env)`,
+            );
+            hasError = true;
+          } else {
+            parsed.push(elem);
+          }
+        }
+        if (!hasError) {
+          // Uniqueness check (only when all entries passed charset validation)
+          const seen = new Set<string>();
+          for (const s of parsed) {
+            if (seen.has(s)) {
+              errors.push(
+                `duplicate secret name: "${s}" (secret names in secrets[] must be unique)`,
+              );
+            } else {
+              seen.add(s);
+            }
+          }
+          secrets = parsed;
+        }
+      }
+    }
+  }
+
+  // Parse databaseUrlEnv (optional string, must be valid env-var name).
+  // Track presence separately from value so the DB-backed required-check below
+  // only fires when the key is fully absent (not when it is present but invalid).
+  const databaseUrlEnvPresent = raw["databaseUrlEnv"] !== undefined;
+  let databaseUrlEnv: string | undefined;
+  {
+    const rawDbUrlEnv = raw["databaseUrlEnv"];
+    if (rawDbUrlEnv !== undefined) {
+      if (typeof rawDbUrlEnv !== "string") {
+        errors.push(
+          `field databaseUrlEnv must be a string (got ${typeof rawDbUrlEnv})`,
+        );
+      } else if (!PORTENV_RE.test(rawDbUrlEnv)) {
+        errors.push(
+          `databaseUrlEnv "${rawDbUrlEnv}" must match ^[A-Z_][A-Z0-9_]*$ ` +
+            `(uppercase env-var name — it holds the DB connection URL to rewrite per env)`,
+        );
+      } else {
+        databaseUrlEnv = rawDbUrlEnv;
+      }
+    }
+  }
+
+  // DB-backed required check: if the app EXPLICITLY declares a non-none DB backend,
+  // databaseUrlEnv is required (PR-C will rewrite it per env and must know which var).
+  //
+  // Predicate mirrors previewDbBackendFor() but uses ONLY explicitly stored values:
+  //   explicit previewDbBackend != "none"  →  required
+  //   explicit dbBackend != "none", no previewDbBackend  →  required
+  //   neither field explicitly set (legacy apps)  →  EXEMPT (default dblab is not stored)
+  //
+  // This preserves byte-identical AppRecords for legacy manifests that pre-date
+  // these fields; only manifests that explicitly declare a DB backend are checked.
+  {
+    const resolvedPreview = previewDbBackend ?? (dbBackend !== undefined ? dbBackend : undefined);
+    // resolvedPreview is undefined only for legacy apps (neither field set) → exempt.
+    // Otherwise it carries the explicitly-declared backend value.
+    const isExplicitlyDbBacked =
+      resolvedPreview !== undefined && resolvedPreview !== "none";
+
+    if (isExplicitlyDbBacked && !databaseUrlEnvPresent) {
+      const which = previewDbBackend !== undefined
+        ? `previewDbBackend="${previewDbBackend}"`
+        : `dbBackend="${dbBackend}"`;
+      errors.push(
+        `"databaseUrlEnv" is required for DB-backed apps (${which}) — ` +
+          `declare which env var holds the DB connection URL so PR-C can rewrite it per env ` +
+          `(e.g. databaseUrlEnv = "DATABASE_URL")`,
+      );
+    }
+  }
+
   // ---- 5. Validate [provision] table (optional) ----------------------------
   let provision: ProvisionManifest | undefined;
   const rawProvision = raw["provision"];
@@ -1024,6 +1140,8 @@ export function parseSamohostToml(text: string): ParseTomlResult {
     ...(defaultListener !== undefined ? { defaultListener } : {}),
     ...(mainListen !== undefined ? { mainListen } : {}),
     ...(releaseTagPattern !== undefined ? { releaseTagPattern } : {}),
+    ...(secrets !== undefined ? { secrets } : {}),
+    ...(databaseUrlEnv !== undefined ? { databaseUrlEnv } : {}),
   };
 
   return {
