@@ -541,21 +541,28 @@ describe("E. unit loops — enable/disable for every service", () => {
     // Prod-accurate stub: sudo enable --now FAILS for the FIRST service unit
     // (samograph@samograph-feat-x.service) and SUCCEEDS for all later ones.
     // systemctl is-active always returns 1 (not active) → enable --now branch.
+    //
+    // sudo is called as: sudo /usr/bin/systemctl enable --now '<unit>'
+    //   $1 = /usr/bin/systemctl   (full path)
+    //   $2 = enable               (subcommand — matches runUnitPhaseWithProdStub)
+    //   $3 = --now
+    //   $4 = <unit-instance>      (also last arg: ${@: -1})
     const FAILING_UNIT = "samograph@samograph-feat-x.service";
     const stub = [
       "systemctl() {",
       "  return 1  # is-active: not active → enable --now branch",
       "}",
       "sudo() {",
-      `  if [[ "$3 $4" == "enable --now" || "$3" == "enable" ]]; then`,
-      // Check if the unit argument (last token) matches the failing unit
+      '  local sub="$2"',
+      '  if [[ "$sub" == "enable" ]]; then',
+      // ${@: -1} = last positional arg = the unit instance name
       `    local last_arg="${"$"}{@: -1}"`,
       `    if [[ "$last_arg" == '${FAILING_UNIT}' ]]; then`,
       "      return 1  # first service: FAIL",
       "    fi",
       "    return 0  # later services: succeed",
       "  fi",
-      "  return 0  # disable: always succeed",
+      "  return 0  # disable and all other ops: succeed",
       "}",
     ].join("\n");
 

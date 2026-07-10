@@ -1037,6 +1037,38 @@ export function validateServicesTopology(
 
   if (services === undefined) return; // no topology to validate
 
+  // Charset parity with the TOML parse path (Fix 3a/3b parity for the
+  // programmatic app-register path). A bad service name breaks the unit-instance
+  // reference (`<name>@<env>.service`); a bad listener name produces a
+  // malformed shell-var name in the health aggregation (`health_ok_<name>`);
+  // a bad portEnv is silently ignored by systemd (only ^[A-Za-z_] names load).
+  for (let si = 0; si < services.length; si++) {
+    const svc = services[si]!;
+    const svcPrefix = `services[${si}]`;
+    if (!ROUTE_NAME_RE.test(svc.name)) {
+      errors.push(
+        `${svcPrefix}: service name "${svc.name}" must match [a-z][a-z0-9-]* ` +
+          `(lowercase letter start, then lowercase letters, digits, hyphens only)`,
+      );
+    }
+    for (let li = 0; li < svc.listeners.length; li++) {
+      const ls = svc.listeners[li]!;
+      const lsPrefix = `${svcPrefix}.listeners[${li}]`;
+      if (!ROUTE_NAME_RE.test(ls.name)) {
+        errors.push(
+          `${lsPrefix}: listener name "${ls.name}" must match [a-z][a-z0-9-]* ` +
+            `(lowercase letter start, then lowercase letters, digits, hyphens only)`,
+        );
+      }
+      if (!PORTENV_RE.test(ls.portEnv)) {
+        errors.push(
+          `${lsPrefix}: portEnv "${ls.portEnv}" must match ^[A-Z_][A-Z0-9_]*$ ` +
+            `(uppercase env-var name — it is embedded in env files and systemd units)`,
+        );
+      }
+    }
+  }
+
   // defaultListener required when services is declared
   const allListenerNames = new Set<string>(
     services.flatMap((s) => s.listeners.map((l) => l.name)),

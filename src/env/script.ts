@@ -1225,11 +1225,22 @@ export function buildEnvCreateScript(
   // Unit instances are baked as literals (not via a shell variable) so the
   // script is self-documenting and the pattern is testable without runtime
   // expansion.
+  //
+  // AGGREGATION (multi-service only): when there are 2+ services, we use a
+  // `unit_all_ok` flag (mirroring `port_check_all_ok` and `health_ok`) so that
+  // a failure on ANY service causes `unit:fail` + exit 1 — not just the last
+  // service. Single-service (legacy) uses the unchanged `if { ... }` form via
+  // phaseBlock so that the byte-identical gate still holds.
   {
-    const unitCommentBody: string[] = ["if { \\"];
     const unitInstances = services.map((svc) => `${svc.unit}@${t.name}.service`);
-    for (const instance of unitInstances) {
-      unitCommentBody.push(
+    const unitComment =
+      "systemd template instances — disable--now+enable--now if already active, enable--now on first create (full-path sudo; grants in host-prep)";
+
+    if (unitInstances.length === 1) {
+      // LEGACY / single-service path: byte-identical to pre-aggregation output.
+      const instance = unitInstances[0]!;
+      const unitCommentBody: string[] = [
+        "if { \\",
         `     # service unit: ${instance}`,
         `     if systemctl is-active ${sq(instance)} >/dev/null 2>&1; then \\`,
         `       sudo /usr/bin/systemctl disable --now ${sq(instance)} \\`,
@@ -1237,16 +1248,39 @@ export function buildEnvCreateScript(
         "     else \\",
         `       sudo /usr/bin/systemctl enable --now ${sq(instance)}; \\`,
         "     fi \\",
+        "   }; ",
+      ];
+      lines.push(...phaseBlock("unit", unitComment, unitCommentBody));
+    } else {
+      // MULTI-SERVICE path: aggregate all-service outcomes into unit_all_ok.
+      // Mirrors the port_check_all_ok pattern: initialise ok=1, set to 0 on any
+      // per-service failure, and emit unit:fail + exit 1 unless all succeeded.
+      lines.push(
+        `# --- unit: ${unitComment} ---`,
+        marker("unit", "start"),
+        "unit_all_ok=1",
+      );
+      for (const instance of unitInstances) {
+        lines.push(
+          `# service unit: ${instance}`,
+          `if systemctl is-active ${sq(instance)} >/dev/null 2>&1; then`,
+          `  sudo /usr/bin/systemctl disable --now ${sq(instance)} \\`,
+          `    && sudo /usr/bin/systemctl enable --now ${sq(instance)} || unit_all_ok=0`,
+          "else",
+          `  sudo /usr/bin/systemctl enable --now ${sq(instance)} || unit_all_ok=0`,
+          "fi",
+        );
+      }
+      lines.push(
+        'if [[ "$unit_all_ok" == "1" ]]; then',
+        `  ${marker("unit", "ok")}`,
+        "else",
+        `  ${marker("unit", "fail")}`,
+        "  exit 1",
+        "fi",
+        "",
       );
     }
-    unitCommentBody.push("   }; ");
-    lines.push(
-      ...phaseBlock(
-        "unit",
-        "systemd template instances — disable--now+enable--now if already active, enable--now on first create (full-path sudo; grants in host-prep)",
-        unitCommentBody,
-      ),
-    );
   }
 
   // ----- vhost -----------------------------------------------------------------
