@@ -709,3 +709,480 @@ describe("runAppRegisterFromToml — dbBackend/previewDbBackend threading (#88)"
     expect(previewDbBackendFor(rec!)).toBe("dblab");
   });
 });
+
+// ---------------------------------------------------------------------------
+// Multi-service spec model — manifest-toml validation (PR: multi-service spec)
+//
+// RED: all assertions written; the parser does not yet accept [[services]],
+//      [[routes]], defaultListener, or mainListen.
+// ---------------------------------------------------------------------------
+
+/** Minimal valid TOML with required legacy fields only. */
+function minimalBase(): string {
+  return [
+    'name        = "my-app"',
+    'repo        = "owner/my-app"',
+    'branch      = "main"',
+    'appDir      = "/opt/my-app/app"',
+    'buildCmd    = "npm run build"',
+    'healthUrl   = "http://localhost:3000/health"',
+    'serviceUnit = "my-app"',
+  ].join("\n");
+}
+
+/** Minimal TOML with a valid two-service block. */
+function twoServiceBase(): string {
+  return [
+    minimalBase(),
+    'defaultListener = "web"',
+    "[[services]]",
+    'name = "web"',
+    'unit = "my-app"',
+    "  [[services.listeners]]",
+    '  name    = "web"',
+    "  port    = 3000",
+    '  portEnv = "PORT"',
+    '  routed  = true',
+    "[[services]]",
+    'name = "worker"',
+    'unit = "my-app-worker"',
+    "  [[services.listeners]]",
+    '  name    = "worker-metrics"',
+    "  port    = 9100",
+    '  portEnv = "METRICS_PORT"',
+  ].join("\n");
+}
+
+describe("parseSamohostToml — multi-service [[services]] valid parse", () => {
+  test("two-service manifest with defaultListener parses ok", () => {
+    const result = parseSamohostToml(twoServiceBase());
+    if (!result.ok) throw new Error("expected ok=true; errors: " + result.errors.join(", "));
+    expect(result.app.services).toHaveLength(2);
+    expect(result.app.defaultListener).toBe("web");
+    const web = result.app.services![0]!;
+    expect(web.name).toBe("web");
+    expect(web.unit).toBe("my-app");
+    expect(web.listeners[0]!.name).toBe("web");
+    expect(web.listeners[0]!.port).toBe(3000);
+    expect(web.listeners[0]!.portEnv).toBe("PORT");
+    expect(web.listeners[0]!.routed).toBe(true);
+  });
+
+  test("mainListen = 'tls' is accepted", () => {
+    const toml = twoServiceBase() + '\nmainListen = "tls"';
+    const result = parseSamohostToml(toml);
+    if (!result.ok) throw new Error("expected ok=true; errors: " + result.errors.join(", "));
+    expect(result.app.mainListen).toBe("tls");
+  });
+
+  test("mainListen = 'cp-http80' is accepted", () => {
+    const toml = twoServiceBase() + '\nmainListen = "cp-http80"';
+    const result = parseSamohostToml(toml);
+    if (!result.ok) throw new Error("expected ok=true; errors: " + result.errors.join(", "));
+    expect(result.app.mainListen).toBe("cp-http80");
+  });
+
+  test("[[routes]] with matchPath + to resolves to routed listener", () => {
+    const toml = [
+      twoServiceBase(),
+      "[[routes]]",
+      'name       = "api"',
+      'matchPath  = "/api/*"',
+      'to         = "web"',
+    ].join("\n");
+    const result = parseSamohostToml(toml);
+    if (!result.ok) throw new Error("expected ok=true; errors: " + result.errors.join(", "));
+    expect(result.app.routes).toHaveLength(1);
+    expect(result.app.routes![0]!.matchPath).toBe("/api/*");
+    expect(result.app.routes![0]!.to).toBe("web");
+  });
+
+  test("[[routes]] respond target is accepted", () => {
+    const toml = [
+      twoServiceBase(),
+      "[[routes]]",
+      'matchPath = "/healthz"',
+      "[routes.respond]",
+      "status = 200",
+      'body   = "ok"',
+    ].join("\n");
+    const result = parseSamohostToml(toml);
+    if (!result.ok) throw new Error("expected ok=true; errors: " + result.errors.join(", "));
+    expect(result.app.routes).toHaveLength(1);
+    expect(result.app.routes![0]!.respond?.status).toBe(200);
+    expect(result.app.routes![0]!.respond?.body).toBe("ok");
+  });
+
+  test("[[routes]] matchRegexp with valid Caddy-safe pattern", () => {
+    const toml = [
+      twoServiceBase(),
+      "[[routes]]",
+      'name          = "rpc"',
+      'matchRegexp   = "^/api/v[0-9]+"',
+      'to            = "web"',
+    ].join("\n");
+    const result = parseSamohostToml(toml);
+    if (!result.ok) throw new Error("expected ok=true; errors: " + result.errors.join(", "));
+    expect(result.app.routes![0]!.matchRegexp).toBe("^/api/v[0-9]+");
+  });
+
+  test("absent [[services]] parses ok — legacy shape, services undefined", () => {
+    const result = parseSamohostToml(minimalBase());
+    if (!result.ok) throw new Error("expected ok=true; errors: " + result.errors.join(", "));
+    expect(result.app.services).toBeUndefined();
+    expect(result.app.routes).toBeUndefined();
+    expect(result.app.defaultListener).toBeUndefined();
+  });
+});
+
+describe("parseSamohostToml — multi-service validation: duplicate names", () => {
+  test("ms-dup-1: duplicate service names → error naming both", () => {
+    const toml = [
+      minimalBase(),
+      'defaultListener = "web"',
+      "[[services]]",
+      'name = "web"',
+      'unit = "my-app"',
+      "  [[services.listeners]]",
+      '  name = "web"',
+      "  port = 3000",
+      '  portEnv = "PORT"',
+      "[[services]]",
+      'name = "web"',   // duplicate
+      'unit = "my-app-worker"',
+      "  [[services.listeners]]",
+      '  name = "metrics"',
+      "  port = 9100",
+      '  portEnv = "METRICS_PORT"',
+    ].join("\n");
+    const result = parseSamohostToml(toml);
+    expect(result.ok).toBe(false);
+    if (result.ok) throw new Error("expected ok=false");
+    expect(result.errors.some((e) => e.toLowerCase().includes("duplicate") && e.includes("web"))).toBe(true);
+  });
+
+  test("ms-dup-2: duplicate listener names (global across services) → error", () => {
+    const toml = [
+      minimalBase(),
+      'defaultListener = "web"',
+      "[[services]]",
+      'name = "web"',
+      'unit = "my-app"',
+      "  [[services.listeners]]",
+      '  name = "shared"',    // same name in two services
+      "  port = 3000",
+      '  portEnv = "PORT"',
+      "[[services]]",
+      'name = "worker"',
+      'unit = "my-app-worker"',
+      "  [[services.listeners]]",
+      '  name = "shared"',   // duplicate listener name
+      "  port = 9100",
+      '  portEnv = "METRICS_PORT"',
+    ].join("\n");
+    const result = parseSamohostToml(toml);
+    expect(result.ok).toBe(false);
+    if (result.ok) throw new Error("expected ok=false");
+    expect(result.errors.some((e) => e.toLowerCase().includes("duplicate") && e.includes("shared"))).toBe(true);
+  });
+
+  test("ms-dup-3: duplicate listener ports → error naming the port", () => {
+    const toml = [
+      minimalBase(),
+      'defaultListener = "web"',
+      "[[services]]",
+      'name = "web"',
+      'unit = "my-app"',
+      "  [[services.listeners]]",
+      '  name = "web"',
+      "  port = 3000",
+      '  portEnv = "PORT"',
+      "[[services]]",
+      'name = "worker"',
+      'unit = "my-app-worker"',
+      "  [[services.listeners]]",
+      '  name = "metrics"',
+      "  port = 3000",     // duplicate port
+      '  portEnv = "METRICS_PORT"',
+    ].join("\n");
+    const result = parseSamohostToml(toml);
+    expect(result.ok).toBe(false);
+    if (result.ok) throw new Error("expected ok=false");
+    expect(result.errors.some((e) => e.toLowerCase().includes("duplicate") && e.includes("3000"))).toBe(true);
+  });
+
+  test("ms-dup-4: duplicate portEnv values → error naming the variable", () => {
+    const toml = [
+      minimalBase(),
+      'defaultListener = "web"',
+      "[[services]]",
+      'name = "web"',
+      'unit = "my-app"',
+      "  [[services.listeners]]",
+      '  name = "web"',
+      "  port = 3000",
+      '  portEnv = "PORT"',
+      "[[services]]",
+      'name = "worker"',
+      'unit = "my-app-worker"',
+      "  [[services.listeners]]",
+      '  name = "metrics"',
+      "  port = 9100",
+      '  portEnv = "PORT"',  // duplicate portEnv
+    ].join("\n");
+    const result = parseSamohostToml(toml);
+    expect(result.ok).toBe(false);
+    if (result.ok) throw new Error("expected ok=false");
+    expect(result.errors.some((e) => e.toLowerCase().includes("duplicate") && e.includes("PORT"))).toBe(true);
+  });
+});
+
+describe("parseSamohostToml — multi-service validation: routes", () => {
+  test("ms-route-1: route.to referencing nonexistent listener → error", () => {
+    const toml = [
+      twoServiceBase(),
+      "[[routes]]",
+      'matchPath = "/api/*"',
+      'to        = "nonexistent"',  // listener "nonexistent" does not exist
+    ].join("\n");
+    const result = parseSamohostToml(toml);
+    expect(result.ok).toBe(false);
+    if (result.ok) throw new Error("expected ok=false");
+    expect(result.errors.some((e) => e.includes("nonexistent"))).toBe(true);
+  });
+
+  test("ms-route-2: route.to targeting listener with routed=false → error", () => {
+    const toml = [
+      minimalBase(),
+      'defaultListener = "web"',
+      "[[services]]",
+      'name = "web"',
+      'unit = "my-app"',
+      "  [[services.listeners]]",
+      '  name    = "web"',
+      "  port    = 3000",
+      '  portEnv = "PORT"',
+      '  routed  = false',   // not routable
+      "[[routes]]",
+      'matchPath = "/api/*"',
+      'to        = "web"',   // references a non-routed listener
+    ].join("\n");
+    const result = parseSamohostToml(toml);
+    expect(result.ok).toBe(false);
+    if (result.ok) throw new Error("expected ok=false");
+    expect(result.errors.some((e) => e.includes("web") && (e.toLowerCase().includes("routed") || e.toLowerCase().includes("route")))).toBe(true);
+  });
+
+  test("ms-route-3: route with both matchPath and matchRegexp → exactly-one error", () => {
+    const toml = [
+      twoServiceBase(),
+      "[[routes]]",
+      'matchPath   = "/api/*"',
+      'matchRegexp = "^/api"',   // both present
+      'to          = "web"',
+    ].join("\n");
+    const result = parseSamohostToml(toml);
+    expect(result.ok).toBe(false);
+    if (result.ok) throw new Error("expected ok=false");
+    expect(result.errors.some((e) => e.toLowerCase().includes("matchpath") || e.toLowerCase().includes("matchregexp"))).toBe(true);
+  });
+
+  test("ms-route-4: route with neither matchPath nor matchRegexp → exactly-one error", () => {
+    const toml = [
+      twoServiceBase(),
+      "[[routes]]",
+      'to = "web"',   // no matcher at all
+    ].join("\n");
+    const result = parseSamohostToml(toml);
+    expect(result.ok).toBe(false);
+    if (result.ok) throw new Error("expected ok=false");
+    expect(result.errors.some((e) => e.toLowerCase().includes("matchpath") || e.toLowerCase().includes("matchregexp"))).toBe(true);
+  });
+
+  test("ms-route-5: route with both to and respond → exactly-one error", () => {
+    const toml = [
+      twoServiceBase(),
+      "[[routes]]",
+      'matchPath = "/api/*"',
+      'to        = "web"',
+      "[routes.respond]",
+      "status = 200",
+      'body   = "ok"',
+    ].join("\n");
+    const result = parseSamohostToml(toml);
+    expect(result.ok).toBe(false);
+    if (result.ok) throw new Error("expected ok=false");
+    expect(result.errors.some((e) => e.toLowerCase().includes("to") || e.toLowerCase().includes("respond"))).toBe(true);
+  });
+
+  test("ms-route-6: route with neither to nor respond → exactly-one error", () => {
+    const toml = [
+      twoServiceBase(),
+      "[[routes]]",
+      'matchPath = "/api/*"',
+      // no to, no respond
+    ].join("\n");
+    const result = parseSamohostToml(toml);
+    expect(result.ok).toBe(false);
+    if (result.ok) throw new Error("expected ok=false");
+    expect(result.errors.some((e) => e.toLowerCase().includes("to") || e.toLowerCase().includes("respond"))).toBe(true);
+  });
+
+  test("ms-route-7: regexp that does not compile → error", () => {
+    const toml = [
+      twoServiceBase(),
+      "[[routes]]",
+      'matchRegexp = "[invalid("',   // unclosed bracket → compile error
+      'to          = "web"',
+    ].join("\n");
+    const result = parseSamohostToml(toml);
+    expect(result.ok).toBe(false);
+    if (result.ok) throw new Error("expected ok=false");
+    expect(result.errors.some((e) => e.toLowerCase().includes("regexp") || e.toLowerCase().includes("regex"))).toBe(true);
+  });
+
+  test("ms-route-8: regexp with unsafe charset (double quote) → error", () => {
+    const toml = [
+      twoServiceBase(),
+      "[[routes]]",
+      // double-quote inside the regexp is unsafe to embed in Caddy config
+      "matchRegexp = '^/api/\"evil'",
+      'to          = "web"',
+    ].join("\n");
+    const result = parseSamohostToml(toml);
+    expect(result.ok).toBe(false);
+    if (result.ok) throw new Error("expected ok=false");
+    expect(result.errors.some((e) => e.toLowerCase().includes("regexp") || e.toLowerCase().includes("charset"))).toBe(true);
+  });
+});
+
+describe("parseSamohostToml — multi-service validation: defaultListener", () => {
+  test("ms-dl-1: [[services]] present but defaultListener absent → error", () => {
+    const toml = [
+      minimalBase(),
+      // no defaultListener
+      "[[services]]",
+      'name = "web"',
+      'unit = "my-app"',
+      "  [[services.listeners]]",
+      '  name = "web"',
+      "  port = 3000",
+      '  portEnv = "PORT"',
+    ].join("\n");
+    const result = parseSamohostToml(toml);
+    expect(result.ok).toBe(false);
+    if (result.ok) throw new Error("expected ok=false");
+    expect(result.errors.some((e) => e.toLowerCase().includes("defaultlistener"))).toBe(true);
+  });
+
+  test("ms-dl-2: defaultListener pointing to nonexistent listener → error", () => {
+    const toml = [
+      minimalBase(),
+      'defaultListener = "does-not-exist"',
+      "[[services]]",
+      'name = "web"',
+      'unit = "my-app"',
+      "  [[services.listeners]]",
+      '  name = "web"',
+      "  port = 3000",
+      '  portEnv = "PORT"',
+    ].join("\n");
+    const result = parseSamohostToml(toml);
+    expect(result.ok).toBe(false);
+    if (result.ok) throw new Error("expected ok=false");
+    expect(result.errors.some((e) => e.includes("does-not-exist"))).toBe(true);
+  });
+});
+
+describe("parseSamohostToml — multi-service validation: matcher name charset", () => {
+  test("ms-name-1: route name with invalid chars (uppercase) → error", () => {
+    const toml = [
+      twoServiceBase(),
+      "[[routes]]",
+      'name      = "Api-Route"',   // uppercase A not in [a-z][a-z0-9-]*
+      'matchPath = "/api/*"',
+      'to        = "web"',
+    ].join("\n");
+    const result = parseSamohostToml(toml);
+    expect(result.ok).toBe(false);
+    if (result.ok) throw new Error("expected ok=false");
+    expect(result.errors.some((e) => e.toLowerCase().includes("name"))).toBe(true);
+  });
+
+  test("ms-name-2: route name matching [a-z][a-z0-9-]* is accepted", () => {
+    const toml = [
+      twoServiceBase(),
+      "[[routes]]",
+      'name      = "api-v2"',
+      'matchPath = "/api/*"',
+      'to        = "web"',
+    ].join("\n");
+    const result = parseSamohostToml(toml);
+    if (!result.ok) throw new Error("expected ok=true; errors: " + result.errors.join(", "));
+    expect(result.app.routes![0]!.name).toBe("api-v2");
+  });
+
+  test("ms-name-3: route name starting with digit → error", () => {
+    const toml = [
+      twoServiceBase(),
+      "[[routes]]",
+      'name      = "1bad"',   // starts with digit
+      'matchPath = "/api/*"',
+      'to        = "web"',
+    ].join("\n");
+    const result = parseSamohostToml(toml);
+    expect(result.ok).toBe(false);
+    if (result.ok) throw new Error("expected ok=false");
+    expect(result.errors.some((e) => e.toLowerCase().includes("name"))).toBe(true);
+  });
+});
+
+describe("parseSamohostToml — multi-service validation: unknown sub-table keys", () => {
+  test("ms-key-1: unknown key inside [[services]] rejected", () => {
+    const toml = [
+      minimalBase(),
+      'defaultListener = "web"',
+      "[[services]]",
+      'name       = "web"',
+      'unit       = "my-app"',
+      'typoField  = "oops"',   // unknown key
+      "  [[services.listeners]]",
+      '  name = "web"',
+      "  port = 3000",
+      '  portEnv = "PORT"',
+    ].join("\n");
+    const result = parseSamohostToml(toml);
+    expect(result.ok).toBe(false);
+    if (result.ok) throw new Error("expected ok=false");
+    expect(result.errors.some((e) => e.includes("typoField"))).toBe(true);
+  });
+
+  test("ms-key-2: unknown key inside [[services.listeners]] rejected", () => {
+    const toml = [
+      minimalBase(),
+      'defaultListener = "web"',
+      "[[services]]",
+      'name = "web"',
+      'unit = "my-app"',
+      "  [[services.listeners]]",
+      '  name        = "web"',
+      "  port        = 3000",
+      '  portEnv     = "PORT"',
+      '  unknownFlag = true',  // unknown key
+    ].join("\n");
+    const result = parseSamohostToml(toml);
+    expect(result.ok).toBe(false);
+    if (result.ok) throw new Error("expected ok=false");
+    expect(result.errors.some((e) => e.includes("unknownFlag"))).toBe(true);
+  });
+});
+
+describe("parseSamohostToml — multi-service: mainListen validation", () => {
+  test("ms-ml-1: mainListen with invalid value rejected", () => {
+    const toml = twoServiceBase() + '\nmainListen = "bogus"';
+    const result = parseSamohostToml(toml);
+    expect(result.ok).toBe(false);
+    if (result.ok) throw new Error("expected ok=false");
+    expect(result.errors.some((e) => e.toLowerCase().includes("mainlisten"))).toBe(true);
+  });
+});
