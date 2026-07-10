@@ -325,14 +325,34 @@ const REWIRE_DB_HOSTPORT_FN_LINES: string[] = [
  * clone role (samohost_env). Called from the db phase &&-chain AFTER
  * samohost_sync_clone_globals (so the app role already exists in the clone).
  *
- * Security model:
+ * Security model — TWO vectors closed (samorev blocker, PR #142):
+ *
+ * 1. ARGV VECTOR: The prior implementation passed the SQL via `-c "ALTER ROLE
+ *    ... PASSWORD '$PW'"`, exposing the plaintext password in the psql process
+ *    argv (/proc/<pid>/cmdline, `ps aux`) for the lifetime of the process.
+ *    Fix: SQL is fed via STDIN (`-f -`), so the psql argv contains only
+ *    connection flags — the secret is never on the command line.
+ *
+ * 2. SERVER-LOG VECTOR: When log_statement=ddl/all is set in postgresql.conf
+ *    the server logs every DDL statement including ALTER ROLE … PASSWORD,
+ *    storing the plaintext password in the pg log. Fix: `SET log_statement TO
+ *    'none'` and `SET log_min_duration_statement TO -1` are prepended in the
+ *    SAME session stdin batch before the ALTER ROLE, so the privileged session
+ *    never logs the secret-bearing statement.
+ *    Approach rationale: client-side SCRAM verifier computation would also close
+ *    this vector (server never sees the plaintext), but SCRAM-SHA-256 verifier
+ *    generation is not reliably available in pure bash on target hosts without
+ *    additional tooling. Session-local SET is deterministic on all Postgres
+ *    versions ≥ 9.6 and requires no extra packages.
+ *
+ * Other invariants (unchanged):
  *   - Password is generated once per env via samohost-secrets 'init' (reuse
  *     semantics), so clone RESETS re-apply the SAME password → DATABASE_URL
  *     stays stable across rebuilds.
  *   - Password is read back via 'get' action (root helper, no file-read grant
  *     needed for the SSH user).
- *   - ALTER ROLE output is redirected to /dev/null so the SQL text (which
- *     contains the password) never appears in samohost's phase-marker parser.
+ *   - >/dev/null suppresses psql rowcount/notice output only; it does NOT
+ *     protect from the argv vector — that is the job of -f - above.
  */
 const SET_CLONE_ROLE_PASSWORD_FN_LINES: string[] = [
   "samohost_set_clone_role_password() {",
@@ -341,13 +361,18 @@ const SET_CLONE_ROLE_PASSWORD_FN_LINES: string[] = [
   "  sudo /usr/local/sbin/samohost-secrets init \"$SAMOHOST_ENV_NAME\" \"$SAMOHOST_SECRETS_ENV_USER\" SAMOHOST_CLONE_ROLE_PW",
   "  SAMOHOST_CLONE_ROLE_PW=\"$(sudo /usr/local/sbin/samohost-secrets get \"$SAMOHOST_ENV_NAME\" SAMOHOST_CLONE_ROLE_PW)\"",
   "  # Apply the password to the clone's app role via the privileged clone role (samohost_env).",
-  "  # Redirect stdout to /dev/null: the SQL text (containing the password) must not",
-  "  # appear in samohost's phase-marker parser output.",
-  "  PGPASSWORD=\"$SAMOHOST_DB_PASSWORD\" \\",
-  "    /usr/bin/psql -h 127.0.0.1 -p \"$SAMOHOST_DB_PORT\" \\",
-  "      -U samohost_env -d postgres \\",
-  "      -c \"ALTER ROLE $SAMOHOST_CLONE_APP_DBROLE WITH LOGIN PASSWORD '$SAMOHOST_CLONE_ROLE_PW'\" \\",
-  "    >/dev/null",
+  "  # ARGV FIX: SQL is fed via STDIN (-f -), never via -c, so the secret is absent",
+  "  #   from /proc/<pid>/cmdline and 'ps aux' for the lifetime of the psql process.",
+  "  # SERVER-LOG FIX: SET log_statement/log_min_duration_statement suppress DDL",
+  "  #   logging in this session BEFORE the ALTER ROLE, so the plaintext password",
+  "  #   never reaches the pg server log even when log_statement=ddl/all is set.",
+  "  # >/dev/null suppresses psql rowcount/notice output only (NOT the argv-leak",
+  "  #   protection — that comes from -f - above; >/dev/null alone does not close",
+  "  #   the /proc/<pid>/cmdline surface).",
+  "  printf \"SET log_statement TO 'none';\\nSET log_min_duration_statement TO -1;\\nALTER ROLE %s WITH LOGIN PASSWORD '%s';\\n\" \\",
+  "    \"$SAMOHOST_CLONE_APP_DBROLE\" \"$SAMOHOST_CLONE_ROLE_PW\" \\",
+  "    | PGPASSWORD=\"$SAMOHOST_DB_PASSWORD\" /usr/bin/psql -h 127.0.0.1 -p \"$SAMOHOST_DB_PORT\" \\",
+  "        -U samohost_env -d postgres -X -f - >/dev/null",
   "}",
 ];
 
