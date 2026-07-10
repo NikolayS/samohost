@@ -183,3 +183,55 @@ describe("servicesOf — multi-service app (services field present)", () => {
     expect(app.services).toBe(originalServices);
   });
 });
+
+// ---------------------------------------------------------------------------
+// Fix 6b: servicesOf() MUST THROW (not fabricate) when defaultListener is
+// missing or doesn't resolve to a declared listener.
+//
+// RED: current code fabricates via:
+//   app.defaultListener ?? app.services[0]?.listeners[0]?.name ?? "web"
+// This silently produces a dangling listener name and never errors.
+// GREEN: after fix, servicesOf() throws with a descriptive message.
+// ---------------------------------------------------------------------------
+
+describe("servicesOf — throws on unresolvable defaultListener (Fix 6)", () => {
+  function multiServiceApp(defaultListener?: string): AppRecord {
+    return legacyApp({
+      services: [
+        {
+          name: "web",
+          unit: "my-app",
+          listeners: [{ name: "web", port: 3000, portEnv: "PORT" }],
+        },
+      ],
+      // If undefined, it's deliberately absent to test the missing case.
+      ...(defaultListener !== undefined ? { defaultListener } : {}),
+    });
+  }
+
+  test("svc-throw-1: defaultListener references nonexistent listener → throws", () => {
+    // Currently: fabricates via app.services[0]?.listeners[0]?.name ("web") — no error.
+    // After fix: throws because "ghost" is not in the declared listener set.
+    const app = multiServiceApp("ghost");
+    expect(() => servicesOf(app)).toThrow();
+  });
+
+  test("svc-throw-2: multi-service app with no defaultListener field → throws", () => {
+    // Currently: fabricates via the fallback chain — returns "web" with no error.
+    // After fix: throws because defaultListener is required for multi-service apps.
+    const app = multiServiceApp(undefined);
+    expect(() => servicesOf(app)).toThrow();
+  });
+
+  test("svc-throw-3: throw message describes the problem (not a generic error)", () => {
+    const app = multiServiceApp("nonexistent");
+    let msg = "";
+    try {
+      servicesOf(app);
+    } catch (e) {
+      msg = e instanceof Error ? e.message : String(e);
+    }
+    // Message must mention the bad listener name so the operator knows what to fix.
+    expect(msg.toLowerCase()).toMatch(/nonexistent|defaultlistener|listener/i);
+  });
+});

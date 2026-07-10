@@ -1203,11 +1203,580 @@ describe("parseSamohostToml — multi-service validation: unknown sub-table keys
 });
 
 describe("parseSamohostToml — multi-service: mainListen validation", () => {
-  test("ms-ml-1: mainListen with invalid value rejected", () => {
-    const toml = twoServiceBase() + '\nmainListen = "bogus"';
+  test("ms-ml-1: mainListen with invalid value rejected (value at ROOT level)", () => {
+    // Fix: mainListen must appear at the root table, BEFORE any [[services]] headers.
+    // Appending after [[services.listeners]] binds the key to the listener sub-table
+    // (TOML context), triggering an unknown-key error instead of the enum guard.
+    const toml = [
+      minimalBase(),
+      'defaultListener = "web"',
+      'mainListen = "bogus"',        // at root — exercises the enum guard
+      "[[services]]",
+      'name = "web"',
+      'unit = "my-app"',
+      "  [[services.listeners]]",
+      '  name    = "web"',
+      "  port    = 3000",
+      '  portEnv = "PORT"',
+    ].join("\n");
     const result = parseSamohostToml(toml);
     expect(result.ok).toBe(false);
     if (result.ok) throw new Error("expected ok=false");
     expect(result.errors.some((e) => e.toLowerCase().includes("mainlisten"))).toBe(true);
+  });
+});
+
+// ===========================================================================
+// samorev injection + validation gap fixes (PR #135 blocking)
+// RED: all assertions below fail on the current #135 head.
+// GREEN: pass after the implementation fixes in toml.ts / services.ts / app.ts.
+// ===========================================================================
+
+// ---------------------------------------------------------------------------
+// Fix 1 + Fix 7: brace/dollar injection guard + printable-ASCII charset in matchRegexp
+// ---------------------------------------------------------------------------
+
+describe("injection guard: matchRegexp — brace/dollar + charset (Fix 1, Fix 7)", () => {
+  /** Build a two-service TOML with one [[routes]] entry using the supplied regexp. */
+  function routeWithRegexp(regexp: string): string {
+    return [
+      twoServiceBase(),
+      "[[routes]]",
+      `matchRegexp = ${JSON.stringify(regexp)}`,
+      'to          = "web"',
+    ].join("\n");
+  }
+
+  // --- RED: brace-dollar sequences ------------------------------------
+  test("inj-re-1: {$ sequence rejected (Caddy env-substitution guard)", () => {
+    const result = parseSamohostToml(routeWithRegexp("{$SECRET}"));
+    expect(result.ok).toBe(false);
+    if (result.ok) throw new Error("expected ok=false");
+    expect(result.errors.some((e) =>
+      e.toLowerCase().includes("regexp") || e.toLowerCase().includes("unsafe") || e.toLowerCase().includes("brace")
+    )).toBe(true);
+  });
+
+  test("inj-re-2: bare { not forming a quantifier rejected", () => {
+    const result = parseSamohostToml(routeWithRegexp("{notAQuantifier}"));
+    expect(result.ok).toBe(false);
+    if (result.ok) throw new Error("expected ok=false");
+    expect(result.errors.some((e) =>
+      e.toLowerCase().includes("regexp") || e.toLowerCase().includes("brace") || e.toLowerCase().includes("unsafe")
+    )).toBe(true);
+  });
+
+  test("inj-re-3: bare } without matching { rejected", () => {
+    const result = parseSamohostToml(routeWithRegexp("^/api}badclose"));
+    expect(result.ok).toBe(false);
+    if (result.ok) throw new Error("expected ok=false");
+    expect(result.errors.some((e) =>
+      e.toLowerCase().includes("regexp") || e.toLowerCase().includes("brace") || e.toLowerCase().includes("unsafe")
+    )).toBe(true);
+  });
+
+  // --- RED: printable-ASCII guard (Fix 7) ----------------------------
+  test("inj-re-4: non-ASCII character (U+00E9 é) rejected (printable-ASCII guard)", () => {
+    // Current CADDY_SAFE_REGEXP admits U+00E9 — it's not in ["\\\`\x00-\x1f\x7f].
+    // After Fix 7 (^[\x20-\x7e]+$), U+00E9 > 0x7e is rejected.
+    const result = parseSamohostToml(routeWithRegexp("café"));
+    expect(result.ok).toBe(false);
+    if (result.ok) throw new Error("expected ok=false");
+    expect(result.errors.some((e) =>
+      e.toLowerCase().includes("regexp") || e.toLowerCase().includes("charset") || e.toLowerCase().includes("ascii")
+    )).toBe(true);
+  });
+
+  // --- GREEN (regression guards already working pre-fix) --------------
+  test("inj-re-5: backslash in matchRegexp rejected (already banned pre-fix)", () => {
+    const result = parseSamohostToml(routeWithRegexp("^/api\\test"));
+    expect(result.ok).toBe(false);
+    if (result.ok) throw new Error("expected ok=false");
+    expect(result.errors.some((e) =>
+      e.toLowerCase().includes("regexp") || e.toLowerCase().includes("unsafe") || e.toLowerCase().includes("charset")
+    )).toBe(true);
+  });
+
+  test("inj-re-6: backtick in matchRegexp rejected (already banned pre-fix)", () => {
+    const result = parseSamohostToml(routeWithRegexp("^/api`cmd`exec"));
+    expect(result.ok).toBe(false);
+    if (result.ok) throw new Error("expected ok=false");
+    expect(result.errors.some((e) =>
+      e.toLowerCase().includes("regexp") || e.toLowerCase().includes("unsafe") || e.toLowerCase().includes("charset")
+    )).toBe(true);
+  });
+
+  test("inj-re-7: newline in matchRegexp rejected (already banned pre-fix)", () => {
+    // Newline is \x0a — in the \x00-\x1f control range, already banned.
+    const result = parseSamohostToml(routeWithRegexp("^/api\ninjected"));
+    expect(result.ok).toBe(false);
+    if (result.ok) throw new Error("expected ok=false");
+    expect(result.errors.some((e) =>
+      e.toLowerCase().includes("regexp") || e.toLowerCase().includes("unsafe") || e.toLowerCase().includes("charset")
+    )).toBe(true);
+  });
+
+  // --- GREEN (valid quantifiers must remain accepted post-fix) --------
+  test("inj-re-8: valid quantifier {1,3} accepted (regex quantifier allowance)", () => {
+    const result = parseSamohostToml(routeWithRegexp("^/api/v[0-9]{1,3}"));
+    if (!result.ok) throw new Error("expected ok=true; errors: " + result.errors.join(", "));
+    expect(result.app.routes![0]!.matchRegexp).toBe("^/api/v[0-9]{1,3}");
+  });
+
+  test("inj-re-9: valid quantifier {2,} accepted (open-ended quantifier)", () => {
+    const result = parseSamohostToml(routeWithRegexp("^/path/[a-z]{2,}"));
+    if (!result.ok) throw new Error("expected ok=true; errors: " + result.errors.join(", "));
+    expect(result.app.routes![0]!.matchRegexp).toBe("^/path/[a-z]{2,}");
+  });
+
+  test("inj-re-10: valid quantifier {5} accepted (exact-count quantifier)", () => {
+    const result = parseSamohostToml(routeWithRegexp("[0-9]{5}"));
+    if (!result.ok) throw new Error("expected ok=true; errors: " + result.errors.join(", "));
+    expect(result.app.routes![0]!.matchRegexp).toBe("[0-9]{5}");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Fix 2: injection guard on matchPath and respond.body
+// ---------------------------------------------------------------------------
+
+describe("injection guard: matchPath (Fix 2)", () => {
+  function routeWithPath(path: string): string {
+    return [
+      twoServiceBase(),
+      "[[routes]]",
+      `matchPath = ${JSON.stringify(path)}`,
+      'to        = "web"',
+    ].join("\n");
+  }
+
+  test("inj-path-1: {$ injection in matchPath rejected", () => {
+    // matchPath currently has NO charset guard — any string passes.
+    const result = parseSamohostToml(routeWithPath("{$SECRET}/api"));
+    expect(result.ok).toBe(false);
+    if (result.ok) throw new Error("expected ok=false");
+    expect(result.errors.some((e) =>
+      e.toLowerCase().includes("matchpath") || e.toLowerCase().includes("unsafe") || e.toLowerCase().includes("brace")
+    )).toBe(true);
+  });
+
+  test("inj-path-2: bare non-quantifier brace in matchPath rejected", () => {
+    const result = parseSamohostToml(routeWithPath("{injection}/api"));
+    expect(result.ok).toBe(false);
+    if (result.ok) throw new Error("expected ok=false");
+    expect(result.errors.some((e) =>
+      e.toLowerCase().includes("matchpath") || e.toLowerCase().includes("brace") || e.toLowerCase().includes("unsafe")
+    )).toBe(true);
+  });
+
+  test("inj-path-3: double-quote in matchPath rejected", () => {
+    const result = parseSamohostToml(routeWithPath('/api/"evil'));
+    expect(result.ok).toBe(false);
+    if (result.ok) throw new Error("expected ok=false");
+    expect(result.errors.some((e) =>
+      e.toLowerCase().includes("matchpath") || e.toLowerCase().includes("unsafe") || e.toLowerCase().includes("charset")
+    )).toBe(true);
+  });
+
+  test("inj-path-4: normal path /api/* is still accepted", () => {
+    const result = parseSamohostToml(routeWithPath("/api/*"));
+    if (!result.ok) throw new Error("expected ok=true; errors: " + result.errors.join(", "));
+    expect(result.app.routes![0]!.matchPath).toBe("/api/*");
+  });
+});
+
+describe("injection guard: respond.body (Fix 2)", () => {
+  function routeWithBody(body: string): string {
+    return [
+      twoServiceBase(),
+      "[[routes]]",
+      'matchPath = "/healthz"',
+      "[routes.respond]",
+      "status = 200",
+      `body   = ${JSON.stringify(body)}`,
+    ].join("\n");
+  }
+
+  test("inj-body-1: {$ injection in respond.body rejected", () => {
+    // respond.body currently has NO charset guard.
+    const result = parseSamohostToml(routeWithBody("{$SECRET}"));
+    expect(result.ok).toBe(false);
+    if (result.ok) throw new Error("expected ok=false");
+    expect(result.errors.some((e) =>
+      e.toLowerCase().includes("body") || e.toLowerCase().includes("unsafe") || e.toLowerCase().includes("brace")
+    )).toBe(true);
+  });
+
+  test("inj-body-2: double-quote in respond.body rejected", () => {
+    const result = parseSamohostToml(routeWithBody('ok"evil'));
+    expect(result.ok).toBe(false);
+    if (result.ok) throw new Error("expected ok=false");
+    expect(result.errors.some((e) =>
+      e.toLowerCase().includes("body") || e.toLowerCase().includes("unsafe") || e.toLowerCase().includes("charset")
+    )).toBe(true);
+  });
+
+  test("inj-body-3: normal respond.body 'ok' is still accepted", () => {
+    const result = parseSamohostToml(routeWithBody("ok"));
+    if (!result.ok) throw new Error("expected ok=true; errors: " + result.errors.join(", "));
+    expect(result.app.routes![0]!.respond?.body).toBe("ok");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Fix 3a: portEnv charset ^[A-Z_][A-Z0-9_]*$
+// ---------------------------------------------------------------------------
+
+describe("portEnv charset validation (Fix 3)", () => {
+  function listenerWithPortEnv(portEnv: string): string {
+    return [
+      minimalBase(),
+      'defaultListener = "web"',
+      "[[services]]",
+      'name = "web"',
+      'unit = "my-app"',
+      "  [[services.listeners]]",
+      '  name = "web"',
+      "  port = 3000",
+      `  portEnv = ${JSON.stringify(portEnv)}`,
+    ].join("\n");
+  }
+
+  test("portenv-1: portEnv with hyphen rejected (must be [A-Z_][A-Z0-9_]*)", () => {
+    const result = parseSamohostToml(listenerWithPortEnv("bad-port-env"));
+    expect(result.ok).toBe(false);
+    if (result.ok) throw new Error("expected ok=false");
+    expect(result.errors.some((e) =>
+      e.toLowerCase().includes("portenv") || e.toLowerCase().includes("env")
+    )).toBe(true);
+  });
+
+  test("portenv-2: portEnv with lowercase rejected", () => {
+    const result = parseSamohostToml(listenerWithPortEnv("port"));
+    expect(result.ok).toBe(false);
+    if (result.ok) throw new Error("expected ok=false");
+    expect(result.errors.some((e) =>
+      e.toLowerCase().includes("portenv") || e.toLowerCase().includes("env")
+    )).toBe(true);
+  });
+
+  test("portenv-3: portEnv starting with digit rejected", () => {
+    const result = parseSamohostToml(listenerWithPortEnv("1PORT"));
+    expect(result.ok).toBe(false);
+    if (result.ok) throw new Error("expected ok=false");
+    expect(result.errors.some((e) =>
+      e.toLowerCase().includes("portenv") || e.toLowerCase().includes("env")
+    )).toBe(true);
+  });
+
+  test("portenv-4: portEnv = PORT accepted", () => {
+    const result = parseSamohostToml(listenerWithPortEnv("PORT"));
+    if (!result.ok) throw new Error("expected ok=true; errors: " + result.errors.join(", "));
+    expect(result.app.services![0]!.listeners[0]!.portEnv).toBe("PORT");
+  });
+
+  test("portenv-5: portEnv = _PORT accepted (underscore prefix)", () => {
+    const result = parseSamohostToml(listenerWithPortEnv("_PORT"));
+    if (!result.ok) throw new Error("expected ok=true; errors: " + result.errors.join(", "));
+    expect(result.app.services![0]!.listeners[0]!.portEnv).toBe("_PORT");
+  });
+
+  test("portenv-6: portEnv = APP_PORT_8080 accepted (complex valid name)", () => {
+    const result = parseSamohostToml(listenerWithPortEnv("APP_PORT_8080"));
+    if (!result.ok) throw new Error("expected ok=true; errors: " + result.errors.join(", "));
+    expect(result.app.services![0]!.listeners[0]!.portEnv).toBe("APP_PORT_8080");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Fix 3b: service name + listener name charset ^[a-z][a-z0-9-]*$
+// ---------------------------------------------------------------------------
+
+describe("service/listener name charset validation (Fix 3)", () => {
+  function serviceWithName(svcName: string): string {
+    return [
+      minimalBase(),
+      `defaultListener = "web"`,
+      "[[services]]",
+      `name = ${JSON.stringify(svcName)}`,
+      'unit = "my-app"',
+      "  [[services.listeners]]",
+      '  name = "web"',
+      "  port = 3000",
+      '  portEnv = "PORT"',
+    ].join("\n");
+  }
+
+  function listenerWithName(lsName: string): string {
+    return [
+      minimalBase(),
+      `defaultListener = ${JSON.stringify(lsName)}`,
+      "[[services]]",
+      'name = "web"',
+      'unit = "my-app"',
+      "  [[services.listeners]]",
+      `  name = ${JSON.stringify(lsName)}`,
+      "  port = 3000",
+      '  portEnv = "PORT"',
+    ].join("\n");
+  }
+
+  test("svcname-1: service name with uppercase rejected", () => {
+    const result = parseSamohostToml(serviceWithName("Web-Service"));
+    expect(result.ok).toBe(false);
+    if (result.ok) throw new Error("expected ok=false");
+    expect(result.errors.some((e) =>
+      e.toLowerCase().includes("service") && e.toLowerCase().includes("name")
+    )).toBe(true);
+  });
+
+  test("svcname-2: service name starting with digit rejected", () => {
+    const result = parseSamohostToml(serviceWithName("1web"));
+    expect(result.ok).toBe(false);
+    if (result.ok) throw new Error("expected ok=false");
+    expect(result.errors.some((e) =>
+      e.toLowerCase().includes("service") && e.toLowerCase().includes("name")
+    )).toBe(true);
+  });
+
+  test("svcname-3: service name with underscore rejected", () => {
+    const result = parseSamohostToml(serviceWithName("web_worker"));
+    expect(result.ok).toBe(false);
+    if (result.ok) throw new Error("expected ok=false");
+    expect(result.errors.some((e) =>
+      e.toLowerCase().includes("service") && e.toLowerCase().includes("name")
+    )).toBe(true);
+  });
+
+  test("lsname-1: listener name with underscore rejected", () => {
+    const result = parseSamohostToml(listenerWithName("web_listener"));
+    expect(result.ok).toBe(false);
+    if (result.ok) throw new Error("expected ok=false");
+    expect(result.errors.some((e) =>
+      e.toLowerCase().includes("listener") && e.toLowerCase().includes("name")
+    )).toBe(true);
+  });
+
+  test("lsname-2: listener name with uppercase rejected", () => {
+    const result = parseSamohostToml(listenerWithName("Web"));
+    expect(result.ok).toBe(false);
+    if (result.ok) throw new Error("expected ok=false");
+    expect(result.errors.some((e) =>
+      e.toLowerCase().includes("listener") && e.toLowerCase().includes("name")
+    )).toBe(true);
+  });
+
+  test("lsname-3: listener name = web-front accepted (hyphen ok)", () => {
+    const result = parseSamohostToml(listenerWithName("web-front"));
+    if (!result.ok) throw new Error("expected ok=true; errors: " + result.errors.join(", "));
+    expect(result.app.services![0]!.listeners[0]!.name).toBe("web-front");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Fix 4: port must be an integer in 1..65535
+// ---------------------------------------------------------------------------
+
+describe("port integer range validation (Fix 4)", () => {
+  function listenerWithPort(portLiteral: string): string {
+    return [
+      minimalBase(),
+      'defaultListener = "web"',
+      "[[services]]",
+      'name = "web"',
+      'unit = "my-app"',
+      "  [[services.listeners]]",
+      '  name = "web"',
+      `  port = ${portLiteral}`,
+      '  portEnv = "PORT"',
+    ].join("\n");
+  }
+
+  test("port-1: port = 0 rejected (below 1)", () => {
+    const result = parseSamohostToml(listenerWithPort("0"));
+    expect(result.ok).toBe(false);
+    if (result.ok) throw new Error("expected ok=false");
+    expect(result.errors.some((e) =>
+      e.toLowerCase().includes("port") && (e.includes("1") || e.toLowerCase().includes("range") || e.toLowerCase().includes("integer"))
+    )).toBe(true);
+  });
+
+  test("port-2: port = -1 rejected (negative)", () => {
+    const result = parseSamohostToml(listenerWithPort("-1"));
+    expect(result.ok).toBe(false);
+    if (result.ok) throw new Error("expected ok=false");
+    expect(result.errors.some((e) =>
+      e.toLowerCase().includes("port") && (e.toLowerCase().includes("range") || e.toLowerCase().includes("integer"))
+    )).toBe(true);
+  });
+
+  test("port-3: port = 70000 rejected (above 65535)", () => {
+    const result = parseSamohostToml(listenerWithPort("70000"));
+    expect(result.ok).toBe(false);
+    if (result.ok) throw new Error("expected ok=false");
+    expect(result.errors.some((e) =>
+      e.toLowerCase().includes("port") && (e.includes("65535") || e.toLowerCase().includes("range"))
+    )).toBe(true);
+  });
+
+  test("port-4: port = 3.5 rejected (non-integer float)", () => {
+    // TOML: 3.5 is a valid float; typeof 3.5 === "number" passes current check.
+    // After fix: Number.isInteger(3.5) === false → rejected.
+    const result = parseSamohostToml(listenerWithPort("3.5"));
+    expect(result.ok).toBe(false);
+    if (result.ok) throw new Error("expected ok=false");
+    expect(result.errors.some((e) =>
+      e.toLowerCase().includes("port") && (e.toLowerCase().includes("integer") || e.toLowerCase().includes("range"))
+    )).toBe(true);
+  });
+
+  test("port-5: port = 1 accepted (lower bound)", () => {
+    const result = parseSamohostToml(listenerWithPort("1"));
+    if (!result.ok) throw new Error("expected ok=true; errors: " + result.errors.join(", "));
+    expect(result.app.services![0]!.listeners[0]!.port).toBe(1);
+  });
+
+  test("port-6: port = 65535 accepted (upper bound)", () => {
+    const result = parseSamohostToml(listenerWithPort("65535"));
+    if (!result.ok) throw new Error("expected ok=true; errors: " + result.errors.join(", "));
+    expect(result.app.services![0]!.listeners[0]!.port).toBe(65535);
+  });
+
+  test("port-7: port = 3000 accepted (typical value)", () => {
+    const result = parseSamohostToml(listenerWithPort("3000"));
+    if (!result.ok) throw new Error("expected ok=true; errors: " + result.errors.join(", "));
+    expect(result.app.services![0]!.listeners[0]!.port).toBe(3000);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Fix 5: [[routes]] without [[services]] must be rejected
+// ---------------------------------------------------------------------------
+
+describe("routes-without-services rejection (Fix 5)", () => {
+  test("rws-1: [[routes]] declared without [[services]] → error", () => {
+    // Currently: routes parsing runs independently of services; if services is
+    // undefined, route.to cross-reference is skipped — no error emitted.
+    // After fix: any [[routes]] without [[services]] must produce an error.
+    const toml = [
+      minimalBase(),
+      "[[routes]]",
+      'matchPath = "/api/*"',
+      'to        = "web"',
+    ].join("\n");
+    const result = parseSamohostToml(toml);
+    expect(result.ok).toBe(false);
+    if (result.ok) throw new Error("expected ok=false");
+    expect(result.errors.some((e) =>
+      (e.toLowerCase().includes("route") && e.toLowerCase().includes("service")) ||
+      e.toLowerCase().includes("routes") ||
+      e.toLowerCase().includes("topology")
+    )).toBe(true);
+  });
+
+  test("rws-2: [[routes]] with respond (no to) without [[services]] → also rejected", () => {
+    const toml = [
+      minimalBase(),
+      "[[routes]]",
+      'matchPath = "/healthz"',
+      "[routes.respond]",
+      "status = 200",
+      'body   = "ok"',
+    ].join("\n");
+    const result = parseSamohostToml(toml);
+    expect(result.ok).toBe(false);
+    if (result.ok) throw new Error("expected ok=false");
+    expect(result.errors.some((e) =>
+      e.toLowerCase().includes("route") || e.toLowerCase().includes("service")
+    )).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Fix 6a: runAppRegister validates programmatic services/defaultListener
+// ---------------------------------------------------------------------------
+
+describe("runAppRegister — programmatic service topology validation (Fix 6)", () => {
+  let dir: string;
+  let vmStore: StateStore;
+  let appStore: AppStore;
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), "samohost-svc-val-"));
+    vmStore = new StateStore(join(dir, "state.json"));
+    appStore = new AppStore(join(dir, "apps.json"));
+    vmStore.upsert(vm());
+  });
+
+  afterEach(() => rmSync(dir, { recursive: true, force: true }));
+
+  function base() {
+    return {
+      vm: "samo-we-field-record",
+      name: "svc-test-app",
+      repo: "owner/svc-test",
+      branch: "main",
+      appDir: "/opt/svc-test/app",
+      buildCmd: "npm run build",
+      serviceUnit: "svc-test-app",
+      healthUrl: "http://localhost:3000/health",
+      rlsNonSuperuser: false as const,
+    };
+  }
+
+  const validService = {
+    name: "web",
+    unit: "svc-test-app",
+    listeners: [{ name: "web", port: 3000, portEnv: "PORT" }],
+  };
+
+  test("reg-svc-1: services set + no defaultListener → exits 1 (validation gap)", () => {
+    // Currently runAppRegister has NO validation for services/defaultListener.
+    // A dangling defaultListener gets persisted to disk and breaks servicesOf later.
+    const c = capture();
+    const code = runAppRegister({
+      ...base(),
+      services: [validService],
+      // defaultListener deliberately absent
+    }, { json: false }, vmStore, appStore, c.out, c.err);
+    expect(code).toBe(1);
+    // Nothing should be persisted when validation fails
+    expect(appStore.list().filter((r) => r.vmId === "vm-1111")).toHaveLength(0);
+  });
+
+  test("reg-svc-2: services set + defaultListener references nonexistent listener → exits 1", () => {
+    const c = capture();
+    const code = runAppRegister({
+      ...base(),
+      services: [validService],
+      defaultListener: "does-not-exist",
+    }, { json: false }, vmStore, appStore, c.out, c.err);
+    expect(code).toBe(1);
+    expect(appStore.list().filter((r) => r.vmId === "vm-1111")).toHaveLength(0);
+  });
+
+  test("reg-svc-3: routes set without services → exits 1", () => {
+    const c = capture();
+    const code = runAppRegister({
+      ...base(),
+      routes: [{ matchPath: "/api/*", to: "web" }],
+      // services deliberately absent
+    }, { json: false }, vmStore, appStore, c.out, c.err);
+    expect(code).toBe(1);
+    expect(appStore.list().filter((r) => r.vmId === "vm-1111")).toHaveLength(0);
+  });
+
+  test("reg-svc-4: valid services + matching defaultListener → exits 0 and persists", () => {
+    // GREEN even before fix: confirms no regression when input is valid.
+    // (This tests that we don't break the valid path.)
+    const c = capture();
+    const code = runAppRegister({
+      ...base(),
+      services: [validService],
+      defaultListener: "web",
+    }, { json: false }, vmStore, appStore, c.out, c.err);
+    // After fix, this must still pass.
+    expect(code).toBe(0);
+    expect(appStore.list().filter((r) => r.vmId === "vm-1111")).toHaveLength(1);
   });
 });
