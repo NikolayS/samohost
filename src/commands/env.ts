@@ -28,11 +28,11 @@ import {
 import { parseEnvOutcome, type EnvOutcome } from "../env/parse.ts";
 import { envName } from "../env/name.ts";
 import {
-  allocatePort,
   DEFAULT_POOL,
   parseListeningPorts,
   type PortPool,
 } from "../env/ports.ts";
+import { servicesOf } from "../app/services.ts";
 import {
   buildEnvCreateScript,
   buildEnvDestroyScript,
@@ -245,21 +245,72 @@ export function deriveTarget(
   }
   const names = new Map(existingOnVm.map((e) => [e.name, e.branch]));
   const name = envName(app.name, branch, names);
-  const port = allocatePort(
-    [...existingOnVm.map((e) => e.port), ...extraUsedPorts],
-    pool,
-  );
-  if (port === undefined) {
+
+  // Build the union of ALL ports already in use on this VM: each env's primary
+  // port PLUS every entry in its per-listener ports map. This ensures that two
+  // envs of the same multi-service app never collide on any listener port even
+  // when those ports don't appear in the env's primary `port` field.
+  const allUsed: number[] = [
+    ...existingOnVm.map((e) => e.port),
+    ...existingOnVm.flatMap((e) =>
+      e.ports !== undefined ? Object.values(e.ports) : [],
+    ),
+    ...extraUsedPorts,
+  ];
+
+  // Determine the listener topology for this app so we can allocate one port
+  // per listener in declaration order.
+  const { services, defaultListener } = servicesOf(app);
+  const allListeners = services.flatMap((svc) => svc.listeners);
+
+  // Allocate one pool port per listener in declaration order.
+  // Each allocation extends the used set so no two listeners in this allocation
+  // share a port with each other or with any existing env.
+  const allocatedPorts: Record<string, number> = {};
+  const usedSet = new Set(allUsed);
+
+  for (const listener of allListeners) {
+    // Find the lowest free port in the pool (not in usedSet).
+    let found: number | undefined;
+    for (let p = pool.base; p < pool.base + pool.size; p++) {
+      if (!usedSet.has(p)) {
+        found = p;
+        break;
+      }
+    }
+    if (found === undefined) {
+      return {
+        error:
+          `port pool exhausted (${pool.size} ports from ${pool.base}) — ` +
+          `destroy stale envs before creating new ones`,
+      };
+    }
+    allocatedPorts[listener.name] = found;
+    usedSet.add(found); // prevent the next listener from reusing this port
+  }
+
+  // The default listener's port is the back-compat `port` field.
+  const defaultListenerPort = allocatedPorts[defaultListener];
+  if (defaultListenerPort === undefined) {
+    // servicesOf() guarantees defaultListener exists in allListeners, so this
+    // is unreachable for well-formed apps; fail closed in case of future drift.
     return {
       error:
-        `port pool exhausted (${pool.size} ports from ${pool.base}) — ` +
-        `destroy stale envs before creating new ones`,
+        `port allocation: defaultListener "${defaultListener}" not found in ` +
+        `allocated ports for app "${app.name}" — check the app spec`,
     };
   }
+
+  // For legacy (single-listener) apps, omit `ports` to preserve back-compat:
+  // callers that check for `ports === undefined` can distinguish the two cases.
+  // For multi-listener apps, always emit the full `ports` map.
+  const isMultiListener = allListeners.length > 1;
+
   return {
     name,
     branch,
-    port,
+    port: defaultListenerPort,
+    ...(isMultiListener ? { ports: allocatedPorts } : {}),
     vhost: `${name}.${previewDomain}`,
     dbBackend: db,
     ...(db === "dblab" ? { dbName: name } : {}),
@@ -489,6 +540,11 @@ export interface EnvCreateReport {
   app: string;
   branch: string;
   port: number;
+  /**
+   * Per-listener allocated ports for multi-service apps (keyed by listener
+   * name). Absent for legacy single-listener apps (`port` covers them).
+   */
+  ports?: Record<string, number>;
   vhost: string;
   db: EnvDbBackend;
   outcome: EnvOutcome;
@@ -747,6 +803,9 @@ export async function runEnvCreate(
     branch: input.branch,
     name: target.name,
     port: target.port,
+    // Persist per-listener ports for multi-service apps so re-create and
+    // destroy reuse the same allocated ports (idempotent, no collision).
+    ...(target.ports !== undefined ? { ports: target.ports } : {}),
     vhost: target.vhost,
     dbBackend: target.dbBackend,
     ...(target.dbName !== undefined ? { dbName: target.dbName } : {}),
@@ -778,6 +837,7 @@ export async function runEnvCreate(
     app: r.app.name,
     branch: input.branch,
     port: target.port,
+    ...(target.ports !== undefined ? { ports: target.ports } : {}),
     vhost: target.vhost,
     db: target.dbBackend,
     outcome,

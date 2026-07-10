@@ -138,8 +138,17 @@ export function renderVhost(plan: VhostPlan): string {
       // Inline path matcher — double-quoted to prevent token splitting on spaces.
       matcherToken = `"${m.path}"`;
     } else {
-      // Should not happen for well-formed plans, but fall back gracefully.
-      matcherToken = "";
+      // A route with no name, no path, and no regexp is a programming error —
+      // the manifest validator must never produce such a plan. Throw instead of
+      // emitting an empty matcher token (which would produce a catch-all route
+      // that shadows every subsequent handle, silently breaking routing).
+      // Defense-in-depth: this path is unreachable via validated manifests today
+      // but safer than silently emitting a shadowing catch-all.
+      throw new Error(
+        `renderVhost: route has no valid matcher (no name/path/regexp) — ` +
+          `this indicates a malformed VhostPlan that bypassed manifest validation; ` +
+          `check the route spec at plan.host="${plan.host}"`,
+      );
     }
 
     const target = route.target;

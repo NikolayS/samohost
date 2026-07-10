@@ -26,6 +26,8 @@
  */
 
 import type { AppRecord, EnvDbBackend, EnvRecord } from "../types.ts";
+import { servicesOf } from "../app/services.ts";
+import { planFromEnv, renderVhost } from "../caddy/render.ts";
 
 /** Same marker prefix as deploy scripts — one parser convention everywhere. */
 export const ENV_PHASE_PREFIX = "<<<SAMOHOST_PHASE:";
@@ -542,8 +544,17 @@ export interface EnvScriptTarget {
   name: string;
   /** Raw git branch the env tracks. */
   branch: string;
-  /** Allocated app port (env/ports.ts). */
+  /**
+   * Allocated port for the DEFAULT listener (back-compat).
+   * For multi-service apps this equals ports[defaultListener].
+   */
   port: number;
+  /**
+   * Per-listener allocated ports for multi-service apps, keyed by listener name.
+   * Absent for legacy single-service apps (use `port` instead).
+   * When present, every listener in servicesOf(app) has an entry here.
+   */
+  ports?: Record<string, number>;
   /** Full vhost (e.g. `field-record-1-feat-x.samo.cat`). */
   vhost: string;
   dbBackend: EnvDbBackend;
@@ -758,6 +769,8 @@ function sudoWrapBuildCmd(buildCmd: string, appUser: string): string {
 function buildEnvfileScopedBodyLines(
   app: AppRecord,
   t: EnvScriptTarget,
+  portMap: Map<string, number>,
+  allListeners: Array<{ listener: import("../types.ts").ListenerSpec; unit: string }>,
 ): string[] {
   const root = envsRoot(app);
   const envDir = `${root}/${t.name}`;
@@ -773,8 +786,21 @@ function buildEnvfileScopedBodyLines(
     `if _sh_env="$(mktemp)" \\`,
     `   && cp ${sq(templatePath)} "$_sh_env" \\`,
     `   && chmod 600 "$_sh_env" \\`,
-    `   && printf '\\nPORT=%s\\n' ${sq(String(t.port))} >> "$_sh_env" \\`,
   ];
+
+  // Per-listener portEnv strip-then-append in the samo-owned temp file.
+  // Operator templates carry prod port values; strip-then-append prevents
+  // duplicate entries and ensures the allocated preview port wins.
+  for (const { listener } of allListeners) {
+    const allocatedPort = portMap.get(listener.name) ?? t.port;
+    lines.push(
+      `   && _sh_env2="$(mktemp)" \\`,
+      `   && { grep -vE ${sq(`^${listener.portEnv}=`)} "$_sh_env" >> "$_sh_env2" || true; } \\`,
+      `   && mv "$_sh_env2" "$_sh_env" \\`,
+      `   && chmod 600 "$_sh_env" \\`,
+      `   && printf ${sq(`${listener.portEnv}=${String(allocatedPort)}\\n`)} >> "$_sh_env" \\`,
+    );
+  }
 
   // Rewire functions are already defined in the outer bash (db-phase setup).
   // SAMOHOST_ENV_DB_VARS and SAMOHOST_DB_NAME / SAMOHOST_DB_PORT are set there.
@@ -829,6 +855,32 @@ export function buildEnvCreateScript(
   }
 
   const root = envsRoot(app);
+
+  // Resolve the service topology via servicesOf() so that legacy single-service
+  // apps and multi-service apps share one code path. For a legacy app (no
+  // services field), servicesOf() synthesizes the single "web" service from
+  // healthUrl, keeping the external behaviour identical.
+  const { services } = servicesOf(app);
+
+  // Flat list of (listener, owning service) pairs in declaration order.
+  // Declaration order is preserved throughout: port-check, envfile, health.
+  const allListeners = services.flatMap((svc) =>
+    svc.listeners.map((l) => ({ listener: l, unit: svc.unit })),
+  );
+
+  // Listener-name → allocated preview port.
+  // Multi-service: read from target.ports; legacy: all listeners share target.port.
+  const portMap = new Map<string, number>();
+  if (t.ports !== undefined) {
+    for (const [name, port] of Object.entries(t.ports)) {
+      portMap.set(name, port);
+    }
+  } else {
+    for (const { listener } of allListeners) {
+      portMap.set(listener.name, t.port);
+    }
+  }
+
   const lines: string[] = [
     "#!/usr/bin/env bash",
     "# samohost env-create script (generated; pushed over ssh stdin to `bash -s`).",
@@ -842,32 +894,39 @@ export function buildEnvCreateScript(
     `SAMOHOST_ENV_DIR=${sq(`${root}/${t.name}`)}`,
     `SAMOHOST_REPO=${sq(app.repo)}`,
     `SAMOHOST_APP_DIR=${sq(app.appDir)}`,
-    `SAMOHOST_UNIT_INSTANCE=${sq(`${app.serviceUnit}@${t.name}.service`)}`,
     `SAMOHOST_ENV_TEMPLATE=${sq(`${root}.template.env`)}`,
     `SAMOHOST_CADDY_SNIPPET=${sq(`/etc/caddy/sites.d/${t.name}.caddy`)}`,
     "",
   ];
 
-  // ----- port-check: FIRST phase — fail CLOSED if a foreign process already
-  // holds the allocated port (observed bug: ghrunner CI zombie on 0.0.0.0:3100
-  // caused the preview URL to silently serve the wrong process). Detection uses
-  // `ss -ltnH` (no sudo required on Ubuntu). If the port is held by OUR OWN
-  // active systemd instance (idempotent re-create), it is NOT a foreign
-  // occupant and we allow it (the unit phase will restart it). On a foreign
-  // occupant we emit :fail, remove any stale Caddy snippet (so the URL goes
-  // DARK rather than continuing to serve the squatter), reload Caddy, and
-  // exit 1. Reuses the existing sudo rm/reload caddy grants from host-prep
-  // sudoers — no new grants needed.
+  // ----- port-check: FIRST phase — fail CLOSED if any listener port is held
+  // by a foreign process. Loops all allocated listener ports. Detection uses
+  // `ss -ltnH` (no sudo on Ubuntu). If a port is held by OUR OWN active
+  // systemd unit (idempotent re-create) it is allowed; any other occupant
+  // fails CLOSED, removes the stale Caddy snippet (URL goes DARK), and exits 1.
+  // Reuses the existing sudo rm/reload caddy grants from host-prep sudoers.
   lines.push(
     ...PORT_CHECK_FN_LINES,
     "",
-    `# --- port-check: abort if a foreign process holds port $SAMOHOST_PORT ---`,
+    `# --- port-check: abort if any foreign process holds a listener port ---`,
     marker("port-check", "start"),
-    `if samohost_port_check_ok "$SAMOHOST_PORT" "$SAMOHOST_UNIT_INSTANCE"; then`,
+    "port_check_all_ok=1",
+  );
+  for (const { listener, unit } of allListeners) {
+    const allocatedPort = portMap.get(listener.name) ?? t.port;
+    const unitInstance = `${unit}@${t.name}.service`;
+    lines.push(
+      `if ! samohost_port_check_ok ${sq(String(allocatedPort))} ${sq(unitInstance)}; then`,
+      `  echo "samohost: port-check FAILED — a foreign process is already listening on port ${allocatedPort} (listener ${listener.name}, unit ${unitInstance}); allocate a different port or clean up the occupant before retrying" >&2`,
+      "  port_check_all_ok=0",
+      "fi",
+    );
+  }
+  lines.push(
+    'if [[ "$port_check_all_ok" == "1" ]]; then',
     `  ${marker("port-check", "ok")}`,
     "else",
     `  ${marker("port-check", "fail")}`,
-    '  echo "samohost: port-check FAILED — a foreign process is already listening on port $SAMOHOST_PORT (not our own active unit $SAMOHOST_UNIT_INSTANCE); allocate a different port or clean up the occupant before retrying" >&2',
     "  # Remove any stale Caddy snippet so the URL goes DARK (not serving the squatter).",
     '  sudo /usr/bin/rm -f "$SAMOHOST_CADDY_SNIPPET"',
     "  sudo /usr/bin/systemctl reload caddy || true",
@@ -1070,7 +1129,7 @@ export function buildEnvCreateScript(
   // (backward compatibility for AppRecords that predate the appUser field).
   let envfileBody: string[];
   if (app.appUser !== undefined) {
-    envfileBody = buildEnvfileScopedBodyLines(app, t);
+    envfileBody = buildEnvfileScopedBodyLines(app, t, portMap, allListeners);
   } else {
     // Original &&-chain body (no appUser — backward compat).
     // Set the preview-env marker so the banner fires. env create is
@@ -1094,8 +1153,21 @@ export function buildEnvCreateScript(
     envfileBody = [
       "if cp \"$SAMOHOST_ENV_TEMPLATE\" \"$SAMOHOST_ENV_DIR/.env\" \\",
       "   && chmod 600 \"$SAMOHOST_ENV_DIR/.env\" \\",
-      '   && printf \'\\nPORT=%s\\n\' "$SAMOHOST_PORT" >> "$SAMOHOST_ENV_DIR/.env" \\',
     ];
+    // Per-listener portEnv strip-then-append: operator templates legitimately
+    // carry prod port values (e.g. WS_HUB_PORT=8788); append-only would let
+    // dotenv order decide the winner (unsafe). Strip the stale prod value first,
+    // then append the allocated preview port. Same idiom as the BASE_URL strip.
+    for (const { listener } of allListeners) {
+      const allocatedPort = portMap.get(listener.name) ?? t.port;
+      envfileBody.push(
+        `   && _sh_env_tmp="$(mktemp)" \\`,
+        `   && { grep -vE ${sq(`^${listener.portEnv}=`)} "$SAMOHOST_ENV_DIR/.env" >> "$_sh_env_tmp" || true; } \\`,
+        `   && mv "$_sh_env_tmp" "$SAMOHOST_ENV_DIR/.env" \\`,
+        `   && chmod 600 "$SAMOHOST_ENV_DIR/.env" \\`,
+        `   && printf ${sq(`${listener.portEnv}=${String(allocatedPort)}\\n`)} >> "$SAMOHOST_ENV_DIR/.env" \\`,
+      );
+    }
     if (t.dbBackend === "template") {
       // Rewire every mapped var to the per-env db ON THE HOST (issue #11).
       envfileBody.push('   && samohost_rewire_db_vars "$SAMOHOST_ENV_DIR/.env" \\');
@@ -1135,44 +1207,81 @@ export function buildEnvCreateScript(
   // Restart semantics: `enable --now` is a NO-OP on an already-active unit,
   // so a re-create/heal that rewrites .env never reloads the app's DB config.
   //
-  // Strategy:
-  //   - not yet active → `sudo /usr/bin/systemctl enable --now` (first-create:
-  //     start the unit and persist it across reboots)
-  //   - already active → `sudo /usr/bin/systemctl disable --now` then
-  //     `sudo /usr/bin/systemctl enable --now` (stop + restart + persist)
+  // Strategy per service unit:
+  //   - not yet active → `sudo /usr/bin/systemctl enable --now` (first-create)
+  //   - already active → `disable --now` then `enable --now` (stop + restart)
   //
-  // WHY disable--now+enable--now instead of bare restart: adopted VMs (VMs
-  // cut over to samohost without a full re-provision) received only
-  // enable --now, disable --now, and reset-failed in their NOPASSWD sudoers
-  // grant — the cutover itself restarted units via disable--now/enable--now
-  // (proven: those are the only grants present). A bare `restart` grant was
-  // NEVER added to adopted hosts, so `sudo /usr/bin/systemctl restart` exits
-  // 1 (DENIED) on every adopted VM, causing rebuild/self-heal to fail with
-  // the app never reloading its new DB. Both `disable --now` and `enable --now`
-  // are already universally granted on every host (adopted + provisioned), so
-  // the two-call sequence works everywhere with no new grant required.
+  // WHY disable--now+enable--now instead of bare restart: adopted VMs received
+  // only enable --now / disable --now / reset-failed in their NOPASSWD sudoers
+  // grant; a bare `restart` grant was NEVER added. Both `disable --now` and
+  // `enable --now` are universally granted, so the two-call sequence works on
+  // every host type without a new grant.
   //
-  // `is-active` is an UNPRIVILEGED read — use bare `systemctl is-active`
-  // (no sudo). The hardened host's sudoers NOPASSWD block covers only
-  // enable --now / disable --now / reset-failed; `sudo is-active` is DENIED
-  // (exit 1), which would make the if-branch always false and only
-  // `enable --now` would ever run. Consistent with PORT_CHECK_FN_LINES (~91).
-  lines.push(
-    ...phaseBlock(
-      "unit",
-      "systemd template instance — disable--now+enable--now if already active, enable--now on first create (full-path sudo; grants in host-prep)",
-      [
+  // `is-active` is UNPRIVILEGED — bare `systemctl is-active` (no sudo). The
+  // hardened host's NOPASSWD block covers only enable/disable/reset-failed;
+  // `sudo is-active` is DENIED (exit 1) → if-branch always false → only
+  // `enable --now` would ever run. Consistent with PORT_CHECK_FN_LINES.
+  //
+  // Unit instances are baked as literals (not via a shell variable) so the
+  // script is self-documenting and the pattern is testable without runtime
+  // expansion.
+  //
+  // AGGREGATION (multi-service only): when there are 2+ services, we use a
+  // `unit_all_ok` flag (mirroring `port_check_all_ok` and `health_ok`) so that
+  // a failure on ANY service causes `unit:fail` + exit 1 — not just the last
+  // service. Single-service (legacy) uses the unchanged `if { ... }` form via
+  // phaseBlock so that the byte-identical gate still holds.
+  {
+    const unitInstances = services.map((svc) => `${svc.unit}@${t.name}.service`);
+    const unitComment =
+      "systemd template instances — disable--now+enable--now if already active, enable--now on first create (full-path sudo; grants in host-prep)";
+
+    if (unitInstances.length === 1) {
+      // LEGACY / single-service path: byte-identical to pre-aggregation output.
+      const instance = unitInstances[0]!;
+      const unitCommentBody: string[] = [
         "if { \\",
-        '     if systemctl is-active "$SAMOHOST_UNIT_INSTANCE" >/dev/null 2>&1; then \\',
-        '       sudo /usr/bin/systemctl disable --now "$SAMOHOST_UNIT_INSTANCE" \\',
-        '         && sudo /usr/bin/systemctl enable --now "$SAMOHOST_UNIT_INSTANCE"; \\',
+        `     # service unit: ${instance}`,
+        `     if systemctl is-active ${sq(instance)} >/dev/null 2>&1; then \\`,
+        `       sudo /usr/bin/systemctl disable --now ${sq(instance)} \\`,
+        `         && sudo /usr/bin/systemctl enable --now ${sq(instance)}; \\`,
         "     else \\",
-        '       sudo /usr/bin/systemctl enable --now "$SAMOHOST_UNIT_INSTANCE"; \\',
+        `       sudo /usr/bin/systemctl enable --now ${sq(instance)}; \\`,
         "     fi \\",
         "   }; ",
-      ],
-    ),
-  );
+      ];
+      lines.push(...phaseBlock("unit", unitComment, unitCommentBody));
+    } else {
+      // MULTI-SERVICE path: aggregate all-service outcomes into unit_all_ok.
+      // Mirrors the port_check_all_ok pattern: initialise ok=1, set to 0 on any
+      // per-service failure, and emit unit:fail + exit 1 unless all succeeded.
+      lines.push(
+        `# --- unit: ${unitComment} ---`,
+        marker("unit", "start"),
+        "unit_all_ok=1",
+      );
+      for (const instance of unitInstances) {
+        lines.push(
+          `# service unit: ${instance}`,
+          `if systemctl is-active ${sq(instance)} >/dev/null 2>&1; then`,
+          `  sudo /usr/bin/systemctl disable --now ${sq(instance)} \\`,
+          `    && sudo /usr/bin/systemctl enable --now ${sq(instance)} || unit_all_ok=0`,
+          "else",
+          `  sudo /usr/bin/systemctl enable --now ${sq(instance)} || unit_all_ok=0`,
+          "fi",
+        );
+      }
+      lines.push(
+        'if [[ "$unit_all_ok" == "1" ]]; then',
+        `  ${marker("unit", "ok")}`,
+        "else",
+        `  ${marker("unit", "fail")}`,
+        "  exit 1",
+        "fi",
+        "",
+      );
+    }
+  }
 
   // ----- vhost -----------------------------------------------------------------
   // The record is PROXIED (orange cloud), so CF edge fronts the origin. Caddy
@@ -1182,57 +1291,102 @@ export function buildEnvCreateScript(
   // allows :443 from CF IPs only), so the `tls internal` self-signed cert is
   // never exposed to clients. ACME is not used: it cannot complete behind a
   // CF-locked :443 and the host has no DNS-01 plugin.
-  // The printf format string builds a Caddy site block:
   //
-  //   <vhost> {
-  //     tls internal
-  //     reverse_proxy localhost:<port>
-  //     log {
-  //       output file /var/log/caddy/<name>.log
-  //       format json
-  //     }
-  //   }
+  // The vhost snippet is produced by renderVhost(planFromEnv(app, envRecord))
+  // — the SAME renderer used for production main-host vhosts. For legacy
+  // single-service apps (zero routes), renderVhost() emits a BARE
+  // `reverse_proxy localhost:<port>` with NO `handle {}` wrapper, which is
+  // Caddy-semantically identical to the previous printf form. For multi-service
+  // apps the renderer adds named matchers and handle blocks.
   //
   // The `log { output file ... format json }` block is the idle-GC access-log
-  // hook: it writes one JSON line per request with `ts` (Unix float) and
-  // `request.host` fields. The idle-GC pass reads max(ts) from this file to
-  // stamp EnvRecord.lastAccess, enabling idle detection from real traffic
-  // rather than createdAt (which never resets). `/var/log/caddy/` is the
-  // standard Caddy log dir; the host-prep sudoers already grants write access.
-  lines.push(
-    ...phaseBlock(
-      "vhost",
-      "Caddy vhost snippet + reload (sites.d include applied in host-prep)",
-      [
-        "if printf '%s {\\n\\ttls internal\\n\\treverse_proxy localhost:%s\\n\\tlog {\\n\\t\\toutput file /var/log/caddy/%s.log\\n\\t\\tformat json\\n\\t}\\n}\\n' \\",
-        '     "$SAMOHOST_VHOST" "$SAMOHOST_PORT" "$SAMOHOST_ENV_NAME" \\',
-        '   | sudo /usr/bin/tee "$SAMOHOST_CADDY_SNIPPET" >/dev/null \\',
-        "   && sudo /usr/bin/systemctl reload caddy; ",
-      ],
-    ),
-  );
+  // hook (writes one JSON line per request with `ts` and `request.host`). The
+  // idle-GC pass reads max(ts) from this file to stamp EnvRecord.lastAccess,
+  // enabling idle detection from real traffic rather than createdAt.
+  // `/var/log/caddy/` is the standard Caddy log dir; host-prep sudoers already
+  // grants write access. The idle-GC contract requires this block on every vhost.
+  {
+    // Build a minimal EnvRecord-like object for planFromEnv. planFromEnv reads
+    // target.ports (multi-service) or target.port (legacy) and the vhost name.
+    const envRecordForPlan: EnvRecord = {
+      id: "tmp",
+      vmId: "",
+      appName: app.name,
+      branch: t.branch,
+      name: t.name,
+      port: t.port,
+      ...(t.ports !== undefined ? { ports: t.ports } : {}),
+      vhost: t.vhost,
+      dbBackend: t.dbBackend,
+      createdAt: "",
+    };
+    const vhostContent = renderVhost(planFromEnv(app, envRecordForPlan));
+    // Escape the vhost content for safe embedding in a printf argument. The
+    // content is produced by our own renderer so it contains no secrets, but
+    // backslashes and single-quotes still need escaping for the sq() wrapper.
+    const vhostSq = sq(vhostContent);
+    lines.push(
+      ...phaseBlock(
+        "vhost",
+        "Caddy vhost snippet + reload via renderVhost (sites.d include applied in host-prep)",
+        [
+          `if printf %s ${vhostSq} \\`,
+          '   | sudo /usr/bin/tee "$SAMOHOST_CADDY_SNIPPET" >/dev/null \\',
+          "   && sudo /usr/bin/systemctl reload caddy; ",
+        ],
+      ),
+    );
+  }
 
   // ----- health ------------------------------------------------------------------
-  lines.push(
-    `# --- health: poll the app on its localhost port ---`,
-    marker("health", "start"),
-    "health_ok=0",
-    `for attempt in $(seq 1 ${HEALTH_RETRIES}); do`,
-    '  code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 "http://localhost:${SAMOHOST_PORT}/" || echo 000)',
-    '  if [[ "$code" == "200" ]]; then health_ok=1; break; fi',
-    `  sleep ${HEALTH_SLEEP_SEC}`,
-    "done",
-    'if [[ "$health_ok" == "1" ]]; then',
-    `  ${marker("health", "ok")}`,
-    "else",
-    `  ${marker("health", "fail")}`,
-    '  echo "env health check failed — env left in place for inspection; destroy to clean up" >&2',
-    "  exit 1",
-    "fi",
-    "",
-    'echo "env ready: https://${SAMOHOST_VHOST} (port ${SAMOHOST_PORT})"',
-    "",
-  );
+  // Poll every listener that declares a healthPath. All must return HTTP 200
+  // for the env to be considered healthy. Listeners without healthPath are
+  // not probed (internal/metrics listeners that should not be publicly reachable
+  // are excluded from health gating).
+  {
+    const healthableListeners = allListeners.filter(
+      ({ listener }) => listener.healthPath !== undefined,
+    );
+
+    lines.push(
+      `# --- health: poll all listeners that declare a healthPath ---`,
+      marker("health", "start"),
+      "health_ok=1",
+    );
+
+    for (const { listener } of healthableListeners) {
+      const allocatedPort = portMap.get(listener.name) ?? t.port;
+      const healthUrl = `http://localhost:${allocatedPort}${listener.healthPath ?? "/"}`;
+      lines.push(
+        `# listener: ${listener.name} (${listener.portEnv}=${allocatedPort})`,
+        `health_ok_${listener.name.replace(/-/g, "_")}=0`,
+        `for attempt in $(seq 1 ${HEALTH_RETRIES}); do`,
+        `  code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 ${sq(healthUrl)} || echo 000)`,
+        '  if [[ "$code" == "200" ]]; then',
+        `    health_ok_${listener.name.replace(/-/g, "_")}=1`,
+        "    break",
+        "  fi",
+        `  sleep ${HEALTH_SLEEP_SEC}`,
+        "done",
+        `if [[ "$health_ok_${listener.name.replace(/-/g, "_")}" != "1" ]]; then`,
+        `  echo "env health check failed for listener ${listener.name} (${healthUrl}) — env left in place for inspection; destroy to clean up" >&2`,
+        "  health_ok=0",
+        "fi",
+      );
+    }
+
+    lines.push(
+      'if [[ "$health_ok" == "1" ]]; then',
+      `  ${marker("health", "ok")}`,
+      "else",
+      `  ${marker("health", "fail")}`,
+      "  exit 1",
+      "fi",
+      "",
+      'echo "env ready: https://${SAMOHOST_VHOST} (port ${SAMOHOST_PORT})"',
+      "",
+    );
+  }
 
   return lines.join("\n");
 }
@@ -1260,27 +1414,29 @@ export function buildEnvDestroyScript(
     `SAMOHOST_ENV_NAME=${sq(t.name)}`,
     `SAMOHOST_ENV_DIR=${sq(`${root}/${t.name}`)}`,
     `SAMOHOST_CADDY_SNIPPET=${sq(`/etc/caddy/sites.d/${t.name}.caddy`)}`,
+    "",
   ];
 
   if (!isStatic) {
-    // Node path: stop the systemd template instance.
-    lines.push(
-      `SAMOHOST_UNIT_INSTANCE=${sq(`${app.serviceUnit}@${t.name}.service`)}`,
-    );
-  }
-
-  lines.push(
-    "",
-  );
-
-  if (!isStatic) {
-    // Node path: emit unit-stop phase.
+    // Node path: stop all service units in the topology.
+    // Use servicesOf() so multi-service apps stop every service; legacy apps
+    // produce a single-service view (same as the old SAMOHOST_UNIT_INSTANCE).
+    // `disable --now ... || true` is absent-tolerant: destroying a legacy env
+    // whose AppRecord later gained multi-service declarations is safe.
+    const { services } = servicesOf(app);
+    const unitInstances = services.map((svc) => `${svc.unit}@${t.name}.service`);
     lines.push(
       `# --- unit-stop ---`,
       marker("unit-stop", "start"),
-      'sudo /usr/bin/systemctl disable --now "$SAMOHOST_UNIT_INSTANCE" 2>/dev/null || true',
-      "# Clear any residual 'failed' unit state (issue #11 finding 8; cosmetic).",
-      'sudo /usr/bin/systemctl reset-failed "$SAMOHOST_UNIT_INSTANCE" 2>/dev/null || true',
+    );
+    for (const instance of unitInstances) {
+      lines.push(
+        `sudo /usr/bin/systemctl disable --now ${sq(instance)} 2>/dev/null || true`,
+        `# Clear any residual 'failed' unit state (issue #11 finding 8; cosmetic).`,
+        `sudo /usr/bin/systemctl reset-failed ${sq(instance)} 2>/dev/null || true`,
+      );
+    }
+    lines.push(
       marker("unit-stop", "ok"),
       "",
     );
@@ -2037,6 +2193,7 @@ export function targetFromRecord(env: EnvRecord): EnvScriptTarget {
     name: env.name,
     branch: env.branch,
     port: env.port,
+    ...(env.ports !== undefined ? { ports: env.ports } : {}),
     vhost: env.vhost,
     dbBackend: env.dbBackend,
     ...(env.dbName !== undefined ? { dbName: env.dbName } : {}),

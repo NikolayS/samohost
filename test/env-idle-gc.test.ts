@@ -547,13 +547,15 @@ describe("buildEnvCreateScript — per-vhost JSON access log in Caddy snippet", 
     expect(script).toContain("format json");
   });
 
-  test("generated Caddy snippet logs to /var/log/caddy/<env-name>.log via $SAMOHOST_ENV_NAME", () => {
+  test("generated Caddy snippet logs to /var/log/caddy/<env-name>.log (baked literal)", () => {
     const script = buildEnvCreateScript(sampleApp, target);
-    // The vhost snippet is written by a bash printf at runtime; the log path
-    // uses $SAMOHOST_ENV_NAME so different envs each get their own log file.
-    // The script contains the literal prefix /var/log/caddy/ and the variable.
+    // The vhost snippet is rendered by renderVhost (caddy/render.ts) and the log
+    // path is derived from target.name — baked as a literal rather than via a
+    // shell variable. The idle-GC contract is preserved: the log file name maps
+    // 1-to-1 to the env name so GC can locate and parse it.
     expect(script).toContain("/var/log/caddy/");
-    expect(script).toContain("$SAMOHOST_ENV_NAME");
+    // planFromEnv sets logFile = `/var/log/caddy/${target.name}.log`
+    expect(script).toContain("/var/log/caddy/field-record-1-feat-log.log");
   });
 
   test("log block emits ts and request.host fields (json format includes them)", () => {
