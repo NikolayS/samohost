@@ -1,0 +1,284 @@
+/**
+ * Batched per-VM SSH cycle runner (preview-pipeline budget fix).
+ *
+ * ROOT CAUSE: the trigger's heal pass AND the PR-preview pass each open
+ * separate SSH connections to the same VM. With a connection budget of 2
+ * attempts per 600 s (fail2ban-safe), a VM with ≥ 2 PR preview envs
+ * exhausts the budget before all creates complete — subsequent work-items
+ * throw BudgetExceededError and the preview never converges.
+ *
+ * FIX: `runBatchedVmCycle` collects ALL per-VM SSH work for one trigger
+ * cycle (heal re-creates + PR env creates/updates) and issues it as a
+ * SINGLE `bash -s` remote call. The connection budget is therefore consumed
+ * ONCE per VM per cycle regardless of N previews.
+ *
+ * The combined bash script uses a per-section sentinel wrapper so the
+ * caller can splice the combined stdout/stderr back into per-work-item
+ * results using `parseBatchOutput`.
+ *
+ * Sentinel format (matches ENV_PHASE_PREFIX from env/script.ts):
+ *   <<<SAMOHOST_BATCH:START:<id>>>>
+ *   ... script output ...
+ *   <<<SAMOHOST_BATCH:END:<id>>>>
+ *
+ * Design:
+ *   - remote() is called ONCE for the entire VM's work-load.
+ *   - Each work-item (dead clone re-create / PR env create) is wrapped in a
+ *     sentinel block inside the combined script.
+ *   - If remote() throws (e.g. BudgetExceededError, SshError), ALL work-
+ *     items for that VM fail together — this is correct: if we cannot reach
+ *     the VM we cannot do any work there.
+ *   - Each work-item's parsed outcome is returned in `BatchWorkResult[]`.
+ */
+
+import type { VmRecord } from "../types.ts";
+import type { AppRecord } from "../types.ts";
+import type { EnvStore } from "../state/envs.ts";
+import type { SpawnResult } from "./runner.ts";
+
+// ---------------------------------------------------------------------------
+// Public types
+// ---------------------------------------------------------------------------
+
+/**
+ * One unit of SSH work for a single VM cycle.
+ * Either a PR env create/update or a dead clone re-create (heal).
+ */
+export interface BatchWorkItem {
+  /** Stable ID used to correlate sentinel blocks in the combined output. */
+  id: string;
+  /** The bash script fragment to run (must be self-contained). */
+  script: string;
+}
+
+/** Result for one BatchWorkItem after the combined SSH call. */
+export interface BatchWorkResult {
+  id: string;
+  stdout: string;
+  stderr: string;
+  /** True if the item's sentinel START/END block was found in the output. */
+  found: boolean;
+}
+
+/** Return type of runBatchedVmCycle. */
+export interface BatchCycleResult {
+  /** False if the combined SSH call itself failed (remote threw or exit!=0). */
+  ok: boolean;
+  /** Error from the remote() call when ok=false. */
+  error?: string;
+  /** Per-work-item results (empty when ok=false). */
+  items: BatchWorkResult[];
+  /** Raw combined stdout from the SSH session. */
+  rawStdout: string;
+  /** Raw combined stderr from the SSH session. */
+  rawStderr: string;
+}
+
+// ---------------------------------------------------------------------------
+// Sentinel helpers
+// ---------------------------------------------------------------------------
+
+const SENTINEL_START = (id: string) => `<<<SAMOHOST_BATCH:START:${id}>>>`;
+const SENTINEL_END = (id: string) => `<<<SAMOHOST_BATCH:END:${id}>>>`;
+
+/**
+ * Wrap a script fragment in sentinel markers so its output can be extracted
+ * from the combined output of a multi-script bash session.
+ */
+export function wrapScriptWithSentinels(id: string, script: string): string {
+  return [
+    `echo '${SENTINEL_START(id)}'`,
+    script,
+    `echo '${SENTINEL_END(id)}'`,
+  ].join("\n");
+}
+
+/**
+ * Build the combined bash -s script from an array of BatchWorkItems.
+ * Each item's script is wrapped in sentinels; items run sequentially.
+ * A per-item `set +e` ensures one item's failure does not abort the rest.
+ */
+export function buildBatchScript(items: BatchWorkItem[]): string {
+  const parts = items.map((item) =>
+    [
+      "set +e",
+      wrapScriptWithSentinels(item.id, item.script),
+      "set -e",
+    ].join("\n"),
+  );
+  return ["#!/bin/bash", "set -euo pipefail", ...parts].join("\n\n");
+}
+
+/**
+ * Parse the combined stdout/stderr from a batch SSH call back into per-item
+ * sections. Each section is extracted by finding the SENTINEL_START /
+ * SENTINEL_END pair for each item id.
+ */
+export function parseBatchOutput(
+  items: BatchWorkItem[],
+  rawStdout: string,
+  rawStderr: string,
+): BatchWorkResult[] {
+  return items.map((item) => {
+    const start = SENTINEL_START(item.id);
+    const end = SENTINEL_END(item.id);
+    const si = rawStdout.indexOf(start);
+    const ei = rawStdout.indexOf(end);
+
+    if (si === -1 || ei === -1 || si >= ei) {
+      return { id: item.id, stdout: "", stderr: rawStderr, found: false };
+    }
+
+    const section = rawStdout.slice(si + start.length, ei).trim();
+    return { id: item.id, stdout: section, stderr: rawStderr, found: true };
+  });
+}
+
+// ---------------------------------------------------------------------------
+// runBatchedVmCycle — the primary public API
+// ---------------------------------------------------------------------------
+
+/**
+ * Inputs for a single VM's batch cycle.
+ */
+export interface BatchedVmCycleInput {
+  vm: VmRecord;
+  app: AppRecord;
+  /** PR envs that need creating or re-deploying this cycle. */
+  prs: Array<{
+    branch: string;
+    headSha: string;
+    prNumber: number;
+    /** The script to run for this PR (build + restart). */
+    script?: string;
+  }>;
+  /** Dead clones that need re-creation this cycle. */
+  deadClones: Array<{
+    envName: string;
+    cloneId: string;
+    /** The script to run for this re-create. */
+    script?: string;
+  }>;
+  envStore: EnvStore;
+  /**
+   * Injectable remote runner: run a script on the VM and return stdout/stderr.
+   * MUST be called EXACTLY ONCE per cycle (the whole point of this module).
+   */
+  remote: (vm: VmRecord, script: string) => Promise<SpawnResult>;
+}
+
+/**
+ * Result of a VM batch cycle.
+ */
+export interface BatchedVmCycleOutput {
+  ok: boolean;
+  error?: string;
+  prResults: Array<{
+    branch: string;
+    prNumber: number;
+    headSha: string;
+    stdout: string;
+    stderr: string;
+    found: boolean;
+  }>;
+  healResults: Array<{
+    envName: string;
+    cloneId: string;
+    stdout: string;
+    stderr: string;
+    found: boolean;
+  }>;
+}
+
+/**
+ * Execute ALL per-VM SSH work for one trigger cycle in a single SSH session.
+ *
+ * One call to remote() regardless of how many PRs or dead clones are in scope.
+ * This is the primary fix for the connection-budget exhaustion bug.
+ */
+export async function runBatchedVmCycle(
+  input: BatchedVmCycleInput,
+): Promise<BatchedVmCycleOutput> {
+  const { vm, prs, deadClones, remote } = input;
+
+  // Build per-item BatchWorkItems for prs + dead clones.
+  const items: BatchWorkItem[] = [];
+
+  for (const pr of prs) {
+    const id = `pr-${pr.prNumber}-${pr.branch.replace(/[^a-z0-9]/gi, "-")}`;
+    // Use provided script or a placeholder if not given (callers wire real scripts).
+    const script = pr.script ?? `echo "pr-preview: branch=${pr.branch} sha=${pr.headSha}"`;
+    items.push({ id, script });
+  }
+
+  for (const clone of deadClones) {
+    const id = `heal-${clone.cloneId}-${clone.envName.replace(/[^a-z0-9]/gi, "-")}`;
+    const script = clone.script ?? `echo "heal: env=${clone.envName} clone=${clone.cloneId}"`;
+    items.push({ id, script });
+  }
+
+  // If there is no work, return early with no SSH call.
+  if (items.length === 0) {
+    return { ok: true, prResults: [], healResults: [] };
+  }
+
+  // Build the combined script and run it in ONE SSH session.
+  const combinedScript = buildBatchScript(items);
+
+  let raw: SpawnResult;
+  try {
+    // THE KEY INVARIANT: remote() is called EXACTLY ONCE per VM per cycle.
+    raw = await remote(vm, combinedScript);
+  } catch (e) {
+    const error = e instanceof Error ? e.message : String(e);
+    return {
+      ok: false,
+      error,
+      prResults: prs.map((pr) => ({
+        branch: pr.branch,
+        prNumber: pr.prNumber,
+        headSha: pr.headSha,
+        stdout: "",
+        stderr: error,
+        found: false,
+      })),
+      healResults: deadClones.map((c) => ({
+        envName: c.envName,
+        cloneId: c.cloneId,
+        stdout: "",
+        stderr: error,
+        found: false,
+      })),
+    };
+  }
+
+  const parsed = parseBatchOutput(items, raw.stdout, raw.stderr);
+  const parsedById = new Map(parsed.map((r) => [r.id, r]));
+
+  const prResults = prs.map((pr) => {
+    const id = `pr-${pr.prNumber}-${pr.branch.replace(/[^a-z0-9]/gi, "-")}`;
+    const r = parsedById.get(id);
+    return {
+      branch: pr.branch,
+      prNumber: pr.prNumber,
+      headSha: pr.headSha,
+      stdout: r?.stdout ?? "",
+      stderr: r?.stderr ?? raw.stderr,
+      found: r?.found ?? false,
+    };
+  });
+
+  const healResults = deadClones.map((clone) => {
+    const id = `heal-${clone.cloneId}-${clone.envName.replace(/[^a-z0-9]/gi, "-")}`;
+    const r = parsedById.get(id);
+    return {
+      envName: clone.envName,
+      cloneId: clone.cloneId,
+      stdout: r?.stdout ?? "",
+      stderr: r?.stderr ?? raw.stderr,
+      found: r?.found ?? false,
+    };
+  });
+
+  return { ok: true, prResults, healResults };
+}

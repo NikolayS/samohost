@@ -28,7 +28,7 @@
  */
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -37,7 +37,6 @@ import {
   type EnvExecDeps,
 } from "../src/commands/env.ts";
 import {
-  defaultTriggerDeps,
   type TriggerDeps,
 } from "../src/commands/trigger.ts";
 import { AppStore } from "../src/state/apps.ts";
@@ -226,11 +225,13 @@ describe("(b) error surfacing — stderr surfaced on failed env-create", () => {
     const DBLAB_REJECT =
       "Error: cannot create clone: maxCloneCount (5) reached; delete an existing clone first";
 
-    // Non-ok remote result: outcome phase markers show failure, stderr has the DBLab message.
+    // Non-ok remote result: outcome phase markers show failure (status="fail"),
+    // stderr has the DBLab message.
+    // NOTE: the parse.ts EnvPhaseStatus uses "fail" not "failed".
     const M_FAIL = (p: string, s: string) => `<<<SAMOHOST_PHASE:${p}:${s}>>>`;
     const CREATE_FAIL =
       M_FAIL("clone", "start") + "\n" +
-      M_FAIL("clone", "failed") + "\n";
+      M_FAIL("clone", "fail") + "\n";
 
     const deps: EnvExecDeps = {
       remote: async (_vm, _script) => ({
@@ -274,7 +275,7 @@ describe("(b) error surfacing — stderr surfaced on failed env-create", () => {
     const M_FAIL = (p: string, s: string) => `<<<SAMOHOST_PHASE:${p}:${s}>>>`;
     const CREATE_FAIL =
       M_FAIL("clone", "start") + "\n" +
-      M_FAIL("clone", "failed") + "\n";
+      M_FAIL("clone", "fail") + "\n";
 
     const deps: EnvExecDeps = {
       remote: async (_vm, _script) => ({

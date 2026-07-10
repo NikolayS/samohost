@@ -493,6 +493,12 @@ export interface EnvCreateReport {
   db: EnvDbBackend;
   outcome: EnvOutcome;
   exitCode: number;
+  /**
+   * Raw stderr from the remote SSH session, present only when non-empty and
+   * outcome !== "ok". Surfaces DBLab-reject / build failures that previously
+   * were swallowed after parseEnvOutcome() consumed them silently.
+   */
+  stderr?: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -757,6 +763,15 @@ export async function runEnvCreate(
   envStore.upsert(record);
 
   const exitCode = outcome === "ok" ? 0 : 1;
+
+  // Capture stderr for surfacing — present only when non-empty and non-ok.
+  // This ensures DBLab-reject ("maxCloneCount exceeded") / build failures are
+  // diagnosable from the journal instead of being swallowed silently.
+  const capturedStderr =
+    outcome !== "ok" && result.stderr.trim() !== ""
+      ? result.stderr.trim()
+      : undefined;
+
   const report: EnvCreateReport = {
     env: target.name,
     vm: r.vm.name,
@@ -767,6 +782,7 @@ export async function runEnvCreate(
     db: target.dbBackend,
     outcome,
     exitCode,
+    ...(capturedStderr !== undefined ? { stderr: capturedStderr } : {}),
   };
   if (opts.json) {
     out(JSON.stringify(report, null, 2));
@@ -781,6 +797,10 @@ export async function runEnvCreate(
           `recorded — re-run create (idempotent; NOTE: a re-run drops and ` +
           `recreates the per-env database) or destroy to clean up`,
       );
+      // Surface the remote stderr so DBLab-reject / build failure is diagnosable.
+      if (capturedStderr !== undefined) {
+        err(`env create remote stderr: ${capturedStderr}`);
+      }
     }
   }
   return exitCode;

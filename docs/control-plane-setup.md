@@ -119,6 +119,50 @@ ExecStart=/usr/bin/bun run src/cli.ts trigger run --gc --pr-previews
 Previews still need the same CF DNS + origin-TLS setup as any `env create`
 (`docs/preview-reachability.md`).
 
+### Required env vars for `--pr-previews` / `--heal`
+
+The trigger service **requires** the following variable when `--pr-previews` or
+`--heal` is active. Set it via the `EnvironmentFile` **drop-in** — not as a
+shell `export` (exports in interactive sessions are not inherited by systemd
+units). A missing or incorrectly-scoped value is a hard prerequisite failure:
+the trigger now emits a loud startup error instead of silently skipping DNS
+each cycle (the silent skip caused infinite-fail-with-zero-progress incidents).
+
+| Variable | Required for | Notes |
+|---|---|---|
+| `CLOUDFLARE_SAMOCAT` | `--pr-previews` | Zone-scoped DNS write token for `*.samo.cat`. Without it, per-preview DNS A records are not created and previews on VMs not covered by the wildcard are unreachable. The token must have **DNS:Edit** permission on the `samo.cat` zone. |
+
+**Setting the token via a drop-in** (audit the base unit AND all drop-ins on
+every rotation — see *Secret discipline* note above):
+
+```ini
+# /etc/systemd/system/samohost-trigger.service.d/secrets.conf
+# chmod 0600 this file — it contains a secret token.
+[Service]
+EnvironmentFile=/home/samo/.samohost.env
+```
+
+`/home/samo/.samohost.env` (chmod 0600, owned by `samo`):
+```
+CLOUDFLARE_SAMOCAT=<zone-scoped DNS write token>
+GH_TOKEN=<github PAT with repo:read + issues:write>
+```
+
+After changing the EnvironmentFile: `systemctl daemon-reload && systemctl restart samohost-trigger.service` (or wait for the next timer tick).
+
+### DBLab clone-cap sizing
+
+The DBLab engine enforces a `maxCloneCount` per logical DB. Size it to cover
+**all simultaneously-open PRs** for the app, not just the expected average. If
+`maxCloneCount` is too low, `env create` for new PRs will fail with
+`cannot create clone: maxCloneCount reached` — the error is now surfaced in the
+trigger journal (previously it was silently swallowed).
+
+`maxCloneCount` is set in the DBLab config on the project VM
+(e.g. `/etc/dblab/config.yml`), not as a samohost setting. After raising it,
+restart the DBLab engine: `systemctl restart dblab`. See
+`docs/dblab-install-runbook.md` for the config schema.
+
 ## One-time host prep ordering (per project VM, run as root on the VM)
 
 samohost **renders** these scripts for operator review and does **not**

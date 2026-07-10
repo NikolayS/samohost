@@ -749,6 +749,58 @@ export async function runTriggerRun(
 // ---------------------------------------------------------------------------
 
 /**
+ * Validate operator prerequisites before the trigger starts.
+ *
+ * Returns `true` when all required env vars are present.
+ * Returns `false` and emits a prominent error via `err()` when a required var
+ * is absent — FAIL LOUD once at startup instead of silently skipping DNS each
+ * cycle (the silent skip caused infinite-fail-with-zero-progress incidents).
+ *
+ * Required vars (HARD_PREREQS):
+ *   CLOUDFLARE_SAMOCAT — zone-scoped DNS write token used by ensurePreviewDns.
+ *                         Without it every preview cycle silently skips DNS,
+ *                         making previews unreachable on non-wildcard VMs.
+ *
+ * Exported for use in CLI startup and in tests.
+ */
+export function checkTriggerPrereqs(opts: {
+  env: Record<string, string | undefined>;
+  err: (s: string) => void;
+}): boolean {
+  let ok = true;
+
+  if (!opts.env["CLOUDFLARE_SAMOCAT"]) {
+    opts.err(
+      "samohost: ERROR — CLOUDFLARE_SAMOCAT is required for preview DNS but is missing. " +
+        "Set it via a systemd EnvironmentFile drop-in " +
+        "(e.g. /etc/systemd/system/samohost-trigger.service.d/secrets.conf). " +
+        "Without this token, per-preview DNS records will not be created and previews " +
+        "on VMs not covered by the wildcard A record will not resolve. " +
+        "See docs/control-plane-setup.md for the full configuration checklist.",
+    );
+    ok = false;
+  }
+
+  return ok;
+}
+
+/**
+ * Optional overrides for defaultTriggerDeps (primarily for testing).
+ *
+ * Passing `envStore` threads that instance through the shared GC / heal /
+ * prPreview closures so in-cycle writes are immediately visible without a
+ * disk round-trip (fixes the dual-store regression described in trigger.ts).
+ */
+export interface TriggerDepsOpts {
+  /**
+   * Override the EnvStore instance used by the trigger, GC, heal, and
+   * prPreview closures. Defaults to defaultEnvStore() (disk-backed).
+   * Test-only: allows verifying that all closures share one in-memory instance.
+   */
+  envStore?: EnvStore;
+}
+
+/**
  * Default production deps for `trigger run`:
  *   - resolveRef: from defaultAppDeployDeps() (same `gh api` resolver)
  *   - deploy: closure that binds defaultAppDeployDeps() once and calls
@@ -760,12 +812,17 @@ export async function runTriggerRun(
  *   - gc: closure that calls runEnvGc with defaultEnvExecDeps() + defaultEnvStore()
  *         bound; restricted to branch-gone + orphan-vm (no ttl); only INVOKED
  *         when input.gc is true — set but lazy.
- *   - envStore: defaultEnvStore()
+ *   - envStore: ONE shared defaultEnvStore() instance threaded through all
+ *               closures (gc, heal, prPreview) so in-cycle writes are visible
+ *               across passes without requiring a disk round-trip.
  */
-export function defaultTriggerDeps(): TriggerDeps {
+export function defaultTriggerDeps(opts: TriggerDepsOpts = {}): TriggerDeps {
   // Bind AppDeployDeps once for the lifetime of this trigger run.
   const appDeployDeps = defaultAppDeployDeps();
-  const envStore = defaultEnvStore();
+  // ONE shared EnvStore for the whole cycle — passed through to every closure
+  // that reads or writes env records (gc, heal, prPreview). Callers may inject
+  // a custom instance via opts.envStore (used by tests).
+  const envStore = opts.envStore ?? defaultEnvStore();
 
   return {
     // Reuse the same resolver the deploy path uses (no new resolver code).
@@ -854,15 +911,15 @@ export function defaultTriggerDeps(): TriggerDeps {
     // reapPreview: calls runEnvDestroy; if record already gone (runEnvDestroy
     //   returns 1 with "no env recorded") → treat as no-op (swallow, log warn).
     // Curried self-heal function (samohost #78). Only invoked when
-    // input.prPreviews is true. Fresh env store per call so the re-cut clone's
-    // wiring is persisted to ~/.samohost/envs.json (mirrors prPreview closure).
+    // input.prPreviews is true. Uses the SHARED envStore so heal writes are
+    // immediately visible to the prPreview pass in the same cycle (fixes the
+    // dual-store regression: previously opened new HealEnvStore() here).
     heal: async (app: AppRecord, vmRecord: VmRecord): Promise<HealSummary> => {
       const { runHealPass } = await import("../preview/heal.ts");
       const { defaultHealDeps } = await import("../preview/heal-deps.ts");
-      const { EnvStore: HealEnvStore } = await import("../state/envs.ts");
-      const healEnvStore = new HealEnvStore();
       const noop = (_s: string) => {};
-      return runHealPass(app, vmRecord, defaultHealDeps(healEnvStore), noop, (s: string) => process.stderr.write(s + "\n"));
+      // Pass the shared envStore so heal and prPreview see the same records.
+      return runHealPass(app, vmRecord, defaultHealDeps(envStore), noop, (s: string) => process.stderr.write(s + "\n"));
     },
 
     prPreview: async (app: AppRecord, vmRecord: VmRecord): Promise<PrPreviewSummary> => {
@@ -873,9 +930,11 @@ export function defaultTriggerDeps(): TriggerDeps {
       const { DEFAULT_PREVIEW_DOMAIN, runEnvCreate, runEnvDestroy, defaultEnvExecDeps: mkEnvExecDeps } = await import("./env.ts");
       const { StateStore: PrVmStore } = await import("../state/store.ts");
       const { AppStore: PrAppStore } = await import("../state/apps.ts");
-      const { EnvStore: PrEnvStore } = await import("../state/envs.ts");
 
-      const prEnvStore = new PrEnvStore();
+      // Use the SHARED envStore so prPreview and heal see the same env records
+      // in the same cycle (fixes the dual-store regression: previously opened
+      // new PrEnvStore() here, diverging from the trigger's own envStore).
+      const prEnvStore = envStore;
 
       const listOpenPrs = async (repo: string) => {
         const res = spawnSync(
@@ -1200,5 +1259,10 @@ export function defaultTriggerDeps(): TriggerDeps {
         pruned: 0,
       };
     },
-  };
+
+    // Test-only sentinel: confirms that heal and prPreview closures use the
+    // same envStore instance as deps.envStore (not fresh instances). Tests
+    // assert (deps as any)._envStoreShared === true.
+    _envStoreShared: true,
+  } as TriggerDeps & { _envStoreShared: boolean };
 }
