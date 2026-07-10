@@ -209,8 +209,8 @@ async function validateCaddyfile(caddyfile: string): Promise<void> {
 // ---------------------------------------------------------------------------
 
 describe("renderVhost — structural", () => {
-  describe("cv-0: zero routes → single reverse_proxy back-compat", () => {
-    test("zero routes emits exactly one reverse_proxy handle", () => {
+  describe("cv-0: zero routes → bare single reverse_proxy (no handle wrapper)", () => {
+    test("zero routes emits bare reverse_proxy without a handle{} wrapper", () => {
       const plan: VhostPlan = {
         host: "myapp.samo.cat",
         listen: "tls-internal",
@@ -219,7 +219,12 @@ describe("renderVhost — structural", () => {
         logFile: "/var/log/caddy/myapp.log",
       };
       const out = renderVhost(plan);
+      // Must contain the bare directive — NOT wrapped in handle { }
       expect(out).toContain("reverse_proxy localhost:3000");
+      // The bare form has no handle block at all: a `handle {}` wrapper creates
+      // an extra subroute layer in adapted JSON, diverging from the real
+      // buildEnvCreateScript printf template (src/env/script.ts vhost phase).
+      expect(out).not.toContain("handle {");
       // No path_regexp named matchers
       expect(out).not.toContain("path_regexp");
     });

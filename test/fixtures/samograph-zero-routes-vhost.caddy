@@ -1,12 +1,17 @@
-# zero-routes single-reverse-proxy reference — back-compat form
-# A legacy / single-service preview env with no routing rules: just one
-# reverse_proxy handle. renderVhost({..., routes:[]}) must produce a
-# Caddy-semantically-identical file (proven by caddy-adapt JSON equality).
+# zero-routes (single-service) reference fixture — TRUE back-compat form.
+#
+# Source: buildEnvCreateScript printf template in src/env/script.ts (the
+# "vhost" phase, line ~1207). Extracted verbatim for a sample env with
+# vhost=samograph-zero.samo.cat, port=3000, name=samograph-zero.
+#
+# The env-create script emits a BARE `reverse_proxy localhost:<port>` with NO
+# `handle {}` wrapper. renderVhost({routes:[]}) must produce a
+# Caddy-semantically-identical result; caddy-a2 proves this via caddy adapt
+# JSON deep-equal. The `handle {}` wrapper produces a DIFFERENT subroute layer
+# in adapted JSON and would silently change every legacy env's vhost shape.
 samograph-zero.samo.cat {
 	tls internal
-	handle {
-		reverse_proxy localhost:3000
-	}
+	reverse_proxy localhost:3000
 	log {
 		output file /var/log/caddy/samograph-zero.log
 		format json
