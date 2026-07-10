@@ -915,6 +915,15 @@ export interface TriggerDepsOpts {
    * (buildCurlProbeArgs / parseCurlProbeResult), same as runEnvCreate.
    */
   httpProbe?: (url: string) => Promise<{ status: number; ok: boolean }>;
+  /**
+   * Injectable sleep function for integration tests.
+   *
+   * When provided, the HTTPS probe retry loop uses this instead of the real
+   * setTimeout — allows tests to avoid 5s×8=40s wait when probing a fake URL.
+   *
+   * Production: absent → real Promise-based setTimeout(ms).
+   */
+  sleep?: (ms: number) => Promise<void>;
 }
 
 /**
@@ -1438,9 +1447,21 @@ export function defaultTriggerDeps(opts: TriggerDepsOpts = {}): TriggerDeps {
 
       // ------------------------------------------------------------------
       // Phase 2: List open PRs (gh CLI — no SSH).
+      //
+      // B1 FIX: distinguish "no open PRs" from "could not fetch PRs".
+      // A gh-list ERROR (thrown or non-zero exit) means we have NO RELIABLE
+      // knowledge of which PRs are open.  Proceeding with openPrs=[] would
+      // cause the closed-PR reap loop to destroy EVERY PR-managed env on this
+      // VM — a catastrophic false-positive.
+      //
+      // Strategy: use a sentinel `prListSucceeded` flag.  Only when the list
+      // call succeeds do we populate `openPrs` and allow the reap loop to run.
+      // On any error we SKIP the PR preview pass for this app (fail-loud via
+      // stderr) so the issue is visible in the journal.
       // ------------------------------------------------------------------
       type OpenPrItem = { number: number; headRef: string; headSha: string };
       let openPrs: OpenPrItem[] = [];
+      let prListSucceeded = !cycleOpts.prPreviews; // true when pass is disabled (no-op)
 
       if (cycleOpts.prPreviews) {
         try {
@@ -1456,25 +1477,51 @@ export function defaultTriggerDeps(opts: TriggerDepsOpts = {}): TriggerDeps {
               ],
               { encoding: "utf8" },
             );
-            if (res.status === 0) {
-              const parsed = JSON.parse(res.stdout) as Array<{
-                number: number;
-                headRefName: string;
-                headRefOid: string;
-                isCrossRepository: boolean;
-              }>;
-              openPrs = parsed
-                .filter((p) => !p.isCrossRepository)
-                .map((p) => ({
-                  number: p.number,
-                  headRef: p.headRefName,
-                  headSha: p.headRefOid,
-                }));
+            if (res.status !== 0) {
+              // Non-zero exit from gh pr list — fail-loud and skip this app.
+              throw new Error(
+                `gh pr list failed (exit ${res.status}): ${(res.stderr ?? "").trim()}`,
+              );
             }
+            const parsed = JSON.parse(res.stdout) as Array<{
+              number: number;
+              headRefName: string;
+              headRefOid: string;
+              isCrossRepository: boolean;
+            }>;
+            openPrs = parsed
+              .filter((p) => !p.isCrossRepository)
+              .map((p) => ({
+                number: p.number,
+                headRef: p.headRefName,
+                headSha: p.headRefOid,
+              }));
           }
-        } catch {
-          /* ignore — PR pass proceeds with empty list */
+          // Only reach here on success — set the sentinel.
+          prListSucceeded = true;
+        } catch (e) {
+          // Fail-loud: surface the error so operators see it in the journal.
+          // Do NOT proceed with openPrs=[] — that would false-positive reap.
+          process.stderr.write(
+            `samohost: batchedVmCycle: gh pr list FAILED for ${app.name} — ` +
+              `${e instanceof Error ? e.message : String(e)}; ` +
+              `SKIPPING PR preview pass for this app this cycle to avoid ` +
+              `false-positive reap of PR-managed envs\n`,
+          );
+          // prListSucceeded stays false → reap loop is gated below.
         }
+      }
+
+      // H5 CAP: apply MAX_PR_PREVIEWS_PER_CYCLE before computing needDeploy.
+      // Safety cap — not a target.  Emit a warning when truncated.
+      const { MAX_PR_PREVIEWS_PER_CYCLE } = await import("../preview/pr.ts");
+      if (openPrs.length > MAX_PR_PREVIEWS_PER_CYCLE) {
+        process.stderr.write(
+          `samohost: batchedVmCycle: ${app.name} has ${openPrs.length} open PRs — ` +
+            `processing only the first ${MAX_PR_PREVIEWS_PER_CYCLE} (safety cap); ` +
+            `remaining ${openPrs.length - MAX_PR_PREVIEWS_PER_CYCLE} skipped this cycle\n`,
+        );
+        openPrs = openPrs.slice(0, MAX_PR_PREVIEWS_PER_CYCLE);
       }
 
       // PRs that need a deploy (new env or changed SHA).
@@ -1508,6 +1555,7 @@ export function defaultTriggerDeps(opts: TriggerDepsOpts = {}): TriggerDeps {
       // for first-time creates (store-only allocation — no SSH port probe).
       const prWorkItems: Array<{
         branch: string; headSha: string; prNumber: number; script: string;
+        vhost: string; isNewEnv: boolean;
       }> = [];
       // Track newly pre-upserted env records for port-conflict avoidance
       // across multiple new PR envs in the same batch cycle.
@@ -1516,6 +1564,7 @@ export function defaultTriggerDeps(opts: TriggerDepsOpts = {}): TriggerDeps {
       for (const pr of prsNeedingDeploy) {
         const existing = envStore.get(vmRecord.id, app.name, pr.headRef);
         let targetForPr: import("../env/script.ts").EnvScriptTarget;
+        const isNewEnv = existing === undefined;
 
         if (existing !== undefined) {
           targetForPr = localTargetFromRecord(existing);
@@ -1565,7 +1614,54 @@ export function defaultTriggerDeps(opts: TriggerDepsOpts = {}): TriggerDeps {
           headSha: pr.headSha,
           prNumber: pr.number,
           script,
+          vhost: targetForPr.vhost,
+          isNewEnv,
         });
+      }
+
+      // B2 FIX: call ensurePreviewDns for each NEW PR preview BEFORE the batch
+      // SSH so the ACME HTTP-01 challenge from Caddy can resolve to this VM's IP.
+      // This was present in the old runEnvCreate path (env.ts:660) but was
+      // dropped when the batched path bypassed runEnvCreate.
+      //
+      // Only called for NEW envs (isNewEnv=true) — re-deploys reuse the existing
+      // DNS record.  DNS failure is non-fatal (warn + continue), matching the old
+      // runEnvCreate behaviour.
+      for (const item of prWorkItems) {
+        if (!item.isNewEnv) continue;
+
+        if (opts.ensurePreviewDns !== undefined) {
+          // Test-injected spy.
+          try {
+            await opts.ensurePreviewDns(item.vhost, vmRecord.ip);
+          } catch (e) {
+            process.stderr.write(
+              `samohost: batchedVmCycle: warning: ensurePreviewDns failed for ` +
+                `${item.vhost} — ${e instanceof Error ? e.message : String(e)}; continuing\n`,
+            );
+          }
+        } else {
+          // Production: use CloudflareDns from CLOUDFLARE_SAMOCAT env var.
+          try {
+            const { CloudflareDns } = await import("../dns/cloudflare.ts");
+            const { ensurePreviewDns: ensureDns } = await import("../dns/ensure.ts");
+            const cfToken = process.env["CLOUDFLARE_SAMOCAT"];
+            if (cfToken) {
+              const provider = new CloudflareDns(cfToken);
+              await ensureDns(provider, item.vhost, vmRecord.ip);
+            } else {
+              process.stderr.write(
+                `samohost: batchedVmCycle: CLOUDFLARE_SAMOCAT not set — ` +
+                  `skipping DNS ensure for ${item.vhost} (relying on wildcard A record)\n`,
+              );
+            }
+          } catch (e) {
+            process.stderr.write(
+              `samohost: batchedVmCycle: warning: DNS ensure failed for ` +
+                `${item.vhost} — ${e instanceof Error ? e.message : String(e)}; continuing\n`,
+            );
+          }
+        }
       }
 
       // ------------------------------------------------------------------
@@ -1671,69 +1767,134 @@ export function defaultTriggerDeps(opts: TriggerDepsOpts = {}): TriggerDeps {
           existingRecord.lastDeployedSha === undefined;
 
         if (pr2?.found === true) {
-          // Stamp lastDeployedSha + prNumber on the env record.
           const rec = envStore.get(vmRecord.id, app.name, pr.headRef);
-          if (rec !== undefined) {
-            envStore.upsert({ ...rec, lastDeployedSha: pr.headSha, prNumber: pr.number });
-          }
-
           const vhost = rec?.vhost ?? existingRecord?.vhost ?? "";
           const url = vhost ? `https://${vhost}` : undefined;
-          const action: PrPreviewResult["action"] = wasNewEnv ? "created" : "redeployed";
 
-          // Post or update the preview-link comment.
-          let commentError: string | undefined;
+          // B3 FIX: external HTTPS reachability gate (mirrors the old
+          // runEnvCreate path in env.ts:691-728).
+          //
+          // The on-host script's health phase runs `curl http://localhost:PORT/`
+          // inside the remote bash — it returns ok even when the preview URL is
+          // EXTERNALLY unreachable (TLS not provisioned, DNS not propagated,
+          // Caddy not listening on 443, etc.).
+          //
+          // Only stamp lastDeployedSha + post the comment when the PUBLIC URL
+          // returns 200 via the external probe.  On failure, leave the record
+          // WITHOUT a lastDeployedSha stamp so the reconcile loop retries next
+          // cycle (dishonest-state fix: stamping on failure would make
+          // needDeploy=false and the broken preview would never be retried).
+          let probeOk = true; // default: no probe wired → treat as ok (back-compat)
           if (url !== undefined) {
-            const body =
-              `${PR_COMMENT_MARKER}\n\u{1F50E} **Preview:** ${url} — auto-updates on push.`;
-            try {
-              const { spawnSync: spawnSyncGh } = await import("node:child_process");
-              // Find existing comment.
-              const listRes = spawnSyncGh(
-                "gh",
-                ["api", `repos/${app.repo}/issues/${pr.number}/comments`, "--paginate"],
-                { encoding: "utf8" },
-              );
-              let existingCommentId: number | undefined;
-              if (listRes.status === 0) {
-                const comments = JSON.parse(listRes.stdout) as Array<{ id: number; body: string }>;
-                const found = comments.find((c) => c.body.includes(PR_COMMENT_MARKER));
-                if (found !== undefined) existingCommentId = found.id;
+            const { EXTERNAL_PROBE_RETRIES } = await import("./env.ts");
+            const sleep = opts.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
+            const PROBE_SLEEP_MS = 5000;
+            let lastProbeStatus: number | undefined;
+            let lastProbeError: string | undefined;
+            probeOk = false;
+
+            const probe = opts.httpProbe ?? (async (probeUrl: string) => {
+              // Production: use system curl (avoids Bun's CA verification issues
+              // with Cloudflare's GTS edge cert chain, per env.ts:533-537).
+              const { spawnSync: curlSpawn } = await import("node:child_process");
+              const { buildCurlProbeArgs, parseCurlProbeResult } = await import("./env.ts");
+              const curlArgs = buildCurlProbeArgs(probeUrl);
+              const res = curlSpawn(curlArgs[0], curlArgs.slice(1), { encoding: "utf8", timeout: 15_000 });
+              return parseCurlProbeResult(res.stdout ?? "", res.status ?? 1);
+            });
+
+            for (let attempt = 0; attempt < EXTERNAL_PROBE_RETRIES; attempt++) {
+              if (attempt > 0) await sleep(PROBE_SLEEP_MS);
+              try {
+                const result = await probe(`${url}/`);
+                lastProbeStatus = result.status;
+                if (result.ok) { probeOk = true; break; }
+              } catch (e) {
+                lastProbeError = e instanceof Error ? e.message : String(e);
               }
-              const writeRes = existingCommentId !== undefined
-                ? spawnSyncGh(
-                    "gh",
-                    ["api", "--method", "PATCH",
-                     `repos/${app.repo}/issues/comments/${existingCommentId}`,
-                     "-f", `body=${body}`],
-                    { encoding: "utf8" },
-                  )
-                : spawnSyncGh(
-                    "gh",
-                    ["api", "--method", "POST",
-                     `repos/${app.repo}/issues/${pr.number}/comments`,
-                     "-f", `body=${body}`],
-                    { encoding: "utf8" },
-                  );
-              if (writeRes.status !== 0) {
-                throw new Error(
-                  `gh api comment write failed (exit ${writeRes.status}): ` +
-                    `${(writeRes.stderr ?? "").trim()}`,
-                );
-              }
-            } catch (e) {
-              commentError = e instanceof Error ? e.message : String(e);
+            }
+
+            if (!probeOk) {
+              const detail = lastProbeError !== undefined
+                ? `error: ${lastProbeError}`
+                : `HTTP ${lastProbeStatus}`;
               process.stderr.write(
-                `samohost: batchedVmCycle: PR #${pr.number} (${app.name}): env is up at ` +
-                  `${url} but POSTING comment FAILED — ${commentError}\n`,
+                `samohost: batchedVmCycle: external probe FAILED for ${url}/ — ` +
+                  `on-host phases passed but the public URL is unreachable (${detail}); ` +
+                  `not stamping lastDeployedSha — will retry next cycle\n`,
               );
             }
           }
 
-          prPreviewResultsList.push({
-            prNumber: pr.number, branch: pr.headRef, url, action,
-            ...(commentError !== undefined ? { commentError } : {}),
-          });
+          if (probeOk) {
+            // Stamp lastDeployedSha + prNumber ONLY when the external probe passed.
+            if (rec !== undefined) {
+              envStore.upsert({ ...rec, lastDeployedSha: pr.headSha, prNumber: pr.number });
+            }
+
+            const action: PrPreviewResult["action"] = wasNewEnv ? "created" : "redeployed";
+
+            // Post or update the preview-link comment.
+            let commentError: string | undefined;
+            if (url !== undefined) {
+              const body =
+                `${PR_COMMENT_MARKER}\n\u{1F50E} **Preview:** ${url} — auto-updates on push.`;
+              try {
+                const { spawnSync: spawnSyncGh } = await import("node:child_process");
+                // Find existing comment.
+                const listRes = spawnSyncGh(
+                  "gh",
+                  ["api", `repos/${app.repo}/issues/${pr.number}/comments`, "--paginate"],
+                  { encoding: "utf8" },
+                );
+                let existingCommentId: number | undefined;
+                if (listRes.status === 0) {
+                  const comments = JSON.parse(listRes.stdout) as Array<{ id: number; body: string }>;
+                  const found = comments.find((c) => c.body.includes(PR_COMMENT_MARKER));
+                  if (found !== undefined) existingCommentId = found.id;
+                }
+                const writeRes = existingCommentId !== undefined
+                  ? spawnSyncGh(
+                      "gh",
+                      ["api", "--method", "PATCH",
+                       `repos/${app.repo}/issues/comments/${existingCommentId}`,
+                       "-f", `body=${body}`],
+                      { encoding: "utf8" },
+                    )
+                  : spawnSyncGh(
+                      "gh",
+                      ["api", "--method", "POST",
+                       `repos/${app.repo}/issues/${pr.number}/comments`,
+                       "-f", `body=${body}`],
+                      { encoding: "utf8" },
+                    );
+                if (writeRes.status !== 0) {
+                  throw new Error(
+                    `gh api comment write failed (exit ${writeRes.status}): ` +
+                      `${(writeRes.stderr ?? "").trim()}`,
+                  );
+                }
+              } catch (e) {
+                commentError = e instanceof Error ? e.message : String(e);
+                process.stderr.write(
+                  `samohost: batchedVmCycle: PR #${pr.number} (${app.name}): env is up at ` +
+                    `${url} but POSTING comment FAILED — ${commentError}\n`,
+                );
+              }
+            }
+
+            prPreviewResultsList.push({
+              prNumber: pr.number, branch: pr.headRef, url, action,
+              ...(commentError !== undefined ? { commentError } : {}),
+            });
+          } else {
+            // External probe failed: report as failed, no stamp, no comment.
+            prPreviewResultsList.push({
+              prNumber: pr.number, branch: pr.headRef,
+              action: "failed",
+              error: "external HTTPS probe failed — preview unreachable; will retry next cycle",
+            });
+          }
         } else {
           prPreviewResultsList.push({
             prNumber: pr.number, branch: pr.headRef,
@@ -1757,42 +1918,49 @@ export function defaultTriggerDeps(opts: TriggerDepsOpts = {}): TriggerDeps {
       }
 
       // Reap closed-PR envs (envs whose PR is no longer open AND were PR-managed).
-      const allEnvsForApp = envStore.listFor(vmRecord.id, app.name);
-      for (const env of allEnvsForApp) {
-        if (openPrBranchSet.has(env.branch)) continue; // still open — keep
-        if (env.prNumber === undefined) continue; // not PR-managed — never reap
-        if (envStore.get(vmRecord.id, app.name, env.branch) === undefined) continue; // already gone
+      //
+      // B1 FIX: ONLY run the reap when prListSucceeded=true.  When the PR list
+      // call failed, we have no reliable knowledge of which PRs are open.
+      // Reaping with openPrBranchSet={} would destroy ALL PR-managed envs —
+      // a catastrophic false-positive.  Skip reap entirely on list failure.
+      if (prListSucceeded) {
+        const allEnvsForApp = envStore.listFor(vmRecord.id, app.name);
+        for (const env of allEnvsForApp) {
+          if (openPrBranchSet.has(env.branch)) continue; // still open — keep
+          if (env.prNumber === undefined) continue; // not PR-managed — never reap
+          if (envStore.get(vmRecord.id, app.name, env.branch) === undefined) continue; // already gone
 
-        try {
-          const { runEnvDestroy: localRunEnvDestroy, defaultEnvExecDeps: mkEnvExecDeps3 } =
-            await import("./env.ts");
-          const { StateStore: ReapVmStore } = await import("../state/store.ts");
-          const { AppStore: ReapAppStore } = await import("../state/apps.ts");
-          const reapVmStore = new ReapVmStore();
-          const reapAppStore = new ReapAppStore();
-          const reapEnvExecDeps = mkEnvExecDeps3();
-          const noopReap = (_s: string) => {};
+          try {
+            const { runEnvDestroy: localRunEnvDestroy, defaultEnvExecDeps: mkEnvExecDeps3 } =
+              await import("./env.ts");
+            const { StateStore: ReapVmStore } = await import("../state/store.ts");
+            const { AppStore: ReapAppStore } = await import("../state/apps.ts");
+            const reapVmStore = new ReapVmStore();
+            const reapAppStore = new ReapAppStore();
+            const reapEnvExecDeps = mkEnvExecDeps3();
+            const noopReap = (_s: string) => {};
 
-          await localRunEnvDestroy(
-            { vm: vmRecord.name, app: app.name, branch: env.branch },
-            { json: false },
-            reapVmStore,
-            reapAppStore,
-            envStore,
-            reapEnvExecDeps,
-            noopReap,
-            (s: string) => {
-              if (!s.includes("no env recorded")) {
-                process.stderr.write(`samohost: batchedVmCycle reap: ${s}\n`);
-              }
-            },
-          );
-          prPreviewResultsList.push({ prNumber: -1, branch: env.branch, action: "reaped" });
-        } catch (e) {
-          prPreviewResultsList.push({
-            prNumber: -1, branch: env.branch, action: "error",
-            error: e instanceof Error ? e.message : String(e),
-          });
+            await localRunEnvDestroy(
+              { vm: vmRecord.name, app: app.name, branch: env.branch },
+              { json: false },
+              reapVmStore,
+              reapAppStore,
+              envStore,
+              reapEnvExecDeps,
+              noopReap,
+              (s: string) => {
+                if (!s.includes("no env recorded")) {
+                  process.stderr.write(`samohost: batchedVmCycle reap: ${s}\n`);
+                }
+              },
+            );
+            prPreviewResultsList.push({ prNumber: -1, branch: env.branch, action: "reaped" });
+          } catch (e) {
+            prPreviewResultsList.push({
+              prNumber: -1, branch: env.branch, action: "error",
+              error: e instanceof Error ? e.message : String(e),
+            });
+          }
         }
       }
 

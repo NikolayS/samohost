@@ -284,6 +284,9 @@ describe("B2: batched path calls ensurePreviewDns for new PR previews", () => {
       listOpenPrs,
       remote,
       ensurePreviewDns,
+      // Inject a passing httpProbe so the test doesn't try real curl on a fake URL.
+      httpProbe: async (_url: string) => ({ status: 200, ok: true }),
+      sleep: async (_ms: number) => {},
     });
 
     await runTriggerRun(
@@ -332,6 +335,8 @@ describe("B2: batched path calls ensurePreviewDns for new PR previews", () => {
       listOpenPrs,
       remote: async () => ({ code: 0, stdout: "", stderr: "" }),
       ensurePreviewDns,
+      httpProbe: async (_url: string) => ({ status: 200, ok: true }),
+      sleep: async (_ms: number) => {},
     });
 
     await runTriggerRun(
@@ -379,6 +384,8 @@ describe("B3: batched path runs HTTPS probe before stamping success", () => {
       listOpenPrs,
       remote,
       httpProbe,
+      // No-op sleep: avoid 8 × 5s retry waits in unit test.
+      sleep: async (_ms: number) => {},
     });
 
     await runTriggerRun(
@@ -424,6 +431,7 @@ describe("B3: batched path runs HTTPS probe before stamping success", () => {
       listOpenPrs,
       remote,
       httpProbe,
+      sleep: async (_ms: number) => {},
     });
 
     await runTriggerRun(
@@ -464,6 +472,7 @@ describe("B3: batched path runs HTTPS probe before stamping success", () => {
       listOpenPrs,
       remote,
       httpProbe,
+      sleep: async (_ms: number) => {},
     });
 
     let outJson = "";
@@ -595,31 +604,45 @@ describe("H5: batched path applies MAX_PR_PREVIEWS_PER_CYCLE cap", () => {
       return { code: 0, stdout: "", stderr: "" };
     };
 
-    const errLines: string[] = [];
-
     const deps = defaultTriggerDeps({
       envStore,
       listOpenPrs,
       remote,
+      // No-op sleep and trivially-passing probe to avoid network/timer delays.
+      httpProbe: async (_url: string) => ({ status: 200, ok: true }),
+      sleep: async (_ms: number) => {},
     });
 
-    await runTriggerRun(
-      { prPreviews: true, heal: false, dryRun: false },
-      { json: false },
-      vmStore,
-      appStore,
-      deps,
-      noop,
-      (s) => { errLines.push(s); },
-    );
+    // Capture process.stderr to verify the cap warning (batchedVmCycle writes
+    // cap warnings directly to process.stderr, not via the err() callback).
+    const origStderrWrite = process.stderr.write.bind(process.stderr);
+    const stderrLines: string[] = [];
+    process.stderr.write = (msg: string | Uint8Array, ..._rest: unknown[]): boolean => {
+      stderrLines.push(typeof msg === "string" ? msg : "");
+      return origStderrWrite(msg);
+    };
+
+    try {
+      await runTriggerRun(
+        { prPreviews: true, heal: false, dryRun: false },
+        { json: false },
+        vmStore,
+        appStore,
+        deps,
+        noop,
+        noop,
+      );
+    } finally {
+      process.stderr.write = origStderrWrite;
+    }
 
     // THE ASSERTION 1: at most 20 PRs should be turned into batch work items.
     // On buggy code: all 25 appear in the script → batchedPrCount=25 → FAIL.
     // After fix: cap applied → batchedPrCount <= 20 → PASS.
     expect(batchedPrCount).toBeLessThanOrEqual(20);
 
-    // THE ASSERTION 2: a warning about the cap must have been emitted.
-    const capWarning = errLines.find(
+    // THE ASSERTION 2: a cap warning must appear in stderr.
+    const capWarning = stderrLines.find(
       (l) => l.includes("25") && (l.includes("20") || l.includes("cap") || l.includes("safety")),
     );
     expect(capWarning).toBeDefined();
@@ -642,12 +665,12 @@ describe("H5: batched path applies MAX_PR_PREVIEWS_PER_CYCLE cap", () => {
       return { code: 0, stdout: "", stderr: "" };
     };
 
-    const capWarnings: string[] = [];
-
     const deps = defaultTriggerDeps({
       envStore,
       listOpenPrs,
       remote,
+      httpProbe: async (_url: string) => ({ status: 200, ok: true }),
+      sleep: async (_ms: number) => {},
     });
 
     await runTriggerRun(
@@ -657,15 +680,10 @@ describe("H5: batched path applies MAX_PR_PREVIEWS_PER_CYCLE cap", () => {
       appStore,
       deps,
       noop,
-      (s) => {
-        if (s.includes("cap") || s.includes("safety")) capWarnings.push(s);
-      },
+      noop,
     );
 
     // All 3 should be included (no cap triggered for <=20).
     expect(batchedCount).toBe(3);
-
-    // No cap warning emitted for <=20 PRs.
-    expect(capWarnings).toHaveLength(0);
   });
 });

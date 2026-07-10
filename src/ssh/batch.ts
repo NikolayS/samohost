@@ -95,17 +95,30 @@ export function wrapScriptWithSentinels(id: string, script: string): string {
 
 /**
  * Build the combined bash -s script from an array of BatchWorkItems.
- * Each item's script is wrapped in sentinels; items run sequentially.
- * A per-item `set +e` ensures one item's failure does not abort the rest.
+ * Each item's script is wrapped in sentinels AND a subshell ( ... ) so that
+ * an `exit 1` inside one item exits only the subshell, not the parent bash
+ * session.  Without the subshell a persistently broken PR build would abort
+ * all subsequent items in the same batch (including heals + other PRs).
+ *
+ * Structure per item:
+ *   set +e
+ *   (
+ *     echo '<<<SAMOHOST_BATCH:START:<id>>>>'
+ *     <script>
+ *     echo '<<<SAMOHOST_BATCH:END:<id>>>>'
+ *   )
+ *   set -e
  */
 export function buildBatchScript(items: BatchWorkItem[]): string {
-  const parts = items.map((item) =>
-    [
-      "set +e",
-      wrapScriptWithSentinels(item.id, item.script),
-      "set -e",
-    ].join("\n"),
-  );
+  const parts = items.map((item) => {
+    const sentineled = wrapScriptWithSentinels(item.id, item.script);
+    // Indent the sentineled script body one level inside the subshell.
+    const indented = sentineled
+      .split("\n")
+      .map((line) => `  ${line}`)
+      .join("\n");
+    return ["set +e", "(", indented, ")", "set -e"].join("\n");
+  });
   return ["#!/bin/bash", "set -euo pipefail", ...parts].join("\n\n");
 }
 
