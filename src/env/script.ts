@@ -983,7 +983,27 @@ export function buildEnvCreateScript(
       // (first create, or the engine already expired it) — same `2>/dev/null ||
       // true` posture as the destroy script (issue #7) — so it never aborts the
       // create on a missing-clone error.
-      '# Pre-create: drop any existing clone of this id so re-create is idempotent (issue #59).',
+      //
+      // Issue #134 fix: preview clones are created with --protected <minutes> so
+      // they survive the GC between 3-minute trigger cycles. dblab clone destroy
+      // rejects a protected clone with "clone is protected" (non-zero exit).
+      // Because the error was swallowed by `|| true`, the subsequent clone create
+      // failed with "already exists" → db:fail → outcome=failed → no
+      // lastDeployedSha stamp → needDeploy=true every cycle.
+      //
+      // dblab has NO --force flag on destroy. The fix is:
+      //   1. dblab clone update --protected false <ID>  (removes protection; no-op
+      //      on an absent clone via || true)
+      //   2. dblab clone destroy <ID>                   (now succeeds)
+      // Protection is re-established immediately by the following clone create
+      // --protected <minutes> call — the new clone is always protected.
+      //
+      // Verified against the live samograph VM (116.203.249.135:2223):
+      //   `dblab clone destroy --help` — no --force flag
+      //   `dblab clone update --help` — has --protected value flag
+      '# Pre-create: unprotect (if protected) then drop any existing clone of this id',
+      '# so re-create is idempotent (issue #59, #134).',
+      '"$SAMOHOST_DBLAB_BIN" clone update --protected false "$SAMOHOST_CLONE_ID" 2>/dev/null || true',
       '"$SAMOHOST_DBLAB_BIN" clone destroy "$SAMOHOST_CLONE_ID" 2>/dev/null || true',
       "",
       ...phaseBlock(

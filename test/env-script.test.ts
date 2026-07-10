@@ -174,11 +174,15 @@ describe("buildEnvCreateScript", () => {
     expect(unprotectIdx).toBeLessThan(destroyIdx);
     expect(destroyIdx).toBeLessThan(createIdx);
     // 4. Protection is re-established on the new clone: create still uses --protected.
+    // The --protected flag may appear on a continuation line immediately after
+    // "clone create --id" (bash multi-line form). Verify it appears in the
+    // 5-line window starting at the clone create line.
     expect(s).toContain("--protected");
-    const protectedMatchCreate = s
-      .split("\n")
-      .find((l) => l.includes("clone create") && l.includes("--protected"));
-    expect(protectedMatchCreate).toBeDefined();
+    const lines = s.split("\n");
+    const createLineIdx = lines.findIndex((l) => l.includes('"$SAMOHOST_DBLAB_BIN" clone create'));
+    expect(createLineIdx).toBeGreaterThan(-1);
+    const createBlock = lines.slice(createLineIdx, createLineIdx + 5).join("\n");
+    expect(createBlock).toContain("--protected");
   });
 
   test("dblab backend: clone create passes --protected with SAMOHOST_DBLAB_LEASE_MINUTES (default 20160 = 2 weeks)", () => {
