@@ -769,14 +769,39 @@ describe("parseSamohostToml — multi-service [[services]] valid parse", () => {
   });
 
   test("mainListen = 'tls' is accepted", () => {
-    const toml = twoServiceBase() + '\nmainListen = "tls"';
+    // mainListen must come before [[services]] to avoid TOML context association
+    const toml = [
+      minimalBase(),
+      'defaultListener = "web"',
+      'mainListen = "tls"',
+      "[[services]]",
+      'name = "web"',
+      'unit = "my-app"',
+      "  [[services.listeners]]",
+      '  name    = "web"',
+      "  port    = 3000",
+      '  portEnv = "PORT"',
+      '  routed  = true',
+    ].join("\n");
     const result = parseSamohostToml(toml);
     if (!result.ok) throw new Error("expected ok=true; errors: " + result.errors.join(", "));
     expect(result.app.mainListen).toBe("tls");
   });
 
   test("mainListen = 'cp-http80' is accepted", () => {
-    const toml = twoServiceBase() + '\nmainListen = "cp-http80"';
+    const toml = [
+      minimalBase(),
+      'defaultListener = "web"',
+      'mainListen = "cp-http80"',
+      "[[services]]",
+      'name = "web"',
+      'unit = "my-app"',
+      "  [[services.listeners]]",
+      '  name    = "web"',
+      "  port    = 3000",
+      '  portEnv = "PORT"',
+      '  routed  = true',
+    ].join("\n");
     const result = parseSamohostToml(toml);
     if (!result.ok) throw new Error("expected ok=true; errors: " + result.errors.join(", "));
     expect(result.app.mainListen).toBe("cp-http80");

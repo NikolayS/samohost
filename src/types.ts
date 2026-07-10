@@ -243,6 +243,33 @@ export interface AppSpec {
    * fallback to `"template"`; any non-dblab backend must be stated explicitly here.
    */
   previewDbBackend?: EnvDbBackend;
+
+  // ---- Multi-service spec model (additive; absent = legacy single-service) --
+
+  /**
+   * Declared services. When absent, consumers call `servicesOf(app)` to get
+   * the synthesized legacy single-service shape. NEVER access this directly
+   * in consumers — always go through `servicesOf()`.
+   */
+  services?: ServiceSpec[];
+  /**
+   * Caddy routing rules for a multi-service app. When absent (legacy), no
+   * routes are registered (the single service handles all traffic).
+   */
+  routes?: RouteSpec[];
+  /**
+   * Name of the listener that receives the default (unmatched) request path.
+   * REQUIRED when `services` is set. Must reference an existing listener name.
+   */
+  defaultListener?: string;
+  /**
+   * How the production main-host is wired into Caddy:
+   *  - `"cp-http80"` : control-plane plain HTTP on port 80 (no TLS termination
+   *                    here; TLS is handled upstream, e.g. a CF tunnel).
+   *  - `"tls"`       : full TLS termination on this VM (ACME or internal cert).
+   * Absent = legacy behaviour (host-prep derives mode from existing convention).
+   */
+  mainListen?: "cp-http80" | "tls";
 }
 
 /**
@@ -273,6 +300,89 @@ export interface AppRecord extends AppSpec {
  *                 (no per-env database).
  */
 export type EnvDbBackend = "dblab" | "template" | "none";
+
+// ---------------------------------------------------------------------------
+// Multi-service spec model (PR: multi-service app spec — additive, optional)
+//
+// All fields are OPTIONAL on AppSpec/AppRecord/EnvRecord. Absent = legacy
+// single-service behaviour, byte-identical to the pre-multi-service state.
+// ---------------------------------------------------------------------------
+
+/**
+ * A single inbound listener for a service: the port it binds, the env var
+ * that carries the port, and optional routing metadata.
+ *
+ * `routed`: when false (default: undefined = treated as true for back-compat),
+ * Caddy will NOT reverse-proxy public traffic to this listener. Use for
+ * internal/metrics listeners that must never be publicly reachable.
+ */
+export interface ListenerSpec {
+  /** Unique name across all listeners in this app (used as a `to` target). */
+  name: string;
+  /** TCP port the process binds. Must be unique across all listeners. */
+  port: number;
+  /** Environment variable injected with the port number. Must be unique. */
+  portEnv: string;
+  /** HTTP path polled by health checks (default "/" when absent). */
+  healthPath?: string;
+  /**
+   * Whether Caddy may route external traffic to this listener.
+   * Absent or true = routable; false = internal-only (metrics, etc.).
+   */
+  routed?: boolean;
+}
+
+/**
+ * A named service within a multi-service app. Each service maps to one
+ * systemd unit and may expose one or more listeners.
+ */
+export interface ServiceSpec {
+  /** Unique name for this service within the app. */
+  name: string;
+  /** systemd unit name (e.g. "field-record", "field-record-worker"). */
+  unit: string;
+  /**
+   * Optional override for the ExecStart path in the systemd unit.
+   * When absent the unit file is used as-is (no ExecStart override).
+   */
+  execStart?: string;
+  /** One or more inbound listeners this service exposes. */
+  listeners: ListenerSpec[];
+}
+
+/**
+ * A Caddy routing rule for a multi-service app.
+ *
+ * Exactly one of `matchPath | matchRegexp` must be set (matcher).
+ * Exactly one of `to | respond` must be set (action).
+ *
+ * `name`: optional Caddy named-matcher id. Must match `[a-z][a-z0-9-]*`.
+ */
+export interface RouteSpec {
+  /** Optional Caddy named-matcher id: `[a-z][a-z0-9-]*`. */
+  name?: string;
+  /** Caddy `path` matcher (e.g. "/api/*"). Mutually exclusive with matchRegexp. */
+  matchPath?: string;
+  /**
+   * Caddy `path_regexp` pattern. Must compile as a Go regexp AND use only
+   * Caddy-safe characters (no unescaped quotes or control chars that would
+   * break the config file). Mutually exclusive with matchPath.
+   */
+  matchRegexp?: string;
+  /**
+   * Target listener name (must exist and have routed !== false).
+   * Mutually exclusive with respond.
+   */
+  to?: string;
+  /**
+   * Static response target: Caddy returns this status + body directly.
+   * Mutually exclusive with to.
+   */
+  respond?: {
+    status: number;
+    body: string;
+  };
+}
 
 /**
  * A persisted preview environment (SPEC-DELTA §4 "env command family"): one
@@ -316,6 +426,13 @@ export interface EnvRecord {
    * envs are not immediately reaped.
    */
   lastAccess?: string;
+  /**
+   * Per-listener allocated port numbers for multi-service envs, keyed by
+   * listener name (e.g. `{ "web": 40100, "metrics": 40101 }`).
+   * Absent for legacy single-service envs (`EnvRecord.port` covers them).
+   * Set by the port-allocator in a later PR; read-only here.
+   */
+  ports?: Record<string, number>;
 }
 
 /**

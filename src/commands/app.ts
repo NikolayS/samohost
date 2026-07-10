@@ -31,7 +31,7 @@ import {
   type RunDeps,
   type SpawnResult,
 } from "../ssh/runner.ts";
-import type { AppRecord, AppSpec, EnvDbBackend, VmRecord } from "../types.ts";
+import type { AppRecord, AppSpec, EnvDbBackend, ServiceSpec, RouteSpec, VmRecord } from "../types.ts";
 import { parseSamohostToml } from "../manifest/toml.ts";
 
 // ---------------------------------------------------------------------------
@@ -84,6 +84,16 @@ export interface AppRegisterInput {
    * Mirrors {@link AppSpec.appUser}.
    */
   appUser?: string;
+
+  // ---- Multi-service spec model (additive; absent = legacy single-service) --
+  /** Declared services. Mirrors {@link AppSpec.services}. */
+  services?: ServiceSpec[];
+  /** Caddy routing rules. Mirrors {@link AppSpec.routes}. */
+  routes?: RouteSpec[];
+  /** Default listener name (required when services is set). Mirrors {@link AppSpec.defaultListener}. */
+  defaultListener?: string;
+  /** Production main-host Caddy wiring mode. Mirrors {@link AppSpec.mainListen}. */
+  mainListen?: "cp-http80" | "tls";
 }
 
 /**
@@ -204,6 +214,11 @@ export function runAppRegister(
     ...(input.dbBackend !== undefined ? { dbBackend: input.dbBackend } : {}),
     ...(input.previewDbBackend !== undefined ? { previewDbBackend: input.previewDbBackend } : {}),
     ...(input.appUser !== undefined ? { appUser: input.appUser } : {}),
+    // Multi-service spec model (additive; absent = legacy single-service)
+    ...(input.services !== undefined ? { services: input.services } : {}),
+    ...(input.routes !== undefined ? { routes: input.routes } : {}),
+    ...(input.defaultListener !== undefined ? { defaultListener: input.defaultListener } : {}),
+    ...(input.mainListen !== undefined ? { mainListen: input.mainListen } : {}),
   };
 
   const existing = appStore.get(vm.id, input.name);
@@ -303,6 +318,11 @@ export function runAppRegisterFromToml(
     ...(app.dbBackend !== undefined ? { dbBackend: app.dbBackend } : {}),
     ...(app.previewDbBackend !== undefined ? { previewDbBackend: app.previewDbBackend } : {}),
     ...(app.appUser !== undefined ? { appUser: app.appUser } : {}),
+    // Multi-service spec model (additive; absent = legacy single-service)
+    ...(app.services !== undefined ? { services: app.services } : {}),
+    ...(app.routes !== undefined ? { routes: app.routes } : {}),
+    ...(app.defaultListener !== undefined ? { defaultListener: app.defaultListener } : {}),
+    ...(app.mainListen !== undefined ? { mainListen: app.mainListen } : {}),
   };
 
   return runAppRegister(registerInput, opts, vmStore, appStore, out, err);
