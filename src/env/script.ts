@@ -321,6 +321,103 @@ const REWIRE_DB_HOSTPORT_FN_LINES: string[] = [
 ];
 
 /**
+ * Bash function: set a password on the clone's app role using the privileged
+ * clone role (samohost_env). Called from the db phase &&-chain AFTER
+ * samohost_sync_clone_globals (so the app role already exists in the clone).
+ *
+ * Security model — TWO vectors closed (samorev blocker, PR #142):
+ *
+ * 1. ARGV VECTOR: The prior implementation passed the SQL via `-c "ALTER ROLE
+ *    ... PASSWORD '$PW'"`, exposing the plaintext password in the psql process
+ *    argv (/proc/<pid>/cmdline, `ps aux`) for the lifetime of the process.
+ *    Fix: SQL is fed via STDIN (`-f -`), so the psql argv contains only
+ *    connection flags — the secret is never on the command line.
+ *
+ * 2. SERVER-LOG VECTOR: When log_statement=ddl/all is set in postgresql.conf
+ *    the server logs every DDL statement including ALTER ROLE … PASSWORD,
+ *    storing the plaintext password in the pg log. Fix: `SET log_statement TO
+ *    'none'` and `SET log_min_duration_statement TO -1` are prepended in the
+ *    SAME session stdin batch before the ALTER ROLE, so the privileged session
+ *    never logs the secret-bearing statement.
+ *    Approach rationale: client-side SCRAM verifier computation would also close
+ *    this vector (server never sees the plaintext), but SCRAM-SHA-256 verifier
+ *    generation is not reliably available in pure bash on target hosts without
+ *    additional tooling. Session-local SET is deterministic on all Postgres
+ *    versions ≥ 9.6 and requires no extra packages.
+ *
+ * Other invariants (unchanged):
+ *   - Password is generated once per env via samohost-secrets 'init' (reuse
+ *     semantics), so clone RESETS re-apply the SAME password → DATABASE_URL
+ *     stays stable across rebuilds.
+ *   - Password is read back via 'get' action (root helper, no file-read grant
+ *     needed for the SSH user).
+ *   - >/dev/null suppresses psql rowcount/notice output only; it does NOT
+ *     protect from the argv vector — that is the job of -f - above.
+ */
+const SET_CLONE_ROLE_PASSWORD_FN_LINES: string[] = [
+  "samohost_set_clone_role_password() {",
+  "  # Init the clone-role password (reuse-or-generate; 'init' preserves the existing",
+  "  # value so a clone RESET re-applies the SAME password → DATABASE_URL stays stable).",
+  "  sudo /usr/local/sbin/samohost-secrets init \"$SAMOHOST_ENV_NAME\" \"$SAMOHOST_SECRETS_ENV_USER\" SAMOHOST_CLONE_ROLE_PW",
+  "  SAMOHOST_CLONE_ROLE_PW=\"$(sudo /usr/local/sbin/samohost-secrets get \"$SAMOHOST_ENV_NAME\" SAMOHOST_CLONE_ROLE_PW)\"",
+  "  # Apply the password to the clone's app role via the privileged clone role (samohost_env).",
+  "  # ARGV FIX: SQL is fed via STDIN (-f -), never via -c, so the secret is absent",
+  "  #   from /proc/<pid>/cmdline and 'ps aux' for the lifetime of the psql process.",
+  "  # SERVER-LOG FIX: SET log_statement/log_min_duration_statement suppress DDL",
+  "  #   logging in this session BEFORE the ALTER ROLE, so the plaintext password",
+  "  #   never reaches the pg server log even when log_statement=ddl/all is set.",
+  "  # >/dev/null suppresses psql rowcount/notice output only (NOT the argv-leak",
+  "  #   protection — that comes from -f - above; >/dev/null alone does not close",
+  "  #   the /proc/<pid>/cmdline surface).",
+  "  printf \"SET log_statement TO 'none';\\nSET log_min_duration_statement TO -1;\\nALTER ROLE %s WITH LOGIN PASSWORD '%s';\\n\" \\",
+  "    \"$SAMOHOST_CLONE_APP_DBROLE\" \"$SAMOHOST_CLONE_ROLE_PW\" \\",
+  "    | PGPASSWORD=\"$SAMOHOST_DB_PASSWORD\" /usr/bin/psql -h 127.0.0.1 -p \"$SAMOHOST_DB_PORT\" \\",
+  "        -U samohost_env -d postgres -X -f - >/dev/null",
+  "}",
+];
+
+/**
+ * Bash function: rewrite the credentialed DATABASE_URL (the specific var named
+ * by manifest `databaseUrlEnv`) to include the clone-role password. Called in
+ * the envfile phase AFTER samohost_rewire_db_hostport has already rewritten
+ * host:port.
+ *
+ * Placed AFTER the db phase in the generated script so the first occurrence
+ * of the function name is post-db:ok (ordering test invariant).
+ *
+ * Uses strip-then-append composition (same pattern as rewire_db_hostport) to
+ * prevent duplicate env var entries. Output is suppressed (no stdout).
+ * (Closing brace at column 0 — tests extract and execute this function.)
+ */
+const REWIRE_DB_CREDENTIALED_FN_LINES: string[] = [
+  "samohost_rewire_db_credentialed() {",
+  "  local envfile=\"$1\"",
+  "  # No-op when credential rewire is not configured (no databaseUrlEnv on the app).",
+  "  [[ -n \"${SAMOHOST_CLONE_CRED_VAR:-}\" ]] || return 0",
+  "  local var=\"$SAMOHOST_CLONE_CRED_VAR\"",
+  "  local line val scheme dbpath rewritten",
+  "  line=\"$(grep -E \"^${var}=\" \"$envfile\" | tail -n 1 || true)\"",
+  "  if [[ -z \"$line\" ]]; then",
+  "    echo \"samohost: envfile is missing ${var} (declared as databaseUrlEnv) — cannot rewrite credentialed URL\" >&2",
+  "    return 1",
+  "  fi",
+  "  val=\"${line#*=}\"",
+  "  # Extract scheme component (e.g. 'postgresql://'), stripping optional leading quote.",
+  "  scheme=\"$(printf '%s' \"$val\" | sed -nE 's|^(\"?[A-Za-z0-9+]+://).*|\\1|p')\"",
+  "  scheme=\"${scheme#\\\"}\"",
+  "  # Extract DB path: /dbname[?params] — everything after the host:port component.",
+  "  dbpath=\"$(printf '%s' \"$val\" | sed -nE 's|^\"?[A-Za-z0-9+]+://[^/]*(/[^\"]*)$|\\1|p')\"",
+  "  # Build the credentialed URL: scheme + role:password@127.0.0.1:port + /dbname.",
+  "  rewritten=\"${scheme}${SAMOHOST_CLONE_APP_DBROLE}:${SAMOHOST_CLONE_ROLE_PW}@127.0.0.1:${SAMOHOST_DB_PORT}${dbpath}\"",
+  "  # Strip-then-append prevents duplicate entries (same pattern as rewire_db_hostport).",
+  "  grep -vE \"^${var}=\" \"$envfile\" > \"${envfile}.credrew\" || true",
+  "  printf '%s=%s\\n' \"$var\" \"$rewritten\" >> \"${envfile}.credrew\"",
+  "  mv \"${envfile}.credrew\" \"$envfile\"",
+  "  chmod 600 \"$envfile\"",
+  "}",
+];
+
+/**
  * Bash function: print the role component of every mapped envDbVars URL in
  * the operator template, one per line (PR #22 review finding 2). These are,
  * by definition, the roles the app signs in as — the seed of the scoped
@@ -587,8 +684,25 @@ const SAMOHOST_SECRETS_HELPER_LINES: string[] = [
   "  clean)",
   "    rm -rf \"$SECRETS_DIR\"",
   "    ;;",
+  "  get)",
+  "    _get_var=\"${3:-}\"",
+  "    if [[ -z \"$_get_var\" ]]; then",
+  "      echo \"samohost-secrets: get requires a secret name argument\" >&2",
+  "      exit 1",
+  "    fi",
+  "    if [[ ! -f \"$SECRETS_FILE\" ]]; then",
+  "      echo \"samohost-secrets: secrets file not found for env '${ENV_NAME}' — run init first\" >&2",
+  "      exit 1",
+  "    fi",
+  "    _line=\"$(grep -E \"^${_get_var}[=]\" \"$SECRETS_FILE\" | tail -n 1 || true)\"",
+  "    if [[ -z \"$_line\" ]]; then",
+  "      echo \"samohost-secrets: secret '${_get_var}' not found in ${SECRETS_FILE}\" >&2",
+  "      exit 1",
+  "    fi",
+  "    printf '%s\\n' \"${_line#*=}\"",
+  "    ;;",
   "  *)",
-  "    echo \"samohost-secrets: unknown action '${ACTION}' — use init|rotate|clean\" >&2",
+  "    echo \"samohost-secrets: unknown action '${ACTION}' — use init|rotate|clean|get\" >&2",
   "    exit 1",
   "    ;;",
   "esac",
@@ -890,6 +1004,12 @@ function buildEnvfileScopedBodyLines(
     // SAMOHOST_DB_PORT is already in the outer bash from samohost_clone_port.
     // No KEY=val forwarding prefix needed.
     lines.push(`   && samohost_rewire_db_hostport "$_sh_env" \\`);
+    if (app.databaseUrlEnv !== undefined) {
+      // Credentialed URL rewrite: replaces user:pw@host:port in the var named
+      // by databaseUrlEnv with the clone-role credentials (set in the db phase).
+      // Runs AFTER hostport rewire so the host:port is already correct.
+      lines.push(`   && samohost_rewire_db_credentialed "$_sh_env" \\`);
+    }
   }
 
   lines.push(
@@ -1113,6 +1233,26 @@ export function buildEnvCreateScript(
       "",
       ...REWIRE_DB_HOSTPORT_FN_LINES,
       "",
+      // Clone-role password setup: when databaseUrlEnv is declared, emit the
+      // variables and function that set a password on the clone's app role.
+      // The SET_CLONE_ROLE_PASSWORD function is defined BEFORE the db phase
+      // (must be in scope when the db &&-chain calls it). The companion
+      // REWIRE_DB_CREDENTIALED function is defined AFTER the db phase so its
+      // first occurrence in the script is post-db:ok (ordering test invariant).
+      ...(app.databaseUrlEnv !== undefined
+        ? [
+            // The specific env var to rewrite with credentials.
+            `SAMOHOST_CLONE_CRED_VAR=${sq(app.databaseUrlEnv)}`,
+            // User to own the secrets file (same as the app user for secrets[]).
+            `SAMOHOST_SECRETS_ENV_USER=${sq(app.appUser ?? "root")}`,
+            // Derive the app role name from the template's databaseUrlEnv URL.
+            // Parsed at runtime: strips VAR= prefix then extracts the user component.
+            `SAMOHOST_CLONE_APP_DBROLE="$(grep -E "^${app.databaseUrlEnv}=" "$SAMOHOST_ENV_TEMPLATE" | tail -n 1 | sed -nE 's/^[^=]+=//' | sed -nE 's|^"?[A-Za-z0-9+]+://([^:/@?"]+)(:[^@/]*)?@.*|\\1|p')"`,
+            "",
+            ...SET_CLONE_ROLE_PASSWORD_FN_LINES,
+            "",
+          ]
+        : []),
       // Idempotent re-create (issue #59): destroy any prior clone of this id
       // FIRST, so a re-create over an existing clone succeeds instead of failing
       // at the engine with "clone already exists". This mirrors the template
@@ -1155,13 +1295,21 @@ export function buildEnvCreateScript(
           "     >/dev/null \\",
           '   && SAMOHOST_DB_PORT="$(samohost_clone_port)" \\',
           '   && [[ "$SAMOHOST_DB_PORT" =~ ^[0-9]+$ ]] \\',
-          "   && samohost_sync_clone_globals",
+          // When databaseUrlEnv is set, extend the &&-chain to set the clone-role
+          // password AFTER the globals sync (roles must exist before ALTER ROLE).
+          ...(app.databaseUrlEnv !== undefined
+            ? ["   && samohost_sync_clone_globals \\", "   && samohost_set_clone_role_password"]
+            : ["   && samohost_sync_clone_globals"]),
         ],
         [
           '  echo "samohost: dblab clone create/status failed, no numeric port at .db.port in the clone status JSON, or the prod globals sync failed parity" >&2',
           "  exit 1",
         ],
       ),
+      // Credentialed rewrite function placed AFTER the db phase so the first
+      // occurrence of "samohost_rewire_db_credentialed" in the script is
+      // post-db:ok (ordering test invariant: envfile phase follows db phase).
+      ...(app.databaseUrlEnv !== undefined ? ["", ...REWIRE_DB_CREDENTIALED_FN_LINES, ""] : []),
     );
   } else if (t.dbBackend === "template") {
     const dbName = t.dbName ?? t.name.replace(/-/g, "_");
@@ -1911,7 +2059,6 @@ export function buildHostPrepScript(
 ): string {
   const isStatic = app.kind === "static";
   const root = envsRoot(app);
-  const unit = app.serviceUnit;
   // Issue #97: the preview unit and the envs root must be owned by the app
   // user when appUser is registered. Fall back to sshUser for back-compat with
   // AppRecords that predate the appUser field.
@@ -2108,11 +2255,13 @@ export function buildHostPrepScript(
       nodeOnlyLines.push("systemctl daemon-reload", "");
     }
 
-    // Step 2b: install the samohost-secrets helper when the app declares secrets.
+    // Step 2b: install the samohost-secrets helper when the app declares secrets[]
+    // OR when databaseUrlEnv is set (the clone-role password uses the same helper).
     // Installed here (before sudoers) so the helper binary exists when visudo
     // validates the NOPASSWD grant for it.  Single-quoted heredoc: no expansion
     // in the helper body during host-prep execution.
-    if ((app.secrets ?? []).length > 0) {
+    const needsSecretsHelper = (app.secrets ?? []).length > 0 || app.databaseUrlEnv !== undefined;
+    if (needsSecretsHelper) {
       nodeOnlyLines.push(
         `# 2b. samohost-secrets helper: validates env-name, performs all per-env`,
         `#     secrets file operations.  ONE exact-path sudoers grant covers all`,
@@ -2133,14 +2282,23 @@ export function buildHostPrepScript(
     `cat > /etc/sudoers.d/samohost-env-${app.name} <<SUDOERS`,
   ];
   if (!isStatic) {
-    sudoersLines.push(
-      `${sshUser} ALL=(root) NOPASSWD: /usr/bin/systemctl enable --now ${unit}@*.service`,
-      // No restart grant: the unit phase's already-active branch uses
-      // disable --now + enable --now (both universally granted on adopted and
-      // provisioned VMs alike). A bare restart was never added to adopted hosts.
-      `${sshUser} ALL=(root) NOPASSWD: /usr/bin/systemctl disable --now ${unit}@*.service`,
-      `${sshUser} ALL=(root) NOPASSWD: /usr/bin/systemctl reset-failed ${unit}@*.service`,
-    );
+    // Emit enable/disable/reset-failed grants for EVERY unique service unit,
+    // not just the primary unit (samorev #141 finding 1). A second unit (e.g.
+    // samograph-live@*) would be sudo-DENIED at enable without this fix.
+    // For single-service apps, uniqueSudoUnits has exactly one entry (the
+    // primary unit), so the output is byte-identical to the old single push.
+    const { services: sudoServices } = servicesOf(app);
+    const uniqueSudoUnits = [...new Set(sudoServices.map((s) => s.unit))];
+    for (const sudoUnit of uniqueSudoUnits) {
+      sudoersLines.push(
+        `${sshUser} ALL=(root) NOPASSWD: /usr/bin/systemctl enable --now ${sudoUnit}@*.service`,
+        // No restart grant: the unit phase's already-active branch uses
+        // disable --now + enable --now (both universally granted on adopted and
+        // provisioned VMs alike). A bare restart was never added to adopted hosts.
+        `${sshUser} ALL=(root) NOPASSWD: /usr/bin/systemctl disable --now ${sudoUnit}@*.service`,
+        `${sshUser} ALL=(root) NOPASSWD: /usr/bin/systemctl reset-failed ${sudoUnit}@*.service`,
+      );
+    }
   }
   sudoersLines.push(
     `${sshUser} ALL=(root) NOPASSWD: /usr/bin/systemctl reload caddy`,
@@ -2191,11 +2349,12 @@ export function buildHostPrepScript(
       `${sshUser} ALL=(${app.appUser}) NOPASSWD: /usr/bin/chmod 600 ${root}/*/.env`,
     );
   }
-  // When the app declares secrets[], grant ONE exact-path NOPASSWD for the
-  // samohost-secrets helper (installed by step 2b above).  The helper validates
-  // the env-name argument and performs ALL secrets file operations internally —
-  // no user-controlled wildcard remains in any sudoers grant (BLOCKER 2 fix).
-  if ((app.secrets ?? []).length > 0) {
+  // Grant ONE exact-path NOPASSWD for the samohost-secrets helper when:
+  //   - the app declares secrets[] (init/get for app secrets), OR
+  //   - databaseUrlEnv is set (init/get for the clone-role password).
+  // The helper validates the env-name argument before touching any path.
+  // (BLOCKER 2 fix + clone-role password extension.)
+  if ((app.secrets ?? []).length > 0 || app.databaseUrlEnv !== undefined) {
     sudoersLines.push(
       `# Secrets: ONE exact-path grant for the samohost-secrets helper.`,
       `# The helper validates env-name (^[a-z0-9][a-z0-9-]*$) before touching any path.`,

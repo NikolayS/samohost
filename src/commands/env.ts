@@ -665,6 +665,27 @@ export async function runEnvCreate(
   const r = resolve(vmStore, appStore, input.vm, input.app, err);
   if (r === undefined) return 1;
 
+  // Fail-loud: dblab and template backends rewrite the DATABASE_URL in the
+  // clone/template env. Without databaseUrlEnv declared on the app, env-create
+  // would push a script that cannot perform the credentialed URL rewrite —
+  // the app would boot against the production database (wrong) or fail auth
+  // (prod role is passwordless; clone pg_hba uses md5 for all TCP connections).
+  // PR-A in the manifest validator only catches explicit previewDbBackend
+  // declarations; this catches default-dblab apps (like samograph) that reach
+  // env-create without a manifest that was validated against the latest schema.
+  if (
+    (input.db === "dblab" || input.db === "template") &&
+    r.app.databaseUrlEnv === undefined
+  ) {
+    err(
+      `error: app '${r.app.name}' has no 'databaseUrlEnv' declared in the manifest ` +
+        `but the preview DB backend is '${input.db}' — ` +
+        `declare databaseUrlEnv in the manifest so the clone URL can be rewritten ` +
+        `(e.g. databaseUrlEnv = "DATABASE_URL")`,
+    );
+    return 1;
+  }
+
   const existing = envStore.get(r.vm.id, r.app.name, input.branch);
   let target: EnvScriptTarget | { error: string };
   if (existing) {
