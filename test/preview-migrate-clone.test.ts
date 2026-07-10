@@ -27,6 +27,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   buildEnvCreateScript,
+  buildHostPrepScript,
   type EnvScriptTarget,
 } from "../src/env/script.ts";
 import type { AppRecord } from "../src/types.ts";
@@ -374,38 +375,35 @@ describe("GAP 1: migrate phase — schema in branch applied to clone before app 
   });
 
   test("executed: migrate phase is FAIL-CLOSED — migrate:fail + exit 1 when command fails", () => {
-    // Extract the migrate phase from a no-appUser script, replace the migrate
-    // command with `false` (always fails), and verify:
-    //   1. The process exits non-zero.
-    //   2. The migrate:fail marker is printed.
-    //   3. The migrate:ok marker is NOT printed.
+    // dbBackend: "none" must NOT emit a migrate phase at all: no per-env DB
+    // rewiring has happened, so the composed .env still carries the operator
+    // template's PROD DATABASE_URL — migrateCmd would target the LIVE PROD DB.
+    const sNone = buildEnvCreateScript(
+      app({ migrateCmd: "npm run migrate" }),
+      target({ dbBackend: "none" }),
+    );
+    expect(sNone).not.toContain("SAMOHOST_PHASE:migrate:");
+
+    // dblab backend (per-env DB guaranteed, .env rewired to clone): migrate
+    // phase IS emitted. Verify the phase is fail-closed by running a harness
+    // where the command fails.
     const s = buildEnvCreateScript(
       app({ migrateCmd: "npm run migrate" }),
-      target({ dbBackend: "none" }), // no DB setup needed for this test
+      target(), // dbBackend: "dblab" (default)
     );
-
-    // Verify the migrate phase exists in the script.
     expect(s).toContain("<<<SAMOHOST_PHASE:migrate:start>>>");
 
-    // Build a minimal harness: define SAMOHOST_ENV_DIR pointing at a tmpdir
-    // with a dummy .env, then extract + run just the migrate phase section.
     const dir = mkdtempSync(join(tmpdir(), "samohost-migrate-fail-"));
     try {
       // Write a minimal .env so the source doesn't fail on a missing file.
       writeFileSync(join(dir, ".env"), "DATABASE_URL=postgresql://x:y@localhost/test\n");
 
-      // Build a script that:
-      // 1. Sets up SAMOHOST_ENV_DIR to our tmpdir.
-      // 2. Has a migrate function body that always fails.
-      // 3. Exercises the migrate phase markers and fail-closed exit.
+      // Minimal harness mirroring the exact phaseBlock structure:
+      //   marker start; if <cmd>; then marker ok; else marker fail; exit 1; fi
       const harness = [
         "set -euo pipefail",
         `SAMOHOST_ENV_DIR='${dir}'`,
-        // Marker helper.
         'marker() { echo "<<<SAMOHOST_PHASE:$1:$2>>>"; }',
-        // Simulate the migrate phase with a command that always fails.
-        // We mirror the exact phaseBlock structure:
-        //   marker start; if <cmd>; then marker ok; else marker fail; exit 1; fi
         'marker migrate start',
         'if false; then',
         '  marker migrate ok',
@@ -416,11 +414,8 @@ describe("GAP 1: migrate phase — schema in branch applied to clone before app 
       ].join("\n");
 
       const res = spawnSync("bash", ["-c", harness], { encoding: "utf8" });
-      // Must exit non-zero.
       expect(res.status).not.toBe(0);
-      // Must emit migrate:fail.
       expect(res.stdout).toContain("<<<SAMOHOST_PHASE:migrate:fail>>>");
-      // Must NOT emit migrate:ok.
       expect(res.stdout).not.toContain("<<<SAMOHOST_PHASE:migrate:ok>>>");
     } finally {
       rmSync(dir, { recursive: true, force: true });
@@ -428,18 +423,24 @@ describe("GAP 1: migrate phase — schema in branch applied to clone before app 
   });
 
   test("executed: migrate phase passes when migrateCmd succeeds", () => {
+    // dbBackend: "none" must NOT emit a migrate phase at all (PROD-risk guard).
+    const sNone = buildEnvCreateScript(
+      app({ migrateCmd: "npm run migrate" }),
+      target({ dbBackend: "none" }),
+    );
+    expect(sNone).not.toContain("SAMOHOST_PHASE:migrate:");
+
+    // dblab backend: migrate phase emitted; verify it passes on success.
     const dir = mkdtempSync(join(tmpdir(), "samohost-migrate-ok-"));
     try {
       writeFileSync(join(dir, ".env"), "DATABASE_URL=postgresql://x:y@localhost/test\n");
 
-      // Extract the migrate phase from the generated script and run it
-      // with a command that always succeeds (true).
       const s = buildEnvCreateScript(
         app({ migrateCmd: "npm run migrate" }),
-        target({ dbBackend: "none" }),
+        target(), // dbBackend: "dblab"
       );
 
-      // Extract just the migrate phase lines (between migrate:start and migrate:ok/fail).
+      // Extract just the migrate phase lines.
       const lines = s.split("\n");
       const startIdx = lines.findIndex((l) =>
         l.includes("<<<SAMOHOST_PHASE:migrate:start>>>"),
@@ -537,7 +538,9 @@ describe("GAP 3: role-assumption replay — GRANT R TO L for SET ROLE capability
   test("executed: GRANT R TO L emitted in applied.sql when pg_has_role returns t", () => {
     // prod_has_role = "t" means the login role L has membership in scoped role R.
     // We expect the clone to receive GRANT R TO L.
-    const r = runSyncGlobalsRA({ prodHasRole: "t", cloneAuthMembers: "1" });
+    // cloneAuthMembers: "2" because the test fixture has 2 L roles (field_record,
+    // app_user) and pg_has_role returns "t" for every pair → 2 grants emitted.
+    const r = runSyncGlobalsRA({ prodHasRole: "t", cloneAuthMembers: "2" });
     expect(r.code).toBe(0);
     // applied.sql must contain at least one GRANT ... TO statement (role membership).
     expect(r.applied).toMatch(/GRANT "[a-z_]+" TO "[a-z_]+";/);
@@ -561,7 +564,8 @@ describe("GAP 3: role-assumption replay — GRANT R TO L for SET ROLE capability
   });
 
   test("executed: GRANT statement does not grant SUPERUSER — only role membership", () => {
-    const r = runSyncGlobalsRA({ prodHasRole: "t", cloneAuthMembers: "1" });
+    // cloneAuthMembers: "2" — fixture has 2 L roles × pg_has_role=t → 2 grants.
+    const r = runSyncGlobalsRA({ prodHasRole: "t", cloneAuthMembers: "2" });
     expect(r.code).toBe(0);
     // The role-membership grants in applied.sql must not include any cluster privilege.
     const roleGrants = r.applied
@@ -589,12 +593,14 @@ describe("GAP 3: role-assumption replay — GRANT R TO L for SET ROLE capability
   });
 
   test("executed: healthy parity passes when clone memberships >= prod", () => {
-    // When prod has explicit memberships (e.g. from previous grants) and clone
-    // matches them, parity must pass.
+    // When prod is superuser-based (prodAuthMembers: "0") but pg_has_role returns
+    // "t" for the L/R pairs, the parity gate uses emitted-count logic:
+    // 2 grants emitted (2 L roles × pg_has_role=t) — clone must report ≥2
+    // for the scoped L roles. cloneAuthMembers: "2" satisfies this.
     const r = runSyncGlobalsRA({
       prodHasRole: "t",
       prodAuthMembers: "0",  // prod is superuser-based — no explicit pg_auth_members
-      cloneAuthMembers: "1", // clone got the explicit GRANT
+      cloneAuthMembers: "2", // clone got both emitted GRANTs
     });
     expect(r.code).toBe(0);
   });
@@ -605,5 +611,130 @@ describe("GAP 3: role-assumption replay — GRANT R TO L for SET ROLE capability
       expect(s).not.toContain("samohost_sync_clone_globals");
       expect(s).not.toContain("pg_has_role");
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// BLOCKER 1 (b) — db-preflight hint must not suggest --db none for apps that
+// have a migrateCmd or envDbVars. Using --db none skips DB rewiring entirely,
+// so migrateCmd would target the PROD DATABASE_URL and envDbVars URLs remain
+// at prod. The hint must point to installing dblab or using --db template.
+// ---------------------------------------------------------------------------
+
+describe("BLOCKER 1(b): db-preflight hint omits --db none for apps with migrateCmd or envDbVars", () => {
+  test("hint omits --db none when app declares migrateCmd", () => {
+    // The db-preflight failure hint (only emitted for dblab backend) must NOT
+    // suggest 'none' as a fallback when the app declares a migrateCmd.
+    // The hint currently says "(or use --db template|none)" — the `none` part
+    // is the trap. Using --db none would skip the migrate phase AND leave
+    // DATABASE_URL pointing at the PROD DB — a catastrophic silent
+    // data-destruction path. After the fix the hint must not mention `none`.
+    const s = buildEnvCreateScript(
+      app({ migrateCmd: "bun packages/shared/db/migrate.ts" }),
+      target({ dbBackend: "dblab" }),
+    );
+    // Find the db-preflight failure hint line (it mentions dblab-install-runbook).
+    const hintLine = s
+      .split("\n")
+      .find((l) => l.includes("dblab-install-runbook") || l.includes("Diagnose with:"));
+    expect(hintLine).toBeDefined();
+    // The hint must NOT contain `none` (including `template|none`) for migrateCmd apps.
+    expect(hintLine).not.toContain("none");
+  });
+
+  test("hint omits --db none when app declares envDbVars", () => {
+    // envDbVars names the DB URL env vars that get rewired to the clone.
+    // With --db none, no rewiring happens → those URLs still point at PROD.
+    const s = buildEnvCreateScript(
+      app({ envDbVars: ["DATABASE_URL", "APP_DATABASE_URL"] }),
+      target({ dbBackend: "dblab" }),
+    );
+    const hintLine = s
+      .split("\n")
+      .find((l) => l.includes("dblab-install-runbook") || l.includes("Diagnose with:"));
+    expect(hintLine).toBeDefined();
+    // Must NOT contain `none` (including `template|none`) for envDbVars apps.
+    expect(hintLine).not.toContain("none");
+  });
+
+  test("hint may still suggest --db none for apps with no migrateCmd and no envDbVars", () => {
+    // A static site or no-DB app has no migrateCmd and no envDbVars — using
+    // --db none is safe for them. The hint may continue to mention it.
+    // The hint contains `template|none`; checking for `none` as a substring.
+    const noDbApp = app({ migrateCmd: undefined, envDbVars: undefined });
+    const s = buildEnvCreateScript(noDbApp, target({ dbBackend: "dblab" }));
+    const hintLine = s
+      .split("\n")
+      .find((l) => l.includes("dblab-install-runbook") || l.includes("Diagnose with:"));
+    expect(hintLine).toBeDefined();
+    // Still safe to suggest --db none for no-DB apps.
+    expect(hintLine).toContain("none");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// BLOCKER 2 (scoped parity gate) — additional RED scenarios that prove the
+// fix is non-vacuous and non-bricking.
+// ---------------------------------------------------------------------------
+
+describe("BLOCKER 2: scoped emitted-count parity gate (non-vacuous + non-bricking)", () => {
+  test("parity gate FAILS when emitted grants don't land — superuser-prod scenario", () => {
+    // Superuser-prod: prod's cluster-wide pg_auth_members = 0 (no explicit
+    // memberships; the superuser privilege implies them). With the OLD gate,
+    // prod=0 vs clone=0 passes vacuously (0 >= 0) — even if our GRANTs never
+    // landed. With the NEW emitted-count gate: pg_has_role returns 't' for 2
+    // L/R pairs → 2 grants emitted, but clone_scoped=0 → FAIL CLOSED.
+    const r = runSyncGlobalsRA({
+      prodHasRole: "t",      // membership exists on prod (superuser implies it)
+      prodAuthMembers: "0",  // prod cluster-wide pg_auth_members = 0
+      cloneAuthMembers: "0", // GRANTs did not land in the clone
+    });
+    expect(r.code).not.toBe(0);
+    expect(r.stderr.toLowerCase()).toMatch(/parity|role|grant/);
+  });
+
+  test("parity gate PASSES with high cluster-wide count but correct scoped count", () => {
+    // Brick prevention: if the cluster has many unrelated memberships (99 from
+    // other apps/roles), the OLD cluster-wide gate would BRICK (clone_scoped=2
+    // < prod_cluster=99 → FAIL). The NEW scoped gate: emitted=2, clone_scoped=2
+    // → PASS — unrelated memberships are irrelevant.
+    const r = runSyncGlobalsRA({
+      prodHasRole: "t",       // membership exists; grants are emitted
+      prodAuthMembers: "99",  // many unrelated cluster memberships
+      cloneAuthMembers: "2",  // our 2 scoped grants landed
+    });
+    expect(r.code).toBe(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// NEEDED: bun → absolute path in resolveBuildBin so appUser sudoers grant
+// for migrateCmd "bun packages/..." is a valid exact-path NOPASSWD line.
+// ---------------------------------------------------------------------------
+
+describe("NEEDED: bun migrateCmd produces absolute-path sudoers grant", () => {
+  test("bun migrateCmd resolves to absolute path in appUser sudoers (visudo-safe)", () => {
+    // `bun packages/shared/db/migrate.ts` is the motivating migrateCmd for
+    // samograph. Without a `bun` mapping in resolveBuildBin, the sudoers line
+    // becomes `NOPASSWD: bun` (relative path) — visudo -cf rejects it, the
+    // host-prep script aborts after writing the file, and `sudo -u <appUser>
+    // bun ...` matches no grant → migrate always fails on the appUser path.
+    // Fix: map bun → /usr/bin/bun (system-wide; matches ExecStart in docs/).
+    const s = buildHostPrepScript(
+      app({
+        migrateCmd: "bun packages/shared/db/migrate.ts",
+        appUser: "field-record",
+      }),
+      "samo",
+    );
+    // Must emit the absolute-path grant — not the bare binary name.
+    expect(s).toContain("NOPASSWD: /usr/bin/bun");
+    // Bare `bun` with no leading slash must NOT appear as a sudoers Cmnd.
+    // (The path may legitimately appear in comments or environment strings,
+    // so we check the NOPASSWD pattern specifically.)
+    const sudoersLine = s
+      .split("\n")
+      .find((l) => l.includes("NOPASSWD:") && l.includes("bun") && !l.includes("/usr/bin/bun"));
+    expect(sudoersLine).toBeUndefined();
   });
 });
