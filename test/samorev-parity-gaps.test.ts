@@ -337,7 +337,8 @@ describe("(3) PORT_GUARD: fail-closed when Phase-1 reveals squatted alloc port",
     // THE ASSERTION: PR #301 must fail-closed (squatted port).
     // On current code: no live port check → port 3100 allocated → batch runs →
     //   fake success → httpProbe ok → action="created" → FAIL (RED).
-    // After fix: Phase-1 ports parsed → 3100 squatted → PR excluded → action="failed" → PASS.
+    // After fix: Phase-1 ports parsed → 3100 is squatted → natural alloc is 3100 →
+    //   fail-closed into prEarlyFailures → action="failed" → PASS.
     const prResult = (report.prPreviews ?? [])
       .flatMap((s) => s.results)
       .find((r) => r.prNumber === pr.number);

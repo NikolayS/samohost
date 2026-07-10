@@ -1416,28 +1416,45 @@ export function defaultTriggerDeps(opts: TriggerDepsOpts = {}): TriggerDeps {
       cycleOpts: { heal: boolean; prPreviews: boolean },
     ): Promise<{ heal: HealSummary; prPreview: PrPreviewSummary }> => {
       // The injectable remote for counting in tests; prod uses the real runner.
+      // NOTE: we import the factory here but build the WORK remote lazily after
+      // computing the item count so it gets a proportionally scaled timeout
+      // (Fix 1 — BATCH_TIMEOUT).
       const { defaultEnvExecDeps: mkEnvExecDeps2 } = await import("./env.ts");
-      const remote = opts.remote ?? mkEnvExecDeps2().remote;
 
       // ------------------------------------------------------------------
-      // Phase 1: Probe clone health (1 SSH call per VM, heal-only work).
+      // Phase 1: Probe clone health + live ports (1 SSH call per VM).
+      //
+      // FIX 3 (PORT_GUARD): the probe script already outputs ss -ltnH via
+      // HEAL_PROBE_PORTS_{BEGIN,END}. We now parse and cache those live ports
+      // so Phase-3 can pass them to deriveTarget as extraUsedPorts — causing
+      // deriveTarget to skip squatted ports.  If deriveTarget's only candidate
+      // is squatted (pool exhausted when live ports removed), it returns an
+      // {error} and the PR is fail-closed (not pre-upserted, not batched).
       // ------------------------------------------------------------------
       type LocalCloneHealth = "alive" | "dead" | "unknown";
       const cloneHealthMap = new Map<string, LocalCloneHealth>();
+      // Live ports parsed from Phase-1 probe. Empty set when Phase-1 did not run.
+      let phase1LivePorts: ReadonlySet<number> = new Set();
+
       const dblabEnvs: EnvRecord[] = cycleOpts.heal
         ? envStore.listFor(vmRecord.id, app.name).filter((e) => e.dbBackend === "dblab")
         : [];
 
       if (dblabEnvs.length > 0) {
-        const { buildBatchedProbeScript, parseBatchedProbe } = await import(
-          "../preview/heal-deps.ts"
-        );
+        const { buildBatchedProbeScript, parseBatchedProbe, parseProbeListeningPorts } =
+          await import("../preview/heal-deps.ts");
         const cloneIds = dblabEnvs.map((e) => e.dbName ?? e.name);
         const probeScript = buildBatchedProbeScript(cloneIds);
+        // Phase-1 uses the standard 120s probe remote (opts.remote for tests,
+        // default runner for prod). Timeout is NOT scaled here because the probe
+        // is proportional to #clones, not #work items.
+        const probeRemote = opts.remote ?? mkEnvExecDeps2().remote;
         try {
-          const probeResult = await remote(vmRecord, probeScript); // SSH CALL #1
+          const probeResult = await probeRemote(vmRecord, probeScript); // SSH CALL #1
           const parsed = parseBatchedProbe(probeResult.code === 0, probeResult.stdout, cloneIds);
           for (const [k, v] of parsed) cloneHealthMap.set(k, v);
+          // FIX 3: cache live ports from the same probe output.
+          phase1LivePorts = parseProbeListeningPorts(probeResult.stdout);
         } catch (e) {
           // Probe failed → mark all as unknown (fail-closed; no healing this cycle).
           process.stderr.write(
@@ -1468,10 +1485,15 @@ export function defaultTriggerDeps(opts: TriggerDepsOpts = {}): TriggerDeps {
       // call succeeds do we populate `openPrs` and allow the reap loop to run.
       // On any error we SKIP the PR preview pass for this app (fail-loud via
       // stderr) so the issue is visible in the journal.
+      //
+      // FIX 5b (REPORTING_PRLIST): capture the error message in `prListError`
+      // so it appears in PrPreviewSummary.listError, making a list-failure
+      // distinguishable from zero-open-PRs.
       // ------------------------------------------------------------------
       type OpenPrItem = { number: number; headRef: string; headSha: string };
       let openPrs: OpenPrItem[] = [];
       let prListSucceeded = !cycleOpts.prPreviews; // true when pass is disabled (no-op)
+      let prListError: string | undefined;
 
       if (cycleOpts.prPreviews) {
         try {
@@ -1512,9 +1534,10 @@ export function defaultTriggerDeps(opts: TriggerDepsOpts = {}): TriggerDeps {
         } catch (e) {
           // Fail-loud: surface the error so operators see it in the journal.
           // Do NOT proceed with openPrs=[] — that would false-positive reap.
+          prListError = e instanceof Error ? e.message : String(e);
           process.stderr.write(
             `samohost: batchedVmCycle: gh pr list FAILED for ${app.name} — ` +
-              `${e instanceof Error ? e.message : String(e)}; ` +
+              `${prListError}; ` +
               `SKIPPING PR preview pass for this app this cycle to avoid ` +
               `false-positive reap of PR-managed envs\n`,
           );
@@ -1542,6 +1565,16 @@ export function defaultTriggerDeps(opts: TriggerDepsOpts = {}): TriggerDeps {
 
       // ------------------------------------------------------------------
       // Phase 3: Build batch work items (no SSH).
+      //
+      // FIX 3 (PORT_GUARD): pass phase1LivePorts as extraUsedPorts to
+      // deriveTarget so squatted ports are skipped during allocation. If the
+      // pool is exhausted after excluding squatted ports, deriveTarget returns
+      // {error} and the PR item is fail-closed (not pre-upserted, not batched).
+      //
+      // FIX 5a (REPORTING_DERIVETARGET): when deriveTarget fails, push a
+      // descriptive "failed" result immediately into prEarlyFailures so
+      // Phase-6 can surface the real error instead of the generic fallback
+      // "item not found in batch output".
       // ------------------------------------------------------------------
       const {
         buildEnvCreateScript,
@@ -1553,6 +1586,10 @@ export function defaultTriggerDeps(opts: TriggerDepsOpts = {}): TriggerDeps {
       } = await import("./env.ts");
       const { DEFAULT_POOL: localPool } = await import("../env/ports.ts");
 
+      // Early failures from Phase-3 (deriveTarget, port squatter, DNS missing).
+      // Keyed by headRef so Phase-6 can find them per-PR.
+      const prEarlyFailures = new Map<string, { prNumber: number; error: string }>();
+
       // Heal items: one item per dead clone, using the existing stored target.
       const deadCloneItems: Array<{ envName: string; cloneId: string; script: string }> = [];
       for (const env of deadEnvs) {
@@ -1562,7 +1599,7 @@ export function defaultTriggerDeps(opts: TriggerDepsOpts = {}): TriggerDeps {
       }
 
       // PR items: one item per PR needing deploy, allocating a new target
-      // for first-time creates (store-only allocation — no SSH port probe).
+      // for first-time creates.  FIX 3: pass live ports to deriveTarget.
       const prWorkItems: Array<{
         branch: string; headSha: string; prNumber: number; script: string;
         vhost: string; isNewEnv: boolean;
@@ -1579,7 +1616,7 @@ export function defaultTriggerDeps(opts: TriggerDepsOpts = {}): TriggerDeps {
         if (existing !== undefined) {
           targetForPr = localTargetFromRecord(existing);
         } else {
-          // New env: derive target from store-allocated port.
+          // New env: derive target using store-only allocation (natural allocation).
           const allEnvsNow = envStore.listFor(vmRecord.id);
           const t = localDeriveTarget(
             app,
@@ -1588,15 +1625,42 @@ export function defaultTriggerDeps(opts: TriggerDepsOpts = {}): TriggerDeps {
             localPreviewDomain,
             allEnvsNow,
             localPool,
+            // extraUsedPorts intentionally NOT passed here — we want the store-only
+            // natural allocation so we can explicitly check if IT is squatted.
           );
           if ("error" in t) {
-            // Port pool exhausted or bad domain — skip this PR (logged below).
+            // Port pool exhausted or bad domain.
+            // FIX 5a: push a descriptive failed result so Phase-6 surfaces the
+            // real error rather than "item not found in batch output".
+            const errMsg = t.error;
             process.stderr.write(
               `samohost: batchedVmCycle: cannot derive target for PR #${pr.number}` +
-                ` (${pr.headRef}): ${t.error}\n`,
+                ` (${pr.headRef}): ${errMsg}\n`,
             );
+            prEarlyFailures.set(pr.headRef, { prNumber: pr.number, error: errMsg });
             continue;
           }
+
+          // FIX 3 (PORT_GUARD): FAIL-CLOSED. The old single-env path (runEnvCreate)
+          // probed actually-bound ports and refused to proceed if the allocated port
+          // was already live. In the batched path the allocation was store-only, so
+          // a squatter caused a wedged env (port pinned forever in the record).
+          //
+          // Fix: compare the naturally-allocated port against Phase-1 live ports. If
+          // squatted → fail this PR for the current cycle. The next cycle will retry
+          // and either the squatter will be gone, or the cycle will fail again. We
+          // do NOT try a different port — that would silently let the PR land on an
+          // unexpected port while the squatter is still bound on the intended one.
+          if (phase1LivePorts.has(t.port)) {
+            const errMsg =
+              `port ${t.port} is already bound on ${vmRecord.name} ` +
+              `(squatted by a foreign process per Phase-1 probe); ` +
+              `skipping this PR — will retry next cycle after squatter vacates`;
+            process.stderr.write(`samohost: batchedVmCycle: ${errMsg}\n`);
+            prEarlyFailures.set(pr.headRef, { prNumber: pr.number, error: errMsg });
+            continue;
+          }
+
           targetForPr = t;
 
           // Pre-upsert a placeholder env record to reserve the allocated port
@@ -1629,16 +1693,34 @@ export function defaultTriggerDeps(opts: TriggerDepsOpts = {}): TriggerDeps {
         });
       }
 
-      // B2 FIX: call ensurePreviewDns for each NEW PR preview BEFORE the batch
-      // SSH so the ACME HTTP-01 challenge from Caddy can resolve to this VM's IP.
-      // This was present in the old runEnvCreate path (env.ts:660) but was
-      // dropped when the batched path bypassed runEnvCreate.
+      // ------------------------------------------------------------------
+      // DNS ensure phase: call ensurePreviewDns for PR items that need it.
       //
-      // Only called for NEW envs (isNewEnv=true) — re-deploys reuse the existing
-      // DNS record.  DNS failure is non-fatal (warn + continue), matching the old
-      // runEnvCreate behaviour.
+      // FIX 2 (DNS_RETRY): re-ensure DNS not only for brand-new envs
+      // (isNewEnv=true) but ALSO for existing envs that lack lastDeployedSha
+      // — those are envs from a prior failed cycle where the env record was
+      // pre-upserted but the deploy never completed.  On the first cycle the
+      // DNS ensure fires (isNewEnv=true), but on every subsequent retry cycle
+      // isNewEnv=false because the placeholder record exists.  Without this
+      // fix, DNS is never re-ensured and the ACME HTTP-01 challenge cannot
+      // resolve → the preview stays unreachable forever after the first miss.
+      //
+      // FIX 4 (PREREQ_CONSISTENT): when CLOUDFLARE_SAMOCAT is missing in
+      // the production code path (opts.ensurePreviewDns not injected), we no
+      // longer silently degrade to wildcard-reliance.  A missing token means
+      // the DNS record will not be created and the preview WILL NOT resolve on
+      // per-VM DNS setups — exactly the 525 root cause we ship this PR to fix.
+      // The token is already required by checkTriggerPrereqs() at startup; the
+      // runtime degrade was inconsistent AND re-caused the same bug at the
+      // create step.  Items that fail the DNS step are recorded in prEarlyFailures
+      // so Phase-6 surfaces them as action="failed".
+      // ------------------------------------------------------------------
       for (const item of prWorkItems) {
-        if (!item.isNewEnv) continue;
+        // FIX 2: call DNS ensure for isNewEnv=true OR for existing envs that
+        // have no lastDeployedSha (prior failed cycle — DNS was never confirmed).
+        const existingForItem = envStore.get(vmRecord.id, app.name, item.branch);
+        const needsDnsEnsure = item.isNewEnv || existingForItem?.lastDeployedSha === undefined;
+        if (!needsDnsEnsure) continue;
 
         if (opts.ensurePreviewDns !== undefined) {
           // Test-injected spy.
@@ -1652,23 +1734,32 @@ export function defaultTriggerDeps(opts: TriggerDepsOpts = {}): TriggerDeps {
           }
         } else {
           // Production: use CloudflareDns from CLOUDFLARE_SAMOCAT env var.
+          //
+          // FIX 4 (PREREQ_CONSISTENT): token absence is a hard error, not a
+          // silent degrade.  checkTriggerPrereqs() already exits 1 at startup
+          // when the token is missing; this runtime gate is the defence-in-depth
+          // counterpart.  The token is required for previews to resolve —
+          // proceeding without it causes the 525 we are fixing.
+          const cfToken = process.env["CLOUDFLARE_SAMOCAT"];
+          if (!cfToken) {
+            const dnsErr =
+              `CLOUDFLARE_SAMOCAT is not set — cannot ensure DNS for ${item.vhost}; ` +
+              `preview will not resolve without a per-record DNS entry. ` +
+              `Set CLOUDFLARE_SAMOCAT via a systemd EnvironmentFile drop-in and restart.`;
+            process.stderr.write(`samohost: batchedVmCycle: ERROR — ${dnsErr}\n`);
+            // Record the failure so Phase-6 surfaces it as action="failed".
+            prEarlyFailures.set(item.branch, { prNumber: item.prNumber, error: dnsErr });
+            continue;
+          }
           try {
             const { CloudflareDns } = await import("../dns/cloudflare.ts");
             const { ensurePreviewDns: ensureDns } = await import("../dns/ensure.ts");
-            const cfToken = process.env["CLOUDFLARE_SAMOCAT"];
-            if (cfToken) {
-              const zoneId = process.env["SAMOHOST_SAMOCAT_ZONE_ID"];
-              const provider = new CloudflareDns({
-                token: cfToken,
-                ...(zoneId ? { zoneId } : { zoneName: "samo.cat" }),
-              });
-              await ensureDns(provider, item.vhost, vmRecord.ip);
-            } else {
-              process.stderr.write(
-                `samohost: batchedVmCycle: CLOUDFLARE_SAMOCAT not set — ` +
-                  `skipping DNS ensure for ${item.vhost} (relying on wildcard A record)\n`,
-              );
-            }
+            const zoneId = process.env["SAMOHOST_SAMOCAT_ZONE_ID"];
+            const provider = new CloudflareDns({
+              token: cfToken,
+              ...(zoneId ? { zoneId } : { zoneName: "samo.cat" }),
+            });
+            await ensureDns(provider, item.vhost, vmRecord.ip);
           } catch (e) {
             process.stderr.write(
               `samohost: batchedVmCycle: warning: DNS ensure failed for ` +
@@ -1678,10 +1769,27 @@ export function defaultTriggerDeps(opts: TriggerDepsOpts = {}): TriggerDeps {
         }
       }
 
+      // Remove items that failed DNS ensure from the work list so they are not
+      // batched to the VM (they are already recorded in prEarlyFailures for
+      // Phase-6 to surface as action="failed").
+      const effectivePrWorkItems = prWorkItems.filter(
+        (item) => !prEarlyFailures.has(item.branch),
+      );
+
       // ------------------------------------------------------------------
       // Phase 4: Run batch (1 SSH call for ALL heal + PR work).
+      //
+      // FIX 1 (BATCH_TIMEOUT): compute a timeout proportional to the number
+      // of work items so large batches do not hit the old fixed 120s wall.
+      // Formula (from batch.ts): BASE + N × PER_ITEM.
+      // Only applies to the WORK session (Phase 4).  The Phase-1 probe uses
+      // the standard default timeout (120s) — probe is cheap; scaling it
+      // would not help the timed-out multi-PR scenario.
       // ------------------------------------------------------------------
-      const { runBatchedVmCycle: runBatch } = await import("../ssh/batch.ts");
+      const {
+        runBatchedVmCycle: runBatch,
+        computeBatchTimeoutMs,
+      } = await import("../ssh/batch.ts");
 
       let batchResult: import("../ssh/batch.ts").BatchedVmCycleOutput = {
         ok: true,
@@ -1689,15 +1797,22 @@ export function defaultTriggerDeps(opts: TriggerDepsOpts = {}): TriggerDeps {
         healResults: [],
       };
 
-      const hasWork = deadCloneItems.length > 0 || prWorkItems.length > 0;
+      const hasWork = deadCloneItems.length > 0 || effectivePrWorkItems.length > 0;
       if (hasWork) {
+        // FIX 1: scale the work-session timeout by total item count.
+        const totalItems = deadCloneItems.length + effectivePrWorkItems.length;
+        const scaledTimeoutMs = computeBatchTimeoutMs(totalItems);
+        // When opts.remote is injected (tests), use it as-is (it's a fake).
+        // In production, build a fresh runner with the scaled timeout.
+        const workRemote = opts.remote ?? mkEnvExecDeps2({ timeoutMs: scaledTimeoutMs }).remote;
+
         batchResult = await runBatch({
           vm: vmRecord,
           app,
-          prs: prWorkItems,
+          prs: effectivePrWorkItems,
           deadClones: deadCloneItems,
           envStore,
-          remote, // SSH CALL #2 (conditional — only when there is work)
+          remote: workRemote, // SSH CALL #2 (conditional — only when there is work)
         });
       }
 
@@ -1759,6 +1874,10 @@ export function defaultTriggerDeps(opts: TriggerDepsOpts = {}): TriggerDeps {
 
       // ------------------------------------------------------------------
       // Phase 6: Build PrPreviewSummary + post comments.
+      //
+      // FIX 5a (REPORTING_DERIVETARGET): check prEarlyFailures FIRST so the
+      // real error (port exhaustion, squatted port, DNS missing) is surfaced
+      // instead of the generic "item not found in batch output" fallback.
       // ------------------------------------------------------------------
       const prPreviewResultsList: PrPreviewResult[] = [];
       const openPrBranchSet = new Set(openPrs.map((p) => p.headRef));
@@ -1766,6 +1885,17 @@ export function defaultTriggerDeps(opts: TriggerDepsOpts = {}): TriggerDeps {
 
       // Process PRs that needed deploy.
       for (const pr of prsNeedingDeploy) {
+        // FIX 5a: surface early failures (deriveTarget, port squatter, DNS) with
+        // the real error message before falling through to the batch-result logic.
+        const earlyFail = prEarlyFailures.get(pr.headRef);
+        if (earlyFail !== undefined) {
+          prPreviewResultsList.push({
+            prNumber: pr.number, branch: pr.headRef,
+            action: "failed", error: earlyFail.error,
+          });
+          continue;
+        }
+
         const existingRecord = envStore.get(vmRecord.id, app.name, pr.headRef);
 
         if (!batchResult.ok) {
@@ -1986,6 +2116,9 @@ export function defaultTriggerDeps(opts: TriggerDepsOpts = {}): TriggerDeps {
         vm: vmRecord.name,
         openPrs: openPrs.length,
         results: prPreviewResultsList,
+        // FIX 5b (REPORTING_PRLIST): surface gh-list error so callers can
+        // distinguish "zero open PRs" from "PR list call failed → zero processed".
+        ...(prListError !== undefined ? { listError: prListError } : {}),
       };
 
       return { heal: healSummaryOut, prPreview: prPreviewSummaryOut };

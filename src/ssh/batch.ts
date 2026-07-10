@@ -37,6 +37,41 @@ import type { EnvStore } from "../state/envs.ts";
 import type { SpawnResult } from "./runner.ts";
 
 // ---------------------------------------------------------------------------
+// Batch timeout scaling
+// ---------------------------------------------------------------------------
+
+/**
+ * Base SSH timeout for a batch session (covers connection overhead + minimal
+ * script startup before any work items run).
+ */
+export const BATCH_TIMEOUT_BASE_MS = 120_000; // 2 min base
+
+/**
+ * Per-item allowance added to the base timeout. Each work item (PR build or
+ * dead-clone re-create) can run the full env-create script; budgeting 2 min
+ * per item ensures a single 120s wall-clock timeout does not abort a 5-item
+ * batch that legitimately takes up to 10 min.
+ */
+export const BATCH_TIMEOUT_PER_ITEM_MS = 120_000; // 2 min per item
+
+/**
+ * Compute the SSH wall-clock timeout for a batch session with `nItems` work
+ * items. Returns a value proportional to N so large batches do not time out
+ * before all items complete.
+ *
+ * Formula: BASE + N × PER_ITEM
+ *   nItems=0 → 120 s (base only, covers the probe / no-op path)
+ *   nItems=1 → 240 s
+ *   nItems=5 → 720 s (12 min — enough for 5 full dblab+build+restart cycles)
+ *
+ * The old fixed 120 s fired on nItems≥2 because a 2-item batch (each ~90s)
+ * takes 180 s total but the session timed out after 120 s.
+ */
+export function computeBatchTimeoutMs(nItems: number): number {
+  return BATCH_TIMEOUT_BASE_MS + Math.max(0, nItems) * BATCH_TIMEOUT_PER_ITEM_MS;
+}
+
+// ---------------------------------------------------------------------------
 // Public types
 // ---------------------------------------------------------------------------
 

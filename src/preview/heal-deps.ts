@@ -105,6 +105,20 @@ function between(stdout: string, begin: string, end: string): string {
 }
 
 /**
+ * PURE: extract the listening-ports set from the PORTS section of a
+ * batched-probe stdout. Returns an empty set when the section is absent
+ * (e.g. Phase-1 never ran or the probe failed).
+ *
+ * Called by `batchedVmCycle` to get live-bound ports from the Phase-1 probe
+ * output so it can fail-closed on a squatted port before pre-upserting an env
+ * record and dispatching batch SSH work.
+ */
+export function parseProbeListeningPorts(probeStdout: string): ReadonlySet<number> {
+  const section = between(probeStdout, HEAL_PROBE_PORTS_BEGIN, HEAL_PROBE_PORTS_END);
+  return parseListeningPorts(section);
+}
+
+/**
  * PURE: map one clone's status-section + the host's listening ports to a
  * {@link CloneHealth} verdict.
  *

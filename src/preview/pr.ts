@@ -76,6 +76,12 @@ export interface PrPreviewSummary {
   /** Count of open PRs seen (pre-cap). */
   openPrs: number;
   results: PrPreviewResult[];
+  /**
+   * Set when the PR-list call (gh pr list) failed. Presence of this field
+   * distinguishes "gh failure → 0 PRs processed" from "0 open PRs → no work".
+   * When set, results is always [] (no reap, no creates — fail-closed).
+   */
+  listError?: string;
 }
 
 /** Return value of ensurePreview. */

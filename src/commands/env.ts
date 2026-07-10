@@ -1000,8 +1000,8 @@ function defaultInUsePortsProbe(
 }
 
 /** Default production env-exec deps. */
-export function defaultEnvExecDeps(): EnvExecDeps {
-  const remoteTimeoutMs = 120_000;
+export function defaultEnvExecDeps(opts?: { timeoutMs?: number }): EnvExecDeps {
+  const remoteTimeoutMs = opts?.timeoutMs ?? 120_000;
   return {
     remote: defaultRemoteScriptRunner(remoteTimeoutMs),
     remoteTimeoutMs,

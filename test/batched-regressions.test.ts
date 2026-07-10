@@ -406,6 +406,9 @@ describe("B3: batched path runs HTTPS probe before stamping success", () => {
       resolveRef: fastResolveRef,
       // No-op sleep: avoid 8 × 5s retry waits in unit test.
       sleep: async (_ms: number) => {},
+      // No-op DNS: this test focuses on probe gate, not DNS. Without a CF token
+      // the production path would fail-closed before even reaching the probe.
+      ensurePreviewDns: async (_vhost: string, _ip: string) => {},
     });
 
     await runTriggerRun(
@@ -453,6 +456,8 @@ describe("B3: batched path runs HTTPS probe before stamping success", () => {
       httpProbe,
       resolveRef: fastResolveRef,
       sleep: async (_ms: number) => {},
+      // No-op DNS: this test focuses on probe gate, not DNS.
+      ensurePreviewDns: async (_vhost: string, _ip: string) => {},
     });
 
     await runTriggerRun(
@@ -495,6 +500,8 @@ describe("B3: batched path runs HTTPS probe before stamping success", () => {
       httpProbe,
       resolveRef: fastResolveRef,
       sleep: async (_ms: number) => {},
+      // No-op DNS: this test focuses on probe gate, not DNS.
+      ensurePreviewDns: async (_vhost: string, _ip: string) => {},
     });
 
     let outJson = "";
@@ -634,6 +641,8 @@ describe("H5: batched path applies MAX_PR_PREVIEWS_PER_CYCLE cap", () => {
       // No-op sleep and trivially-passing probe to avoid network/timer delays.
       httpProbe: async (_url: string) => ({ status: 200, ok: true }),
       sleep: async (_ms: number) => {},
+      // No-op DNS: this test focuses on the PR cap, not DNS ensure.
+      ensurePreviewDns: async (_vhost: string, _ip: string) => {},
     });
 
     // Capture process.stderr to verify the cap warning (batchedVmCycle writes
@@ -695,6 +704,8 @@ describe("H5: batched path applies MAX_PR_PREVIEWS_PER_CYCLE cap", () => {
       resolveRef: fastResolveRef,
       httpProbe: async (_url: string) => ({ status: 200, ok: true }),
       sleep: async (_ms: number) => {},
+      // No-op DNS: this test focuses on the PR cap, not DNS ensure.
+      ensurePreviewDns: async (_vhost: string, _ip: string) => {},
     });
 
     await runTriggerRun(
