@@ -97,6 +97,7 @@ function makeApp(o: Partial<AppRecord> = {}): AppRecord {
     buildCmd: "npm run build",
     serviceUnit: "field-record",
     healthUrl: "http://localhost:3000/api/version",
+    databaseUrlEnv: "DATABASE_URL",
     ...o,
   };
 }

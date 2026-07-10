@@ -2034,7 +2034,6 @@ export function buildHostPrepScript(
 ): string {
   const isStatic = app.kind === "static";
   const root = envsRoot(app);
-  const unit = app.serviceUnit;
   // Issue #97: the preview unit and the envs root must be owned by the app
   // user when appUser is registered. Fall back to sshUser for back-compat with
   // AppRecords that predate the appUser field.
