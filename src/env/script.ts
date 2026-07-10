@@ -43,6 +43,7 @@ export type EnvPhaseName =
   | "envfile"
   | "secrets-preflight"
   | "secrets"
+  | "migrate"
   | "unit"
   | "vhost"
   | "health"
@@ -599,6 +600,59 @@ const SYNC_CLONE_GLOBALS_FN_LINES: string[] = [
   '  sudo -u postgres /usr/bin/psql -At -d "$prod_db" -c "SELECT rolname, rolcanlogin, rolpassword FROM pg_authid WHERE rolname NOT LIKE \'pg\\_%\' AND rolname <> \'postgres\'" 2>/dev/null \\',
   '    | samohost_emit_scoped_role_sql "$scoped_roles" \\',
   '    | PGPASSWORD="$SAMOHOST_DB_PASSWORD" psql -h 127.0.0.1 -p "$SAMOHOST_DB_PORT" -U samohost_env -d postgres -f - >/dev/null 2>&1 || true',
+  "  # 1.5. Role-assumption replay: for each login role L (envDbVars URL roles) and",
+  "  #      each scoped role R (R≠L), if prod pg_has_role(L, R, 'USAGE') is true,",
+  "  #      emit GRANT R TO L into the clone. pg_has_role covers both explicit",
+  "  #      membership AND the superuser-in-prod case, so SET ROLE works on the",
+  "  #      clone without granting SUPERUSER (step 1 stripped it). This closes the",
+  "  #      gap where the app's tenant queries run SET LOCAL ROLE <app_role> and the",
+  "  #      clone login role — stripped of superuser — cannot assume it.",
+  "  #      No cluster privilege is granted: GRANT R TO L is pure role membership.",
+  "  #",
+  "  #      PARITY GATE (emitted-count scoped): grants are written to a temp file",
+  "  #      so the count is captured BEFORE applying (a pipe subshell loses the",
+  "  #      count). After applying, the clone's pg_auth_members is queried SCOPED",
+  "  #      to the L roles (login roles from envDbVars URLs) only — neither",
+  "  #      vacuous (superuser-prod has prod cluster count=0 → OLD gate 0>=0 was",
+  "  #      a no-op even when grants didn't land) nor cluster-wide / brick-risk",
+  "  #      (unrelated memberships on other apps' roles don't inflate the count).",
+  '  _ra_grants_file="$(mktemp)"',
+  "  emitted_grants=0",
+  "  while IFS= read -r _ra_l; do",
+  '    [[ "$_ra_l" =~ ^[a-z_][a-z0-9_]*$ ]] || continue',
+  "    while IFS= read -r _ra_r; do",
+  '      [[ "$_ra_l" == "$_ra_r" ]] && continue',
+  '      _ra_has="$(sudo -u postgres /usr/bin/psql -At -d "$prod_db" -c "SELECT pg_has_role(\'${_ra_l}\',\'${_ra_r}\',\'USAGE\')" 2>/dev/null || echo f)"',
+  '      [[ "$_ra_has" == "t" ]] || continue',
+  '      printf \'GRANT "%s" TO "%s";\\n\' "$_ra_r" "$_ra_l" >> "$_ra_grants_file"',
+  "      emitted_grants=$((emitted_grants+1))",
+  '    done < "$scoped_roles"',
+  "  done < <(samohost_app_url_roles)",
+  '  if [[ -s "$_ra_grants_file" ]]; then',
+  '    PGPASSWORD="$SAMOHOST_DB_PASSWORD" psql -v ON_ERROR_STOP=1 -h 127.0.0.1 -p "$SAMOHOST_DB_PORT" -U samohost_env -d postgres -f - < "$_ra_grants_file" >/dev/null 2>&1 || apply_failures=$((apply_failures+1))',
+  "  fi",
+  '  rm -f "$_ra_grants_file"',
+  "  # 1.5-gate. Scoped parity: verify that all emitted GRANTs landed in the clone.",
+  "  #   Build an IN-clause from the login roles (L side) for a scoped clone query.",
+  "  #   This is neither vacuous (emitted count is authoritative: even when",
+  "  #   prod_cluster.pg_auth_members=0 for a superuser prod, we still emitted grants",
+  "  #   and the clone must have them) nor cluster-wide / brick-prone (the IN-clause",
+  "  #   scopes the count to only the app's login roles — unrelated roles on the same",
+  "  #   cluster are invisible to the query).",
+  '  _ra_login_in=""',
+  "  while IFS= read -r _ra_l; do",
+  '    [[ "$_ra_l" =~ ^[a-z_][a-z0-9_]*$ ]] || continue',
+  "    _ra_login_in=\"${_ra_login_in:+${_ra_login_in},}'${_ra_l}'\"",
+  "  done < <(samohost_app_url_roles)",
+  '  _ra_clone_cnt="$(PGPASSWORD="$SAMOHOST_DB_PASSWORD" psql -h 127.0.0.1 -p "$SAMOHOST_DB_PORT" -U samohost_env -d postgres -At -c "SELECT count(*) FROM pg_auth_members m JOIN pg_roles mr ON mr.oid = m.member WHERE mr.rolname IN (${_ra_login_in:-\'__none__\'})" 2>/dev/null)" || _ra_clone_cnt=""',
+  '  if ! [[ "$_ra_clone_cnt" =~ ^[0-9]+$ ]]; then',
+  '    echo "samohost: role-assumption parity: cannot read scoped clone membership count — failing CLOSED" >&2',
+  "    return 1",
+  "  fi",
+  '  if [[ "$_ra_clone_cnt" -lt "$emitted_grants" ]]; then',
+  '    echo "samohost: role-assumption parity FAILED (emitted=${emitted_grants}, clone_scoped=${_ra_clone_cnt}) — emitted GRANTs did not all land in the clone" >&2',
+  "    return 1",
+  "  fi",
   "  # 2. Table ownership (prod's owner role; owner-bypass RLS semantics match).",
   "  #    Idempotent DDL: ON_ERROR_STOP failures are real and counted by exit",
   "  #    code only — output stays suppressed.",
@@ -631,6 +685,12 @@ const SYNC_CLONE_GLOBALS_FN_LINES: string[] = [
   "  fi",
   "  # 6. Parity gates (fail CLOSED): an env whose clone cannot honor the",
   "  #    app's RLS/grant contract is never composed.",
+  "  #    Role-assumption membership parity is handled in section 1.5-gate",
+  "  #    (scoped emitted-count gate) rather than here, because a cluster-wide",
+  "  #    prod pg_auth_members count is (a) vacuous for superuser-prod (count=0",
+  "  #    even when membership is implied) and (b) brick-prone when unrelated",
+  "  #    apps/roles on the same cluster inflate the prod count above the clone's",
+  "  #    scoped count. The scoped gate at 1.5 is authoritative.",
   '  samohost_parity_check "RLS policies" "SELECT count(*) FROM pg_policies" \\',
   '    && samohost_parity_check "table grants" "SELECT count(*) FROM information_schema.table_privileges WHERE grantee NOT IN (\'postgres\',\'PUBLIC\') AND table_schema NOT IN (\'pg_catalog\',\'information_schema\')" \\',
   '    && samohost_parity_check "table ownership" "SELECT count(*) FROM pg_tables WHERE schemaname NOT IN (\'pg_catalog\',\'information_schema\') AND tableowner <> \'postgres\'"',
@@ -937,6 +997,13 @@ function resolveBuildBin(buildCmd: string): string {
     npm: "/usr/bin/npm",
     node: "/usr/bin/node",
     npx: "/usr/bin/npx",
+    // bun: system-wide path (matches ExecStart in docs/control-plane-setup.md
+    // and the ExecStart used in app-bootstrap tests). Without this mapping,
+    // `bun packages/shared/db/migrate.ts` as migrateCmd produces
+    // `NOPASSWD: bun` (relative path) — visudo -cf rejects it and the
+    // host-prep script aborts. `sudo -u <appUser> bun ...` also matches no
+    // grant → migrate always fails on the appUser path.
+    bun: "/usr/bin/bun",
   };
   return UBUNTU_PATHS[first] ?? first;
 }
@@ -1240,7 +1307,16 @@ export function buildEnvCreateScript(
         ],
         [
           '  echo "DBLab engine not confirmed running: healthz (http://127.0.0.1:2345/healthz) did not answer, or no dblab CLI on PATH / at ~/bin/dblab — refusing to attempt a clone." >&2',
-          '  echo "Diagnose with: samohost env preflight <vm>; install per docs/dblab-install-runbook.md (or use --db template|none)" >&2',
+          // SAFETY: do NOT suggest `--db none` for apps that declare a
+          // migrateCmd or explicit envDbVars. Using --db none skips all DB
+          // rewiring — migrateCmd would run against the PROD DATABASE_URL and
+          // envDbVars URLs would still point at PROD. Point those apps to
+          // installing dblab or using --db template (a real per-env DB) only.
+          // Apps with neither migrateCmd nor envDbVars (e.g. static sites) are
+          // safe with the full fallback list.
+          ...((app.migrateCmd !== undefined || (app.envDbVars !== undefined && app.envDbVars.length > 0))
+            ? ['  echo "Diagnose with: samohost env preflight <vm>; install per docs/dblab-install-runbook.md (apps with migrateCmd or envDbVars require a real per-env DB; use --db template if dblab is unavailable)" >&2']
+            : ['  echo "Diagnose with: samohost env preflight <vm>; install per docs/dblab-install-runbook.md (or use --db template|none)" >&2']),
           "  exit 1",
         ],
       ),
@@ -1530,6 +1606,46 @@ export function buildEnvCreateScript(
         [
           `if sudo /usr/local/sbin/samohost-secrets init ${sq(t.name)} ${sq(secretsEnvUser)} ${secretNames.map(sq).join(" ")}; `,
         ],
+      ),
+    );
+  }
+
+  // ----- migrate (optional) -----------------------------------------------
+  // SAFETY GATE: only emit the migrate phase when the resolved DB backend is
+  // `dblab` or `template` — i.e. when a per-env DB is guaranteed AND the
+  // composed .env has been rewired to it. For `dbBackend: "none"` there is NO
+  // per-env DB rewiring, so the composed .env still carries the operator
+  // template's PROD DATABASE_URL. Emitting migrateCmd in that state would
+  // apply unmerged branch migrations directly to the LIVE PROD DATABASE — a
+  // catastrophic, irreversible action. The db-preflight failure hint (above)
+  // already SUGGESTED `--db none` as a fallback; hardening it here closes the
+  // path: an operator who follows that hint cannot accidentally migrate prod.
+  //
+  // When `migrateCmd` is absent, or when dbBackend is `none`, the generated
+  // script is byte-identical to pre-feature output — the phase is absent.
+  //
+  // Environment sourcing: same principle as src/app/script.ts:141.
+  //   no-appUser path: samo owns SAMOHOST_ENV_DIR/.env (0600); source it in a
+  //     subshell before migrateCmd so DATABASE_URL (clone URL) is visible.
+  //   appUser path: appUser owns the .env and reads it; wrap migrateCmd with
+  //     sudo -u <appUser> (same pattern as install/build). The migration tool
+  //     runs as appUser in SAMOHOST_ENV_DIR where .env is readable by appUser.
+  //
+  // Fail-closed: a non-zero exit from migrateCmd emits migrate:fail + exit 1,
+  // same as every other phase. Idempotent runners no-op when already current.
+  if (app.migrateCmd !== undefined && (t.dbBackend === "dblab" || t.dbBackend === "template")) {
+    const migrateCmdExpr = app.appUser !== undefined
+      // appUser case: wrap with sudo -u <appUser>, same pattern as build.
+      // The migration tool (appUser-owned env dir) loads .env from cwd.
+      ? `if ${sudoWrapBuildCmd(app.migrateCmd, app.appUser)}; `
+      // no-appUser case: source composed .env in a subshell before migrateCmd
+      // so DATABASE_URL (rewritten to the clone) is available to the command.
+      : `if (set -a && . "$SAMOHOST_ENV_DIR/.env" && set +a && ${app.migrateCmd}); `;
+    lines.push(
+      ...phaseBlock(
+        "migrate",
+        "run migrateCmd in $SAMOHOST_ENV_DIR with composed env (branch schema applied before app boots)",
+        [migrateCmdExpr],
       ),
     );
   }
@@ -2376,11 +2492,25 @@ export function buildHostPrepScript(
     // npm-based the resolved binary equals /usr/bin/npm and we omit the
     // duplicate; the single /usr/bin/npm line covers install + build.
     const buildBin = resolveBuildBin(app.buildCmd);
+    // Resolve the migrate-command binary (migrateCmd may use a different binary
+    // than buildCmd, e.g. `npx prisma migrate deploy` vs `npm run build`).
+    // When migrateCmd is absent or resolves to the same binary as buildCmd or npm,
+    // no duplicate line is added.
+    const migrateBin = app.migrateCmd !== undefined
+      ? resolveBuildBin(app.migrateCmd)
+      : undefined;
     sudoersLines.push(
       `${sshUser} ALL=(${app.appUser}) NOPASSWD: SETENV: /usr/bin/git`,
       `${sshUser} ALL=(${app.appUser}) NOPASSWD: /usr/bin/npm`,
       ...(buildBin !== "/usr/bin/npm"
         ? [`${sshUser} ALL=(${app.appUser}) NOPASSWD: ${buildBin}`]
+        : []),
+      // migrateCmd binary grant: only when it differs from npm and buildBin
+      // (avoid duplicate sudoers lines for the same exact path).
+      ...(migrateBin !== undefined &&
+        migrateBin !== "/usr/bin/npm" &&
+        migrateBin !== buildBin
+        ? [`${sshUser} ALL=(${app.appUser}) NOPASSWD: ${migrateBin}`]
         : []),
       // Scoped envfile write grants (samorev security fix — replaces the broad
       // /usr/bin/bash SETENV grant). Path pattern uses the envs root so the
