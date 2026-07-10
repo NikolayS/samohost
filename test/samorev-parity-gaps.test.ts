@@ -19,7 +19,6 @@ import { join } from "node:path";
 import {
   HEAL_PROBE_CLONE_BEGIN,
   HEAL_PROBE_CLONE_END,
-  HEAL_PROBE_STATUS_ERR,
   HEAL_PROBE_PORTS_BEGIN,
   HEAL_PROBE_PORTS_END,
 } from "../src/preview/heal-deps.ts";
