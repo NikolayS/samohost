@@ -1147,9 +1147,21 @@ describe("issue #7: clone globals sync (logical retrieval drops cluster roles/gr
     const fn = extractFn(s, "samohost_sync_clone_globals");
     // Every psql APPLY into the clone silences both streams (error text can
     // quote failing statements, which may contain role password hashes).
+    // EXCEPTION: count/read queries inside $(...) capture stdout into a variable
+    // (so it never reaches the terminal) and only need 2>/dev/null for stderr.
+    // Those lines match `="$(PGPASSWORD=...` — the assignment captures output.
     for (const line of fn.split("\n")) {
       if (line.includes("PGPASSWORD") && line.includes("psql")) {
-        expect(line).toContain(">/dev/null 2>&1");
+        // Lines inside command substitution $(…) capture stdout — output is not
+        // leaked to the terminal. Only stderr suppression (2>/dev/null) required.
+        const isCapture = /="\$\(PGPASSWORD/.test(line);
+        if (!isCapture) {
+          // Apply operations: must silence both stdout and stderr.
+          expect(line).toContain(">/dev/null 2>&1");
+        } else {
+          // Capture operations: stderr must still be suppressed.
+          expect(line).toContain("2>/dev/null");
+        }
       }
     }
     // And nothing echoes generated DDL.
