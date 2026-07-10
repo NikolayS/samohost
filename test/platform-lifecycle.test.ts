@@ -187,10 +187,17 @@ describe("HOST-PREP CONTRACT: buildHostPrepScript() generic platform invariants"
 
   test("mainHost set: snippet uses '>' overwrite, not '>>' append (idempotent)", () => {
     const s = buildHostPrepScript(app({ mainHost: "field-record-1.samo.team" }), "agent");
-    const line = s.split("\n").find((l) => l.includes("00-main-field-record-1.caddy"));
-    expect(line).toBeDefined();
-    expect(line).toContain("> /etc/caddy/sites.d/00-main-field-record-1.caddy");
-    expect(line).not.toContain(">>");
+    // The staged write uses > (whole-file overwrite), never >> (append).
+    // Runtime idempotency is guaranteed by the landmine guard: if the live
+    // file already has the same bytes, the guard exits 0 without reload.
+    const stagedLine = s
+      .split("\n")
+      .find((l) => l.includes(".staged-00-main-field-record-1.caddy"));
+    expect(stagedLine).toBeDefined();
+    expect(stagedLine).toContain(
+      "> /etc/caddy/sites.d/.staged-00-main-field-record-1.caddy",
+    );
+    expect(stagedLine).not.toContain(">>");
   });
 
   // --- Firewall: 443/tcp opened so origin answers HTTPS. ---------------------
