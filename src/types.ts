@@ -270,6 +270,15 @@ export interface AppSpec {
    * Absent = legacy behaviour (host-prep derives mode from existing convention).
    */
   mainListen?: "cp-http80" | "tls";
+  /**
+   * Optional glob pattern (e.g. `"v*"`) that the client repo carries to declare
+   * which git tags correspond to release events.
+   *
+   * IMPORTANT — accepted + persisted; the tag-gated deploy behavior is a
+   * separate, not-yet-shipped feature — prod deploys on main SHA + CI-green
+   * regardless of this value.
+   */
+  releaseTagPattern?: string;
 }
 
 /**

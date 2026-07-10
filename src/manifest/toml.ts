@@ -80,6 +80,15 @@ export interface AppManifest {
   defaultListener?: string;
   /** Production main-host Caddy wiring mode. Maps to {@link AppSpec.mainListen}. */
   mainListen?: "cp-http80" | "tls";
+  /**
+   * Optional glob pattern (e.g. `"v*"`) for release tags. Maps to
+   * {@link AppSpec.releaseTagPattern}. Must be a non-empty string when present.
+   *
+   * IMPORTANT — accepted + persisted; the tag-gated deploy behavior is a
+   * separate, not-yet-shipped feature — prod deploys on main SHA + CI-green
+   * regardless of this value.
+   */
+  releaseTagPattern?: string;
 }
 
 /**
@@ -139,6 +148,9 @@ const APP_KEYS = new Set<string>([
   "routes",
   "defaultListener",
   "mainListen",
+  // accepted + persisted; the tag-gated deploy behavior is a separate,
+  // not-yet-shipped feature — prod deploys on main SHA + CI-green regardless of this value.
+  "releaseTagPattern",
 ]);
 
 const PROVISION_KEYS = new Set<string>([
@@ -959,6 +971,27 @@ export function parseSamohostToml(text: string): ParseTomlResult {
     }
   }
 
+  // ---- 9b. Validate releaseTagPattern (optional string, must be non-empty) ----
+  // accepted + persisted; the tag-gated deploy behavior is a separate,
+  // not-yet-shipped feature — prod deploys on main SHA + CI-green regardless of this value.
+  let releaseTagPattern: string | undefined;
+  {
+    const rawRtp = raw["releaseTagPattern"];
+    if (rawRtp !== undefined) {
+      if (typeof rawRtp !== "string") {
+        errors.push(
+          `field releaseTagPattern must be a string (got ${typeof rawRtp})`,
+        );
+      } else if (rawRtp.length === 0) {
+        errors.push(
+          `field releaseTagPattern must be a non-empty string (e.g. "v*") — empty string is not a valid glob pattern`,
+        );
+      } else {
+        releaseTagPattern = rawRtp;
+      }
+    }
+  }
+
   // ---- 10. Return result -------------------------------------------------------
   if (errors.length > 0) {
     return { ok: false, errors };
@@ -990,6 +1023,7 @@ export function parseSamohostToml(text: string): ParseTomlResult {
     ...(routes !== undefined ? { routes } : {}),
     ...(defaultListener !== undefined ? { defaultListener } : {}),
     ...(mainListen !== undefined ? { mainListen } : {}),
+    ...(releaseTagPattern !== undefined ? { releaseTagPattern } : {}),
   };
 
   return {

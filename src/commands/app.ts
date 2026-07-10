@@ -94,6 +94,15 @@ export interface AppRegisterInput {
   defaultListener?: string;
   /** Production main-host Caddy wiring mode. Mirrors {@link AppSpec.mainListen}. */
   mainListen?: "cp-http80" | "tls";
+  /**
+   * Optional glob pattern for release tags (e.g. `"v*"`). Mirrors
+   * {@link AppSpec.releaseTagPattern}.
+   *
+   * IMPORTANT — accepted + persisted; the tag-gated deploy behavior is a
+   * separate, not-yet-shipped feature — prod deploys on main SHA + CI-green
+   * regardless of this value.
+   */
+  releaseTagPattern?: string;
 }
 
 /**
@@ -241,6 +250,9 @@ export function runAppRegister(
     ...(input.routes !== undefined ? { routes: input.routes } : {}),
     ...(input.defaultListener !== undefined ? { defaultListener: input.defaultListener } : {}),
     ...(input.mainListen !== undefined ? { mainListen: input.mainListen } : {}),
+    // accepted + persisted; the tag-gated deploy behavior is a separate,
+    // not-yet-shipped feature — prod deploys on main SHA + CI-green regardless of this value.
+    ...(input.releaseTagPattern !== undefined ? { releaseTagPattern: input.releaseTagPattern } : {}),
   };
 
   const existing = appStore.get(vm.id, input.name);
@@ -345,6 +357,7 @@ export function runAppRegisterFromToml(
     ...(app.routes !== undefined ? { routes: app.routes } : {}),
     ...(app.defaultListener !== undefined ? { defaultListener: app.defaultListener } : {}),
     ...(app.mainListen !== undefined ? { mainListen: app.mainListen } : {}),
+    ...(app.releaseTagPattern !== undefined ? { releaseTagPattern: app.releaseTagPattern } : {}),
   };
 
   return runAppRegister(registerInput, opts, vmStore, appStore, out, err);
