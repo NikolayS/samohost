@@ -29,6 +29,8 @@
  *      ms-ul-1  multi-service create: enable --now for every service unit instance
  *      ms-ul-2  multi-service create: rebuild-branch disable --now + enable --now for every unit
  *      ms-ul-3  multi-service destroy: disable --now for every service unit instance
+ *      ms-ul-4  unit aggregation fail-closed: first-service enable failure NOT masked by
+ *               later-service success → unit:fail emitted and phase exits non-zero
  *
  *   F. health loop
  *      ms-hl-1  every listener with healthPath gets a health probe in the create script
@@ -46,6 +48,11 @@
  *
  *   J. EnvCreateReport.ports populated
  *      ms-rp-1  runEnvCreate report includes ports for multi-service apps
+ *
+ *   K. validateServicesTopology charset parity (programmatic app-register path)
+ *      ms-vst-1  bad portEnv (starts with digit) → error returned
+ *      ms-vst-2  bad service name (uppercase) → error returned
+ *      ms-vst-3  bad listener name (underscore) → error returned
  */
 
 import { describe, expect, test } from "bun:test";
@@ -60,11 +67,12 @@ import {
   type EnvExecDeps,
 } from "../src/commands/env.ts";
 import { renderVhost, planFromEnv, type VhostPlan } from "../src/caddy/render.ts";
+import { validateServicesTopology } from "../src/manifest/toml.ts";
 import { DEFAULT_POOL } from "../src/env/ports.ts";
 import { AppStore } from "../src/state/apps.ts";
 import { EnvStore } from "../src/state/envs.ts";
 import { StateStore } from "../src/state/store.ts";
-import type { AppRecord, EnvRecord, VmRecord } from "../src/types.ts";
+import type { AppRecord, EnvRecord, ServiceSpec, ListenerSpec, VmRecord } from "../src/types.ts";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -497,6 +505,109 @@ describe("E. unit loops — enable/disable for every service", () => {
     const disableCount = [...script.matchAll(/disable --now/g)].length;
     expect(disableCount).toBeGreaterThanOrEqual(3);
   });
+
+  /**
+   * ms-ul-4 — unit aggregation fail-closed: first-service `enable --now`
+   * returns 1 (failure), a later service returns 0 (success). The unit phase
+   * must emit `unit:fail` and exit non-zero. Later-service success must NOT
+   * mask the earlier failure.
+   *
+   * Also verifies the legacy single-service path still reaches `unit:ok` when
+   * its single service succeeds — the single-service code path must not be
+   * disturbed by the aggregation change.
+   *
+   * This test runs bash directly against the generated unit-phase block (same
+   * pattern as runUnitPhaseWithProdStub in env-script.test.ts). The sudo stub
+   * is parameterized: for the failing-unit-instance name it returns 1; for
+   * every other unit instance it returns 0. systemctl is-active always returns
+   * 1 (not active) so every service takes the `enable --now` branch — isolating
+   * the failure to the enable call only.
+   */
+  test("ms-ul-4: first-service enable failure is NOT masked by later-service success → unit:fail + non-zero exit (fail-closed)", () => {
+    // Multi-service create script
+    const app = multiApp();
+    const t = multiTarget();
+    const script = buildEnvCreateScript(app, t);
+
+    // Extract the unit phase block
+    const unitEchoLine = 'echo "<<<SAMOHOST_PHASE:unit:start>>>"';
+    const vhostEchoLine = 'echo "<<<SAMOHOST_PHASE:vhost:start>>>"';
+    const unitStart = script.indexOf(unitEchoLine);
+    const vhostStart = script.indexOf(vhostEchoLine);
+    expect(unitStart).toBeGreaterThan(-1);
+    expect(vhostStart).toBeGreaterThan(-1);
+    const unitBlock = script.slice(unitStart, vhostStart);
+
+    // Prod-accurate stub: sudo enable --now FAILS for the FIRST service unit
+    // (samograph@samograph-feat-x.service) and SUCCEEDS for all later ones.
+    // systemctl is-active always returns 1 (not active) → enable --now branch.
+    const FAILING_UNIT = "samograph@samograph-feat-x.service";
+    const stub = [
+      "systemctl() {",
+      "  return 1  # is-active: not active → enable --now branch",
+      "}",
+      "sudo() {",
+      `  if [[ "$3 $4" == "enable --now" || "$3" == "enable" ]]; then`,
+      // Check if the unit argument (last token) matches the failing unit
+      `    local last_arg="${"$"}{@: -1}"`,
+      `    if [[ "$last_arg" == '${FAILING_UNIT}' ]]; then`,
+      "      return 1  # first service: FAIL",
+      "    fi",
+      "    return 0  # later services: succeed",
+      "  fi",
+      "  return 0  # disable: always succeed",
+      "}",
+    ].join("\n");
+
+    const prog = [
+      "set -uo pipefail",
+      stub,
+      unitBlock,
+    ].join("\n");
+
+    const res = spawnSync("bash", ["-c", prog], { encoding: "utf8" });
+
+    // The phase must exit non-zero (fail-closed): first-service failure not masked.
+    expect(res.status).not.toBe(0);
+
+    // unit:fail marker must be emitted; unit:ok must NOT be emitted.
+    expect(res.stdout ?? "").toContain("<<<SAMOHOST_PHASE:unit:fail>>>");
+    expect(res.stdout ?? "").not.toContain("<<<SAMOHOST_PHASE:unit:ok>>>");
+  });
+
+  test("ms-ul-4b: legacy single-service unit:ok path unchanged — success still emits unit:ok", () => {
+    // Single-service (legacy) create script: all-ok path must still reach unit:ok.
+    const app = legacyApp();
+    const t = legacyTarget();
+    const script = buildEnvCreateScript(app, t);
+
+    const unitEchoLine = 'echo "<<<SAMOHOST_PHASE:unit:start>>>"';
+    const vhostEchoLine = 'echo "<<<SAMOHOST_PHASE:vhost:start>>>"';
+    const unitStart = script.indexOf(unitEchoLine);
+    const vhostStart = script.indexOf(vhostEchoLine);
+    expect(unitStart).toBeGreaterThan(-1);
+    expect(vhostStart).toBeGreaterThan(-1);
+    const unitBlock = script.slice(unitStart, vhostStart);
+
+    // Stub: is-active returns 1 (not active); enable --now returns 0 (success).
+    const stub = [
+      "systemctl() { return 1; }",
+      "sudo() { return 0; }",
+    ].join("\n");
+
+    const prog = [
+      "set -uo pipefail",
+      stub,
+      unitBlock,
+    ].join("\n");
+
+    const res = spawnSync("bash", ["-c", prog], { encoding: "utf8" });
+
+    // Single-service success: must exit 0 and emit unit:ok.
+    expect(res.status).toBe(0);
+    expect(res.stdout ?? "").toContain("<<<SAMOHOST_PHASE:unit:ok>>>");
+    expect(res.stdout ?? "").not.toContain("<<<SAMOHOST_PHASE:unit:fail>>>");
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -826,5 +937,99 @@ describe("J. EnvCreateReport.ports populated", () => {
       delete process.env["SAMOHOST_ENVS"];
       delete process.env["SAMOHOST_DOMAINS"];
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// K. validateServicesTopology charset parity (programmatic app-register path)
+// ---------------------------------------------------------------------------
+//
+// The TOML parse path enforces PORTENV_RE (^[A-Z_][A-Z0-9_]*$) and
+// ROUTE_NAME_RE (^[a-z][a-z0-9-]*$) for portEnv, service name and listener
+// name respectively. The programmatic path (`app register` via CLI flags or
+// SDK) calls validateServicesTopology, which currently does NOT enforce these
+// charsets. A bad listener name reaching the unit phase produces a shell-var
+// name like `health_ok_Bad_listener` with uppercase chars — valid bash — but
+// a portEnv like "123PORT" in a systemd EnvironmentFile would be silently
+// ignored by systemd (it only loads lines matching ^[A-Za-z_][A-Za-z0-9_]*=).
+// Worse, a bad service name like "Web.Service" would break the unit-instance
+// name (`Web.Service@env.service`) causing systemctl to reject the argument.
+//
+// Fix: add the same charset guards to validateServicesTopology so the
+// programmatic path is parity with the TOML path.
+// ---------------------------------------------------------------------------
+
+/**
+ * Helper: build a minimal valid ServiceSpec with one listener.
+ * Callers override the fields they want to make invalid.
+ */
+function makeService(
+  o: Partial<ServiceSpec> & { listenerOverride?: Partial<ListenerSpec> } = {},
+): ServiceSpec {
+  const { listenerOverride, ...rest } = o;
+  return {
+    name: "web",
+    unit: "field-record",
+    listeners: [
+      {
+        name: "web",
+        port: 3000,
+        portEnv: "PORT",
+        ...listenerOverride,
+      },
+    ],
+    ...rest,
+  };
+}
+
+describe("K. validateServicesTopology charset parity (programmatic path)", () => {
+  test("ms-vst-1: portEnv starting with a digit is rejected with a descriptive error", () => {
+    // "123PORT" fails ^[A-Z_][A-Z0-9_]*$ — systemd silently ignores it.
+    const errors: string[] = [];
+    validateServicesTopology(
+      [makeService({ listenerOverride: { portEnv: "123PORT" } })],
+      [],
+      "web",
+      errors,
+    );
+    // Must produce at least one error mentioning the invalid portEnv.
+    expect(errors.length).toBeGreaterThan(0);
+    const combined = errors.join(" ");
+    // Error should identify the offending value so the operator knows what to fix.
+    expect(combined).toContain("123PORT");
+  });
+
+  test("ms-vst-2: service name containing uppercase is rejected with a descriptive error", () => {
+    // "WebService" fails ^[a-z][a-z0-9-]*$ — systemctl rejects unit names with
+    // uppercase in the instance template.
+    const errors: string[] = [];
+    validateServicesTopology(
+      [makeService({ name: "WebService" })],
+      [],
+      "web",
+      errors,
+    );
+    // Must produce at least one error mentioning the invalid service name.
+    expect(errors.length).toBeGreaterThan(0);
+    const combined = errors.join(" ");
+    expect(combined).toContain("WebService");
+  });
+
+  test("ms-vst-3: listener name containing underscore is rejected with a descriptive error", () => {
+    // "web_api" fails ^[a-z][a-z0-9-]*$ — underscores are not allowed (hyphens
+    // are). A bad listener name would also produce a malformed shell-var name
+    // in the health aggregation (`health_ok_web_api` — ambiguous with a name
+    // that coincidentally starts with `web_api`).
+    const errors: string[] = [];
+    validateServicesTopology(
+      [makeService({ listenerOverride: { name: "web_api" }, name: "web_api" })],
+      [],
+      "web_api",
+      errors,
+    );
+    // Must produce at least one error mentioning the invalid name.
+    expect(errors.length).toBeGreaterThan(0);
+    const combined = errors.join(" ");
+    expect(combined).toContain("web_api");
   });
 });
