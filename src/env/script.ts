@@ -1247,7 +1247,7 @@ export function buildEnvCreateScript(
             `SAMOHOST_SECRETS_ENV_USER=${sq(app.appUser ?? "root")}`,
             // Derive the app role name from the template's databaseUrlEnv URL.
             // Parsed at runtime: strips VAR= prefix then extracts the user component.
-            `SAMOHOST_CLONE_APP_DBROLE="$(grep -E "^${app.databaseUrlEnv}=" "$SAMOHOST_ENV_TEMPLATE" | tail -n 1 | sed -nE 's/^[^=]+=//' | sed -nE 's|^"?[A-Za-z0-9+]+://([^:/@?"]+)(:[^@/]*)?@.*|\\1|p')"`,
+            `SAMOHOST_CLONE_APP_DBROLE="$(grep -E "^${app.databaseUrlEnv}=" "$SAMOHOST_ENV_TEMPLATE" | tail -n 1 | sed -E 's/^[^=]+=//' | sed -nE 's|^"?[A-Za-z0-9+]+://([^:/@?"]+)(:[^@/]*)?@.*|\\1|p')"`,
             "",
             ...SET_CLONE_ROLE_PASSWORD_FN_LINES,
             "",
@@ -1406,6 +1406,14 @@ export function buildEnvCreateScript(
       envfileBody.push(
         '   && samohost_rewire_db_hostport "$SAMOHOST_ENV_DIR/.env" \\',
       );
+      if (app.databaseUrlEnv !== undefined) {
+        // Credentialed URL rewrite: replaces user:pw@host:port with clone-role
+        // credentials (set in the db phase via samohost_set_clone_role_password).
+        // Runs AFTER hostport rewire so the host:port is already correct.
+        envfileBody.push(
+          '   && samohost_rewire_db_credentialed "$SAMOHOST_ENV_DIR/.env" \\',
+        );
+      }
     }
     envfileBody.push(
       '   && printf \'\\nSAMO_ENV=preview\\nSAMO_BRANCH=%s\\n\' "$SAMOHOST_BRANCH" >> "$SAMOHOST_ENV_DIR/.env" \\',
