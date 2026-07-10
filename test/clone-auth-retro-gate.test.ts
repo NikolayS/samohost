@@ -447,12 +447,20 @@ describe("HARDEN 3. log_min_error_statement: suppress error-statement log in ALT
   });
 
   test("SET log_min_error_statement appears BEFORE ALTER ROLE in the printf batch", () => {
+    // Use lastIndexOf to find the occurrences in the printf format string (not
+    // in earlier comments — the guard comment mentions "ALTER ROLE" but that is
+    // prose, not SQL, and appears before the printf call in the function body).
     const s = buildEnvCreateScript(appWithDbUrl(), target({ dbBackend: "dblab" }));
     const fn = extractSetPwFn(s);
-    const logMinErrIdx = fn.indexOf("SET log_min_error_statement");
-    const alterRoleIdx = fn.indexOf("ALTER ROLE");
+    // Both must be present in the function.
+    expect(fn).toContain("SET log_min_error_statement");
+    expect(fn).toContain("ALTER ROLE");
+    // The last occurrence of each is in the printf format string (the SQL batch).
+    const logMinErrIdx = fn.lastIndexOf("SET log_min_error_statement");
+    const alterRoleIdx = fn.lastIndexOf("ALTER ROLE");
     expect(logMinErrIdx).toBeGreaterThan(-1);
     expect(alterRoleIdx).toBeGreaterThan(-1);
+    // SET must come before ALTER ROLE in the SQL batch.
     expect(logMinErrIdx).toBeLessThan(alterRoleIdx);
   });
 
