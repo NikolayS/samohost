@@ -1647,7 +1647,11 @@ export function defaultTriggerDeps(opts: TriggerDepsOpts = {}): TriggerDeps {
             const { ensurePreviewDns: ensureDns } = await import("../dns/ensure.ts");
             const cfToken = process.env["CLOUDFLARE_SAMOCAT"];
             if (cfToken) {
-              const provider = new CloudflareDns(cfToken);
+              const zoneId = process.env["SAMOHOST_SAMOCAT_ZONE_ID"];
+              const provider = new CloudflareDns({
+                token: cfToken,
+                ...(zoneId ? { zoneId } : { zoneName: "samo.cat" }),
+              });
               await ensureDns(provider, item.vhost, vmRecord.ip);
             } else {
               process.stderr.write(
@@ -1799,7 +1803,10 @@ export function defaultTriggerDeps(opts: TriggerDepsOpts = {}): TriggerDeps {
               const { spawnSync: curlSpawn } = await import("node:child_process");
               const { buildCurlProbeArgs, parseCurlProbeResult } = await import("./env.ts");
               const curlArgs = buildCurlProbeArgs(probeUrl);
-              const res = curlSpawn(curlArgs[0], curlArgs.slice(1), { encoding: "utf8", timeout: 15_000 });
+              // curlArgs[0] is always "curl" (non-undefined) — buildCurlProbeArgs
+              // returns a string[] with "curl" as the first element.
+              const cmd = curlArgs[0] as string;
+              const res = curlSpawn(cmd, curlArgs.slice(1), { encoding: "utf8", timeout: 15_000 });
               return parseCurlProbeResult(res.stdout ?? "", res.status ?? 1);
             });
 

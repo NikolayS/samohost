@@ -305,10 +305,12 @@ describe("B2: batched path calls ensurePreviewDns for new PR previews", () => {
     expect(dnsCalls.length).toBeGreaterThan(0);
 
     // The call must use the VM's IP.
-    expect(dnsCalls[0].ip).toBe("10.0.0.1");
+    const firstCall = dnsCalls[0];
+    expect(firstCall).toBeDefined();
+    expect(firstCall?.ip).toBe("10.0.0.1");
 
     // The vhost must belong to the preview domain (samo.cat).
-    expect(dnsCalls[0].vhost).toContain(".samo.cat");
+    expect(firstCall?.vhost).toContain(".samo.cat");
   });
 
   test("ensurePreviewDns is NOT called for unchanged PRs (no extra DNS calls)", async () => {
