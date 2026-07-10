@@ -603,13 +603,98 @@ describe("5. leak-regression: clone-role password value never in TS-controlled o
     // The psql ALTER ROLE call must redirect stdout to /dev/null to prevent
     // the SQL statement (which includes the password) from appearing in
     // samohost's phase-marker stdout parsing.
-    // Search for the clone-role-specific ALTER ROLE (not the role-replay ALTER ROLE
-    // in samohost_emit_scoped_role_sql, which has no /dev/null — that function
-    // echoes role DDL to stdout intentionally for piping into psql).
-    const alterRoleIdx = s.indexOf("ALTER ROLE $SAMOHOST_CLONE_APP_DBROLE");
+    // After the argv-leak fix the SQL arrives via STDIN (-f -); the function
+    // body must contain -f - and >/dev/null suppression together.
+    const fnMatch = s.match(/(samohost_set_clone_role_password\(\) \{[\s\S]*?\n\})/);
+    expect(fnMatch).not.toBeNull();
+    const fnBody = fnMatch![1]!;
+    // SQL must be delivered via stdin (-f -), not via -c argument.
+    expect(fnBody).toContain("-f -");
+    // psql rowcount/notice output must be suppressed.
+    expect(fnBody).toContain(">/dev/null");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 6. Argv-surface regression: password NEVER in psql -c/-v inline argument
+// ---------------------------------------------------------------------------
+
+describe("6. argv-surface: password delivered via stdin -f -, never via psql -c", () => {
+  const appWithDbUrl = () =>
+    app({ databaseUrlEnv: "DATABASE_URL", appUser: "samograph-user" });
+
+  /** Extract the body of samohost_set_clone_role_password from the script. */
+  function extractSetPwFn(s: string): string {
+    const m = s.match(/(samohost_set_clone_role_password\(\) \{[\s\S]*?\n\})/);
+    if (m === null) throw new Error("samohost_set_clone_role_password() not found");
+    return m[1]!;
+  }
+
+  test("ARGV VECTOR: psql inside samohost_set_clone_role_password has NO -c flag (no SQL in argv)", () => {
+    // samorev blocker: the prior implementation ran
+    //   psql ... -c "ALTER ROLE ... PASSWORD '$SAMOHOST_CLONE_ROLE_PW'"
+    // making the password readable via /proc/<pid>/cmdline and `ps aux` for
+    // the lifetime of the psql process. The fix must feed the SQL via STDIN.
+    const s = buildEnvCreateScript(appWithDbUrl(), target({ dbBackend: "dblab" }));
+    const fnBody = extractSetPwFn(s);
+    // Must NOT have -c with any SQL inline (covers -c "...", -c '...', -c $(...))
+    expect(fnBody).not.toMatch(/psql\b[^\n]*\s-c\s/m);
+    expect(fnBody).not.toMatch(/\s-c\s+"[^"]*ALTER/m);
+    expect(fnBody).not.toMatch(/\s-c\s+'[^']*ALTER/m);
+  });
+
+  test("ARGV VECTOR: psql uses -f - (stdin) for the ALTER ROLE statement", () => {
+    const s = buildEnvCreateScript(appWithDbUrl(), target({ dbBackend: "dblab" }));
+    const fnBody = extractSetPwFn(s);
+    // The only correct delivery mechanism that keeps SQL off the argv.
+    expect(fnBody).toContain("-f -");
+  });
+
+  test("ARGV VECTOR: SAMOHOST_CLONE_ROLE_PW is never on the same line as a psql -c flag", () => {
+    const s = buildEnvCreateScript(appWithDbUrl(), target({ dbBackend: "dblab" }));
+    const fnBody = extractSetPwFn(s);
+    // The variable reference must NOT appear on the same script line as a -c flag.
+    // This directly tests the /proc/<pid>/cmdline argv surface: if -c and the PW
+    // variable are on the same (logical) line, the shell expands $SAMOHOST_CLONE_ROLE_PW
+    // into the -c argument and the password ends up in the process argv.
+    expect(fnBody).not.toMatch(/-c[^\n]*CLONE_ROLE_PW/);
+  });
+
+  test("SERVER LOG VECTOR: log_statement suppressed BEFORE ALTER ROLE in the stdin batch", () => {
+    // When log_statement=ddl/all is set in postgresql.conf the server logs
+    // every DDL statement including ALTER ROLE … PASSWORD, exposing the
+    // plaintext password in the pg log. The fix: prepend
+    //   SET log_statement TO 'none';
+    //   SET log_min_duration_statement TO -1;
+    // in the SAME session stdin batch so the privileged psql session never
+    // logs the secret-bearing statement.
+    const s = buildEnvCreateScript(appWithDbUrl(), target({ dbBackend: "dblab" }));
+    const fnBody = extractSetPwFn(s);
+    // Session-local log suppression must be present.
+    expect(fnBody).toMatch(/SET log_statement\b/);
+    expect(fnBody).toMatch(/SET log_min_duration_statement\b/);
+    // Log suppression must appear BEFORE the ALTER ROLE text in the function.
+    const logStmtIdx = fnBody.indexOf("SET log_statement");
+    const alterRoleIdx = fnBody.indexOf("ALTER ROLE");
+    expect(logStmtIdx).toBeGreaterThan(-1);
     expect(alterRoleIdx).toBeGreaterThan(-1);
-    // Check the lines around ALTER ROLE contain /dev/null redirection.
-    const surrounding = s.slice(Math.max(0, alterRoleIdx - 50), alterRoleIdx + 300);
-    expect(surrounding).toContain("/dev/null");
+    expect(logStmtIdx).toBeLessThan(alterRoleIdx);
+  });
+
+  test("COMMENT FIX: >/dev/null is not described as the password-protection mechanism", () => {
+    // The old comment said '/dev/null: the SQL text (containing the password)'
+    // suggesting >/dev/null was the protection. It is not — it only suppresses
+    // psql rowcount/notice output. After the fix the comment must not attribute
+    // the security property to >/dev/null.
+    const s = buildEnvCreateScript(appWithDbUrl(), target({ dbBackend: "dblab" }));
+    const fnBody = extractSetPwFn(s);
+    // Must not claim /dev/null prevents password from appearing in argv/logs.
+    expect(fnBody).not.toMatch(/\/dev\/null.*SQL text.*contain.*password/i);
+    expect(fnBody).not.toMatch(/\/dev\/null.*contain.*password/i);
+  });
+
+  test("SYNTAX: fixed samohost_set_clone_role_password passes bash -n syntax check", () => {
+    const s = buildEnvCreateScript(appWithDbUrl(), target({ dbBackend: "dblab" }));
+    expect(bashSyntaxOk(s)).toBe(true);
   });
 });
