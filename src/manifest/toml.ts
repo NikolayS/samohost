@@ -875,7 +875,7 @@ export function parseSamohostToml(text: string): ParseTomlResult {
         : `dbBackend="${dbBackend}"`;
       errors.push(
         `"databaseUrlEnv" is required for DB-backed apps (${which}) — ` +
-          `declare which env var holds the DB connection URL so PR-C can rewrite it per env ` +
+          `declare which env var holds the DB connection URL so preview env-create can rewrite it per env ` +
           `(e.g. databaseUrlEnv = "DATABASE_URL")`,
       );
     }

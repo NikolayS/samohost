@@ -603,7 +603,10 @@ describe("5. leak-regression: clone-role password value never in TS-controlled o
     // The psql ALTER ROLE call must redirect stdout to /dev/null to prevent
     // the SQL statement (which includes the password) from appearing in
     // samohost's phase-marker stdout parsing.
-    const alterRoleIdx = s.indexOf("ALTER ROLE");
+    // Search for the clone-role-specific ALTER ROLE (not the role-replay ALTER ROLE
+    // in samohost_emit_scoped_role_sql, which has no /dev/null — that function
+    // echoes role DDL to stdout intentionally for piping into psql).
+    const alterRoleIdx = s.indexOf("ALTER ROLE $SAMOHOST_CLONE_APP_DBROLE");
     expect(alterRoleIdx).toBeGreaterThan(-1);
     // Check the lines around ALTER ROLE contain /dev/null redirection.
     const surrounding = s.slice(Math.max(0, alterRoleIdx - 50), alterRoleIdx + 300);
