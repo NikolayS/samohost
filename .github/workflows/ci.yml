@@ -27,6 +27,8 @@ jobs:
       - run: bunx tsc --noEmit
       - run: bun test
         env:
-          # Hard-fail if caddy binary is missing in CI — a skip must never
-          # silently green the caddy-adapt tests in CI.
+          # DO NOT REMOVE — without this flag every caddy-a* (adapt equality)
+          # test is silently skipped via test.skipIf(!hasCaddy), turning the
+          # whole rig green with zero adapt validation. Hard-fail here ensures
+          # the caddy install step above is never silently bypassed.
           SAMOHOST_REQUIRE_CADDY: "1"

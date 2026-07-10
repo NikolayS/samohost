@@ -14,8 +14,11 @@
  * Order contract: Caddy `handle` is first-match. The renderer NEVER reorders
  * routes. The default `reverse_proxy` handle is always last.
  *
- * Back-compat: zero routes → exactly one `reverse_proxy localhost:<defaultPort>`
- * handle, byte-identical to the pre-multi-service single-service preview form.
+ * Back-compat: zero routes → BARE `reverse_proxy localhost:<defaultPort>` with
+ * NO `handle {}` wrapper — Caddy-semantically identical to the single-service
+ * preview form emitted by buildEnvCreateScript (src/env/script.ts vhost phase).
+ * Wrapping in `handle {}` would add an extra subroute layer in adapted JSON,
+ * silently changing the shape of every legacy env's vhost on next render.
  *
  * Idle-GC contract: every vhost emits a JSON access log to `plan.logFile`
  * (/var/log/caddy/<name>.log). The idle-GC pass reads that file for
@@ -160,10 +163,23 @@ export function renderVhost(plan: VhostPlan): string {
     }
   }
 
-  // Default handle (ALWAYS LAST — Caddy first-match, so this is the fallback).
-  lines.push(`\thandle {`);
-  lines.push(`\t\treverse_proxy localhost:${plan.defaultPort}`);
-  lines.push(`\t}`);
+  // Default reverse_proxy.
+  // Zero routes (legacy single-service): emit the BARE directive with no
+  // `handle {}` wrapper — matches buildEnvCreateScript's printf template
+  // (src/env/script.ts vhost phase) exactly. The `handle {}` wrapper creates
+  // an extra subroute layer in adapted JSON that diverges from today's live
+  // single-service preview form and would silently change every legacy env's
+  // vhost on next render.
+  //
+  // Routes present (multi-service): wrap in a catch-all `handle {}` so it
+  // acts as Caddy's last-resort fallback after all matcher-specific handles.
+  if (plan.routes.length === 0) {
+    lines.push(`\treverse_proxy localhost:${plan.defaultPort}`);
+  } else {
+    lines.push(`\thandle {`);
+    lines.push(`\t\treverse_proxy localhost:${plan.defaultPort}`);
+    lines.push(`\t}`);
+  }
 
   // JSON access log (idle-GC contract: must be present on every vhost).
   lines.push(`\tlog {`);
