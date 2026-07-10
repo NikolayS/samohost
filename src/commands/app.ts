@@ -32,7 +32,7 @@ import {
   type SpawnResult,
 } from "../ssh/runner.ts";
 import type { AppRecord, AppSpec, EnvDbBackend, ServiceSpec, RouteSpec, VmRecord } from "../types.ts";
-import { parseSamohostToml } from "../manifest/toml.ts";
+import { parseSamohostToml, validateServicesTopology } from "../manifest/toml.ts";
 
 // ---------------------------------------------------------------------------
 // Parsed inputs (produced by the CLI parser)
@@ -189,6 +189,28 @@ export function runAppRegister(
   if (vm === undefined) {
     err(`error: VM not found in state: ${input.vm}`);
     return 1;
+  }
+
+  // Fix 6a: validate service topology on the programmatic path too.
+  // The TOML path runs the same check via parseSamohostToml. Without this guard,
+  // `app register` (called from CLI flags or other code) could persist an AppRecord
+  // with a dangling defaultListener or routes-without-services, causing a runtime
+  // error in servicesOf() or in the Caddy config writer.
+  if (input.services !== undefined || input.routes !== undefined || input.defaultListener !== undefined) {
+    const topologyErrors: string[] = [];
+    validateServicesTopology(
+      input.services,
+      input.routes,
+      input.defaultListener,
+      topologyErrors,
+    );
+    if (topologyErrors.length > 0) {
+      err(`error: service topology validation failed (${topologyErrors.length} error(s)):`);
+      for (const msg of topologyErrors) {
+        err(`  - ${msg}`);
+      }
+      return 1;
+    }
   }
 
   const spec: AppSpec = {

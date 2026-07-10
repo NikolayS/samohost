@@ -83,11 +83,33 @@ export interface ServicesView {
  */
 export function servicesOf(app: AppSpec): ServicesView {
   if (app.services !== undefined) {
-    // Multi-service: return declared topology as-is.
+    // Fix 6b: for multi-service apps, defaultListener MUST resolve to a declared
+    // listener. The old code fabricated a fallback:
+    //   app.defaultListener ?? app.services[0]?.listeners[0]?.name ?? "web"
+    // This silently swallowed a validation gap (app registered without
+    // defaultListener, or with a dangling name). Now we throw so the operator
+    // sees the problem at call time rather than getting a mysterious Caddy error.
+    if (app.defaultListener === undefined) {
+      throw new Error(
+        `servicesOf: multi-service app "${app.name}" has no defaultListener declared — ` +
+          `re-register with a valid defaultListener that matches a declared listener name`,
+      );
+    }
+    const allListenerNames = new Set<string>(
+      app.services.flatMap((s) => s.listeners.map((l) => l.name)),
+    );
+    if (!allListenerNames.has(app.defaultListener)) {
+      throw new Error(
+        `servicesOf: multi-service app "${app.name}" defaultListener "${app.defaultListener}" ` +
+          `does not match any declared listener ` +
+          `(known: ${[...allListenerNames].join(", ") || "(none)"}) — ` +
+          `re-register with a valid defaultListener`,
+      );
+    }
     return {
       services: app.services,
       routes: app.routes ?? [],
-      defaultListener: app.defaultListener ?? app.services[0]?.listeners[0]?.name ?? "web",
+      defaultListener: app.defaultListener,
     };
   }
 
