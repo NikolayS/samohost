@@ -312,6 +312,12 @@ const REWIRE_DB_HOSTPORT_FN_LINES: string[] = [
   "      return 1",
   "    fi",
   "    rewritten=\"$(printf '%s' \"$val\" | sed -E 's|^(\"?[A-Za-z0-9+]+://)([^/]*@)?[^/?\"]*|\\1\\2127.0.0.1:'\"$SAMOHOST_DB_PORT\"'|')\"",
+  // UMASK FIX: pre-create the temp file at 0600 with install before the bare `>`
+  // redirect fills it. A bare `>` creates the file at umask permissions (typically
+  // 0644 on stock Ubuntu), briefly exposing all env secrets as world-readable.
+  // `install -m 600 /dev/null` creates the file at exactly 0600 before any content
+  // is written — the same pattern used for .env.baseurl in the envfile phase.
+  '    install -m 600 /dev/null "${envfile}.rewired"',
   '    grep -vE "^${var}=" "$envfile" > "${envfile}.rewired" || true',
   "    printf '%s=%s\\n' \"$var\" \"$rewritten\" >> \"${envfile}.rewired\"",
   '    mv "${envfile}.rewired" "$envfile"',
@@ -339,6 +345,9 @@ const REWIRE_DB_HOSTPORT_FN_LINES: string[] = [
  *    'none'` and `SET log_min_duration_statement TO -1` are prepended in the
  *    SAME session stdin batch before the ALTER ROLE, so the privileged session
  *    never logs the secret-bearing statement.
+ *    Additionally, `SET log_min_error_statement TO 'panic'` prevents the server
+ *    from logging the failing statement text (which may carry the password) if
+ *    the ALTER ROLE itself raises an error (e.g., role does not yet exist).
  *    Approach rationale: client-side SCRAM verifier computation would also close
  *    this vector (server never sees the plaintext), but SCRAM-SHA-256 verifier
  *    generation is not reliably available in pure bash on target hosts without
@@ -353,9 +362,24 @@ const REWIRE_DB_HOSTPORT_FN_LINES: string[] = [
  *     needed for the SSH user).
  *   - >/dev/null suppresses psql rowcount/notice output only; it does NOT
  *     protect from the argv vector — that is the job of -f - above.
+ *
+ * Hardening (retro-gate 77358aa):
+ *   - [[ -n "$SAMOHOST_CLONE_APP_DBROLE" ]] guard before all SQL work: fails
+ *     loud (non-zero + marker message) if the extraction pipeline produced an
+ *     empty role, preventing a silent ALTER ROLE with an empty name.
+ *   - -v ON_ERROR_STOP=1 on psql: SQL errors cause psql to exit non-zero so
+ *     the db phase fails instead of silently proceeding with an unset password.
  */
 const SET_CLONE_ROLE_PASSWORD_FN_LINES: string[] = [
   "samohost_set_clone_role_password() {",
+  "  # GUARD: fail loud if DBROLE is empty (extraction pipeline produced no output,",
+  "  # e.g. because the template URL has no user component, or a future sed regression).",
+  "  # Catching this here surfaces the configuration error before any psql call and",
+  "  # prevents a silent password-set failure on an empty role name.",
+  "  [[ -n \"$SAMOHOST_CLONE_APP_DBROLE\" ]] || {",
+  "    echo \"samohost: SAMOHOST_CLONE_APP_DBROLE is empty — the databaseUrlEnv URL in the operator template has no user component; cannot set clone-role password\" >&2",
+  "    return 1",
+  "  }",
   "  # Init the clone-role password (reuse-or-generate; 'init' preserves the existing",
   "  # value so a clone RESET re-applies the SAME password → DATABASE_URL stays stable).",
   "  sudo /usr/local/sbin/samohost-secrets init \"$SAMOHOST_ENV_NAME\" \"$SAMOHOST_SECRETS_ENV_USER\" SAMOHOST_CLONE_ROLE_PW",
@@ -366,13 +390,18 @@ const SET_CLONE_ROLE_PASSWORD_FN_LINES: string[] = [
   "  # SERVER-LOG FIX: SET log_statement/log_min_duration_statement suppress DDL",
   "  #   logging in this session BEFORE the ALTER ROLE, so the plaintext password",
   "  #   never reaches the pg server log even when log_statement=ddl/all is set.",
+  "  #   SET log_min_error_statement TO 'panic' additionally prevents the failing",
+  "  #   statement text (which may include the password) from being written to the",
+  "  #   pg server log when an error occurs in this session (e.g., role not found).",
+  "  # -v ON_ERROR_STOP=1: SQL errors cause psql to exit non-zero so the caller",
+  "  #   knows ALTER ROLE failed and does not silently proceed with an unset password.",
   "  # >/dev/null suppresses psql rowcount/notice output only (NOT the argv-leak",
   "  #   protection — that comes from -f - above; >/dev/null alone does not close",
   "  #   the /proc/<pid>/cmdline surface).",
-  "  printf \"SET log_statement TO 'none';\\nSET log_min_duration_statement TO -1;\\nALTER ROLE %s WITH LOGIN PASSWORD '%s';\\n\" \\",
+  "  printf \"SET log_statement TO 'none';\\nSET log_min_duration_statement TO -1;\\nSET log_min_error_statement TO 'panic';\\nALTER ROLE %s WITH LOGIN PASSWORD '%s';\\n\" \\",
   "    \"$SAMOHOST_CLONE_APP_DBROLE\" \"$SAMOHOST_CLONE_ROLE_PW\" \\",
   "    | PGPASSWORD=\"$SAMOHOST_DB_PASSWORD\" /usr/bin/psql -h 127.0.0.1 -p \"$SAMOHOST_DB_PORT\" \\",
-  "        -U samohost_env -d postgres -X -f - >/dev/null",
+  "        -U samohost_env -d postgres -X -v ON_ERROR_STOP=1 -f - >/dev/null",
   "}",
 ];
 
@@ -410,6 +439,10 @@ const REWIRE_DB_CREDENTIALED_FN_LINES: string[] = [
   "  # Build the credentialed URL: scheme + role:password@127.0.0.1:port + /dbname.",
   "  rewritten=\"${scheme}${SAMOHOST_CLONE_APP_DBROLE}:${SAMOHOST_CLONE_ROLE_PW}@127.0.0.1:${SAMOHOST_DB_PORT}${dbpath}\"",
   "  # Strip-then-append prevents duplicate entries (same pattern as rewire_db_hostport).",
+  // UMASK FIX: pre-create the temp file at 0600 with install before the bare `>`
+  // redirect fills it. A bare `>` creates the file at umask permissions (typically
+  // 0644 on stock Ubuntu), briefly exposing the credentialed URL as world-readable.
+  "  install -m 600 /dev/null \"${envfile}.credrew\"",
   "  grep -vE \"^${var}=\" \"$envfile\" > \"${envfile}.credrew\" || true",
   "  printf '%s=%s\\n' \"$var\" \"$rewritten\" >> \"${envfile}.credrew\"",
   "  mv \"${envfile}.credrew\" \"$envfile\"",
