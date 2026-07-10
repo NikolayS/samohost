@@ -652,7 +652,11 @@ describe("runAppRegisterFromToml — dbBackend/previewDbBackend threading (#88)"
 
   test("reg-db-3: manifest with previewDbBackend='template' yields AppRecord.previewDbBackend='template'", () => {
     // Also dropped: previewDbBackend is not threaded from AppManifest to AppRegisterInput.
-    const tomlPath = writeToml('previewDbBackend = "template"');
+    // Updated (PR secrets+databaseUrlEnv): previewDbBackend='template' is explicitly
+    // DB-backed → databaseUrlEnv is now required; add it to satisfy the new rule.
+    const tomlPath = writeToml(
+      'previewDbBackend = "template"\ndatabaseUrlEnv = "DATABASE_URL"',
+    );
     const c = capture();
     const code = runAppRegisterFromToml(
       { vm: "samo-we-field-record", tomlPath },
@@ -665,13 +669,17 @@ describe("runAppRegisterFromToml — dbBackend/previewDbBackend threading (#88)"
     expect(code).toBe(0);
     const rec = appStore.get("vm-1111", "samohost-fixture");
     expect(rec).toBeDefined();
-    // Fails today: rec.previewDbBackend is undefined (dropped)
     expect(rec?.previewDbBackend).toBe("template");
+    expect(rec?.databaseUrlEnv).toBe("DATABASE_URL");
   });
 
   test("reg-db-4: manifest with both dbBackend='none' and previewDbBackend='dblab' → both persisted", () => {
     // Explicit previewDbBackend must override the dbBackend='none' fallback.
-    const tomlPath = writeToml('dbBackend = "none"\npreviewDbBackend = "dblab"');
+    // Updated (PR secrets+databaseUrlEnv): previewDbBackend='dblab' is explicitly
+    // DB-backed → databaseUrlEnv is now required; add it to satisfy the new rule.
+    const tomlPath = writeToml(
+      'dbBackend = "none"\npreviewDbBackend = "dblab"\ndatabaseUrlEnv = "DATABASE_URL"',
+    );
     const c = capture();
     const code = runAppRegisterFromToml(
       { vm: "samo-we-field-record", tomlPath },
@@ -685,6 +693,7 @@ describe("runAppRegisterFromToml — dbBackend/previewDbBackend threading (#88)"
     const rec = appStore.get("vm-1111", "samohost-fixture");
     expect(rec?.dbBackend).toBe("none");
     expect(rec?.previewDbBackend).toBe("dblab");
+    expect(rec?.databaseUrlEnv).toBe("DATABASE_URL");
     // previewDbBackend explicit value wins
     expect(previewDbBackendFor(rec!)).toBe("dblab");
   });
