@@ -52,6 +52,7 @@ import {
 import {
   runTriggerRun,
   defaultTriggerDeps,
+  checkTriggerPrereqs,
   type TriggerRunInput,
 } from "./commands/trigger.ts";
 import {
@@ -2396,6 +2397,12 @@ export async function main(
         err,
       );
     case "trigger-run":
+      // Fail loud at startup when a required operator prerequisite is absent.
+      // Without CLOUDFLARE_SAMOCAT every preview cycle silently skips DNS —
+      // previews are never reachable but the trigger exits 0 with no signal.
+      if (!checkTriggerPrereqs({ env: process.env, err })) {
+        return 1;
+      }
       return runTriggerRun(
         cmd.input,
         { json: cmd.json },

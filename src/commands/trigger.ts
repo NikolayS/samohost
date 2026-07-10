@@ -45,10 +45,11 @@ import {
   defaultEnvStore,
 } from "./env.ts";
 import type { EnvStore } from "../state/envs.ts";
-import type { PrPreviewSummary } from "../preview/pr.ts";
-import type { HealSummary } from "../preview/heal.ts";
+import type { PrPreviewSummary, PrPreviewResult } from "../preview/pr.ts";
+import type { HealSummary, HealResult } from "../preview/heal.ts";
 import type { EnvIdleGcDeps } from "./env-idle.ts";
-import type { AppRecord, EnvDbBackend, VmRecord } from "../types.ts";
+import type { AppRecord, EnvDbBackend, EnvRecord, VmRecord } from "../types.ts";
+import type { SpawnResult } from "../ssh/runner.ts";
 
 // ---------------------------------------------------------------------------
 // Public helpers
@@ -254,6 +255,34 @@ export interface TriggerDeps {
    * fixtures compile; absent => heal pass skipped.
    */
   heal?: (app: AppRecord, vm: VmRecord) => Promise<HealSummary>;
+  /**
+   * OPTIONAL: Combined per-VM batch cycle that replaces the separate
+   * `deps.heal` + `deps.prPreview` calls when present.
+   *
+   * The production implementation (`defaultTriggerDeps`) uses this to run ALL
+   * per-VM SSH work — clone-health probe + dead-clone re-creates + PR env
+   * creates/redeployments — in AT MOST 2 SSH sessions per VM per cycle:
+   *   Session 1: batched clone-health probe (buildBatchedProbeScript).
+   *   Session 2: runBatchedVmCycle — all heal re-creates + PR creates in ONE
+   *              combined `bash -s` heredoc (one SSH connection regardless of N).
+   *
+   * This is the PRIMARY fix for the connection-budget exhaustion bug:
+   * the old per-item SSH pattern (1 probe + N recreates + M PR creates = 1+N+M
+   * connections) exhausted the fail2ban-safe 2/600 s budget for VMs with ≥ 2
+   * preview envs needing attention.
+   *
+   * When present, `runTriggerRun` uses this instead of calling `heal` and
+   * `prPreview` separately. The caller decides which sub-passes to activate via
+   * `cycleOpts.{ heal, prPreviews }`.
+   *
+   * OPTIONAL so all existing test fixtures that build TriggerDeps without
+   * batchedVmCycle continue to compile and run unchanged.
+   */
+  batchedVmCycle?: (
+    app: AppRecord,
+    vm: VmRecord,
+    cycleOpts: { heal: boolean; prPreviews: boolean },
+  ) => Promise<{ heal: HealSummary; prPreview: PrPreviewSummary }>;
   /**
    * OPTIONAL: Curried idle-GC function (samohost #87). When present and
    * `input.idleGc` is true, called once per unique live VM in scope after the
@@ -611,80 +640,128 @@ export async function runTriggerRun(
     }
   }
 
-  // ---- Self-heal pass (samohost #78) -------------------------------------
-  // Runs BEFORE the PR-preview pass and AFTER the GC pass so:
-  //   - a GC'd env is not re-healed (consistent view)
-  //   - a clone re-cut by heal is visible to the PR-preview pass (which sees a
-  //     healthy env instead of a broken one that would need re-creating anyway)
+  // ---- Self-heal + PR-preview pass ----------------------------------------
   //
-  // Gating: `input.heal === true` OR `input.prPreviews === true` (backward
-  // compat — before the `heal` flag existed, heal ran whenever prPreviews ran).
-  // Cron/manual invocations that don't manage PR-previews can now set
-  // `--heal` without `--pr-previews` to heal dead clones independently.
+  // BATCHED PATH (preferred, when deps.batchedVmCycle is wired):
+  //   Calls batchedVmCycle once per live candidate app. The closure runs ALL
+  //   per-VM SSH work — clone-health probe + dead-clone re-creates + PR env
+  //   creates/redeployments — in AT MOST 2 SSH sessions per VM (probe + one
+  //   runBatchedVmCycle call), instead of the old 2+N per-item pattern that
+  //   exhausted the fail2ban-safe budget.
   //
-  // ONE batched probe per app + budget-aware re-creates of the dead ones;
-  // healthy previews untouched. Per-app isolation: one app's heal failure
-  // must not abort the cycle.
+  // FALLBACK PATH (when batchedVmCycle is absent, e.g. test fixtures that do
+  //   not supply it):
+  //   Runs the separate deps.heal and deps.prPreview closures as before. This
+  //   path is kept to avoid breaking any existing test fixtures or callers that
+  //   build TriggerDeps without batchedVmCycle. All shipped production wiring
+  //   MUST supply batchedVmCycle.
+  //
+  // Gating: `input.heal === true` OR `input.prPreviews === true`.
+  // Per-app isolation: one app's failure must not abort the cycle.
   let healSummaries: HealSummary[] | undefined;
-  if ((input.heal === true || input.prPreviews === true) && deps.heal !== undefined) {
-    const liveHealApps: Array<{ app: AppRecord; vm: VmRecord }> = [];
+  let prPreviewSummaries: PrPreviewSummary[] | undefined;
+
+  const wantHealOrPreview = input.heal === true || input.prPreviews === true;
+
+  if (wantHealOrPreview && deps.batchedVmCycle !== undefined) {
+    // ---- BATCHED path (primary production path) ---------------------------
+    const liveAppsForBatch: Array<{ app: AppRecord; vm: VmRecord }> = [];
     for (const app of candidates) {
       const vmRecord = allVms.find((v) => v.id === app.vmId);
       if (vmRecord === undefined) continue;
       if (!LIVE_STATES.has(vmRecord.lifecycleState)) continue;
-      liveHealApps.push({ app, vm: vmRecord });
+      liveAppsForBatch.push({ app, vm: vmRecord });
     }
-    if (liveHealApps.length > 0) {
-      healSummaries = [];
-      for (const { app, vm: vmRecord } of liveHealApps) {
+
+    if (liveAppsForBatch.length > 0) {
+      if (input.heal === true || input.prPreviews === true) healSummaries = [];
+      if (input.prPreviews === true) prPreviewSummaries = [];
+
+      for (const { app, vm: vmRecord } of liveAppsForBatch) {
         try {
-          const summary = await deps.heal(app, vmRecord);
-          healSummaries.push(summary);
-          if (!opts.json && (summary.healed > 0 || summary.failed > 0 || summary.deferred > 0)) {
-            out(`  heal ${vmRecord.name}/${app.name}: examined=${summary.examined} healed=${summary.healed} failed=${summary.failed} deferred=${summary.deferred}`);
+          const result = await deps.batchedVmCycle(app, vmRecord, {
+            heal: input.heal === true || input.prPreviews === true,
+            prPreviews: input.prPreviews === true,
+          });
+
+          if (healSummaries !== undefined) {
+            healSummaries.push(result.heal);
+            const hs = result.heal;
+            if (!opts.json && (hs.healed > 0 || hs.failed > 0 || hs.deferred > 0)) {
+              out(
+                `  heal ${vmRecord.name}/${app.name}: examined=${hs.examined}` +
+                  ` healed=${hs.healed} failed=${hs.failed} deferred=${hs.deferred}`,
+              );
+            }
+          }
+          if (prPreviewSummaries !== undefined) {
+            prPreviewSummaries.push(result.prPreview);
           }
         } catch (e) {
-          err(`samohost: warning: heal pass failed for app ${app.name}: ` + (e instanceof Error ? e.message : String(e)));
+          err(
+            `samohost: warning: batched preview cycle failed for app ${app.name}: ` +
+              (e instanceof Error ? e.message : String(e)),
+          );
         }
       }
     }
-  }
-
-  // ---- PR-preview pass (opt-in: only when input.prPreviews is true and dep is wired) ----
-  // Runs AFTER the GC pass so gc's reap results are visible to the pr-preview
-  // reaper (guards against double-reap: if gc removed a branch-gone env, the
-  // existence guard in runPrPreviewPass will see it as already gone).
-  // Per-app isolation: one app's prPreview failure must not abort the cycle.
-  let prPreviewSummaries: PrPreviewSummary[] | undefined;
-
-  if (input.prPreviews === true && deps.prPreview !== undefined) {
-    const liveCandidateApps: Array<{ app: (typeof candidates)[number]; vm: VmRecord }> = [];
-
-    // POLICY (src/preview/pr.ts lines 9-12): PR previews deploy at HEAD
-    // regardless of CI status — DELIBERATE. checkCiGreen is NOT consulted here.
-    // The prod-deploy CI gate (above) skips apps with ci-none; the PR-preview
-    // pass must run for those apps regardless, so we filter by VM liveness only
-    // and do NOT propagate the prod-deploy CI result here.
-    for (const app of candidates) {
-      const vmRecord = allVms.find((v) => v.id === app.vmId);
-      if (vmRecord === undefined) continue;
-      if (!LIVE_STATES.has(vmRecord.lifecycleState)) continue;
-      liveCandidateApps.push({ app, vm: vmRecord });
+  } else {
+    // ---- FALLBACK path (backward-compat: separate heal + prPreview) -------
+    if ((input.heal === true || input.prPreviews === true) && deps.heal !== undefined) {
+      const liveHealApps: Array<{ app: AppRecord; vm: VmRecord }> = [];
+      for (const app of candidates) {
+        const vmRecord = allVms.find((v) => v.id === app.vmId);
+        if (vmRecord === undefined) continue;
+        if (!LIVE_STATES.has(vmRecord.lifecycleState)) continue;
+        liveHealApps.push({ app, vm: vmRecord });
+      }
+      if (liveHealApps.length > 0) {
+        healSummaries = [];
+        for (const { app, vm: vmRecord } of liveHealApps) {
+          try {
+            const summary = await deps.heal(app, vmRecord);
+            healSummaries.push(summary);
+            if (!opts.json && (summary.healed > 0 || summary.failed > 0 || summary.deferred > 0)) {
+              out(`  heal ${vmRecord.name}/${app.name}: examined=${summary.examined} healed=${summary.healed} failed=${summary.failed} deferred=${summary.deferred}`);
+            }
+          } catch (e) {
+            err(`samohost: warning: heal pass failed for app ${app.name}: ` + (e instanceof Error ? e.message : String(e)));
+          }
+        }
+      }
     }
 
-    if (liveCandidateApps.length > 0) {
-      prPreviewSummaries = [];
+    // PR-preview pass (opt-in: only when input.prPreviews is true and dep is wired).
+    // Runs AFTER the GC pass so gc's reap results are visible to the pr-preview
+    // reaper (guards against double-reap: if gc removed a branch-gone env, the
+    // existence guard in runPrPreviewPass will see it as already gone).
+    // Per-app isolation: one app's prPreview failure must not abort the cycle.
+    if (input.prPreviews === true && deps.prPreview !== undefined) {
+      const liveCandidateApps: Array<{ app: (typeof candidates)[number]; vm: VmRecord }> = [];
 
-      for (const { app, vm: vmRecord } of liveCandidateApps) {
-        try {
-          const summary = await deps.prPreview(app, vmRecord);
-          prPreviewSummaries.push(summary);
-        } catch (e) {
-          // PR-preview failure for one app must not abort the cycle
-          err(
-            `samohost: warning: pr-preview pass failed for app ${app.name}: ` +
-              (e instanceof Error ? e.message : String(e)),
-          );
+      // POLICY (src/preview/pr.ts lines 9-12): PR previews deploy at HEAD
+      // regardless of CI status — DELIBERATE. checkCiGreen is NOT consulted here.
+      for (const app of candidates) {
+        const vmRecord = allVms.find((v) => v.id === app.vmId);
+        if (vmRecord === undefined) continue;
+        if (!LIVE_STATES.has(vmRecord.lifecycleState)) continue;
+        liveCandidateApps.push({ app, vm: vmRecord });
+      }
+
+      if (liveCandidateApps.length > 0) {
+        prPreviewSummaries = [];
+
+        for (const { app, vm: vmRecord } of liveCandidateApps) {
+          try {
+            const summary = await deps.prPreview(app, vmRecord);
+            prPreviewSummaries.push(summary);
+          } catch (e) {
+            // PR-preview failure for one app must not abort the cycle
+            err(
+              `samohost: warning: pr-preview pass failed for app ${app.name}: ` +
+                (e instanceof Error ? e.message : String(e)),
+            );
+          }
         }
       }
     }
@@ -798,6 +875,24 @@ export interface TriggerDepsOpts {
    * Test-only: allows verifying that all closures share one in-memory instance.
    */
   envStore?: EnvStore;
+  /**
+   * Injectable SSH remote function (for integration tests — counts calls per
+   * VM to prove the budget invariant). When provided, the batchedVmCycle
+   * closure uses it for BOTH the clone-health probe AND the batch work call
+   * instead of the prod `runRemote` runner. This is the ONLY way to verify
+   * the budget invariant without a real VM.
+   *
+   * Production: absent (undefined) → batchedVmCycle uses defaultEnvExecDeps().remote.
+   */
+  remote?: (vm: VmRecord, script: string) => Promise<SpawnResult>;
+  /**
+   * Injectable PR-listing function (for integration tests — avoids requiring
+   * a live `gh` binary). When provided, batchedVmCycle uses it instead of
+   * spawning `gh pr list`.
+   *
+   * Production: absent (undefined) → batchedVmCycle spawns `gh pr list`.
+   */
+  listOpenPrs?: (repo: string) => Promise<Array<{ number: number; headRef: string; headSha: string }>>;
 }
 
 /**
@@ -1258,6 +1353,435 @@ export function defaultTriggerDeps(opts: TriggerDepsOpts = {}): TriggerDeps {
         reaped: report.reaped.length,
         pruned: 0,
       };
+    },
+
+    // -----------------------------------------------------------------------
+    // batchedVmCycle — PRIMARY PRODUCTION PATH for heal + PR previews.
+    //
+    // Runs ALL per-VM SSH work in AT MOST 2 SSH sessions per cycle:
+    //   Session 1 (probe): buildBatchedProbeScript → parseBatchedProbe →
+    //                      identifies dead clones without re-creating anything.
+    //   Session 2 (work):  runBatchedVmCycle → one combined `bash -s` call
+    //                      covering every dead-clone re-create AND every PR
+    //                      env create/redeploy that has a changed SHA.
+    //
+    // Uses opts.remote when provided (integration tests inject a counting
+    // remote to verify the budget invariant). Falls back to the production
+    // SSH runner (defaultEnvExecDeps().remote) when absent.
+    // -----------------------------------------------------------------------
+    batchedVmCycle: async (
+      app: AppRecord,
+      vmRecord: VmRecord,
+      cycleOpts: { heal: boolean; prPreviews: boolean },
+    ): Promise<{ heal: HealSummary; prPreview: PrPreviewSummary }> => {
+      // The injectable remote for counting in tests; prod uses the real runner.
+      const { defaultEnvExecDeps: mkEnvExecDeps2 } = await import("./env.ts");
+      const remote = opts.remote ?? mkEnvExecDeps2().remote;
+
+      // ------------------------------------------------------------------
+      // Phase 1: Probe clone health (1 SSH call per VM, heal-only work).
+      // ------------------------------------------------------------------
+      type LocalCloneHealth = "alive" | "dead" | "unknown";
+      const cloneHealthMap = new Map<string, LocalCloneHealth>();
+      const dblabEnvs: EnvRecord[] = cycleOpts.heal
+        ? envStore.listFor(vmRecord.id, app.name).filter((e) => e.dbBackend === "dblab")
+        : [];
+
+      if (dblabEnvs.length > 0) {
+        const { buildBatchedProbeScript, parseBatchedProbe } = await import(
+          "../preview/heal-deps.ts"
+        );
+        const cloneIds = dblabEnvs.map((e) => e.dbName ?? e.name);
+        const probeScript = buildBatchedProbeScript(cloneIds);
+        try {
+          const probeResult = await remote(vmRecord, probeScript); // SSH CALL #1
+          const parsed = parseBatchedProbe(probeResult.code === 0, probeResult.stdout, cloneIds);
+          for (const [k, v] of parsed) cloneHealthMap.set(k, v);
+        } catch (e) {
+          // Probe failed → mark all as unknown (fail-closed; no healing this cycle).
+          process.stderr.write(
+            `samohost: batchedVmCycle: probe failed for ${app.name}@${vmRecord.name} — ` +
+              `${e instanceof Error ? e.message : String(e)}; no heal this cycle\n`,
+          );
+          for (const env of dblabEnvs) {
+            cloneHealthMap.set(env.dbName ?? env.name, "unknown");
+          }
+        }
+      }
+
+      // Dead clones: need re-creating.
+      const deadEnvs = dblabEnvs.filter(
+        (env) => cloneHealthMap.get(env.dbName ?? env.name) === "dead",
+      );
+
+      // ------------------------------------------------------------------
+      // Phase 2: List open PRs (gh CLI — no SSH).
+      // ------------------------------------------------------------------
+      type OpenPrItem = { number: number; headRef: string; headSha: string };
+      let openPrs: OpenPrItem[] = [];
+
+      if (cycleOpts.prPreviews) {
+        try {
+          if (opts.listOpenPrs !== undefined) {
+            openPrs = await opts.listOpenPrs(app.repo);
+          } else {
+            const { spawnSync: spawnSyncPr } = await import("node:child_process");
+            const res = spawnSyncPr(
+              "gh",
+              [
+                "pr", "list", "--repo", app.repo, "--state", "open",
+                "--json", "number,headRefName,headRefOid,isCrossRepository",
+              ],
+              { encoding: "utf8" },
+            );
+            if (res.status === 0) {
+              const parsed = JSON.parse(res.stdout) as Array<{
+                number: number;
+                headRefName: string;
+                headRefOid: string;
+                isCrossRepository: boolean;
+              }>;
+              openPrs = parsed
+                .filter((p) => !p.isCrossRepository)
+                .map((p) => ({
+                  number: p.number,
+                  headRef: p.headRefName,
+                  headSha: p.headRefOid,
+                }));
+            }
+          }
+        } catch {
+          /* ignore — PR pass proceeds with empty list */
+        }
+      }
+
+      // PRs that need a deploy (new env or changed SHA).
+      const prsNeedingDeploy = openPrs.filter((pr) => {
+        const existing = envStore.get(vmRecord.id, app.name, pr.headRef);
+        return existing === undefined || existing.lastDeployedSha !== pr.headSha;
+      });
+
+      // ------------------------------------------------------------------
+      // Phase 3: Build batch work items (no SSH).
+      // ------------------------------------------------------------------
+      const {
+        buildEnvCreateScript,
+        targetFromRecord: localTargetFromRecord,
+      } = await import("../env/script.ts");
+      const {
+        deriveTarget: localDeriveTarget,
+        DEFAULT_PREVIEW_DOMAIN: localPreviewDomain,
+        DEFAULT_POOL: localPool,
+      } = await import("./env.ts");
+
+      // Heal items: one item per dead clone, using the existing stored target.
+      const deadCloneItems: Array<{ envName: string; cloneId: string; script: string }> = [];
+      for (const env of deadEnvs) {
+        const target = localTargetFromRecord(env);
+        const script = buildEnvCreateScript(app, target);
+        deadCloneItems.push({ envName: env.name, cloneId: env.dbName ?? env.name, script });
+      }
+
+      // PR items: one item per PR needing deploy, allocating a new target
+      // for first-time creates (store-only allocation — no SSH port probe).
+      const prWorkItems: Array<{
+        branch: string; headSha: string; prNumber: number; script: string;
+      }> = [];
+      // Track newly pre-upserted env records for port-conflict avoidance
+      // across multiple new PR envs in the same batch cycle.
+      const preUpsertedBranches = new Set<string>();
+
+      for (const pr of prsNeedingDeploy) {
+        const existing = envStore.get(vmRecord.id, app.name, pr.headRef);
+        let targetForPr: import("../env/script.ts").EnvScriptTarget;
+
+        if (existing !== undefined) {
+          targetForPr = localTargetFromRecord(existing);
+        } else {
+          // New env: derive target from store-allocated port.
+          const allEnvsNow = envStore.listFor(vmRecord.id);
+          const t = localDeriveTarget(
+            app,
+            pr.headRef,
+            previewDbBackendFor(app),
+            localPreviewDomain,
+            allEnvsNow,
+            localPool,
+          );
+          if ("error" in t) {
+            // Port pool exhausted or bad domain — skip this PR (logged below).
+            process.stderr.write(
+              `samohost: batchedVmCycle: cannot derive target for PR #${pr.number}` +
+                ` (${pr.headRef}): ${t.error}\n`,
+            );
+            continue;
+          }
+          targetForPr = t;
+
+          // Pre-upsert a placeholder env record to reserve the allocated port
+          // for subsequent PRs in the same batch loop (avoids collisions).
+          if (!preUpsertedBranches.has(pr.headRef)) {
+            preUpsertedBranches.add(pr.headRef);
+            envStore.upsert({
+              id: crypto.randomUUID(),
+              vmId: vmRecord.id,
+              appName: app.name,
+              branch: pr.headRef,
+              name: targetForPr.name,
+              port: targetForPr.port,
+              vhost: targetForPr.vhost,
+              dbBackend: targetForPr.dbBackend,
+              ...(targetForPr.dbName !== undefined ? { dbName: targetForPr.dbName } : {}),
+              createdAt: new Date().toISOString(),
+            });
+          }
+        }
+
+        const script = buildEnvCreateScript(app, targetForPr);
+        prWorkItems.push({
+          branch: pr.headRef,
+          headSha: pr.headSha,
+          prNumber: pr.number,
+          script,
+        });
+      }
+
+      // ------------------------------------------------------------------
+      // Phase 4: Run batch (1 SSH call for ALL heal + PR work).
+      // ------------------------------------------------------------------
+      const { runBatchedVmCycle: runBatch } = await import("../ssh/batch.ts");
+
+      let batchResult: import("../ssh/batch.ts").BatchedVmCycleOutput = {
+        ok: true,
+        prResults: [],
+        healResults: [],
+      };
+
+      const hasWork = deadCloneItems.length > 0 || prWorkItems.length > 0;
+      if (hasWork) {
+        batchResult = await runBatch({
+          vm: vmRecord,
+          app,
+          prs: prWorkItems,
+          deadClones: deadCloneItems,
+          envStore,
+          remote, // SSH CALL #2 (conditional — only when there is work)
+        });
+      }
+
+      // ------------------------------------------------------------------
+      // Phase 5: Build HealSummary from probe + batch results.
+      // ------------------------------------------------------------------
+      const healResults: HealResult[] = [];
+      for (const env of dblabEnvs) {
+        const cloneId = env.dbName ?? env.name;
+        const health = (cloneHealthMap.get(cloneId) ?? "unknown") as
+          "alive" | "dead" | "unknown";
+
+        if (health === "alive") {
+          healResults.push({
+            env: env.name, app: app.name, branch: env.branch,
+            cloneId, health, action: "healthy",
+          });
+        } else if (health === "unknown") {
+          healResults.push({
+            env: env.name, app: app.name, branch: env.branch,
+            cloneId, health, action: "skipped",
+            error: "clone liveness unknown — fail-closed",
+          });
+        } else {
+          // dead
+          if (!batchResult.ok) {
+            healResults.push({
+              env: env.name, app: app.name, branch: env.branch,
+              cloneId, health, action: "heal-failed",
+              error: batchResult.error ?? "batch SSH call failed",
+            });
+          } else {
+            const hr = batchResult.healResults.find((r) => r.envName === env.name);
+            if (hr?.found === true) {
+              healResults.push({
+                env: env.name, app: app.name, branch: env.branch,
+                cloneId, health, action: "healed",
+              });
+            } else {
+              healResults.push({
+                env: env.name, app: app.name, branch: env.branch,
+                cloneId, health, action: "heal-failed",
+                error: hr !== undefined ? hr.stderr : "item not found in batch output",
+              });
+            }
+          }
+        }
+      }
+
+      const healSummaryOut: HealSummary = {
+        app: app.name,
+        vm: vmRecord.name,
+        examined: dblabEnvs.length,
+        healed: healResults.filter((r) => r.action === "healed").length,
+        failed: healResults.filter((r) => r.action === "heal-failed").length,
+        deferred: healResults.filter((r) => r.action === "skipped" && r.health === "dead").length,
+        results: healResults,
+      };
+
+      // ------------------------------------------------------------------
+      // Phase 6: Build PrPreviewSummary + post comments.
+      // ------------------------------------------------------------------
+      const prPreviewResultsList: PrPreviewResult[] = [];
+      const openPrBranchSet = new Set(openPrs.map((p) => p.headRef));
+      const PR_COMMENT_MARKER = "<!-- samohost-preview -->";
+
+      // Process PRs that needed deploy.
+      for (const pr of prsNeedingDeploy) {
+        const existingRecord = envStore.get(vmRecord.id, app.name, pr.headRef);
+
+        if (!batchResult.ok) {
+          prPreviewResultsList.push({
+            prNumber: pr.number, branch: pr.headRef,
+            action: "failed", error: batchResult.error ?? "batch SSH call failed",
+          });
+          continue;
+        }
+
+        const pr2 = batchResult.prResults.find((r) => r.branch === pr.headRef);
+        const wasNewEnv = existingRecord === undefined ||
+          existingRecord.lastDeployedSha === undefined;
+
+        if (pr2?.found === true) {
+          // Stamp lastDeployedSha + prNumber on the env record.
+          const rec = envStore.get(vmRecord.id, app.name, pr.headRef);
+          if (rec !== undefined) {
+            envStore.upsert({ ...rec, lastDeployedSha: pr.headSha, prNumber: pr.number });
+          }
+
+          const vhost = rec?.vhost ?? existingRecord?.vhost ?? "";
+          const url = vhost ? `https://${vhost}` : undefined;
+          const action: PrPreviewResult["action"] = wasNewEnv ? "created" : "redeployed";
+
+          // Post or update the preview-link comment.
+          let commentError: string | undefined;
+          if (url !== undefined) {
+            const body =
+              `${PR_COMMENT_MARKER}\n\u{1F50E} **Preview:** ${url} — auto-updates on push.`;
+            try {
+              const { spawnSync: spawnSyncGh } = await import("node:child_process");
+              // Find existing comment.
+              const listRes = spawnSyncGh(
+                "gh",
+                ["api", `repos/${app.repo}/issues/${pr.number}/comments`, "--paginate"],
+                { encoding: "utf8" },
+              );
+              let existingCommentId: number | undefined;
+              if (listRes.status === 0) {
+                const comments = JSON.parse(listRes.stdout) as Array<{ id: number; body: string }>;
+                const found = comments.find((c) => c.body.includes(PR_COMMENT_MARKER));
+                if (found !== undefined) existingCommentId = found.id;
+              }
+              const writeRes = existingCommentId !== undefined
+                ? spawnSyncGh(
+                    "gh",
+                    ["api", "--method", "PATCH",
+                     `repos/${app.repo}/issues/comments/${existingCommentId}`,
+                     "-f", `body=${body}`],
+                    { encoding: "utf8" },
+                  )
+                : spawnSyncGh(
+                    "gh",
+                    ["api", "--method", "POST",
+                     `repos/${app.repo}/issues/${pr.number}/comments`,
+                     "-f", `body=${body}`],
+                    { encoding: "utf8" },
+                  );
+              if (writeRes.status !== 0) {
+                throw new Error(
+                  `gh api comment write failed (exit ${writeRes.status}): ` +
+                    `${(writeRes.stderr ?? "").trim()}`,
+                );
+              }
+            } catch (e) {
+              commentError = e instanceof Error ? e.message : String(e);
+              process.stderr.write(
+                `samohost: batchedVmCycle: PR #${pr.number} (${app.name}): env is up at ` +
+                  `${url} but POSTING comment FAILED — ${commentError}\n`,
+              );
+            }
+          }
+
+          prPreviewResultsList.push({
+            prNumber: pr.number, branch: pr.headRef, url, action,
+            ...(commentError !== undefined ? { commentError } : {}),
+          });
+        } else {
+          prPreviewResultsList.push({
+            prNumber: pr.number, branch: pr.headRef,
+            action: "failed",
+            error: pr2 !== undefined ? pr2.stderr : "item not found in batch output",
+          });
+        }
+      }
+
+      // Unchanged PRs (already up to date — no deploy needed).
+      for (const pr of openPrs) {
+        const alreadyProcessed = prsNeedingDeploy.some((p) => p.headRef === pr.headRef);
+        if (!alreadyProcessed) {
+          const existing = envStore.get(vmRecord.id, app.name, pr.headRef);
+          prPreviewResultsList.push({
+            prNumber: pr.number, branch: pr.headRef,
+            url: existing !== undefined ? `https://${existing.vhost}` : undefined,
+            action: "unchanged",
+          });
+        }
+      }
+
+      // Reap closed-PR envs (envs whose PR is no longer open AND were PR-managed).
+      const allEnvsForApp = envStore.listFor(vmRecord.id, app.name);
+      for (const env of allEnvsForApp) {
+        if (openPrBranchSet.has(env.branch)) continue; // still open — keep
+        if (env.prNumber === undefined) continue; // not PR-managed — never reap
+        if (envStore.get(vmRecord.id, app.name, env.branch) === undefined) continue; // already gone
+
+        try {
+          const { runEnvDestroy: localRunEnvDestroy, defaultEnvExecDeps: mkEnvExecDeps3 } =
+            await import("./env.ts");
+          const { StateStore: ReapVmStore } = await import("../state/store.ts");
+          const { AppStore: ReapAppStore } = await import("../state/apps.ts");
+          const reapVmStore = new ReapVmStore();
+          const reapAppStore = new ReapAppStore();
+          const reapEnvExecDeps = mkEnvExecDeps3();
+          const noopReap = (_s: string) => {};
+
+          await localRunEnvDestroy(
+            { vm: vmRecord.name, app: app.name, branch: env.branch },
+            { json: false },
+            reapVmStore,
+            reapAppStore,
+            envStore,
+            reapEnvExecDeps,
+            noopReap,
+            (s: string) => {
+              if (!s.includes("no env recorded")) {
+                process.stderr.write(`samohost: batchedVmCycle reap: ${s}\n`);
+              }
+            },
+          );
+          prPreviewResultsList.push({ prNumber: -1, branch: env.branch, action: "reaped" });
+        } catch (e) {
+          prPreviewResultsList.push({
+            prNumber: -1, branch: env.branch, action: "error",
+            error: e instanceof Error ? e.message : String(e),
+          });
+        }
+      }
+
+      const prPreviewSummaryOut: PrPreviewSummary = {
+        app: app.name,
+        vm: vmRecord.name,
+        openPrs: openPrs.length,
+        results: prPreviewResultsList,
+      };
+
+      return { heal: healSummaryOut, prPreview: prPreviewSummaryOut };
     },
 
     // Test-only sentinel: confirms that heal and prPreview closures use the
