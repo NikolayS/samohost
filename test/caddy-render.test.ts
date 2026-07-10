@@ -34,6 +34,19 @@ import { fileURLToPath } from "url";
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
 // ---------------------------------------------------------------------------
+// Monotonic counter — guarantees unique tmp filenames even when multiple
+// adaptJson / validateCaddyfile calls are fired concurrently via Promise.all.
+// Date.now() alone is insufficient: concurrent calls within the same ms share
+// the same timestamp and collide, causing one caddy process to read a file
+// that the other already cleaned up.
+// ---------------------------------------------------------------------------
+
+let _tmpSeq = 0;
+function tmpSeq(): string {
+  return String(++_tmpSeq).padStart(4, "0");
+}
+
+// ---------------------------------------------------------------------------
 // Caddy binary check — hard-fail in CI, skip locally
 // ---------------------------------------------------------------------------
 
@@ -128,7 +141,7 @@ const samographApp: AppSpec = {
 
 /** Run `caddy adapt` on a Caddyfile string and return the parsed JSON. */
 async function adaptJson(caddyfile: string): Promise<unknown> {
-  const tmpFile = `/tmp/samohost-caddy-adapt-${process.pid}-${Date.now()}.caddy`;
+  const tmpFile = `/tmp/samohost-caddy-adapt-${process.pid}-${tmpSeq()}.caddy`;
   await Bun.write(tmpFile, caddyfile);
 
   const proc = Bun.spawn(
@@ -162,7 +175,7 @@ async function adaptJson(caddyfile: string): Promise<unknown> {
 
 /** Run `caddy validate` on a Caddyfile string; throws on non-zero exit. */
 async function validateCaddyfile(caddyfile: string): Promise<void> {
-  const tmpFile = `/tmp/samohost-caddy-validate-${process.pid}-${Date.now()}.caddy`;
+  const tmpFile = `/tmp/samohost-caddy-validate-${process.pid}-${tmpSeq()}.caddy`;
   await Bun.write(tmpFile, caddyfile);
 
   const proc = Bun.spawn(
@@ -548,6 +561,12 @@ describe("caddy-adapt integration", () => {
   );
 
   // caddy-a4 + caddy-a5: caddy validate passes for both listen modes.
+  //
+  // NOTE on logFile: caddy validate actually tries to open the log file writer
+  // (including mkdir of the parent directory). In CI the runner has no
+  // permission to create /var/log/caddy/. We use a /tmp/ path for these two
+  // tests only — the goal is to prove the STRUCTURE is valid (site address,
+  // matchers, handles), not the production log path.
   test.skipIf(!hasCaddy)(
     "caddy-a4: cp-http80 vhost passes caddy validate",
     async () => {
@@ -563,7 +582,9 @@ describe("caddy-adapt integration", () => {
           { matcher: { path: "/webhook*" }, target: { port: 8189 } },
         ],
         defaultPort: 3000,
-        logFile: "/var/log/caddy/samograph-prod.log",
+        // /tmp/ is writable in CI; /var/log/caddy/ requires root (caddy
+        // validate tries to open the log writer, not just parse the config).
+        logFile: `/tmp/caddy-validate-test-${process.pid}.log`,
       };
       await validateCaddyfile(renderVhost(plan));
       // If we reach here, validate returned exit 0
@@ -585,7 +606,7 @@ describe("caddy-adapt integration", () => {
           },
         ],
         defaultPort: 3000,
-        logFile: "/var/log/caddy/myapp.log",
+        logFile: `/tmp/caddy-validate-test-${process.pid}.log`,
       };
       await validateCaddyfile(renderVhost(plan));
       expect(true).toBe(true);
