@@ -100,12 +100,6 @@ function makeEnvRecord(o: Partial<EnvRecord> = {}): EnvRecord {
 
 function noop(_s: string) {}
 
-// Fake probe output: HEAL_PROBE_NO_CLI means dblab not installed → all clones
-// reported "unknown" → no re-creates attempted → only the probe call happens.
-// This is the minimal correct output that lets parseBatchedProbe run without
-// real SSH: one call for the probe, zero for work (budget = 1 in practice).
-const FAKE_PROBE_NO_CLI = "SAMOHOST_HEAL_NO_CLI";
-
 // Fake probe output indicating clone IS dead: triggers a re-create in the
 // batch work item, so the counting remote is called TWICE (probe + batch).
 const FAKE_PROBE_DEAD = (cloneId: string) =>

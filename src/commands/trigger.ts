@@ -1471,8 +1471,8 @@ export function defaultTriggerDeps(opts: TriggerDepsOpts = {}): TriggerDeps {
       const {
         deriveTarget: localDeriveTarget,
         DEFAULT_PREVIEW_DOMAIN: localPreviewDomain,
-        DEFAULT_POOL: localPool,
       } = await import("./env.ts");
+      const { DEFAULT_POOL: localPool } = await import("../env/ports.ts");
 
       // Heal items: one item per dead clone, using the existing stored target.
       const deadCloneItems: Array<{ envName: string; cloneId: string; script: string }> = [];
