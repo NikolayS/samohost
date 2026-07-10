@@ -1694,7 +1694,11 @@ export function buildEnvCreateScript(
       ? `if ${sudoWrapBuildCmd(app.migrateCmd, app.appUser)}; `
       // no-appUser case: source composed .env in a subshell before migrateCmd
       // so DATABASE_URL (rewritten to the clone) is available to the command.
-      : `if (set -a && . "$SAMOHOST_ENV_DIR/.env" && set +a && ${app.migrateCmd}); `;
+      // cd to SAMOHOST_ENV_DIR first: buildCmd may have done `cd apps/web` (or
+      // similar) which changes the outer shell's CWD; the subshell inherits it.
+      // migrateCmd paths (e.g. `bun packages/shared/db/migrate.ts`) are relative
+      // to the repo root, not a sub-directory, so we must reset before running.
+      : `if (cd "$SAMOHOST_ENV_DIR" && set -a && . "$SAMOHOST_ENV_DIR/.env" && set +a && ${app.migrateCmd}); `;
     lines.push(
       ...phaseBlock(
         "migrate",
