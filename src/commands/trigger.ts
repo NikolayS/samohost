@@ -886,6 +886,15 @@ export interface TriggerDepsOpts {
    */
   remote?: (vm: VmRecord, script: string) => Promise<SpawnResult>;
   /**
+   * Injectable resolveRef function (for integration tests — avoids real
+   * GitHub API calls that hit the network and may time out). When provided,
+   * defaultTriggerDeps returns this instead of the production `gh api`
+   * resolver, so tests can supply an instant-returning mock.
+   *
+   * Production: absent (undefined) → uses defaultAppDeployDeps().resolveRef.
+   */
+  resolveRef?: RefResolver;
+  /**
    * Injectable PR-listing function (for integration tests — avoids requiring
    * a live `gh` binary). When provided, batchedVmCycle uses it instead of
    * spawning `gh pr list`.
@@ -952,7 +961,8 @@ export function defaultTriggerDeps(opts: TriggerDepsOpts = {}): TriggerDeps {
 
   return {
     // Reuse the same resolver the deploy path uses (no new resolver code).
-    resolveRef: appDeployDeps.resolveRef,
+    // Tests may inject a fast mock via opts.resolveRef to avoid real GitHub API calls.
+    resolveRef: opts.resolveRef ?? appDeployDeps.resolveRef,
 
     // Curried: AppDeployDeps already captured in closure.
     deploy: (input, opts, vmStore, appStore, out, err) =>

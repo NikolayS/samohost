@@ -71,9 +71,22 @@ function makeApp(o: Partial<AppRecord> = {}): AppRecord {
     buildCmd: "npm run build",
     serviceUnit: "regtest-app",
     healthUrl: "http://localhost:3100/api/version",
+    // Pre-stamp deployedSha so the deploy loop takes the "up-to-date" path
+    // immediately when paired with a mock resolveRef that returns the same SHA.
+    // This avoids real GitHub API calls (resolveRef + checkCiGreen) in CI.
+    deployedSha: "fixed-sha-b134",
     ...o,
   };
 }
+
+/**
+ * A fast no-op resolveRef that returns the pre-stamped deployedSha so the
+ * deploy loop in runTriggerRun skips immediately (action: "up-to-date")
+ * without hitting the GitHub API.  Must be injected via opts.resolveRef in
+ * every defaultTriggerDeps() call in this test file.
+ */
+const fastResolveRef = async (_repo: string, _branch: string): Promise<string> =>
+  "fixed-sha-b134";
 
 function makePrEnvRecord(branch: string, prNumber: number, o: Partial<EnvRecord> = {}): EnvRecord {
   const safeName = `regtest-app-${branch.replace(/[^a-z0-9]/gi, "-")}`.slice(0, 63);
@@ -161,6 +174,7 @@ describe("B1: failed listOpenPrs must skip the app — no reap", () => {
       envStore,
       listOpenPrs: ghFailure,
       remote: countingRemote,
+      resolveRef: fastResolveRef,
     });
 
     let outJson = "";
@@ -227,6 +241,7 @@ describe("B1: failed listOpenPrs must skip the app — no reap", () => {
       envStore,
       listOpenPrs: silentFail,
       remote: async () => ({ code: 0, stdout: "", stderr: "" }),
+      resolveRef: fastResolveRef,
     });
 
     let outJson = "";
@@ -284,6 +299,7 @@ describe("B2: batched path calls ensurePreviewDns for new PR previews", () => {
       listOpenPrs,
       remote,
       ensurePreviewDns,
+      resolveRef: fastResolveRef,
       // Inject a passing httpProbe so the test doesn't try real curl on a fake URL.
       httpProbe: async (_url: string) => ({ status: 200, ok: true }),
       sleep: async (_ms: number) => {},
@@ -337,6 +353,7 @@ describe("B2: batched path calls ensurePreviewDns for new PR previews", () => {
       listOpenPrs,
       remote: async () => ({ code: 0, stdout: "", stderr: "" }),
       ensurePreviewDns,
+      resolveRef: fastResolveRef,
       httpProbe: async (_url: string) => ({ status: 200, ok: true }),
       sleep: async (_ms: number) => {},
     });
@@ -386,6 +403,7 @@ describe("B3: batched path runs HTTPS probe before stamping success", () => {
       listOpenPrs,
       remote,
       httpProbe,
+      resolveRef: fastResolveRef,
       // No-op sleep: avoid 8 × 5s retry waits in unit test.
       sleep: async (_ms: number) => {},
     });
@@ -433,6 +451,7 @@ describe("B3: batched path runs HTTPS probe before stamping success", () => {
       listOpenPrs,
       remote,
       httpProbe,
+      resolveRef: fastResolveRef,
       sleep: async (_ms: number) => {},
     });
 
@@ -474,6 +493,7 @@ describe("B3: batched path runs HTTPS probe before stamping success", () => {
       listOpenPrs,
       remote,
       httpProbe,
+      resolveRef: fastResolveRef,
       sleep: async (_ms: number) => {},
     });
 
@@ -610,6 +630,7 @@ describe("H5: batched path applies MAX_PR_PREVIEWS_PER_CYCLE cap", () => {
       envStore,
       listOpenPrs,
       remote,
+      resolveRef: fastResolveRef,
       // No-op sleep and trivially-passing probe to avoid network/timer delays.
       httpProbe: async (_url: string) => ({ status: 200, ok: true }),
       sleep: async (_ms: number) => {},
@@ -671,6 +692,7 @@ describe("H5: batched path applies MAX_PR_PREVIEWS_PER_CYCLE cap", () => {
       envStore,
       listOpenPrs,
       remote,
+      resolveRef: fastResolveRef,
       httpProbe: async (_url: string) => ({ status: 200, ok: true }),
       sleep: async (_ms: number) => {},
     });
