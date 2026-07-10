@@ -738,3 +738,74 @@ describe("NEEDED: bun migrateCmd produces absolute-path sudoers grant", () => {
     expect(sudoersLine).toBeUndefined();
   });
 });
+
+// ---------------------------------------------------------------------------
+// commit 95cbccb — cd SAMOHOST_ENV_DIR in migrateCmd subshell (regression gate)
+// ---------------------------------------------------------------------------
+// Mirror of the deploy-side test in app-script.test.ts ("issue #122: per-phase
+// cwd"). buildCmd for env-create runs at the top level of the script (which
+// starts with `cd "$SAMOHOST_ENV_DIR"`), but if buildCmd itself does `cd apps/web`
+// the outer shell ends up in apps/web. The no-appUser migrateCmd subshell
+// inherits that CWD. Without `cd "$SAMOHOST_ENV_DIR"` as the FIRST command
+// inside the subshell, relative paths like `bun packages/shared/db/migrate.ts`
+// would resolve against apps/web and die with "Module not found".
+//
+// The fix (commit 95cbccb, src/env/script.ts ~1701):
+//   `if (cd "$SAMOHOST_ENV_DIR" && set -a && . "$SAMOHOST_ENV_DIR/.env" && set +a && <migrateCmd>)`
+// ensures the subshell always starts from the env root regardless of what
+// buildCmd cd'd to.
+// ---------------------------------------------------------------------------
+describe("commit 95cbccb: no-appUser migrate subshell cds to SAMOHOST_ENV_DIR before migrateCmd", () => {
+  test("executed: migrateCmd sees SAMOHOST_ENV_DIR as PWD even when outer shell changed CWD", () => {
+    // Regression gate: without cd "$SAMOHOST_ENV_DIR" in the subshell, a
+    // buildCmd that does `cd apps/web` (etc.) leaves the shell in a subdir.
+    // The migrateCmd would then run from apps/web, not the repo root.
+    //
+    // The migrateCmd here asserts its own CWD equals SAMOHOST_ENV_DIR.
+    // With the fix the subshell cd's first → assertion passes → migrate:ok.
+    // Without the fix CWD is /tmp (set by the harness) → assertion fails → exit 1.
+    const dir = mkdtempSync(join(tmpdir(), "samohost-migrate-cd-"));
+    try {
+      writeFileSync(
+        join(dir, ".env"),
+        "DATABASE_URL=postgresql://x:y@localhost/test\n",
+      );
+
+      const s = buildEnvCreateScript(
+        app({ migrateCmd: 'test "$PWD" = "$SAMOHOST_ENV_DIR"' }),
+        target({ dbBackend: "dblab" }),
+      );
+
+      // Extract just the migrate phase block (start marker through closing fi).
+      const lines = s.split("\n");
+      const startIdx = lines.findIndex((l) =>
+        l.includes("<<<SAMOHOST_PHASE:migrate:start>>>"),
+      );
+      let endIdx = startIdx;
+      for (let i = startIdx; i < lines.length; i++) {
+        if (lines[i]!.trim() === "fi") {
+          endIdx = i;
+          break;
+        }
+      }
+      expect(startIdx).toBeGreaterThan(-1);
+      const migrateBlock = lines.slice(startIdx, endIdx + 1).join("\n");
+
+      const prog = [
+        "set -euo pipefail",
+        `SAMOHOST_ENV_DIR='${dir}'`,
+        // Simulate buildCmd having cd'd away from SAMOHOST_ENV_DIR:
+        "cd /tmp",
+        migrateBlock,
+      ].join("\n");
+
+      const res = spawnSync("bash", ["-c", prog], { encoding: "utf8" });
+      if (res.status !== 0) console.error("stderr:", res.stderr);
+      expect(res.status).toBe(0);
+      expect(res.stdout).toContain("<<<SAMOHOST_PHASE:migrate:ok>>>");
+      expect(res.stdout).not.toContain("<<<SAMOHOST_PHASE:migrate:fail>>>");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});

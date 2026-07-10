@@ -1299,6 +1299,15 @@ const PSQL_STUB = [
   "  fi",
   '  if [[ "$sql" == *"pg_auth_members"* ]]; then cat "$FIX/clone_auth_members"',
   '  elif [[ "$sql" == *"pg_policies"* ]]; then cat "$FIX/clone_policies"',
+  // 3-pre branch: returns the clone table list (for _clone_tab_in in step 3 + parity gates).
+  // "information_schema.tables" (with trailing 's') does NOT match "information_schema.table_privileges"
+  // because the suffix is 's' vs '_privileges', so the table_privileges branch below is unaffected.
+  // CLONE_TAB_LIST_FAIL=1  → return 1 (simulates a failed clone-side psql read — proves fail-closed).
+  // CLONE_TAB_LIST (default "")  → empty output → [[ -z ]] guard in src sets '__none__', preserving
+  //   existing-test behaviour; set to e.g. "'public.app_users'" to exercise the real-table path.
+  '  elif [[ "$sql" == *"information_schema.tables"* ]]; then',
+  '    if [[ "${CLONE_TAB_LIST_FAIL:-}" == "1" ]]; then return 1; fi',
+  '    printf \'%s\\n\' "${CLONE_TAB_LIST:-}"',
   '  elif [[ "$sql" == *"table_privileges"* ]]; then cat "$FIX/clone_grants"',
   '  elif [[ "$sql" == *"pg_tables"* ]]; then cat "$FIX/clone_ownership"',
   "  fi",
@@ -1338,6 +1347,20 @@ interface SyncGlobalsOpts {
    * For snapshot-lag tests, include tables absent from the clone (with IF EXISTS).
    */
   prodOwnerDdl?: string;
+  /**
+   * Output the 3-pre psql stub emits for the clone table list query
+   * (information_schema.tables). Default "" → the [[ -z ]] guard in src sets
+   * _clone_tab_in to '__none__', preserving existing-test parity behaviour.
+   * Set to e.g. "'public.app_users'" (SQL quote_literal format) to exercise the
+   * real-table IN-scoping path through step 3 and the step-6 parity gates.
+   */
+  cloneTabList?: string;
+  /**
+   * If true, the 3-pre psql stub returns non-zero (simulates a failed clone-side
+   * table-list read). After the fix the sync must exit non-zero; before the fix
+   * the || fallback silently substitutes '__none__' and the sync exits 0 (fail-open).
+   */
+  cloneTabListFail?: boolean;
 }
 
 interface SyncGlobalsRun {
@@ -1409,6 +1432,11 @@ function runSyncGlobals(opts: SyncGlobalsOpts = {}): SyncGlobalsRun {
       "set -uo pipefail",
       `FIX='${dir}'`,
       `CLONE_APPLY_FAIL_ON='${opts.cloneApplyFailOn ?? ""}'`,
+      // 3-pre clone table list controls (PSQL_STUB information_schema.tables branch).
+      // CLONE_TAB_LIST: default "" → [[ -z ]] guard sets _clone_tab_in='__none__'.
+      // CLONE_TAB_LIST_FAIL: "1" → psql returns 1 → fail-closed path.
+      `CLONE_TAB_LIST=${JSON.stringify(opts.cloneTabList ?? "")}`,
+      `CLONE_TAB_LIST_FAIL=${opts.cloneTabListFail ? '"1"' : '""'}`,
       `SAMOHOST_ENV_TEMPLATE='${join(dir, "template.env")}'`,
       "SAMOHOST_ENV_DB_VARS=('DATABASE_URL' 'APP_DATABASE_URL')",
       "SAMOHOST_DB_PASSWORD='harness-stub-pw'",
@@ -3584,5 +3612,51 @@ describe("buildControlPlaneCustomDomainVhostRemoveScript", () => {
     // import line is NOT removed — it's persistent infrastructure
     expect(s).not.toContain("sed");
     expect(s).not.toContain("grep -v");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// PR #145 — 3-pre clone table list: fail-closed on query failure + IN-scoping
+// ---------------------------------------------------------------------------
+// The PSQL_STUB now has a branch for the information_schema.tables query (3-pre)
+// via CLONE_TAB_LIST / CLONE_TAB_LIST_FAIL controls. These tests prove:
+//
+// (a) fail-closed: a failed 3-pre psql read exits the sync non-zero.
+//     Before the fix the || echo "'__none__'" fallback swallowed the failure and
+//     served a zero-grant preview as "success" (silent mask worse than the outage).
+//
+// (b) IN-scoping: when the 3-pre stub returns a real table list, the sync exits 0
+//     and the step-3 grant DDL is applied for those tables (not the '__none__'
+//     sentinel path that neutered both the apply and the parity gates).
+// ---------------------------------------------------------------------------
+describe("3-pre clone table list: fail-closed on query failure + IN-scoping (#145)", () => {
+  test("executed: 3-pre psql FAILURE fails the sync CLOSED (not silent '__none__' mask)", () => {
+    // This is the regression gate for the fail-open bug:
+    //   _clone_tab_in="$(psql ... 2>/dev/null || echo "'__none__'")"
+    // converted a clone-side QUERY FAILURE into "zero tables", silently
+    // neutering BOTH the step-3 grant apply (IN('__none__') returns no rows) AND
+    // the step-6 parity gates (0==0 on both sides). A preview whose app role
+    // cannot touch any table was served as "success".
+    // After the fix the || fallback is removed; non-zero psql exit propagates.
+    const r = runSyncGlobals({ cloneTabListFail: true });
+    expect(r.code).not.toBe(0);
+    // The diagnostic message must identify the failing step unambiguously.
+    expect(r.stderr).toContain("3-pre");
+  });
+
+  test("executed: 3-pre with real table list — sync exits 0 and grants applied for those tables", () => {
+    // Proves the IN-scoping non-sentinel path: _clone_tab_in is set to the
+    // actual clone table list (not '__none__'), step-3 emits grants scoped to
+    // those tables, and the step-6 parity gates compare against the same set.
+    // (The PSQL_STUB previously had no information_schema.tables branch, so ALL
+    // executed tests ran with the '__none__' sentinel regardless of intent.)
+    const r = runSyncGlobals({
+      cloneTabList: "'public.app_users'",
+      // Parity fixture counts already match at defaults (315/29/14 each) — no
+      // override needed; the stub ignores the IN clause and returns fixtures.
+    });
+    expect(r.code).toBe(0);
+    // Step-3 grant DDL was sent to the clone (SUDO_STUB returns prod_grant_ddl).
+    expect(r.applied).toContain("GRANT SELECT ON public.app_users TO app_user");
   });
 });
