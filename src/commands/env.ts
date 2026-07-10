@@ -37,6 +37,7 @@ import {
   buildEnvCreateScript,
   buildEnvDestroyScript,
   buildHostPrepScript,
+  buildSecretsRotateScript,
   targetFromRecord,
   type EnvScriptTarget,
 } from "../env/script.ts";
@@ -1450,4 +1451,72 @@ export async function runEnvGc(
 /** Construct the default env store (honors SAMOHOST_ENVS). */
 export function defaultEnvStore(): EnvStore {
   return new EnvStore();
+}
+
+// ---------------------------------------------------------------------------
+// env secrets rotate
+// ---------------------------------------------------------------------------
+
+/** Input for `samohost env secrets rotate <vm> <app> <branch>`. */
+export interface EnvSecretsRotateInput {
+  vm: string;
+  app: string;
+  branch: string;
+}
+
+/**
+ * Regenerate ALL per-env secrets with fresh random values (openssl rand -hex 32
+ * on the VM) and restart all service units so the new values are loaded.
+ *
+ * This is the ONLY intentional secret regeneration path. env-create preserves
+ * existing secrets across rebuilds to keep active sessions valid; rotate forces
+ * new values when the operator explicitly requests it (e.g., after a leak).
+ */
+export async function runEnvSecretsRotate(
+  input: EnvSecretsRotateInput,
+  _opts: { json: boolean },
+  vmStore: StateStore,
+  appStore: AppStore,
+  envStore: EnvStore,
+  deps: EnvExecDeps,
+  out: (s: string) => void,
+  err: (s: string) => void,
+): Promise<number> {
+  const resolved = resolve(vmStore, appStore, input.vm, input.app, err);
+  if (resolved === undefined) return 1;
+  const { vm, app } = resolved;
+
+  if ((app.secrets ?? []).length === 0) {
+    err(`app '${app.name}' declares no secrets — nothing to rotate`);
+    return 1;
+  }
+
+  const name = envName(app.name, input.branch);
+  const envRecord = envStore.listFor(vm.id, app.name).find((e) => e.name === name);
+  if (envRecord === undefined) {
+    err(`env '${name}' not found on VM '${vm.name}' — run 'env create' first`);
+    return 1;
+  }
+
+  const t = targetFromRecord(envRecord);
+  const script = buildSecretsRotateScript(app, t);
+
+  out(`rotating secrets for env '${name}'...`);
+  let result: SpawnResult;
+  try {
+    result = await deps.remote(vm, script);
+  } catch (e) {
+    err(
+      `error: remote secrets-rotate connection failed: ${e instanceof Error ? e.message : String(e)}`,
+    );
+    return 1;
+  }
+
+  if (result.code !== 0) {
+    err(`secrets rotation failed for env '${name}' (exit ${result.code})`);
+    if (result.stderr) err(result.stderr);
+    return 1;
+  }
+  out(`secrets rotated for env '${name}'`);
+  return 0;
 }

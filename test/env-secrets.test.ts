@@ -408,6 +408,8 @@ serviceUnit = "acme-app"
 releaseTagPattern = "v*"
 secrets     = ["SESSION_SECRET", "TOKEN_SECRET"]
 databaseUrlEnv = "DATABASE_URL"
+defaultListener = "web"
+mainListen = "tls"
 
 [[services]]
 name = "web"
@@ -422,9 +424,6 @@ healthPath = "/api/version"
 [[routes]]
 matchPath = "/api/*"
 to = "web"
-
-defaultListener = "web"
-mainListen = "tls"
 `.trim();
 
   function fakeDeps(): OnboardDeps {

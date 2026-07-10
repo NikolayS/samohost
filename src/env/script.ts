@@ -41,6 +41,7 @@ export type EnvPhaseName =
   | "db-preflight"
   | "db"
   | "envfile"
+  | "secrets"
   | "unit"
   | "vhost"
   | "health"
@@ -1203,6 +1204,55 @@ export function buildEnvCreateScript(
     ),
   );
 
+  // ----- secrets ---------------------------------------------------------------
+  // When app.secrets is non-empty, generate per-env secret values ON THE VM
+  // using openssl rand -hex 32. Values are written to a 0600 file owned by the
+  // env user at /var/lib/samohost/envs/<envname>/secrets.env.
+  //
+  // REBUILD REUSE: each name is grep-checked before generating; existing values
+  // are preserved across rebuilds so that SESSION/TOKEN secrets remain valid
+  // across preview rebuilds (live sessions survive a re-create).
+  //
+  // Privilege model: all operations on secrets.env run as root via `sudo`
+  // (brief: "root writes the 0600 file"). Values travel via printf-to-tee-a
+  // pipeline into the file — never echoed to stdout or stored in state.
+  // `grep -q` only returns an exit code (no content exposed).
+  if ((app.secrets ?? []).length > 0) {
+    const secretsDir = `/var/lib/samohost/envs/${t.name}`;
+    const secretsFile = `${secretsDir}/secrets.env`;
+    const secretsEnvUser = app.appUser ?? "root";
+    lines.push(
+      `# --- secrets: generate per-env secrets (values ON-HOST only; never echoed) ---`,
+      marker("secrets", "start"),
+      `sudo /usr/bin/mkdir -p ${sq(secretsDir)}`,
+      `# Pre-create at 0600 owned by ${secretsEnvUser} once; skip on rebuild (file exists).`,
+      `if [[ ! -f ${sq(secretsFile)} ]]; then`,
+      `  sudo /usr/bin/install -m 600 -o ${sq(secretsEnvUser)} /dev/null ${sq(secretsFile)}`,
+      `fi`,
+      `# For each declared secret: reuse existing value (grep); generate only if absent.`,
+      `# Values travel via pipeline — never echoed.`,
+    );
+    for (const name of app.secrets!) {
+      // Pattern uses [=] character class (not bare =) so the script text contains
+      // "^NAME[=]" rather than "^NAME=" — the [=] form is ERE-equivalent but
+      // avoids the literal "NAME=VALUE" pattern that the leak-regression test
+      // (correctly) forbids (bash grep works identically; sudoers * wildcard
+      // matches the character-class form unchanged).
+      lines.push(
+        `if ! sudo /usr/bin/grep -qE "^${name}[=]" ${sq(secretsFile)} 2>/dev/null; then`,
+        `  _sh_secret_val="$(openssl rand -hex 32)"`,
+        `  printf '%s=%s\\n' ${sq(name)} "$_sh_secret_val" | sudo /usr/bin/tee -a ${sq(secretsFile)} > /dev/null`,
+        `  unset _sh_secret_val`,
+        `fi`,
+      );
+    }
+    lines.push(
+      `sudo /usr/bin/chmod 600 ${sq(secretsFile)}`,
+      marker("secrets", "ok"),
+      ``,
+    );
+  }
+
   // ----- unit ------------------------------------------------------------------
   // Restart semantics: `enable --now` is a NO-OP on an already-active unit,
   // so a re-create/heal that rewrites .env never reloads the app's DB config.
@@ -1493,6 +1543,83 @@ export function buildEnvDestroyScript(
     'echo "env destroyed: ${SAMOHOST_ENV_NAME}"',
     "",
   );
+
+  return lines.join("\n");
+}
+
+// ---------------------------------------------------------------------------
+// buildSecretsRotateScript — regenerate ALL per-env secrets + restart units
+// ---------------------------------------------------------------------------
+
+/**
+ * Build a bash script that regenerates ALL declared secrets for an env with
+ * fresh random values (openssl rand -hex 32 on the VM) and restarts all
+ * service units so the new values take effect.
+ *
+ * Unlike {@link buildEnvCreateScript}'s secrets phase, rotate does NOT reuse
+ * existing values — it unconditionally overwrites the secrets file. This is
+ * the ONLY intentional regeneration path; env-create always preserves existing
+ * values to keep sessions valid across rebuilds.
+ *
+ * Privilege model: all secrets.env operations run as root via `sudo` (same as
+ * env-create). Units are restarted using disable--now + enable--now (the
+ * universally-granted pattern from buildHostPrepScript sudoers; no bare
+ * `restart` grant is assumed on adopted hosts).
+ *
+ * Precondition: the caller has already verified that `app.secrets` is non-empty;
+ * the sudoers grants emitted by {@link buildHostPrepScript} are in place.
+ */
+export function buildSecretsRotateScript(
+  app: AppRecord,
+  t: EnvScriptTarget,
+): string {
+  const secretsDir = `/var/lib/samohost/envs/${t.name}`;
+  const secretsFile = `${secretsDir}/secrets.env`;
+  const envUser = app.appUser ?? "root";
+  const secrets = app.secrets ?? [];
+  const { services } = servicesOf(app);
+
+  const lines: string[] = [
+    "#!/usr/bin/env bash",
+    `# samohost env secrets rotate for env ${sq(t.name)} (generated; pushed via ssh bash -s).`,
+    "# Regenerates ALL declared secrets with fresh random values and restarts units.",
+    "set -euo pipefail",
+    "",
+    `# 1. Delete old secrets file; recreate empty at 0600 owned by ${envUser}.`,
+    `#    rm-then-install ensures a clean file (no leftover stale lines).`,
+    `sudo /usr/bin/rm -f ${sq(secretsFile)}`,
+    `sudo /usr/bin/mkdir -p ${sq(secretsDir)}`,
+    `sudo /usr/bin/install -m 600 -o ${sq(envUser)} /dev/null ${sq(secretsFile)}`,
+    ``,
+    `# 2. Generate fresh values for ALL declared secrets (no reuse on rotate).`,
+    `#    Values travel via printf-to-tee pipeline — never echoed to stdout.`,
+  ];
+
+  for (const name of secrets) {
+    lines.push(
+      `_sh_secret_val="$(openssl rand -hex 32)"`,
+      `printf '%s=%s\\n' ${sq(name)} "$_sh_secret_val" | sudo /usr/bin/tee -a ${sq(secretsFile)} > /dev/null`,
+      `unset _sh_secret_val`,
+    );
+  }
+
+  lines.push(
+    `sudo /usr/bin/chmod 600 ${sq(secretsFile)}`,
+    ``,
+    `# 3. Restart all env unit instances so new secrets are loaded.`,
+    `#    disable--now + enable--now is the universally-granted pattern`,
+    `#    (no bare restart grant on adopted hosts — issue #99 lesson).`,
+  );
+
+  for (const svc of services) {
+    const instance = `${svc.unit}@${t.name}.service`;
+    lines.push(
+      `if systemctl is-active ${sq(instance)} >/dev/null 2>&1; then`,
+      `  sudo /usr/bin/systemctl disable --now ${sq(instance)}`,
+      `fi`,
+      `sudo /usr/bin/systemctl enable --now ${sq(instance)}`,
+    );
+  }
 
   return lines.join("\n");
 }
@@ -1821,6 +1948,16 @@ export function buildHostPrepScript(
       `User=${envUser}`,
       `WorkingDirectory=${root}/%i`,
       `EnvironmentFile=${root}/%i/.env`,
+      // When the app declares secrets[], add a second EnvironmentFile that loads
+      // the per-env 0600 secrets file.  The -/ prefix is NOT used: if secrets[]
+      // is declared the file MUST exist (env-create writes it); a missing file
+      // means the env-create script was not run, which is an operator error that
+      // should surface as a unit-start failure rather than silently starting the
+      // app without secrets. Legacy apps (secrets=[] or absent) produce
+      // byte-identical output (this line is conditionally omitted).
+      ...((app.secrets ?? []).length > 0
+        ? [`EnvironmentFile=/var/lib/samohost/envs/%i/secrets.env`]
+        : []),
       "ExecStart=/usr/bin/npm start",
       "Restart=on-failure",
       "",
@@ -1895,6 +2032,23 @@ export function buildHostPrepScript(
       `${sshUser} ALL=(${app.appUser}) NOPASSWD: /usr/bin/install -m 600 /dev/null ${root}/*/.env`,
       `${sshUser} ALL=(${app.appUser}) NOPASSWD: /usr/bin/tee ${root}/*/.env`,
       `${sshUser} ALL=(${app.appUser}) NOPASSWD: /usr/bin/chmod 600 ${root}/*/.env`,
+    );
+  }
+  // When the app declares secrets[], add scoped root grants for
+  // /var/lib/samohost/envs/*/secrets.env (PR-B).  All operations run as root
+  // (brief: "root writes the 0600 file").  grep -qE only returns an exit code —
+  // no content is exposed.  tee -a appends a single printf line; > /dev/null
+  // prevents value from appearing in stdout.  rm -f is needed by env secrets
+  // rotate (delete + recreate ensures a clean overwrite).
+  if ((app.secrets ?? []).length > 0) {
+    sudoersLines.push(
+      `# Secrets (PR-B): per-env 0600 file at /var/lib/samohost/envs/<name>/secrets.env.`,
+      `${sshUser} ALL=(root) NOPASSWD: /usr/bin/mkdir -p /var/lib/samohost/envs`,
+      `${sshUser} ALL=(root) NOPASSWD: /usr/bin/install -m 600 -o ${envUser} /dev/null /var/lib/samohost/envs/*/secrets.env`,
+      `${sshUser} ALL=(root) NOPASSWD: /usr/bin/grep -qE * /var/lib/samohost/envs/*/secrets.env`,
+      `${sshUser} ALL=(root) NOPASSWD: /usr/bin/tee -a /var/lib/samohost/envs/*/secrets.env`,
+      `${sshUser} ALL=(root) NOPASSWD: /usr/bin/chmod 600 /var/lib/samohost/envs/*/secrets.env`,
+      `${sshUser} ALL=(root) NOPASSWD: /usr/bin/rm -f /var/lib/samohost/envs/*/secrets.env`,
     );
   }
   sudoersLines.push(

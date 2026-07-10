@@ -62,6 +62,7 @@ import {
   runEnvDestroy,
   runEnvPreflight,
   runEnvGc,
+  runEnvSecretsRotate,
   defaultEnvExecDeps,
   defaultEnvStore,
   DEFAULT_PREVIEW_DOMAIN,
@@ -72,6 +73,7 @@ import {
   type EnvDestroyInput,
   type EnvPreflightInput,
   type EnvGcInput,
+  type EnvSecretsRotateInput,
 } from "./commands/env.ts";
 import {
   runPreviewRebuild,
@@ -545,6 +547,12 @@ export interface ParsedEnvGc {
   json: boolean;
 }
 
+export interface ParsedEnvSecretsRotate {
+  kind: "env-secrets-rotate";
+  input: EnvSecretsRotateInput;
+  json: boolean;
+}
+
 export interface ParsedDnsStatus {
   kind: "dns-status";
   input: DnsStatusInput;
@@ -632,6 +640,7 @@ export type ParsedCommand =
   | ParsedEnvDestroy
   | ParsedEnvPreflight
   | ParsedEnvGc
+  | ParsedEnvSecretsRotate
   | ParsedDnsStatus
   | ParsedDoctor
   | ParsedTriggerRun
@@ -1652,7 +1661,7 @@ function parseEnv(args: string[]): ParsedCommand {
   const sub = args[0];
   if (sub === undefined) {
     throw new UsageError(
-      "env requires a subcommand: plan | create | list | destroy | gc",
+      "env requires a subcommand: plan | create | list | destroy | gc | secrets",
     );
   }
   const rest = args.slice(1);
@@ -1669,11 +1678,41 @@ function parseEnv(args: string[]): ParsedCommand {
       return parseEnvPreflight(rest);
     case "gc":
       return parseEnvGc(rest);
+    case "secrets":
+      return parseEnvSecrets(rest);
     default:
       throw new UsageError(
-        `unknown env subcommand: ${sub} (plan | create | list | destroy | preflight | gc)`,
+        `unknown env subcommand: ${sub} (plan | create | list | destroy | preflight | gc | secrets)`,
       );
   }
+}
+
+function parseEnvSecrets(args: string[]): ParsedEnvSecretsRotate {
+  const sub = args[0];
+  if (sub === undefined) {
+    throw new UsageError("env secrets requires a subcommand: rotate");
+  }
+  if (sub !== "rotate") {
+    throw new UsageError(`unknown env secrets subcommand: ${sub} (rotate)`);
+  }
+  const rest = args.slice(1);
+  let vm: string | undefined;
+  let app: string | undefined;
+  let branch: string | undefined;
+  let json = false;
+  for (let i = 0; i < rest.length; i++) {
+    const a = rest[i]!;
+    if (a === "--json") { json = true; continue; }
+    if (a.startsWith("-")) throw new UsageError(`unknown flag: ${a}`);
+    if (vm === undefined) { vm = a; continue; }
+    if (app === undefined) { app = a; continue; }
+    if (branch === undefined) { branch = a; continue; }
+    throw new UsageError(`unexpected extra argument: ${a}`);
+  }
+  if (vm === undefined) throw new UsageError("env secrets rotate requires <vm>");
+  if (app === undefined) throw new UsageError("env secrets rotate requires <vm> <app>");
+  if (branch === undefined) throw new UsageError("env secrets rotate requires <vm> <app> <branch>");
+  return { kind: "env-secrets-rotate", input: { vm, app, branch }, json };
 }
 
 function parseEnvPreflight(args: string[]): ParsedEnvPreflight {
@@ -2355,6 +2394,17 @@ export async function main(
       );
     case "env-gc":
       return runEnvGc(
+        cmd.input,
+        { json: cmd.json },
+        new StateStore(),
+        defaultAppStore(),
+        defaultEnvStore(),
+        defaultEnvExecDeps(),
+        out,
+        err,
+      );
+    case "env-secrets-rotate":
+      return runEnvSecretsRotate(
         cmd.input,
         { json: cmd.json },
         new StateStore(),
