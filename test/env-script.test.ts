@@ -262,7 +262,9 @@ describe("buildEnvCreateScript", () => {
     const s = buildEnvCreateScript(app(), target({ port: 3142 }));
     expect(s).toContain("SAMOHOST_PORT='3142'");
     expect(s).toContain("field-record-1-feat-x.samo.cat");
-    expect(s).toContain("http://localhost:${SAMOHOST_PORT}/");
+    // Port is now baked as a literal in the health probe URL (single-quoted shell word)
+    // rather than expanded via ${SAMOHOST_PORT} — structurally equivalent for legacy apps.
+    expect(s).toContain("http://localhost:3142/");
   });
 
   test("phase markers cover the full create sequence", () => {
@@ -855,8 +857,10 @@ describe("issue #11 finding 6: --template-db override", () => {
 describe("issue #11 finding 8: destroy resets the failed unit; host-prep grants cover it", () => {
   test("destroy reset-failed after disable, tolerant of absence", () => {
     const s = buildEnvDestroyScript(app(), target());
+    // Unit names are now baked as literals (single-quoted) rather than via
+    // $SAMOHOST_UNIT_INSTANCE — structurally equivalent for single-service legacy apps.
     expect(s).toContain(
-      'sudo /usr/bin/systemctl reset-failed "$SAMOHOST_UNIT_INSTANCE" 2>/dev/null || true',
+      "sudo /usr/bin/systemctl reset-failed 'field-record@field-record-1-feat-x.service' 2>/dev/null || true",
     );
     expect(s.indexOf("disable --now")).toBeLessThan(s.indexOf("reset-failed"));
   });

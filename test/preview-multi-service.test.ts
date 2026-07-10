@@ -64,7 +64,7 @@ import { DEFAULT_POOL } from "../src/env/ports.ts";
 import { AppStore } from "../src/state/apps.ts";
 import { EnvStore } from "../src/state/envs.ts";
 import { StateStore } from "../src/state/store.ts";
-import type { AppRecord, AppSpec, EnvRecord, VmRecord } from "../src/types.ts";
+import type { AppRecord, EnvRecord, VmRecord } from "../src/types.ts";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -235,7 +235,7 @@ describe("A. deriveTarget — multi-service port allocation", () => {
     expect(ports["ingest"]).toBe(DEFAULT_POOL.base + 2);
 
     // target.port = default listener's port (back-compat)
-    expect(result.port).toBe(ports["web"]);
+    expect(result.port).toBe(ports["web"]!);
   });
 
   test("ms-dt-2: union-of-ports — two envs of the same app never collide on any listener port", () => {
@@ -515,14 +515,18 @@ describe("F. health loop — per-listener health checks", () => {
     expect(script).toContain("http://localhost:3101/health");
   });
 
-  test("ms-hl-2: listener WITHOUT healthPath is NOT probed", () => {
+  test("ms-hl-2: listener WITHOUT healthPath is NOT probed by curl health check", () => {
     const app = multiApp();
     const t = multiTarget();
     const script = buildEnvCreateScript(app, t);
 
-    // ingest (port 3102) has no healthPath — must not be probed
+    // ingest (port 3102) has no healthPath — no curl health probe must be emitted.
+    // NOTE: port 3102 legitimately appears in the vhost as `reverse_proxy localhost:3102`
+    // (for the /webhook* route). Only curl health probes produce `localhost:3102/`
+    // (the path component always starts with `/`).
     expect(script).not.toContain("localhost:3102/");
-    expect(script).not.toContain("localhost:3102");
+    // Confirm there is no curl invocation targeting port 3102
+    expect(script).not.toMatch(/curl[^']*localhost:3102/);
   });
 });
 
