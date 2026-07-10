@@ -947,7 +947,8 @@ function compareSemver(a: Semver, b: Semver): number {
 
 /**
  * From `names`, keep those matching the glob `pattern` that parse as semver,
- * EXCLUDE prereleases unless the pattern opts in (contains a `-`), and return
+ * EXCLUDE prereleases unless the pattern opts in (a `-` OUTSIDE any `[...]`
+ * class), and return
  * the greatest by semver precedence — or `null` if none qualify. Pure.
  */
 export function selectLatestTag(
@@ -955,7 +956,10 @@ export function selectLatestTag(
   pattern: string,
 ): string | null {
   const re = tagGlobToRegExp(pattern);
-  const allowPrerelease = pattern.includes("-");
+  // Opt into prereleases only on a hyphen that is part of the glob's matching
+  // intent — i.e. OUTSIDE any character class. A `-` inside e.g. `[0-9]` (as in
+  // "v[0-9]*.[0-9]*.[0-9]*") must NOT enable prereleases for a prod deploy.
+  const allowPrerelease = pattern.replace(/\[[^\]]*\]/g, "").includes("-");
   let best: Semver | null = null;
   for (const name of names) {
     if (!re.test(name)) continue;

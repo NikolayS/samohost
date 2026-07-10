@@ -148,6 +148,15 @@ describe("selectLatestTag — semver ordering & prerelease policy", () => {
     );
   });
 
+  test("§8 #2 a hyphen INSIDE a glob character class is NOT a prerelease opt-in", () => {
+    // Regression (PR #133 review): "[0-9]" contains a literal '-', but a class
+    // is not a prerelease opt-in. The documented example glob must still
+    // EXCLUDE release candidates from a PRODUCTION deploy.
+    expect(
+      selectLatestTag(["v1.0.0", "v1.2.0-rc.1"], "v[0-9]*.[0-9]*.[0-9]*"),
+    ).toBe("v1.0.0");
+  });
+
   test("no tag matches the glob → null", () => {
     expect(selectLatestTag(["nightly-2026", "latest"], "v*")).toBeNull();
     expect(selectLatestTag([], "v*")).toBeNull();
