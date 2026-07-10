@@ -17,6 +17,7 @@
 
 import { parse as parseToml } from "smol-toml";
 import type { TomlValueWithoutBigInt } from "smol-toml";
+import type { ListenerSpec, ServiceSpec, RouteSpec } from "../types.ts";
 
 /** A plain TOML table returned by smol-toml's `parse()` (no bigint). */
 type TomlTableLike = Record<string, TomlValueWithoutBigInt>;
@@ -69,6 +70,16 @@ export interface AppManifest {
    * Maps to {@link AppSpec.previewDbBackend}.
    */
   previewDbBackend?: "dblab" | "template" | "none";
+
+  // ---- Multi-service spec model (additive; absent = legacy single-service) --
+  /** Declared services. Maps to {@link AppSpec.services}. */
+  services?: ServiceSpec[];
+  /** Caddy routing rules. Maps to {@link AppSpec.routes}. */
+  routes?: RouteSpec[];
+  /** Default listener name (required when services is set). Maps to {@link AppSpec.defaultListener}. */
+  defaultListener?: string;
+  /** Production main-host Caddy wiring mode. Maps to {@link AppSpec.mainListen}. */
+  mainListen?: "cp-http80" | "tls";
 }
 
 /**
@@ -123,6 +134,11 @@ const APP_KEYS = new Set<string>([
   "appUser",
   // `provision` is the only allowed sub-table at top level
   "provision",
+  // Multi-service spec model (additive; absent = legacy single-service)
+  "services",
+  "routes",
+  "defaultListener",
+  "mainListen",
 ]);
 
 const PROVISION_KEYS = new Set<string>([
@@ -130,6 +146,91 @@ const PROVISION_KEYS = new Set<string>([
   "location",
   "labels",
 ]);
+
+/** Allowed keys inside a [[services]] entry. */
+const SERVICE_KEYS = new Set<string>([
+  "name",
+  "unit",
+  "execStart",
+  "listeners",
+]);
+
+/** Allowed keys inside a [[services.listeners]] entry. */
+const LISTENER_KEYS = new Set<string>([
+  "name",
+  "port",
+  "portEnv",
+  "healthPath",
+  "routed",
+]);
+
+/** Allowed keys inside a [[routes]] entry. */
+const ROUTE_KEYS = new Set<string>([
+  "name",
+  "matchPath",
+  "matchRegexp",
+  "to",
+  "respond",
+]);
+
+/** Allowed keys inside a [routes.respond] sub-table. */
+const ROUTE_RESPOND_KEYS = new Set<string>([
+  "status",
+  "body",
+]);
+
+/**
+ * Validate a string value that will be embedded verbatim into a root-written
+ * Caddy JSON config or Caddyfile. Returns null on success, or a human-readable
+ * error reason on failure. Fail-closed.
+ *
+ * Rules (Fix 1+2+7):
+ *   1. Must be non-empty printable ASCII [\x20-\x7e] only — rejects control
+ *      chars, newline, tab, and any non-ASCII (U+0080+). Current negated-class
+ *      admitted U+0085/U+2028/non-ASCII; the positive range closes that gap.
+ *   2. Must not contain: double-quote ("), backslash (\), backtick (`).
+ *      Double-quote terminates JSON strings; backslash needs double-escaping;
+ *      backtick is reserved in some Caddyfile templating contexts.
+ *   3. Must not contain "{$" — Caddyfile expands {$VAR} at parse time for
+ *      every block the config writer has root privilege over. Embedding
+ *      "{$SECRET}" silently injects a live credential value.
+ *   4. Every "{" must begin a valid regex quantifier: {n}, {n,}, or {n,m}
+ *      (digits only). Bare "{" / "}" and any other brace form (e.g. {word},
+ *      {$X}) are rejected. Stripping all valid quantifiers then checking for
+ *      residual "{" or "}" implements this in one pass.
+ */
+function isCaddySafe(s: string): string | null {
+  if (s.length === 0) return "empty string";
+  // Rule 1: printable ASCII only (0x20 space through 0x7e tilde, inclusive).
+  if (!/^[\x20-\x7e]+$/.test(s)) {
+    return "contains non-printable or non-ASCII character (only printable ASCII 0x20-0x7e allowed)";
+  }
+  // Rule 2: banned single characters.
+  if (s.includes('"')) return 'contains double-quote (") — terminates JSON string in Caddy config';
+  if (s.includes("\\")) return "contains backslash (\\) — requires double-escaping in JSON Caddy config";
+  if (s.includes("`")) return "contains backtick (`) — reserved in Caddyfile templating";
+  // Rule 3: brace-dollar Caddy env-substitution.
+  if (s.includes("{$")) {
+    return 'contains "{$" — Caddyfile expands {$VAR} at parse time (env-substitution injection)';
+  }
+  // Rule 4: all remaining "{" / "}" must be valid regex quantifiers.
+  if (s.includes("{") || s.includes("}")) {
+    const stripped = s.replace(/\{[0-9]+(,[0-9]*)?\}/g, "");
+    if (stripped.includes("{")) {
+      return 'contains "{" not part of a valid regex quantifier {n}, {n,}, or {n,m} — bare braces are unsafe in Caddy config';
+    }
+    if (stripped.includes("}")) {
+      return 'contains "}" not part of a valid regex quantifier — bare braces are unsafe in Caddy config';
+    }
+  }
+  return null;
+}
+
+/** Route / service / listener name charset: must match [a-z][a-z0-9-]* */
+const ROUTE_NAME_RE = /^[a-z][a-z0-9-]*$/;
+
+/** portEnv charset: uppercase env-var name ^[A-Z_][A-Z0-9_]*$ */
+const PORTENV_RE = /^[A-Z_][A-Z0-9_]*$/;
 
 // ---------------------------------------------------------------------------
 // Internal helpers
@@ -253,6 +354,298 @@ function parseLabels(
     }
   }
   return hasError ? undefined : result;
+}
+
+// ---------------------------------------------------------------------------
+// Multi-service sub-parsers
+// ---------------------------------------------------------------------------
+
+/**
+ * Parse a [[services.listeners]] entry. Collects errors into the shared array.
+ * Returns undefined on type errors (but continues collecting for all entries).
+ */
+function parseListenerEntry(
+  raw: TomlTableLike,
+  serviceIdx: number,
+  listenerIdx: number,
+  errors: string[],
+): ListenerSpec | undefined {
+  const prefix = `services[${serviceIdx}].listeners[${listenerIdx}]`;
+
+  // Reject unknown keys
+  for (const k of Object.keys(raw)) {
+    if (!LISTENER_KEYS.has(k)) {
+      errors.push(`unknown ${prefix} key: ${k} (check spelling)`);
+    }
+  }
+
+  const name = requireString(raw, "name", errors);
+  // Fix 3b: listener name must match [a-z][a-z0-9-]* (same as service/route names).
+  // They become env identifiers and unit-instance names; bad chars break shell/unit refs.
+  if (name !== undefined && !ROUTE_NAME_RE.test(name)) {
+    errors.push(
+      `${prefix}: listener name "${name}" must match [a-z][a-z0-9-]* ` +
+        `(lowercase letter start, then lowercase letters, digits, hyphens only)`,
+    );
+  }
+
+  // Fix 4: port must be an integer in 1..65535.
+  // typeof-only check admits floats (3.5) and out-of-range values (0, -1, 70000).
+  const portRaw = raw["port"];
+  let port: number | undefined;
+  if (portRaw === undefined) {
+    errors.push(`${prefix}: missing required field: port`);
+  } else if (typeof portRaw !== "number") {
+    errors.push(`${prefix}: field port must be a number (got ${typeof portRaw})`);
+  } else if (!Number.isInteger(portRaw) || portRaw < 1 || portRaw > 65535) {
+    errors.push(
+      `${prefix}: port must be an integer in the range 1-65535 (got ${portRaw})`,
+    );
+  } else {
+    port = portRaw;
+  }
+
+  // Fix 3a: portEnv must be a valid env-var name ^[A-Z_][A-Z0-9_]*$.
+  // It is written verbatim into systemd unit EnvironmentFile and env files by later PRs.
+  const portEnvRaw = raw["portEnv"];
+  let portEnv: string | undefined;
+  if (portEnvRaw === undefined) {
+    errors.push(`${prefix}: missing required field: portEnv`);
+  } else if (typeof portEnvRaw !== "string") {
+    errors.push(`${prefix}: field portEnv must be a string (got ${typeof portEnvRaw})`);
+  } else if (!PORTENV_RE.test(portEnvRaw)) {
+    errors.push(
+      `${prefix}: portEnv "${portEnvRaw}" must match ^[A-Z_][A-Z0-9_]*$ ` +
+        `(uppercase env-var name — it is embedded in env files and systemd units)`,
+    );
+  } else {
+    portEnv = portEnvRaw;
+  }
+
+  const healthPathRaw = raw["healthPath"];
+  let healthPath: string | undefined;
+  if (healthPathRaw !== undefined) {
+    if (typeof healthPathRaw !== "string") {
+      errors.push(`${prefix}: field healthPath must be a string (got ${typeof healthPathRaw})`);
+    } else {
+      healthPath = healthPathRaw;
+    }
+  }
+
+  const routedRaw = raw["routed"];
+  let routed: boolean | undefined;
+  if (routedRaw !== undefined) {
+    if (typeof routedRaw !== "boolean") {
+      errors.push(`${prefix}: field routed must be a boolean (got ${typeof routedRaw})`);
+    } else {
+      routed = routedRaw;
+    }
+  }
+
+  if (name === undefined || port === undefined || portEnv === undefined) {
+    return undefined;
+  }
+
+  return {
+    name,
+    port,
+    portEnv,
+    ...(healthPath !== undefined ? { healthPath } : {}),
+    ...(routed !== undefined ? { routed } : {}),
+  };
+}
+
+/**
+ * Parse a [[services]] entry. Collects errors into the shared array.
+ */
+function parseServiceEntry(
+  raw: TomlTableLike,
+  idx: number,
+  errors: string[],
+): ServiceSpec | undefined {
+  const prefix = `services[${idx}]`;
+
+  // Reject unknown keys
+  for (const k of Object.keys(raw)) {
+    if (!SERVICE_KEYS.has(k)) {
+      errors.push(`unknown ${prefix} key: ${k} (check spelling)`);
+    }
+  }
+
+  const name = requireString(raw, "name", errors);
+  // Fix 3b: service name must match [a-z][a-z0-9-]* — it becomes a unit-instance
+  // identifier and is referenced by routes; bad chars break route/unit resolution.
+  if (name !== undefined && !ROUTE_NAME_RE.test(name)) {
+    errors.push(
+      `${prefix}: service name "${name}" must match [a-z][a-z0-9-]* ` +
+        `(lowercase letter start, then lowercase letters, digits, hyphens only)`,
+    );
+  }
+
+  const unit = requireString(raw, "unit", errors);
+  const execStart = optionalString(raw, "execStart", errors);
+
+  // Parse listeners array
+  const rawListeners = raw["listeners"];
+  const listeners: ListenerSpec[] = [];
+  if (rawListeners === undefined) {
+    errors.push(`${prefix}: missing required field: listeners`);
+  } else if (!isArray(rawListeners)) {
+    errors.push(`${prefix}: field listeners must be an array of tables (got ${typeof rawListeners})`);
+  } else {
+    for (let li = 0; li < rawListeners.length; li++) {
+      const rawL = rawListeners[li];
+      if (rawL === undefined || !isTable(rawL)) {
+        errors.push(`${prefix}.listeners[${li}] must be a table`);
+        continue;
+      }
+      const listener = parseListenerEntry(rawL, idx, li, errors);
+      if (listener !== undefined) listeners.push(listener);
+    }
+  }
+
+  if (name === undefined || unit === undefined) return undefined;
+
+  return {
+    name,
+    unit,
+    ...(execStart !== undefined ? { execStart } : {}),
+    listeners,
+  };
+}
+
+/**
+ * Parse a [[routes]] entry. Collects errors into the shared array.
+ * Cross-reference validation (dangling `to`, routed=false targets) happens
+ * in the main parser after all services are parsed.
+ */
+function parseRouteEntry(
+  raw: TomlTableLike,
+  idx: number,
+  errors: string[],
+): RouteSpec | undefined {
+  const prefix = `routes[${idx}]`;
+
+  // Reject unknown keys
+  for (const k of Object.keys(raw)) {
+    if (!ROUTE_KEYS.has(k)) {
+      errors.push(`unknown ${prefix} key: ${k} (check spelling)`);
+    }
+  }
+
+  const name = optionalString(raw, "name", errors);
+
+  // Validate name charset when present
+  if (name !== undefined && !ROUTE_NAME_RE.test(name)) {
+    errors.push(
+      `${prefix}: route name "${name}" must match [a-z][a-z0-9-]* ` +
+        `(lowercase letter start, then lowercase letters, digits, hyphens only)`,
+    );
+  }
+
+  const matchPath = optionalString(raw, "matchPath", errors);
+  const matchRegexp = optionalString(raw, "matchRegexp", errors);
+  const to = optionalString(raw, "to", errors);
+
+  // Parse respond sub-table
+  let respond: { status: number; body: string } | undefined;
+  const rawRespond = raw["respond"];
+  if (rawRespond !== undefined) {
+    if (!isTable(rawRespond)) {
+      errors.push(`${prefix}.respond must be a table (got ${typeof rawRespond})`);
+    } else {
+      // Reject unknown respond keys
+      for (const k of Object.keys(rawRespond)) {
+        if (!ROUTE_RESPOND_KEYS.has(k)) {
+          errors.push(`unknown ${prefix}.respond key: ${k} (check spelling)`);
+        }
+      }
+      const statusRaw = rawRespond["status"];
+      let status: number | undefined;
+      if (statusRaw === undefined) {
+        errors.push(`${prefix}.respond: missing required field: status`);
+      } else if (typeof statusRaw !== "number") {
+        errors.push(`${prefix}.respond: field status must be a number (got ${typeof statusRaw})`);
+      } else {
+        status = statusRaw;
+      }
+      const bodyRaw = rawRespond["body"];
+      let body: string | undefined;
+      if (bodyRaw === undefined) {
+        errors.push(`${prefix}.respond: missing required field: body`);
+      } else if (typeof bodyRaw !== "string") {
+        errors.push(`${prefix}.respond: field body must be a string (got ${typeof bodyRaw})`);
+      } else {
+        // Fix 2: respond.body is embedded verbatim in root-written Caddy config.
+        const bodyErr = isCaddySafe(bodyRaw);
+        if (bodyErr !== null) {
+          errors.push(
+            `${prefix}.respond: body contains unsafe content: ${bodyErr} — ` +
+              `values are embedded verbatim in Caddy config`,
+          );
+        } else {
+          body = bodyRaw;
+        }
+      }
+      if (status !== undefined && body !== undefined) {
+        respond = { status, body };
+      }
+    }
+  }
+
+  // Exactly one of matchPath | matchRegexp
+  const hasMatch = (matchPath !== undefined ? 1 : 0) + (matchRegexp !== undefined ? 1 : 0);
+  if (hasMatch === 0) {
+    errors.push(`${prefix}: exactly one of matchPath or matchRegexp is required (neither present)`);
+  } else if (hasMatch > 1) {
+    errors.push(`${prefix}: exactly one of matchPath or matchRegexp is required (both present)`);
+  }
+
+  // Exactly one of to | respond
+  const hasTarget = (to !== undefined ? 1 : 0) + (respond !== undefined ? 1 : 0);
+  if (hasTarget === 0) {
+    errors.push(`${prefix}: exactly one of "to" or "respond" is required (neither present)`);
+  } else if (hasTarget > 1) {
+    errors.push(`${prefix}: exactly one of "to" or "respond" is required (both present)`);
+  }
+
+  // Fix 2: matchPath is embedded verbatim in root-written Caddy config; apply the
+  // same injection guard as matchRegexp.
+  if (matchPath !== undefined) {
+    const pathErr = isCaddySafe(matchPath);
+    if (pathErr !== null) {
+      errors.push(
+        `${prefix}: matchPath contains unsafe content: ${pathErr} — ` +
+          `values are embedded verbatim in Caddy config`,
+      );
+    }
+  }
+
+  // Fix 1+7: validate regexp — must be Caddy-safe (printable ASCII, no banned chars,
+  // no brace injection) AND must compile as a valid JS/RE2 regexp.
+  if (matchRegexp !== undefined) {
+    const reErr = isCaddySafe(matchRegexp);
+    if (reErr !== null) {
+      errors.push(
+        `${prefix}: matchRegexp contains unsafe content: ${reErr} — ` +
+          `values are embedded verbatim in Caddy config`,
+      );
+    } else {
+      try {
+        new RegExp(matchRegexp);
+      } catch {
+        errors.push(`${prefix}: matchRegexp does not compile as a valid regexp: ${matchRegexp}`);
+      }
+    }
+  }
+
+  return {
+    ...(name !== undefined ? { name } : {}),
+    ...(matchPath !== undefined ? { matchPath } : {}),
+    ...(matchRegexp !== undefined ? { matchRegexp } : {}),
+    ...(to !== undefined ? { to } : {}),
+    ...(respond !== undefined ? { respond } : {}),
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -401,7 +794,172 @@ export function parseSamohostToml(text: string): ParseTomlResult {
     }
   }
 
-  // ---- 6. Return result ----------------------------------------------------
+  // ---- 6. Validate [[services]] (optional) ------------------------------------
+  let services: ServiceSpec[] | undefined;
+  const rawServices = raw["services"];
+  if (rawServices !== undefined) {
+    if (!isArray(rawServices)) {
+      errors.push(`"services" must be an array of tables (got ${typeof rawServices})`);
+    } else {
+      const parsed: ServiceSpec[] = [];
+      for (let si = 0; si < rawServices.length; si++) {
+        const rawS = rawServices[si];
+        if (rawS === undefined || !isTable(rawS)) {
+          errors.push(`services[${si}] must be a table`);
+          continue;
+        }
+        const svc = parseServiceEntry(rawS, si, errors);
+        if (svc !== undefined) parsed.push(svc);
+      }
+
+      // Uniqueness: service names
+      const svcNames = new Set<string>();
+      for (const svc of parsed) {
+        if (svcNames.has(svc.name)) {
+          errors.push(`duplicate service name: "${svc.name}" (service names must be unique)`);
+        } else {
+          svcNames.add(svc.name);
+        }
+      }
+
+      // Uniqueness: listener names (global), ports, portEnv values
+      const lsNames = new Set<string>();
+      const lsPorts = new Set<number>();
+      const lsPortEnvs = new Set<string>();
+      for (const svc of parsed) {
+        for (const ls of svc.listeners) {
+          if (lsNames.has(ls.name)) {
+            errors.push(
+              `duplicate listener name: "${ls.name}" (listener names must be unique across all services)`,
+            );
+          } else {
+            lsNames.add(ls.name);
+          }
+          if (lsPorts.has(ls.port)) {
+            errors.push(
+              `duplicate listener port: ${ls.port} (listener ports must be unique across all services)`,
+            );
+          } else {
+            lsPorts.add(ls.port);
+          }
+          if (lsPortEnvs.has(ls.portEnv)) {
+            errors.push(
+              `duplicate listener portEnv: "${ls.portEnv}" (portEnv values must be unique across all services)`,
+            );
+          } else {
+            lsPortEnvs.add(ls.portEnv);
+          }
+        }
+      }
+
+      services = parsed;
+    }
+  }
+
+  // ---- 7. Validate [[routes]] (optional) --------------------------------------
+  let routes: RouteSpec[] | undefined;
+  const rawRoutes = raw["routes"];
+  if (rawRoutes !== undefined) {
+    if (!isArray(rawRoutes)) {
+      errors.push(`"routes" must be an array of tables (got ${typeof rawRoutes})`);
+    } else {
+      const parsed: RouteSpec[] = [];
+      for (let ri = 0; ri < rawRoutes.length; ri++) {
+        const rawR = rawRoutes[ri];
+        if (rawR === undefined || !isTable(rawR)) {
+          errors.push(`routes[${ri}] must be a table`);
+          continue;
+        }
+        const route = parseRouteEntry(rawR, ri, errors);
+        // Always push even if partially invalid — we want all errors collected
+        parsed.push(route ?? {});
+      }
+      routes = parsed.length > 0 ? parsed : [];
+    }
+  }
+
+  // ---- 8. Validate service topology (defaultListener, routes cross-refs, Fix 5) ---
+  const defaultListener = optionalString(raw, "defaultListener", errors);
+
+  // Fix 5: [[routes]] cannot exist without [[services]] — routes reference listener
+  // names and there is no topology to resolve them against. A routes-only manifest
+  // would silently produce a dangling "to" reference that later config writers
+  // embed verbatim into Caddy, causing a runtime error instead of a fail-closed gate.
+  if (routes !== undefined && services === undefined) {
+    errors.push(
+      `"[[routes]]" declared without "[[services]]" — routes reference listener names ` +
+        `and require a declared service topology; add [[services]] or remove [[routes]]`,
+    );
+  }
+
+  if (services !== undefined) {
+    if (defaultListener === undefined) {
+      errors.push(
+        `"defaultListener" is required when [[services]] is declared — ` +
+          `specify the listener name that receives unmatched requests`,
+      );
+    } else {
+      // Collect all listener names for cross-reference validation
+      const allListenerNames = new Set<string>(
+        services.flatMap((s) => s.listeners.map((l) => l.name)),
+      );
+      if (!allListenerNames.has(defaultListener)) {
+        errors.push(
+          `"defaultListener" references listener "${defaultListener}" which does not exist ` +
+            `(known listeners: ${[...allListenerNames].join(", ") || "(none)"})`,
+        );
+      }
+    }
+
+    // Cross-reference: validate routes[].to targets
+    if (routes !== undefined) {
+      const allListenerNames = new Set<string>(
+        services.flatMap((s) => s.listeners.map((l) => l.name)),
+      );
+      // Build a map of listener name → routed flag for the routed=false check
+      const routedMap = new Map<string, boolean>();
+      for (const svc of services) {
+        for (const ls of svc.listeners) {
+          routedMap.set(ls.name, ls.routed !== false);
+        }
+      }
+      for (let ri = 0; ri < routes.length; ri++) {
+        const route = routes[ri]!;
+        if (route.to !== undefined) {
+          if (!allListenerNames.has(route.to)) {
+            errors.push(
+              `routes[${ri}].to references listener "${route.to}" which does not exist ` +
+                `(known listeners: ${[...allListenerNames].join(", ") || "(none)"})`,
+            );
+          } else if (routedMap.get(route.to) === false) {
+            errors.push(
+              `routes[${ri}].to references listener "${route.to}" which has routed=false ` +
+                `— only routable listeners may be route targets`,
+            );
+          }
+        }
+      }
+    }
+  }
+
+  // ---- 9. Validate mainListen (optional enum) ---------------------------------
+  let mainListen: "cp-http80" | "tls" | undefined;
+  {
+    const rawMainListen = raw["mainListen"];
+    if (rawMainListen !== undefined) {
+      if (typeof rawMainListen !== "string") {
+        errors.push(`field mainListen must be a string (got ${typeof rawMainListen})`);
+      } else if (rawMainListen !== "cp-http80" && rawMainListen !== "tls") {
+        errors.push(
+          `field mainListen must be "cp-http80" or "tls" (got "${rawMainListen}")`,
+        );
+      } else {
+        mainListen = rawMainListen;
+      }
+    }
+  }
+
+  // ---- 10. Return result -------------------------------------------------------
   if (errors.length > 0) {
     return { ok: false, errors };
   }
@@ -428,6 +986,10 @@ export function parseSamohostToml(text: string): ParseTomlResult {
     ...(kind !== undefined ? { kind } : {}),
     ...(dbBackend !== undefined ? { dbBackend } : {}),
     ...(previewDbBackend !== undefined ? { previewDbBackend } : {}),
+    ...(services !== undefined ? { services } : {}),
+    ...(routes !== undefined ? { routes } : {}),
+    ...(defaultListener !== undefined ? { defaultListener } : {}),
+    ...(mainListen !== undefined ? { mainListen } : {}),
   };
 
   return {
@@ -435,4 +997,86 @@ export function parseSamohostToml(text: string): ParseTomlResult {
     app,
     ...(provision !== undefined ? { provision } : {}),
   };
+}
+
+// ---------------------------------------------------------------------------
+// Shared service topology validator (Fix 6)
+//
+// Used by both the TOML path (parseSamohostToml above) and the programmatic
+// path (runAppRegister in src/commands/app.ts) so the same rules apply
+// regardless of how an app is registered.
+// ---------------------------------------------------------------------------
+
+/**
+ * Validate the service topology (services / routes / defaultListener) against
+ * the rules that Caddy config writers downstream will assume are enforced:
+ *
+ * - [[routes]] without [[services]] → error (routes reference listener names).
+ * - [[services]] without defaultListener → error (required for request routing).
+ * - defaultListener must reference a declared listener name.
+ * - routes[].to must reference a declared listener that is not routed=false.
+ *
+ * Errors are appended to `errors`; the caller decides how to surface them.
+ * Factored here so the TOML reader and the programmatic register path apply
+ * identical validation.
+ */
+export function validateServicesTopology(
+  services: ServiceSpec[] | undefined,
+  routes: RouteSpec[] | undefined,
+  defaultListener: string | undefined,
+  errors: string[],
+): void {
+  // Fix 5: routes without services
+  if (routes !== undefined && routes.length > 0 && services === undefined) {
+    errors.push(
+      '"routes" declared without "services" — routes reference listener names ' +
+        "and require a declared service topology",
+    );
+    return; // no point cross-referencing listeners that don't exist
+  }
+
+  if (services === undefined) return; // no topology to validate
+
+  // defaultListener required when services is declared
+  const allListenerNames = new Set<string>(
+    services.flatMap((s) => s.listeners.map((l) => l.name)),
+  );
+
+  if (defaultListener === undefined) {
+    errors.push(
+      '"defaultListener" is required when services is declared — ' +
+        "specify the listener name that receives unmatched requests",
+    );
+  } else if (!allListenerNames.has(defaultListener)) {
+    errors.push(
+      `"defaultListener" references listener "${defaultListener}" which does not exist ` +
+        `(known listeners: ${[...allListenerNames].join(", ") || "(none)"})`,
+    );
+  }
+
+  // routes[].to cross-reference
+  if (routes !== undefined) {
+    const routedMap = new Map<string, boolean>();
+    for (const svc of services) {
+      for (const ls of svc.listeners) {
+        routedMap.set(ls.name, ls.routed !== false);
+      }
+    }
+    for (let ri = 0; ri < routes.length; ri++) {
+      const route = routes[ri]!;
+      if (route.to !== undefined) {
+        if (!allListenerNames.has(route.to)) {
+          errors.push(
+            `routes[${ri}].to references listener "${route.to}" which does not exist ` +
+              `(known listeners: ${[...allListenerNames].join(", ") || "(none)"})`,
+          );
+        } else if (routedMap.get(route.to) === false) {
+          errors.push(
+            `routes[${ri}].to references listener "${route.to}" which has routed=false ` +
+              "— only routable listeners may be route targets",
+          );
+        }
+      }
+    }
+  }
 }

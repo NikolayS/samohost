@@ -3,7 +3,7 @@ import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "no
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { AppStore } from "../src/state/apps.ts";
-import type { AppRecord } from "../src/types.ts";
+import type { AppRecord, ServiceSpec, RouteSpec } from "../src/types.ts";
 
 let dir: string;
 let appsPath: string;
@@ -96,5 +96,108 @@ describe("AppStore", () => {
     expect(existsSync(`${appsPath}.tmp`)).toBe(false);
     const parsed = JSON.parse(readFileSync(appsPath, "utf8"));
     expect(parsed.apps.length).toBe(1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Multi-service spec model round-trip tests (PR: multi-service spec)
+//
+// RED: AppRecord does not yet carry services/routes/defaultListener/mainListen
+//      or EnvRecord.ports — these fail at the type level until those fields
+//      are added to src/types.ts.
+// ---------------------------------------------------------------------------
+
+describe("AppStore — multi-service spec round-trip", () => {
+  test("rt-1: services + routes + defaultListener survive save+load", () => {
+    const store = new AppStore(appsPath);
+
+    const services: ServiceSpec[] = [
+      {
+        name: "web",
+        unit: "my-app",
+        listeners: [
+          { name: "web", port: 3000, portEnv: "PORT", healthPath: "/", routed: true },
+        ],
+      },
+      {
+        name: "worker",
+        unit: "my-app-worker",
+        listeners: [
+          { name: "metrics", port: 9100, portEnv: "METRICS_PORT" },
+        ],
+      },
+    ];
+
+    const routes: RouteSpec[] = [
+      { name: "api", matchPath: "/api/*", to: "web" },
+      { matchPath: "/healthz", respond: { status: 200, body: "ok" } },
+    ];
+
+    const record = app("vm-a", "multi", {
+      services,
+      routes,
+      defaultListener: "web",
+      mainListen: "tls",
+    });
+
+    store.upsert(record);
+
+    // Reload from disk
+    const reloaded = new AppStore(appsPath);
+    const got = reloaded.get("vm-a", "multi");
+
+    expect(got).toBeDefined();
+    expect(got?.services).toHaveLength(2);
+    expect(got?.services![0]!.name).toBe("web");
+    expect(got?.services![1]!.name).toBe("worker");
+    expect(got?.routes).toHaveLength(2);
+    expect(got?.routes![0]!.name).toBe("api");
+    expect(got?.routes![0]!.matchPath).toBe("/api/*");
+    expect(got?.routes![0]!.to).toBe("web");
+    expect(got?.routes![1]!.respond?.status).toBe(200);
+    expect(got?.routes![1]!.respond?.body).toBe("ok");
+    expect(got?.defaultListener).toBe("web");
+    expect(got?.mainListen).toBe("tls");
+  });
+
+  test("rt-2: legacy app without multi-service fields round-trips cleanly", () => {
+    const store = new AppStore(appsPath);
+    const record = app("vm-b", "legacy");  // no services/routes/defaultListener
+    store.upsert(record);
+
+    const reloaded = new AppStore(appsPath);
+    const got = reloaded.get("vm-b", "legacy");
+    expect(got).toBeDefined();
+    expect(got?.services).toBeUndefined();
+    expect(got?.routes).toBeUndefined();
+    expect(got?.defaultListener).toBeUndefined();
+    expect(got?.mainListen).toBeUndefined();
+  });
+
+  test("rt-3: listener with all optional fields survives round-trip", () => {
+    const store = new AppStore(appsPath);
+    const services: ServiceSpec[] = [
+      {
+        name: "api",
+        unit: "my-api",
+        execStart: "/opt/my-api/app/dist/server.js",
+        listeners: [
+          {
+            name: "api",
+            port: 4000,
+            portEnv: "API_PORT",
+            healthPath: "/api/health",
+            routed: true,
+          },
+        ],
+      },
+    ];
+    store.upsert(app("vm-c", "api-app", { services, defaultListener: "api" }));
+
+    const reloaded = new AppStore(appsPath);
+    const got = reloaded.get("vm-c", "api-app");
+    expect(got?.services![0]!.execStart).toBe("/opt/my-api/app/dist/server.js");
+    expect(got?.services![0]!.listeners[0]!.healthPath).toBe("/api/health");
+    expect(got?.services![0]!.listeners[0]!.routed).toBe(true);
   });
 });
