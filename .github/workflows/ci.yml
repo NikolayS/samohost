@@ -15,5 +15,20 @@ jobs:
         with:
           bun-version: 1.3.13
       - run: bun install --frozen-lockfile
+      # Install Caddy v2.11.4 — pinned to match the fleet (caddy-adapt equality rig)
+      - name: Install Caddy v2.11.4
+        run: |
+          curl -fsSL \
+            "https://github.com/caddyserver/caddy/releases/download/v2.11.4/caddy_2.11.4_linux_amd64.tar.gz" \
+            -o caddy.tar.gz
+          tar -xzf caddy.tar.gz caddy
+          sudo mv caddy /usr/local/bin/caddy
+          caddy version
       - run: bunx tsc --noEmit
       - run: bun test
+        env:
+          # DO NOT REMOVE — without this flag every caddy-a* (adapt equality)
+          # test is silently skipped via test.skipIf(!hasCaddy), turning the
+          # whole rig green with zero adapt validation. Hard-fail here ensures
+          # the caddy install step above is never silently bypassed.
+          SAMOHOST_REQUIRE_CADDY: "1"
