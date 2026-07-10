@@ -81,64 +81,78 @@ describe("buildEnvCreateScript with secrets", () => {
     expect(bashSyntaxOk(s)).toBe(true);
   });
 
-  test("contains openssl rand -hex 32 for each declared secret name", () => {
+  test("values generated on-VM via openssl — env-create calls the helper with secret names", () => {
     const s = buildEnvCreateScript(
       app({ secrets: ["SESSION_SECRET", "TOKEN_SECRET"] }),
       target(),
     );
-    // Generation uses openssl, not a TS crypto call (this is a bash script on the VM).
-    expect(s).toContain("openssl rand -hex 32");
+    // Generation delegates to the samohost-secrets helper (installed by host-prep).
+    // The helper uses openssl rand -hex 32 on the VM — never in TS or in this script.
+    expect(s).toContain("samohost-secrets");
+    // Secret names must appear as arguments to the helper call.
+    expect(s).toContain("SESSION_SECRET");
+    expect(s).toContain("TOKEN_SECRET");
+    // No hardcoded 64-char hex (values are never in this generated script).
+    expect(s).not.toMatch(/[0-9a-f]{64}/);
   });
 
-  test("creates the secrets directory at /var/lib/samohost/envs/<envname>", () => {
+  test("env-create passes the env name to the helper (helper creates the secrets dir)", () => {
     const s = buildEnvCreateScript(
       app({ secrets: ["SESSION_SECRET"] }),
       target({ name: "acme-app-feat-x" }),
     );
-    expect(s).toContain("/var/lib/samohost/envs/acme-app-feat-x");
+    // The env name is passed as the first arg to the helper; the helper
+    // constructs /var/lib/samohost/envs/<env-name>/ internally.
+    expect(s).toContain("samohost-secrets");
+    expect(s).toContain("acme-app-feat-x");
   });
 
-  test("creates secrets.env with mode 0600", () => {
+  test("creates secrets.env with mode 0600 (handled inside the helper)", () => {
     const s = buildEnvCreateScript(
       app({ secrets: ["SESSION_SECRET"] }),
       target(),
     );
-    // The file must be created at 600 (not 644 or anything else).
-    expect(s).toContain("600");
-    expect(s).toContain("secrets.env");
+    // Mode 0600 and ownership are enforced by the helper; env-create passes the
+    // env-user as an arg.  The script must reference the helper init action.
+    expect(s).toContain("samohost-secrets");
+    expect(s).toContain("init");
   });
 
-  test("secrets.env is owned by the env user (appUser or sshUser fallback)", () => {
+  test("secrets.env is owned by the env user (appUser passed to helper)", () => {
     const s = buildEnvCreateScript(
       app({ secrets: ["SESSION_SECRET"], appUser: "acme-user" }),
       target(),
     );
-    // Ownership must be set to appUser, not the SSH user.
+    // The appUser must appear in the helper call (second positional arg).
     expect(s).toContain("acme-user");
-    expect(s).toContain("secrets.env");
+    expect(s).toContain("samohost-secrets");
   });
 
-  test("REBUILD REUSE: checks if each secret name already exists before generating", () => {
+  test("REBUILD REUSE: env-create uses 'init' action (helper skips names that already exist)", () => {
     const s = buildEnvCreateScript(
       app({ secrets: ["SESSION_SECRET", "TOKEN_SECRET"] }),
       target(),
     );
-    // For each name, the script must grep-check before generating.
-    // The reuse guard must cover each declared name.
+    // The 'init' helper action contains the grep-check-then-generate reuse logic.
+    // Verify secret names appear as args; helper is called with 'init'.
     expect(s).toContain("SESSION_SECRET");
     expect(s).toContain("TOKEN_SECRET");
-    // There must be a grep or conditional check that prevents overwriting existing values.
-    expect(s).toMatch(/grep.*SESSION_SECRET|SESSION_SECRET.*grep/);
+    expect(s).toContain("init");
+    // Confirm no unconditional raw generation in this script (would bypass reuse).
+    expect(s).not.toMatch(/openssl rand -hex 32/);
   });
 
-  test("secret values are never echoed to stdout (no cat/echo of secrets.env)", () => {
+  test("secret values are never echoed to stdout (no cat/echo of file contents)", () => {
     const s = buildEnvCreateScript(
       app({ secrets: ["SESSION_SECRET", "TOKEN_SECRET"] }),
       target(),
     );
-    // The script must never cat or echo the secrets file — that would leak values.
+    // The script must never cat the secrets file — that would leak all values.
     expect(s).not.toMatch(/cat .*secrets\.env/);
-    expect(s).not.toMatch(/echo .*secrets\.env/);
+    // Error messages may reference the file PATH but must never pipe/print its CONTENTS.
+    // Allow echo of the path (preflight error message) but forbid reading its contents.
+    expect(s).not.toMatch(/echo \$\(cat .*secrets/);
+    expect(s).not.toMatch(/cat .*secrets.*echo/);
   });
 
   test("no inline Environment= lines in env-create script for secrets (values must live only in secrets.env)", () => {
@@ -292,12 +306,15 @@ describe("buildSecretsRotateScript", () => {
       app({ secrets: ["SESSION_SECRET", "TOKEN_SECRET"] }),
       target(),
     );
-    // Rotate always regenerates — it must NOT have the grep-then-skip guard
-    // (that guard is for the idempotent create path only).
+    // Rotate always regenerates — uses the helper 'rotate' action which does
+    // rm-then-recreate (no reuse). Values generated on-VM via openssl inside helper.
     expect(s).toContain("SESSION_SECRET");
     expect(s).toContain("TOKEN_SECRET");
-    expect(s).toContain("openssl rand -hex 32");
-    // The rotate script must NOT include the conditional reuse check.
+    expect(s).toContain("samohost-secrets");
+    expect(s).toContain("rotate");
+    // No openssl in the rotate script itself (it's inside the helper).
+    expect(s).not.toContain("openssl rand -hex 32");
+    // No conditional grep-then-skip in the rotate script (no reuse on rotate).
     expect(s).not.toMatch(/grep.*SESSION_SECRET.*secrets\.env.*then.*skip/s);
   });
 
@@ -323,13 +340,15 @@ describe("buildSecretsRotateScript", () => {
     expect(s).toContain("sudo /usr/bin/systemctl");
   });
 
-  test("writes secrets.env with mode 0600", () => {
+  test("writes secrets.env with mode 0600 (delegated to helper rotate action)", () => {
     const s = buildSecretsRotateScript(
       app({ secrets: ["SESSION_SECRET"] }),
       target(),
     );
-    expect(s).toContain("600");
-    expect(s).toContain("secrets.env");
+    // File creation at 0600 is performed by the helper rotate action internally.
+    // Verify the rotate script calls the helper with the 'rotate' action.
+    expect(s).toContain("samohost-secrets");
+    expect(s).toContain("rotate");
   });
 
   test("no secret values appear in the rotate script (values generated on VM only)", () => {

@@ -41,6 +41,7 @@ export type EnvPhaseName =
   | "db-preflight"
   | "db"
   | "envfile"
+  | "secrets-preflight"
   | "secrets"
   | "unit"
   | "vhost"
@@ -514,6 +515,84 @@ function sq(s: string): string {
 function marker(phase: EnvPhaseName, status: "start" | "ok" | "fail"): string {
   return `echo "${ENV_PHASE_PREFIX}${phase}:${status}>>>"`;
 }
+
+/**
+ * Body lines of the /usr/local/sbin/samohost-secrets root helper.
+ *
+ * Installed by buildHostPrepScript (as a single-quoted heredoc so no shell
+ * expansion occurs during host-prep).  Called by env-create, rotate, and
+ * destroy scripts via ONE exact-path sudoers NOPASSWD grant — no user-
+ * controlled wildcard remains in the grant or in any sudo call.
+ *
+ * Validates the env-name argument against [a-z0-9][a-z0-9-]* before
+ * constructing any path, preventing path-separator and glob-char injection.
+ *
+ * Actions:
+ *   init   <env-name> <env-user> [name...]  — reuse-or-generate (create path)
+ *   rotate <env-name> <env-user> [name...]  — rm-then-generate-all (no reuse)
+ *   clean  <env-name>                       — rm -rf the env secrets dir
+ */
+const SAMOHOST_SECRETS_HELPER_LINES: string[] = [
+  "#!/usr/bin/env bash",
+  "# samohost-secrets — per-env secrets helper, run as root via ONE sudoers grant.",
+  "# Usage:",
+  "#   samohost-secrets init   <env-name> <env-user> [name1 name2 ...]",
+  "#   samohost-secrets rotate <env-name> <env-user> [name1 name2 ...]",
+  "#   samohost-secrets clean  <env-name>",
+  "set -euo pipefail",
+  "",
+  "ACTION=\"${1:-}\"",
+  "ENV_NAME=\"${2:-}\"",
+  "",
+  "# Validate env-name: only [a-z0-9][a-z0-9-]* — no path separators, no globs,",
+  "# no spaces, no .. — confines all operations to /var/lib/samohost/envs/<name>/.",
+  "if [[ -z \"$ENV_NAME\" ]] || [[ ! \"$ENV_NAME\" =~ ^[a-z0-9][a-z0-9-]*$ ]]; then",
+  "  echo \"samohost-secrets: invalid env name '${ENV_NAME}' — only [a-z0-9-] allowed; no path separators, globs, or spaces\" >&2",
+  "  exit 1",
+  "fi",
+  "",
+  "SECRETS_DIR=\"/var/lib/samohost/envs/${ENV_NAME}\"",
+  "SECRETS_FILE=\"${SECRETS_DIR}/secrets.env\"",
+  "",
+  "case \"$ACTION\" in",
+  "  init)",
+  "    ENV_USER=\"${3:-root}\"",
+  "    shift 3 2>/dev/null || true",
+  "    mkdir -p \"$SECRETS_DIR\"",
+  "    if [[ ! -f \"$SECRETS_FILE\" ]]; then",
+  "      install -m 600 -o \"$ENV_USER\" /dev/null \"$SECRETS_FILE\"",
+  "    fi",
+  "    for _name in \"$@\"; do",
+  "      if ! grep -qE \"^${_name}[=]\" \"$SECRETS_FILE\" 2>/dev/null; then",
+  "        _val=\"$(openssl rand -hex 32)\"",
+  "        printf '%s=%s\\n' \"$_name\" \"$_val\" >> \"$SECRETS_FILE\"",
+  "        unset _val",
+  "      fi",
+  "    done",
+  "    chmod 600 \"$SECRETS_FILE\"",
+  "    ;;",
+  "  rotate)",
+  "    ENV_USER=\"${3:-root}\"",
+  "    shift 3 2>/dev/null || true",
+  "    mkdir -p \"$SECRETS_DIR\"",
+  "    rm -f \"$SECRETS_FILE\"",
+  "    install -m 600 -o \"$ENV_USER\" /dev/null \"$SECRETS_FILE\"",
+  "    for _name in \"$@\"; do",
+  "      _val=\"$(openssl rand -hex 32)\"",
+  "      printf '%s=%s\\n' \"$_name\" \"$_val\" >> \"$SECRETS_FILE\"",
+  "      unset _val",
+  "    done",
+  "    chmod 600 \"$SECRETS_FILE\"",
+  "    ;;",
+  "  clean)",
+  "    rm -rf \"$SECRETS_DIR\"",
+  "    ;;",
+  "  *)",
+  "    echo \"samohost-secrets: unknown action '${ACTION}' — use init|rotate|clean\" >&2",
+  "    exit 1",
+  "    ;;",
+  "esac",
+];
 
 /** Wrap a phase body in start/ok/fail markers with exit-on-fail. */
 function phaseBlock(
@@ -1204,52 +1283,65 @@ export function buildEnvCreateScript(
     ),
   );
 
-  // ----- secrets ---------------------------------------------------------------
-  // When app.secrets is non-empty, generate per-env secret values ON THE VM
-  // using openssl rand -hex 32. Values are written to a 0600 file owned by the
-  // env user at /var/lib/samohost/envs/<envname>/secrets.env.
-  //
-  // REBUILD REUSE: each name is grep-checked before generating; existing values
-  // are preserved across rebuilds so that SESSION/TOKEN secrets remain valid
-  // across preview rebuilds (live sessions survive a re-create).
-  //
-  // Privilege model: all operations on secrets.env run as root via `sudo`
-  // (brief: "root writes the 0600 file"). Values travel via printf-to-tee-a
-  // pipeline into the file — never echoed to stdout or stored in state.
-  // `grep -q` only returns an exit code (no content exposed).
+  // ----- secrets-preflight + secrets ------------------------------------------
+  // When app.secrets is non-empty:
+  //   1. PREFLIGHT: verify that every service unit template on this host already
+  //      carries the EnvironmentFile=/var/lib/samohost/envs/%i/secrets.env line.
+  //      If not, the host-prep has not been re-run after PR-B shipped.  Fail
+  //      LOUD with an actionable message rather than silently booting the app
+  //      without secrets.  (BLOCKER 1b fix.)
+  //   2. SECRETS: call the samohost-secrets helper (installed by host-prep) via
+  //      ONE exact-path sudo grant.  The helper validates the env-name, creates
+  //      the 0600 file, reuses existing values (REBUILD REUSE), and generates
+  //      new ones via openssl rand -hex 32 ON THE VM.  Values never appear in
+  //      this script's stdout; all file ops run inside the helper.
+  //      The phase is wrapped in phaseBlock so failures emit secrets:fail.
   if ((app.secrets ?? []).length > 0) {
-    const secretsDir = `/var/lib/samohost/envs/${t.name}`;
-    const secretsFile = `${secretsDir}/secrets.env`;
     const secretsEnvUser = app.appUser ?? "root";
+    const secretNames = app.secrets!;
+    // All unique service unit template paths that must carry the secrets
+    // EnvironmentFile line.  For legacy single-service apps this is just the
+    // one primary unit; for multi-service apps every service unit is checked.
+    const { services: svcs } = servicesOf(app);
+    const uniqueUnits = [...new Set(svcs.map((s) => s.unit))];
+
+    // --- secrets-preflight ---------------------------------------------------
     lines.push(
-      `# --- secrets: generate per-env secrets (values ON-HOST only; never echoed) ---`,
-      marker("secrets", "start"),
-      `sudo /usr/bin/mkdir -p ${sq(secretsDir)}`,
-      `# Pre-create at 0600 owned by ${secretsEnvUser} once; skip on rebuild (file exists).`,
-      `if [[ ! -f ${sq(secretsFile)} ]]; then`,
-      `  sudo /usr/bin/install -m 600 -o ${sq(secretsEnvUser)} /dev/null ${sq(secretsFile)}`,
-      `fi`,
-      `# For each declared secret: reuse existing value (grep); generate only if absent.`,
-      `# Values travel via pipeline — never echoed.`,
+      `# --- secrets-preflight: verify unit templates have secrets EnvironmentFile ---`,
+      marker("secrets-preflight", "start"),
+      `_secrets_preflight_ok=1`,
     );
-    for (const name of app.secrets!) {
-      // Pattern uses [=] character class (not bare =) so the script text contains
-      // "^NAME[=]" rather than "^NAME=" — the [=] form is ERE-equivalent but
-      // avoids the literal "NAME=VALUE" pattern that the leak-regression test
-      // (correctly) forbids (bash grep works identically; sudoers * wildcard
-      // matches the character-class form unchanged).
+    for (const unitName of uniqueUnits) {
+      const templatePath = `/etc/systemd/system/${unitName}@.service`;
       lines.push(
-        `if ! sudo /usr/bin/grep -qE "^${name}[=]" ${sq(secretsFile)} 2>/dev/null; then`,
-        `  _sh_secret_val="$(openssl rand -hex 32)"`,
-        `  printf '%s=%s\\n' ${sq(name)} "$_sh_secret_val" | sudo /usr/bin/tee -a ${sq(secretsFile)} > /dev/null`,
-        `  unset _sh_secret_val`,
+        `if ! grep -qF 'EnvironmentFile=/var/lib/samohost/envs/%i/secrets.env' ${sq(templatePath)} 2>/dev/null; then`,
+        `  echo "samohost: unit template ${templatePath} is missing EnvironmentFile=/var/lib/samohost/envs/%i/secrets.env — re-run 'samohost env plan --host-prep' to install secrets support, then re-create this env" >&2`,
+        `  _secrets_preflight_ok=0`,
         `fi`,
       );
     }
     lines.push(
-      `sudo /usr/bin/chmod 600 ${sq(secretsFile)}`,
-      marker("secrets", "ok"),
+      `if [[ "$_secrets_preflight_ok" == "1" ]]; then`,
+      `  ${marker("secrets-preflight", "ok")}`,
+      `else`,
+      `  ${marker("secrets-preflight", "fail")}`,
+      `  exit 1`,
+      `fi`,
       ``,
+    );
+
+    // --- secrets (via helper, wrapped in phaseBlock) -------------------------
+    // Values are generated ON THE VM inside the helper (openssl rand -hex 32).
+    // The helper performs: mkdir, create-at-0600 if absent, reuse-or-generate
+    // per name, chmod 600 — all under ONE root grant for /usr/local/sbin/samohost-secrets.
+    lines.push(
+      ...phaseBlock(
+        "secrets",
+        "generate per-env secrets via samohost-secrets helper (values on-VM only; never echoed)",
+        [
+          `if sudo /usr/local/sbin/samohost-secrets init ${sq(t.name)} ${sq(secretsEnvUser)} ${secretNames.map(sq).join(" ")}; `,
+        ],
+      ),
     );
   }
 
@@ -1534,6 +1626,20 @@ export function buildEnvDestroyScript(
     }
   }
 
+  // ----- secrets-cleanup: remove per-env secrets dir -------------------------
+  // When the app declares secrets[], remove /var/lib/samohost/envs/<name>/
+  // to prevent stale secret values from being inherited if the env is later
+  // recreated.  Runs via the samohost-secrets helper (same grant as env-create).
+  // `|| true` keeps destroy idempotent when the dir is already gone or the
+  // helper is absent (e.g. on a host that was prepped before PR-B shipped).
+  if (!isStatic && (app.secrets ?? []).length > 0) {
+    lines.push(
+      `# --- secrets-cleanup: remove per-env secrets dir (prevents stale value inheritance) ---`,
+      `sudo /usr/local/sbin/samohost-secrets clean ${sq(t.name)} 2>/dev/null || true`,
+      ``,
+    );
+  }
+
   lines.push(
     `# --- dir-remove ---`,
     marker("dir-remove", "start"),
@@ -1573,8 +1679,6 @@ export function buildSecretsRotateScript(
   app: AppRecord,
   t: EnvScriptTarget,
 ): string {
-  const secretsDir = `/var/lib/samohost/envs/${t.name}`;
-  const secretsFile = `${secretsDir}/secrets.env`;
   const envUser = app.appUser ?? "root";
   const secrets = app.secrets ?? [];
   const { services } = servicesOf(app);
@@ -1582,42 +1686,29 @@ export function buildSecretsRotateScript(
   const lines: string[] = [
     "#!/usr/bin/env bash",
     `# samohost env secrets rotate for env ${sq(t.name)} (generated; pushed via ssh bash -s).`,
-    "# Regenerates ALL declared secrets with fresh random values and restarts units.",
+    "# Regenerates ALL declared secrets with fresh random values.",
+    "# Only ACTIVE unit instances are restarted — stopped units are left stopped.",
     "set -euo pipefail",
     "",
-    `# 1. Delete old secrets file; recreate empty at 0600 owned by ${envUser}.`,
-    `#    rm-then-install ensures a clean file (no leftover stale lines).`,
-    `sudo /usr/bin/rm -f ${sq(secretsFile)}`,
-    `sudo /usr/bin/mkdir -p ${sq(secretsDir)}`,
-    `sudo /usr/bin/install -m 600 -o ${sq(envUser)} /dev/null ${sq(secretsFile)}`,
+    `# 1. Rotate all secrets via the samohost-secrets helper.`,
+    `#    The helper rm-then-recreates the file, generates ALL names unconditionally`,
+    `#    (no reuse on rotate), and sets mode 0600. Values are generated on-VM.`,
+    `sudo /usr/local/sbin/samohost-secrets rotate ${sq(t.name)} ${sq(envUser)} ${secrets.map(sq).join(" ")}`,
     ``,
-    `# 2. Generate fresh values for ALL declared secrets (no reuse on rotate).`,
-    `#    Values travel via printf-to-tee pipeline — never echoed to stdout.`,
-  ];
-
-  for (const name of secrets) {
-    lines.push(
-      `_sh_secret_val="$(openssl rand -hex 32)"`,
-      `printf '%s=%s\\n' ${sq(name)} "$_sh_secret_val" | sudo /usr/bin/tee -a ${sq(secretsFile)} > /dev/null`,
-      `unset _sh_secret_val`,
-    );
-  }
-
-  lines.push(
-    `sudo /usr/bin/chmod 600 ${sq(secretsFile)}`,
-    ``,
-    `# 3. Restart all env unit instances so new secrets are loaded.`,
-    `#    disable--now + enable--now is the universally-granted pattern`,
+    `# 2. Restart ACTIVE unit instances so new secrets take effect.`,
+    `#    disable--now + enable--now is the universally-granted restart pattern`,
     `#    (no bare restart grant on adopted hosts — issue #99 lesson).`,
-  );
+    `#    Stopped units are intentionally NOT started: rotation only applies to`,
+    `#    running envs; starting a stopped env is env-create's responsibility.`,
+  ];
 
   for (const svc of services) {
     const instance = `${svc.unit}@${t.name}.service`;
     lines.push(
       `if systemctl is-active ${sq(instance)} >/dev/null 2>&1; then`,
-      `  sudo /usr/bin/systemctl disable --now ${sq(instance)}`,
+      `  sudo /usr/bin/systemctl disable --now ${sq(instance)} \\`,
+      `    && sudo /usr/bin/systemctl enable --now ${sq(instance)}`,
       `fi`,
-      `sudo /usr/bin/systemctl enable --now ${sq(instance)}`,
     );
   }
 
@@ -1935,38 +2026,104 @@ export function buildHostPrepScript(
       `install -m 600 -o ${sshUser} -g ${sshUser} /dev/null ${root}.template.env`,
       `echo 'EDIT ${root}.template.env: populate base env vars for previews' >&2`,
       "",
-      `# 2. systemd template unit: one instance per env (%i = env name).`,
-      `#    User= is the app user (${envUser}) — the user that owns the env dir`,
-      `#    and the cloned code (issue #97: was sshUser which cannot read the`,
-      `#    appUser-owned checkout or the 600 .gh-token).`,
-      `cat > /etc/systemd/system/${unit}@.service <<'UNIT'`,
-      "[Unit]",
-      `Description=${app.name} preview env %i`,
-      "After=network.target",
-      "",
-      "[Service]",
-      `User=${envUser}`,
-      `WorkingDirectory=${root}/%i`,
-      `EnvironmentFile=${root}/%i/.env`,
-      // When the app declares secrets[], add a second EnvironmentFile that loads
-      // the per-env 0600 secrets file.  The -/ prefix is NOT used: if secrets[]
-      // is declared the file MUST exist (env-create writes it); a missing file
-      // means the env-create script was not run, which is an operator error that
-      // should surface as a unit-start failure rather than silently starting the
-      // app without secrets. Legacy apps (secrets=[] or absent) produce
-      // byte-identical output (this line is conditionally omitted).
-      ...((app.secrets ?? []).length > 0
-        ? [`EnvironmentFile=/var/lib/samohost/envs/%i/secrets.env`]
-        : []),
-      "ExecStart=/usr/bin/npm start",
-      "Restart=on-failure",
-      "",
-      "[Install]",
-      "WantedBy=multi-user.target",
-      "UNIT",
-      "systemctl daemon-reload",
-      "",
     );
+
+    // Step 2: systemd template unit(s) — one template per unique service unit.
+    // For single-service apps (legacy) only one template is written at the
+    // app.serviceUnit path, preserving byte-identical output (no change in
+    // behavior for apps that don't use multi-service declarations).
+    // For multi-service apps, every distinct svc.unit gets its own template so
+    // that env-create/rotate can start ALL service instances (BLOCKER 1a fix).
+    const { services: hostPrepServices } = servicesOf(app);
+    const uniqueHostPrepUnits = [...new Map(
+      hostPrepServices.map((s) => [s.unit, s]),
+    ).values()];
+
+    if (uniqueHostPrepUnits.length === 1) {
+      // SINGLE-SERVICE / LEGACY: exact original format for byte-identical output.
+      const svc0 = uniqueHostPrepUnits[0]!;
+      nodeOnlyLines.push(
+        `# 2. systemd template unit: one instance per env (%i = env name).`,
+        `#    User= is the app user (${envUser}) — the user that owns the env dir`,
+        `#    and the cloned code (issue #97: was sshUser which cannot read the`,
+        `#    appUser-owned checkout or the 600 .gh-token).`,
+        `cat > /etc/systemd/system/${svc0.unit}@.service <<'UNIT'`,
+        "[Unit]",
+        `Description=${app.name} preview env %i`,
+        "After=network.target",
+        "",
+        "[Service]",
+        `User=${envUser}`,
+        `WorkingDirectory=${root}/%i`,
+        `EnvironmentFile=${root}/%i/.env`,
+        // When the app declares secrets[], add a second EnvironmentFile that loads
+        // the per-env 0600 secrets file.  The -/ prefix is NOT used: if secrets[]
+        // is declared the file MUST exist (env-create writes it); a missing file
+        // means the env-create script was not run, which is an operator error that
+        // should surface as a unit-start failure rather than silently starting the
+        // app without secrets. Legacy apps (secrets=[] or absent) produce
+        // byte-identical output (this line is conditionally omitted).
+        ...((app.secrets ?? []).length > 0
+          ? [`EnvironmentFile=/var/lib/samohost/envs/%i/secrets.env`]
+          : []),
+        "ExecStart=/usr/bin/npm start",
+        "Restart=on-failure",
+        "",
+        "[Install]",
+        "WantedBy=multi-user.target",
+        "UNIT",
+        "systemctl daemon-reload",
+        "",
+      );
+    } else {
+      // MULTI-SERVICE: write a template for every unique service unit so that
+      // ALL unit instances carry the EnvironmentFile for secrets (BLOCKER 1a).
+      nodeOnlyLines.push(
+        `# 2. systemd template units: one instance per env (%i = env name), per service.`,
+        `#    User= is the app user (${envUser}).`,
+      );
+      for (const svc of uniqueHostPrepUnits) {
+        const execStart = svc.execStart ?? "/usr/bin/npm start";
+        nodeOnlyLines.push(
+          `cat > /etc/systemd/system/${svc.unit}@.service <<'UNIT'`,
+          "[Unit]",
+          `Description=${app.name} ${svc.name} preview env %i`,
+          "After=network.target",
+          "",
+          "[Service]",
+          `User=${envUser}`,
+          `WorkingDirectory=${root}/%i`,
+          `EnvironmentFile=${root}/%i/.env`,
+          ...((app.secrets ?? []).length > 0
+            ? [`EnvironmentFile=/var/lib/samohost/envs/%i/secrets.env`]
+            : []),
+          `ExecStart=${execStart}`,
+          "Restart=on-failure",
+          "",
+          "[Install]",
+          "WantedBy=multi-user.target",
+          "UNIT",
+        );
+      }
+      nodeOnlyLines.push("systemctl daemon-reload", "");
+    }
+
+    // Step 2b: install the samohost-secrets helper when the app declares secrets.
+    // Installed here (before sudoers) so the helper binary exists when visudo
+    // validates the NOPASSWD grant for it.  Single-quoted heredoc: no expansion
+    // in the helper body during host-prep execution.
+    if ((app.secrets ?? []).length > 0) {
+      nodeOnlyLines.push(
+        `# 2b. samohost-secrets helper: validates env-name, performs all per-env`,
+        `#     secrets file operations.  ONE exact-path sudoers grant covers all`,
+        `#     env-create / rotate / destroy operations — no user-controlled glob.`,
+        `cat > /usr/local/sbin/samohost-secrets <<'SAMOHOST_SECRETS_HELPER'`,
+        ...SAMOHOST_SECRETS_HELPER_LINES,
+        `SAMOHOST_SECRETS_HELPER`,
+        `chmod 750 /usr/local/sbin/samohost-secrets`,
+        ``,
+      );
+    }
   }
 
   // --- step 4 sudoers: node has systemd+postgres grants; static has caddy only -
@@ -2034,21 +2191,15 @@ export function buildHostPrepScript(
       `${sshUser} ALL=(${app.appUser}) NOPASSWD: /usr/bin/chmod 600 ${root}/*/.env`,
     );
   }
-  // When the app declares secrets[], add scoped root grants for
-  // /var/lib/samohost/envs/*/secrets.env (PR-B).  All operations run as root
-  // (brief: "root writes the 0600 file").  grep -qE only returns an exit code —
-  // no content is exposed.  tee -a appends a single printf line; > /dev/null
-  // prevents value from appearing in stdout.  rm -f is needed by env secrets
-  // rotate (delete + recreate ensures a clean overwrite).
+  // When the app declares secrets[], grant ONE exact-path NOPASSWD for the
+  // samohost-secrets helper (installed by step 2b above).  The helper validates
+  // the env-name argument and performs ALL secrets file operations internally —
+  // no user-controlled wildcard remains in any sudoers grant (BLOCKER 2 fix).
   if ((app.secrets ?? []).length > 0) {
     sudoersLines.push(
-      `# Secrets (PR-B): per-env 0600 file at /var/lib/samohost/envs/<name>/secrets.env.`,
-      `${sshUser} ALL=(root) NOPASSWD: /usr/bin/mkdir -p /var/lib/samohost/envs`,
-      `${sshUser} ALL=(root) NOPASSWD: /usr/bin/install -m 600 -o ${envUser} /dev/null /var/lib/samohost/envs/*/secrets.env`,
-      `${sshUser} ALL=(root) NOPASSWD: /usr/bin/grep -qE * /var/lib/samohost/envs/*/secrets.env`,
-      `${sshUser} ALL=(root) NOPASSWD: /usr/bin/tee -a /var/lib/samohost/envs/*/secrets.env`,
-      `${sshUser} ALL=(root) NOPASSWD: /usr/bin/chmod 600 /var/lib/samohost/envs/*/secrets.env`,
-      `${sshUser} ALL=(root) NOPASSWD: /usr/bin/rm -f /var/lib/samohost/envs/*/secrets.env`,
+      `# Secrets: ONE exact-path grant for the samohost-secrets helper.`,
+      `# The helper validates env-name (^[a-z0-9][a-z0-9-]*$) before touching any path.`,
+      `${sshUser} ALL=(root) NOPASSWD: /usr/local/sbin/samohost-secrets`,
     );
   }
   sudoersLines.push(
