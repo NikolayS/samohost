@@ -1264,6 +1264,27 @@ export function buildEnvCreateScript(
     "",
   ];
 
+  // Emit per-listener portEnv shell variables immediately after the header
+  // globals so the BUILD phase (and every phase that follows) can reference
+  // them. Example: APP_API_ORIGIN=http://127.0.0.1:${APP_API_PORT} in a
+  // buildCmd — without this, build ran before the portEnvs were written to
+  // .env (envfile phase), causing a prod-leak: the variable was unset so the
+  // build would fall back to the service's default prod port instead of the
+  // allocated per-env port.
+  //
+  // Values are taken from portMap — the SAME source that the envfile phase
+  // uses when it writes printf 'PORTENV=PORT\n' to .env — so both phases are
+  // guaranteed to carry identical values (single source of truth).
+  //
+  // Single-service (legacy) apps: portMap holds { web → t.port }; the
+  // synthesized listener has portEnv="PORT", so PORT='<t.port>' is emitted
+  // here. The envfile strip-then-append for PORT is unchanged.
+  for (const { listener } of allListeners) {
+    const allocatedPort = portMap.get(listener.name) ?? t.port;
+    lines.push(`${listener.portEnv}=${sq(String(allocatedPort))}`);
+  }
+  lines.push("");
+
   // ----- port-check: FIRST phase — fail CLOSED if any listener port is held
   // by a foreign process. Loops all allocated listener ports. Detection uses
   // `ss -ltnH` (no sudo on Ubuntu). If a port is held by OUR OWN active
