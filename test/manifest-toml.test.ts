@@ -1780,3 +1780,151 @@ describe("runAppRegister — programmatic service topology validation (Fix 6)", 
     expect(appStore.list().filter((r) => r.vmId === "vm-1111")).toHaveLength(1);
   });
 });
+
+// ---------------------------------------------------------------------------
+// releaseTagPattern — parse-only, inert field (no deploy-gate behavior)
+//
+// RED: these tests fail until APP_KEYS includes "releaseTagPattern",
+//      AppManifest/AppSpec/AppRecord carry the field, and runAppRegisterFromToml
+//      threads it through.
+// GREEN: after the implementation in toml.ts / types.ts / commands/app.ts.
+//
+// Scope: accept + persist only. The tag-gated deploy feature is a separate,
+// not-yet-shipped design; prod deploys on main SHA + CI-green regardless.
+// ---------------------------------------------------------------------------
+
+describe("parseSamohostToml — releaseTagPattern (parse-only, inert)", () => {
+  function minimal(extra = ""): string {
+    return [
+      'name        = "my-app"',
+      'repo        = "owner/my-app"',
+      'branch      = "main"',
+      'appDir      = "/opt/my-app/app"',
+      'buildCmd    = "npm run build"',
+      'healthUrl   = "http://localhost:3000/health"',
+      'serviceUnit = "my-app"',
+      extra,
+    ]
+      .filter(Boolean)
+      .join("\n");
+  }
+
+  // rtp-1: present + valid glob → parses ok, value lands in AppManifest
+  test('rtp-1: releaseTagPattern = "v*" parses ok and value is present', () => {
+    const result = parseSamohostToml(minimal('releaseTagPattern = "v*"'));
+    if (!result.ok) throw new Error("expected ok=true; errors: " + result.errors.join(", "));
+    expect(result.app.releaseTagPattern).toBe("v*");
+  });
+
+  // rtp-2: absent → field undefined, legacy manifests byte-identical
+  test("rtp-2: absent releaseTagPattern → field is undefined (legacy manifests unchanged)", () => {
+    const result = parseSamohostToml(minimal());
+    if (!result.ok) throw new Error("expected ok=true; errors: " + result.errors.join(", "));
+    expect(result.app.releaseTagPattern).toBeUndefined();
+  });
+
+  // rtp-3: empty string → validation error (non-empty required)
+  test('rtp-3: releaseTagPattern = "" (empty string) → validation error', () => {
+    const result = parseSamohostToml(minimal('releaseTagPattern = ""'));
+    expect(result.ok).toBe(false);
+    if (result.ok) throw new Error("expected ok=false");
+    expect(result.errors.some((e) => e.toLowerCase().includes("releasetagpattern"))).toBe(true);
+  });
+
+  // rtp-4: non-string type → validation error
+  test("rtp-4: releaseTagPattern = 123 (wrong type) → validation error", () => {
+    const result = parseSamohostToml(minimal("releaseTagPattern = 123"));
+    expect(result.ok).toBe(false);
+    if (result.ok) throw new Error("expected ok=false");
+    expect(result.errors.some((e) => e.toLowerCase().includes("releasetagpattern"))).toBe(true);
+  });
+
+  // rtp-5: various valid glob patterns are accepted
+  test('rtp-5: releaseTagPattern = "release-*" (more complex glob) parses ok', () => {
+    const result = parseSamohostToml(minimal('releaseTagPattern = "release-*"'));
+    if (!result.ok) throw new Error("expected ok=true; errors: " + result.errors.join(", "));
+    expect(result.app.releaseTagPattern).toBe("release-*");
+  });
+});
+
+describe("runAppRegisterFromToml — releaseTagPattern threaded to AppRecord", () => {
+  let dir: string;
+  let vmStore: StateStore;
+  let appStore: AppStore;
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), "samohost-rtp-"));
+    vmStore = new StateStore(join(dir, "state.json"));
+    appStore = new AppStore(join(dir, "apps.json"));
+    vmStore.upsert({
+      id: "vm-1111",
+      provider: "hetzner",
+      providerId: "137236481",
+      name: "samo-we-field-record",
+      ip: "178.105.246.151",
+      sshKeyPath: "/home/fixture/.ssh/id_ed25519",
+      sshPort: 2223,
+      sshUser: "agent",
+      hostKeyFingerprint: "SHA256:" + "A".repeat(43),
+      region: "fsn1",
+      type: "cx33",
+      modules: [],
+      lifecycleState: "adopted",
+      createdAt: "2026-01-01T00:00:00.000Z",
+      updatedAt: "2026-01-01T00:00:00.000Z",
+    });
+  });
+
+  afterEach(() => rmSync(dir, { recursive: true, force: true }));
+
+  function writeToml(extra: string): string {
+    const path = join(dir, "test.toml");
+    writeFileSync(path, [
+      'name        = "rtp-fixture"',
+      'repo        = "samo-agent/rtp-fixture"',
+      'branch      = "main"',
+      'appDir      = "/opt/rtp-fixture/app"',
+      'buildCmd    = "npm run build"',
+      'healthUrl   = "http://localhost:3000/api/version"',
+      'serviceUnit = "rtp-fixture"',
+      extra,
+    ].filter(Boolean).join("\n"));
+    return path;
+  }
+
+  // rtp-6: releaseTagPattern in toml → lands on AppRecord
+  test('rtp-6: releaseTagPattern "v*" in toml → AppRecord.releaseTagPattern = "v*"', () => {
+    const tomlPath = writeToml('releaseTagPattern = "v*"');
+    const c = capture();
+    const code = runAppRegisterFromToml(
+      { vm: "samo-we-field-record", tomlPath },
+      { json: false },
+      vmStore,
+      appStore,
+      c.out,
+      c.err,
+    );
+    expect(code).toBe(0);
+    const rec = appStore.get("vm-1111", "rtp-fixture");
+    expect(rec).toBeDefined();
+    expect(rec?.releaseTagPattern).toBe("v*");
+  });
+
+  // rtp-7: absent releaseTagPattern → AppRecord field absent (no regression)
+  test("rtp-7: absent releaseTagPattern → AppRecord.releaseTagPattern undefined (no regression)", () => {
+    const tomlPath = writeToml("");
+    const c = capture();
+    const code = runAppRegisterFromToml(
+      { vm: "samo-we-field-record", tomlPath },
+      { json: false },
+      vmStore,
+      appStore,
+      c.out,
+      c.err,
+    );
+    expect(code).toBe(0);
+    const rec = appStore.get("vm-1111", "rtp-fixture");
+    expect(rec).toBeDefined();
+    expect(rec?.releaseTagPattern).toBeUndefined();
+  });
+});
