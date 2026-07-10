@@ -1492,6 +1492,21 @@ export interface HostPrepFirewallOpts {
    * @default true
    */
   allowCfHttps?: boolean;
+
+  /**
+   * When `true`, the generated host-prep script will overwrite a differing
+   * live main vhost file rather than refusing.  A timestamped backup is
+   * created before the overwrite; `caddy validate` is run and the backup is
+   * restored on validate failure.
+   *
+   * Default `false`: the guard **refuses** to overwrite a live file that
+   * differs from the staged content.  This protects hand-authored multi-service
+   * vhosts (e.g. samograph) from being silently clobbered by a re-run
+   * host-prep that only knows the single-service reverse_proxy form.
+   *
+   * @default false
+   */
+  forceMainVhost?: boolean;
 }
 
 /**
@@ -1532,6 +1547,13 @@ export function buildHostPrepScript(
   // production vhost must be provisioned state in sites.d, not a hand-applied
   // VM-local Caddy edit that the next Caddyfile churn de-references together
   // with every preview snippet (observed: Cloudflare 521 on *.samo.cat).
+  //
+  // Landmine guard: multi-service apps (e.g. samograph) hand-author this file
+  // with path/ws routing that the single-service render does not know about.
+  // A bare overwrite silently drops all custom routing → prod goes dark.
+  // The emitted samohost_apply_main_vhost() guard refuses to overwrite a
+  // differing live file unless --force-main-vhost was set for this invocation.
+  const guardFnLines: string[] = [];
   const mainVhostLines: string[] = [];
   if (app.mainHost !== undefined) {
     if (!isValidMainHost(app.mainHost)) {
@@ -1543,17 +1565,72 @@ export function buildHostPrepScript(
       );
     }
     const port = mainEnvPort(app);
+    const livePath = `/etc/caddy/sites.d/00-main-${app.name}.caddy`;
+    const stagedPath = `/etc/caddy/sites.d/.staged-00-main-${app.name}.caddy`;
+    const bakedForce = firewallOpts?.forceMainVhost === true ? "true" : "false";
+
+    // Guard function definition — emitted early in the script (after set -euo
+    // pipefail) so it is available when called later in the Caddy step.
+    // All inner closing tokens use fi/done (not `}`), so the only `}` at
+    // column 0 is the function's own closing brace — safe for extractFn().
+    guardFnLines.push(
+      "# Landmine guard: compare staged vs live main vhost; refuse if different",
+      "# unless force=true.  Called from the Caddy step below.",
+      "samohost_apply_main_vhost() {",
+      "  local staged=\"$1\"",
+      "  local live=\"$2\"",
+      // Regular string so ${3:-false} is emitted verbatim (bash default, not TS).
+      "  local force=\"${3:-false}\"",
+      "  local backup=\"\"",
+      "  if [[ -f \"$live\" ]]; then",
+      "    if diff -q \"$staged\" \"$live\" >/dev/null 2>&1; then",
+      "      rm -f \"$staged\"",
+      "      return 0",
+      "    fi",
+      "    if [[ \"$force\" != \"true\" ]]; then",
+      "      echo \"samohost host-prep: refusing to overwrite hand-authored/drifted main vhost:\" >&2",
+      "      echo \"  $live\" >&2",
+      "      diff -u \"$live\" \"$staged\" >&2 || true",
+      "      echo \"\" >&2",
+      "      echo \"  Re-run with --force-main-vhost to override.\" >&2",
+      "      rm -f \"$staged\"",
+      "      return 1",
+      "    fi",
+      // Regular strings so ${live} and ${...} expand as bash vars, not TS.
+      "    backup=\"${live}.bak.$(date +%Y%m%dT%H%M%S)\"",
+      "    cp \"$live\" \"$backup\"",
+      "  fi",
+      "  mv \"$staged\" \"$live\"",
+      "  if ! caddy validate --config /etc/caddy/Caddyfile; then",
+      "    echo \"samohost host-prep: caddy validate failed — restoring backup\" >&2",
+      "    if [[ -n \"${backup}\" ]] && [[ -f \"${backup}\" ]]; then",
+      "      cp \"${backup}\" \"$live\"",
+      "    else",
+      "      rm -f \"$live\"",
+      "    fi",
+      "    return 1",
+      "  fi",
+      "  systemctl reload caddy",
+      "}",
+      "",
+    );
+
     mainVhostLines.push(
       "",
-      `#    Durable MAIN-env vhost: deterministic content, so the plain '>'`,
-      `#    overwrite is idempotent (re-running host-prep rewrites the same`,
-      `#    bytes in place — no append-drift). The 00- prefix sorts it first.`,
-      `#    Host and port are strictly validated above (root-run script).`,
-      `cat > /etc/caddy/sites.d/00-main-${app.name}.caddy <<'CADDY'`,
+      `#    Landmine guard: render the intended single-service vhost to a staged`,
+      `#    file, then call samohost_apply_main_vhost() to compare + conditionally`,
+      `#    apply.  The guard refuses if the live file exists and differs — unless`,
+      `#    force=true was baked in via --force-main-vhost at host-prep time.`,
+      `#    The 00- prefix sorts the live file first in sites.d.`,
+      `cat > ${stagedPath} <<'CADDY'`,
       `${app.mainHost} {`,
       `\treverse_proxy localhost:${port}`,
       `}`,
       "CADDY",
+      `samohost_apply_main_vhost \\`,
+      `  ${stagedPath} \\`,
+      `  ${livePath} \\`,
+      `  ${bakedForce}`,
     );
   }
 
@@ -1676,6 +1753,9 @@ export function buildHostPrepScript(
     "# Review before applying. Nothing here is executed by samohost itself.",
     "set -euo pipefail",
     "",
+    // Guard function definition (only when mainHost is set); placed early so
+    // it is in scope before the Caddy step that calls it.
+    ...guardFnLines,
     ...nodeOnlyLines,
     `# ${isStatic ? "1" : "3"}. Caddy: include per-env vhost snippets + the durable MAIN-env vhost`,
     `#    (field-record-1#117 ITEM C, 7th drift class).`,
@@ -1683,7 +1763,10 @@ export function buildHostPrepScript(
     `grep -q 'import sites.d/\\*.caddy' /etc/caddy/Caddyfile \\`,
     `  || printf '\\nimport sites.d/*.caddy\\n' >> /etc/caddy/Caddyfile`,
     ...mainVhostLines,
-    "systemctl reload caddy",
+    // When mainHost is set, samohost_apply_main_vhost() handles validate +
+    // reload internally.  When mainHost is absent, emit the top-level reload
+    // to activate the 'import sites.d/*.caddy' addition.
+    ...(app.mainHost === undefined ? ["systemctl reload caddy"] : []),
     "",
     // The env-create script runs later as the non-root env user, so the envs
     // root must already exist and be writable by that user regardless of how

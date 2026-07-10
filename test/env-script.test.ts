@@ -366,26 +366,35 @@ describe("buildHostPrepScript", () => {
     // Host-matched block proxying to the production port (from healthUrl).
     expect(s).toContain("field-record-1.samo.team");
     expect(s).toContain("reverse_proxy localhost:3000");
-    // The sites.d include is still applied, and the snippet write precedes
-    // the caddy reload so one host-prep run leaves the main vhost live.
+    // The sites.d include is still applied.
     expect(s).toContain("import sites.d/*.caddy");
-    expect(s.indexOf("00-main-field-record-1.caddy")).toBeLessThan(
-      s.indexOf("systemctl reload caddy"),
-    );
+    // Landmine guard: the guard function is defined (early in the script) and
+    // handles caddy validate + reload internally.  The staged write precedes
+    // the guard function call (which does the actual apply + reload).
+    expect(s).toContain("samohost_apply_main_vhost() {");
+    expect(s).toContain("systemctl reload caddy"); // inside the guard function
+    const stagedIdx = s.indexOf(".staged-00-main-field-record-1.caddy");
+    const callIdx = s.lastIndexOf("samohost_apply_main_vhost \\");
+    expect(stagedIdx).toBeGreaterThan(-1);
+    expect(callIdx).toBeGreaterThan(stagedIdx); // call follows the staged write
   });
 
   test("main-env vhost write is idempotent (deterministic overwrite, no append-drift)", () => {
     const s = buildHostPrepScript(app({ mainHost: MAIN_HOST }), "agent");
-    // Re-render is byte-identical → re-running host-prep rewrites the same
-    // deterministic snippet in place.
+    // Re-render is byte-identical → re-running host-prep with the same inputs
+    // produces the same staged content every time (no append-drift).
     expect(s).toBe(buildHostPrepScript(app({ mainHost: MAIN_HOST }), "agent"));
-    // The snippet write is a whole-file overwrite (>), never an append (>>).
-    const line = s
+    // The staged write uses > (whole-file overwrite), never >> (append).
+    // Idempotency at runtime is enforced by the guard: when the live file
+    // already contains the same bytes, the guard exits 0 without reload.
+    const stagedLine = s
       .split("\n")
-      .find((l) => l.includes("00-main-field-record-1.caddy"));
-    expect(line).toBeDefined();
-    expect(line).toContain("> /etc/caddy/sites.d/00-main-field-record-1.caddy");
-    expect(line).not.toContain(">>");
+      .find((l) => l.includes(".staged-00-main-field-record-1.caddy"));
+    expect(stagedLine).toBeDefined();
+    expect(stagedLine).toContain(
+      "> /etc/caddy/sites.d/.staged-00-main-field-record-1.caddy",
+    );
+    expect(stagedLine).not.toContain(">>");
   });
 
   test("derives the main vhost port from healthUrl (explicit port and scheme default)", () => {
