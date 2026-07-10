@@ -1237,12 +1237,16 @@ const SUDO_STUB = [
   '  local sql="${!#}"',
   '  if [[ "$sql" == *"count(*)"* ]]; then',
   '    if [[ "$sql" == *"pg_policies"* ]]; then cat "$FIX/prod_policies"',
+  '    elif [[ "$sql" == *"pg_auth_members"* ]]; then cat "$FIX/prod_auth_members"',
   '    elif [[ "$sql" == *"table_privileges"* ]]; then cat "$FIX/prod_grants"',
   '    elif [[ "$sql" == *"pg_tables"* ]]; then cat "$FIX/prod_ownership"',
   "    fi",
   '    [[ -s "$FIX/prod_counts_fail" ]] && return 1',
   "    return 0",
   "  fi",
+  // pg_has_role: return "f" by default (no role-assumption needed in existing tests).
+  // Tests that need "t" use the extended harness in preview-migrate-clone.test.ts.
+  '  if [[ "$sql" == *"pg_has_role"* ]]; then echo f; return 0; fi',
   '  if [[ "$sql" == *"pg_authid"* ]]; then',
   '    if [[ "$sql" == *"CREATE ROLE"* ]]; then cat "$FIX/prod_authid_ddl"',
   '    else cat "$FIX/prod_authid_rows"; fi',
@@ -1281,7 +1285,8 @@ const PSQL_STUB = [
   '    if [[ -n "$CLONE_APPLY_FAIL_ON" && "$batch" == *"$CLONE_APPLY_FAIL_ON"* ]]; then return 1; fi',
   "    return 0",
   "  fi",
-  '  if [[ "$sql" == *"pg_policies"* ]]; then cat "$FIX/clone_policies"',
+  '  if [[ "$sql" == *"pg_auth_members"* ]]; then cat "$FIX/clone_auth_members"',
+  '  elif [[ "$sql" == *"pg_policies"* ]]; then cat "$FIX/clone_policies"',
   '  elif [[ "$sql" == *"table_privileges"* ]]; then cat "$FIX/clone_grants"',
   '  elif [[ "$sql" == *"pg_tables"* ]]; then cat "$FIX/clone_ownership"',
   "  fi",
@@ -1303,6 +1308,18 @@ interface SyncGlobalsOpts {
   cloneApplyFailOn?: string;
   /** DDL the prod-side sudo stub returns for schema-grant queries (ON SCHEMA). */
   prodSchemaGrantDdl?: string;
+  /**
+   * Prod-side pg_auth_members count (for role-assumption parity gate).
+   * Default "0" — prod uses superuser-implies-membership so there are no
+   * explicit pg_auth_members rows for the login role.
+   */
+  prodAuthMembers?: string;
+  /**
+   * Clone-side pg_auth_members count (for role-assumption parity gate).
+   * Default "0" — the default SUDO_STUB returns "f" for pg_has_role so no
+   * GRANTs are emitted and the clone has no explicit memberships.
+   */
+  cloneAuthMembers?: string;
 }
 
 interface SyncGlobalsRun {
@@ -1332,9 +1349,14 @@ function runSyncGlobals(opts: SyncGlobalsOpts = {}): SyncGlobalsRun {
     fix("prod_grants", opts.prodGrants ?? "315");
     fix("prod_ownership", opts.prodOwnership ?? "29");
     fix("prod_counts_fail", opts.prodCountsFail ? "1" : "");
+    // Role-assumption parity fixtures: prod_auth_members defaults to "0"
+    // (prod login role is superuser — no explicit pg_auth_members entries);
+    // clone_auth_members defaults to "0" (no GRANTs emitted when pg_has_role=f).
+    fix("prod_auth_members", opts.prodAuthMembers ?? "0");
     fix("clone_policies", opts.clonePolicies ?? "14");
     fix("clone_grants", opts.cloneGrants ?? "315");
     fix("clone_ownership", opts.cloneOwnership ?? "29");
+    fix("clone_auth_members", opts.cloneAuthMembers ?? "0");
     fix("prod_owner_ddl", "ALTER TABLE public.app_users OWNER TO field_record;\n");
     fix("prod_grant_ddl", "GRANT SELECT ON public.app_users TO app_user;\n");
     // Prod-verified: field_record is the DB owner so it gets CREATE on public

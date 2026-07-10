@@ -43,6 +43,7 @@ export type EnvPhaseName =
   | "envfile"
   | "secrets-preflight"
   | "secrets"
+  | "migrate"
   | "unit"
   | "vhost"
   | "health"
@@ -599,6 +600,26 @@ const SYNC_CLONE_GLOBALS_FN_LINES: string[] = [
   '  sudo -u postgres /usr/bin/psql -At -d "$prod_db" -c "SELECT rolname, rolcanlogin, rolpassword FROM pg_authid WHERE rolname NOT LIKE \'pg\\_%\' AND rolname <> \'postgres\'" 2>/dev/null \\',
   '    | samohost_emit_scoped_role_sql "$scoped_roles" \\',
   '    | PGPASSWORD="$SAMOHOST_DB_PASSWORD" psql -h 127.0.0.1 -p "$SAMOHOST_DB_PORT" -U samohost_env -d postgres -f - >/dev/null 2>&1 || true',
+  "  # 1.5. Role-assumption replay: for each login role L (envDbVars URL roles) and",
+  "  #      each scoped role R (R≠L), if prod pg_has_role(L, R, 'USAGE') is true,",
+  "  #      emit GRANT R TO L into the clone. pg_has_role covers both explicit",
+  "  #      membership AND the superuser-in-prod case, so SET ROLE works on the",
+  "  #      clone without granting SUPERUSER (step 1 stripped it). This closes the",
+  "  #      gap where the app's tenant queries run SET LOCAL ROLE <app_role> and the",
+  "  #      clone login role — stripped of superuser — cannot assume it.",
+  "  #      No cluster privilege is granted: GRANT R TO L is pure role membership.",
+  "  #      Output is suppressed; apply_failures counts any -f psql batch failure.",
+  "  {",
+  "    while IFS= read -r _ra_l; do",
+  '      [[ "$_ra_l" =~ ^[a-z_][a-z0-9_]*$ ]] || continue',
+  "      while IFS= read -r _ra_r; do",
+  '        [[ "$_ra_l" == "$_ra_r" ]] && continue',
+  '        _ra_has="$(sudo -u postgres /usr/bin/psql -At -d "$prod_db" -c "SELECT pg_has_role(\'${_ra_l}\',\'${_ra_r}\',\'USAGE\')" 2>/dev/null || echo f)"',
+  '        [[ "$_ra_has" == "t" ]] || continue',
+  '        printf \'GRANT "%s" TO "%s";\\n\' "$_ra_r" "$_ra_l"',
+  '      done < "$scoped_roles"',
+  '    done < <(samohost_app_url_roles)',
+  '  } | PGPASSWORD="$SAMOHOST_DB_PASSWORD" psql -v ON_ERROR_STOP=1 -h 127.0.0.1 -p "$SAMOHOST_DB_PORT" -U samohost_env -d postgres -f - >/dev/null 2>&1 || apply_failures=$((apply_failures+1))',
   "  # 2. Table ownership (prod's owner role; owner-bypass RLS semantics match).",
   "  #    Idempotent DDL: ON_ERROR_STOP failures are real and counted by exit",
   "  #    code only — output stays suppressed.",
@@ -630,10 +651,16 @@ const SYNC_CLONE_GLOBALS_FN_LINES: string[] = [
   "    return 1",
   "  fi",
   "  # 6. Parity gates (fail CLOSED): an env whose clone cannot honor the",
-  "  #    app's RLS/grant contract is never composed.",
+  "  #    app's RLS/grant contract is never composed. The role-assumption gate",
+  "  #    verifies that the clone's login-role memberships (pg_auth_members) are",
+  "  #    at parity with prod. When prod uses SUPERUSER (count=0), the clone will",
+  "  #    have more explicit memberships (we added them) — the gate passes cleanly",
+  "  #    because clone_count ≥ prod_count. When prod had explicit memberships the",
+  "  #    clone must have at least as many.",
   '  samohost_parity_check "RLS policies" "SELECT count(*) FROM pg_policies" \\',
   '    && samohost_parity_check "table grants" "SELECT count(*) FROM information_schema.table_privileges WHERE grantee NOT IN (\'postgres\',\'PUBLIC\') AND table_schema NOT IN (\'pg_catalog\',\'information_schema\')" \\',
-  '    && samohost_parity_check "table ownership" "SELECT count(*) FROM pg_tables WHERE schemaname NOT IN (\'pg_catalog\',\'information_schema\') AND tableowner <> \'postgres\'"',
+  '    && samohost_parity_check "table ownership" "SELECT count(*) FROM pg_tables WHERE schemaname NOT IN (\'pg_catalog\',\'information_schema\') AND tableowner <> \'postgres\'" \\',
+  '    && samohost_parity_check "role-assumption memberships" "SELECT count(*) FROM pg_auth_members m JOIN pg_roles r ON r.oid = m.member AND r.rolcanlogin = true"',
   "}",
 ];
 
@@ -1534,6 +1561,38 @@ export function buildEnvCreateScript(
     );
   }
 
+  // ----- migrate (optional) -----------------------------------------------
+  // Only emitted when the app declares migrateCmd. Runs AFTER secrets (the
+  // composed .env + secrets.env are fully in place, so DATABASE_URL points at
+  // the clone) and BEFORE unit (migrations run before the new app code boots).
+  // Legacy apps (no migrateCmd) get byte-identical output — the phase is absent.
+  //
+  // Environment sourcing: same principle as src/app/script.ts:141.
+  //   no-appUser path: samo owns SAMOHOST_ENV_DIR/.env (0600); source it in a
+  //     subshell before migrateCmd so DATABASE_URL (clone URL) is visible.
+  //   appUser path: appUser owns the .env and reads it; wrap migrateCmd with
+  //     sudo -u <appUser> (same pattern as install/build). The migration tool
+  //     runs as appUser in SAMOHOST_ENV_DIR where .env is readable by appUser.
+  //
+  // Fail-closed: a non-zero exit from migrateCmd emits migrate:fail + exit 1,
+  // same as every other phase. Idempotent runners no-op when already current.
+  if (app.migrateCmd !== undefined) {
+    const migrateCmdExpr = app.appUser !== undefined
+      // appUser case: wrap with sudo -u <appUser>, same pattern as build.
+      // The migration tool (appUser-owned env dir) loads .env from cwd.
+      ? `if ${sudoWrapBuildCmd(app.migrateCmd, app.appUser)}; `
+      // no-appUser case: source composed .env in a subshell before migrateCmd
+      // so DATABASE_URL (rewritten to the clone) is available to the command.
+      : `if (set -a && . "$SAMOHOST_ENV_DIR/.env" && set +a && ${app.migrateCmd}); `;
+    lines.push(
+      ...phaseBlock(
+        "migrate",
+        "run migrateCmd in $SAMOHOST_ENV_DIR with composed env (branch schema applied before app boots)",
+        [migrateCmdExpr],
+      ),
+    );
+  }
+
   // ----- unit ------------------------------------------------------------------
   // Restart semantics: `enable --now` is a NO-OP on an already-active unit,
   // so a re-create/heal that rewrites .env never reloads the app's DB config.
@@ -2376,11 +2435,25 @@ export function buildHostPrepScript(
     // npm-based the resolved binary equals /usr/bin/npm and we omit the
     // duplicate; the single /usr/bin/npm line covers install + build.
     const buildBin = resolveBuildBin(app.buildCmd);
+    // Resolve the migrate-command binary (migrateCmd may use a different binary
+    // than buildCmd, e.g. `npx prisma migrate deploy` vs `npm run build`).
+    // When migrateCmd is absent or resolves to the same binary as buildCmd or npm,
+    // no duplicate line is added.
+    const migrateBin = app.migrateCmd !== undefined
+      ? resolveBuildBin(app.migrateCmd)
+      : undefined;
     sudoersLines.push(
       `${sshUser} ALL=(${app.appUser}) NOPASSWD: SETENV: /usr/bin/git`,
       `${sshUser} ALL=(${app.appUser}) NOPASSWD: /usr/bin/npm`,
       ...(buildBin !== "/usr/bin/npm"
         ? [`${sshUser} ALL=(${app.appUser}) NOPASSWD: ${buildBin}`]
+        : []),
+      // migrateCmd binary grant: only when it differs from npm and buildBin
+      // (avoid duplicate sudoers lines for the same exact path).
+      ...(migrateBin !== undefined &&
+        migrateBin !== "/usr/bin/npm" &&
+        migrateBin !== buildBin
+        ? [`${sshUser} ALL=(${app.appUser}) NOPASSWD: ${migrateBin}`]
         : []),
       // Scoped envfile write grants (samorev security fix — replaces the broad
       // /usr/bin/bash SETENV grant). Path pattern uses the envs root so the
