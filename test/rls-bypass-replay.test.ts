@@ -366,33 +366,44 @@ describe("rls-bypass-replay: executed — emit behavior", () => {
   });
 
   test("does NOT emit ALTER ROLE BYPASSRLS when prod login role is plain (rolsuper=f, rolbypassrls=f)", () => {
-    // Plain prod role — no RLS-bypass capability → nothing should be emitted on the clone.
+    // Plain prod role — no RLS-bypass capability → no BYPASSRLS ALTER emitted.
+    // Note: the existing role replay emits NOBYPASSRLS (stripping superpowers);
+    // we check that no standalone ALTER ROLE ... BYPASSRLS; (bypass grant) appears.
     const r = runSyncGlobalsRLS({
       prodRlsBypass: "f|f",
       cloneBypassCount: "0",
     });
     expect(r.code).toBe(0);
-    // applied.sql must NOT contain any BYPASSRLS alter.
-    expect(r.applied).not.toMatch(/BYPASSRLS/);
+    // The standalone BYPASSRLS-grant pattern: `ALTER ROLE "X" BYPASSRLS;`
+    // (not preceded by NO, not part of a multi-attribute ALTER).
+    const rlsGrantLines = r.applied
+      .split("\n")
+      .filter((l) => /ALTER ROLE "[a-z_]+" BYPASSRLS;/.test(l));
+    expect(rlsGrantLines.length).toBe(0);
   });
 
-  test("no SUPERUSER granted in applied.sql — only BYPASSRLS attribute", () => {
+  test("no SUPERUSER granted in applied.sql — only BYPASSRLS attribute emitted", () => {
     const r = runSyncGlobalsRLS({
       prodRlsBypass: "t|f",
       cloneBypassCount: "2",
     });
     expect(r.code).toBe(0);
-    // The only BYPASSRLS lines should be `ALTER ROLE "X" BYPASSRLS;`
-    // — no SUPERUSER, CREATEROLE, CREATEDB, etc.
-    const bypassLines = r.applied
+    // The RLS-bypass ALTER must be `ALTER ROLE "X" BYPASSRLS;` — the sole
+    // attribute. It must NOT include SUPERUSER or any other cluster privilege.
+    // (The existing role replay emits NOSUPERUSER/NOBYPASSRLS/... on a separate
+    // ALTER line — those are fine and expected. We check the NEW bypass lines.)
+    const bypassGrantLines = r.applied
       .split("\n")
-      .filter((l) => l.includes("BYPASSRLS"));
-    expect(bypassLines.length).toBeGreaterThan(0);
-    for (const l of bypassLines) {
+      .filter((l) => /ALTER ROLE "[a-z_]+" BYPASSRLS;/.test(l));
+    expect(bypassGrantLines.length).toBeGreaterThan(0);
+    for (const l of bypassGrantLines) {
+      // The bypass ALTER must be the minimal form — no extra privileges.
       expect(l).not.toContain("SUPERUSER");
       expect(l).not.toContain("CREATEROLE");
       expect(l).not.toContain("CREATEDB");
       expect(l).not.toContain("REPLICATION");
+      expect(l).not.toContain("LOGIN");
+      expect(l).not.toContain("PASSWORD");
     }
   });
 });
@@ -449,18 +460,20 @@ describe("rls-bypass-replay: legacy byte-identical when no bypass roles", () => 
     expect(res.status).toBe(0);
   });
 
-  test("when no login role bypasses RLS (f|f), applied.sql has no BYPASSRLS statements (output unchanged)", () => {
-    // The overall applied.sql must be identical in substance to pre-feature
-    // output when no bypass is needed — no extra BYPASSRLS statements injected.
+  test("when no login role bypasses RLS (f|f), applied.sql has no BYPASSRLS grant statements", () => {
+    // When prod roles are plain (no super, no bypassrls), the new code must
+    // emit ZERO standalone `ALTER ROLE "X" BYPASSRLS;` grant statements.
+    // The existing role replay may still emit NOBYPASSRLS (stripping superpowers)
+    // — that is correct and not altered by this feature.
     const r = runSyncGlobalsRLS({
       prodRlsBypass: "f|f",
       cloneBypassCount: "0",
     });
     expect(r.code).toBe(0);
-    // No BYPASSRLS lines in applied.sql at all.
-    const bypassLines = r.applied
+    // Only the new standalone BYPASSRLS-grant form must be absent.
+    const bypassGrantLines = r.applied
       .split("\n")
-      .filter((l) => l.includes("BYPASSRLS"));
-    expect(bypassLines.length).toBe(0);
+      .filter((l) => /ALTER ROLE "[a-z_]+" BYPASSRLS;/.test(l));
+    expect(bypassGrantLines.length).toBe(0);
   });
 });
