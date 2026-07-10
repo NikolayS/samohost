@@ -133,6 +133,54 @@ describe("buildEnvCreateScript", () => {
     expect(s.indexOf("db-preflight:start")).toBeLessThan(destroyIdx);
   });
 
+  test("dblab backend: pre-create unprotects then destroys protected clone (issue #134)", () => {
+    // ROOT CAUSE (task w087o84gs): preview clones are created with --protected
+    // (so they survive the 3-min GC cycles between trigger runs). When the
+    // trigger runs a re-create cycle, the pre-create destroy step runs
+    //   dblab clone destroy "$SAMOHOST_CLONE_ID" 2>/dev/null || true
+    // WITHOUT first unprotecting the clone. DBLab rejects destroy on a
+    // protected clone with "clone is protected" (exit non-zero). Because
+    // the error is swallowed by `|| true`, the script proceeds to `clone
+    // create --id <same-id>`, which fails with "already exists". The db
+    // phase exits :fail → outcome=failed → lastDeployedSha never stamped →
+    // needDeploy=true every cycle → infinite retry with action=failed even
+    // though the preview is externally reachable.
+    //
+    // FIX: before `clone destroy`, run
+    //   dblab clone update --protected false "$SAMOHOST_CLONE_ID" 2>/dev/null || true
+    // (verified on the live samograph VM: dblab clone update --protected false
+    //  <ID> removes protection; there is NO --force on destroy). The unprotect
+    // is a no-op on an absent clone (|| true). Protection is immediately
+    // re-established by `clone create --protected <minutes>` — the fix does NOT
+    // remove protection from running clones, it only handles the transitional
+    // destroy window inside a re-create.
+    const s = buildEnvCreateScript(app(), target({ dbBackend: "dblab" }));
+
+    // 1. The unprotect call must appear before the destroy.
+    expect(s).toContain(
+      '"$SAMOHOST_DBLAB_BIN" clone update --protected false "$SAMOHOST_CLONE_ID"',
+    );
+    // 2. The unprotect must tolerate an absent clone (first create).
+    expect(s).toMatch(
+      /clone update --protected false "\$SAMOHOST_CLONE_ID"[^\n]*\|\| true/,
+    );
+    // 3. Ordering: unprotect BEFORE destroy, destroy BEFORE create.
+    const unprotectIdx = s.indexOf('clone update --protected false "$SAMOHOST_CLONE_ID"');
+    const destroyIdx = s.indexOf('clone destroy "$SAMOHOST_CLONE_ID"');
+    const createIdx = s.indexOf("clone create --id");
+    expect(unprotectIdx).toBeGreaterThan(-1);
+    expect(destroyIdx).toBeGreaterThan(-1);
+    expect(createIdx).toBeGreaterThan(-1);
+    expect(unprotectIdx).toBeLessThan(destroyIdx);
+    expect(destroyIdx).toBeLessThan(createIdx);
+    // 4. Protection is re-established on the new clone: create still uses --protected.
+    expect(s).toContain("--protected");
+    const protectedMatchCreate = s
+      .split("\n")
+      .find((l) => l.includes("clone create") && l.includes("--protected"));
+    expect(protectedMatchCreate).toBeDefined();
+  });
+
   test("dblab backend: clone create passes --protected with SAMOHOST_DBLAB_LEASE_MINUTES (default 20160 = 2 weeks)", () => {
     // Root-cause: without --protected the DBLab engine uses its own
     // maxIdleMinutes, which on a short-lived engine config can be as low as
