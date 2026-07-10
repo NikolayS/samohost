@@ -1332,6 +1332,12 @@ interface SyncGlobalsOpts {
    * GRANTs are emitted and the clone has no explicit memberships.
    */
   cloneAuthMembers?: string;
+  /**
+   * DDL the prod-side sudo stub returns for ownership queries (OWNER TO).
+   * Default: single-table "ALTER TABLE public.app_users OWNER TO field_record;\n".
+   * For snapshot-lag tests, include tables absent from the clone (with IF EXISTS).
+   */
+  prodOwnerDdl?: string;
 }
 
 interface SyncGlobalsRun {
@@ -1369,7 +1375,10 @@ function runSyncGlobals(opts: SyncGlobalsOpts = {}): SyncGlobalsRun {
     fix("clone_grants", opts.cloneGrants ?? "315");
     fix("clone_ownership", opts.cloneOwnership ?? "29");
     fix("clone_auth_members", opts.cloneAuthMembers ?? "0");
-    fix("prod_owner_ddl", "ALTER TABLE public.app_users OWNER TO field_record;\n");
+    fix(
+      "prod_owner_ddl",
+      opts.prodOwnerDdl ?? "ALTER TABLE public.app_users OWNER TO field_record;\n",
+    );
     fix("prod_grant_ddl", "GRANT SELECT ON public.app_users TO app_user;\n");
     // Prod-verified: field_record is the DB owner so it gets CREATE on public
     // via pg_database_owner=UC — replayed explicitly because the clone's DB
@@ -1711,6 +1720,120 @@ describe("schema-grant replay (live-validation finding 2026-06-12)", () => {
     const nearby = lines.slice(schemaGrantQueryIdx, schemaGrantQueryIdx + 5).join("\n");
     expect(nearby).toContain("ON_ERROR_STOP");
     expect(nearby).toContain(">/dev/null 2>&1");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// PR #145 — snapshot-lag tolerance: stale DBLab clone missing prod tables
+// ---------------------------------------------------------------------------
+// Root cause: when the DBLab snapshot pre-dates a prod migration (e.g. 0007
+// magic_links, 0008 webhook_events), the prod table list includes tables that
+// don't exist on the stale clone. Before this fix:
+//   Step 2: ALTER TABLE magic_links OWNER TO samo → psql error (table absent)
+//            → apply_failures++ → exit 1 → no preview could be built.
+//   Step 3: GRANT … ON magic_links … → same error.
+// Fix: (a) ALTER TABLE IF EXISTS skips absent tables silently; (b) step 3
+// grant query and step 6 parity checks are scoped to tables the clone HAS
+// (_clone_tab_in), so counts compare the same table set.
+// ---------------------------------------------------------------------------
+describe("snapshot-lag tolerance (#145): stale clone MISSING prod tables", () => {
+  test("script text: step 2 uses ALTER TABLE IF EXISTS to skip absent tables", () => {
+    const s = buildEnvCreateScript(app(), target({ dbBackend: "dblab" }));
+    const fn = extractFn(s, "samohost_sync_clone_globals");
+    // IF EXISTS turns a "table not found" DDL error into a silent no-op.
+    expect(fn).toContain("ALTER TABLE IF EXISTS");
+    // No plain ALTER TABLE without IF EXISTS allowed in the generated DDL.
+    const alterTableLines = fn
+      .split("\n")
+      .filter((l) => l.includes("ALTER TABLE") && !l.trim().startsWith("#"));
+    for (const line of alterTableLines) {
+      expect(line).toContain("IF EXISTS");
+    }
+  });
+
+  test("script text: step 3-pre computes _clone_tab_in from clone's table list", () => {
+    const s = buildEnvCreateScript(app(), target({ dbBackend: "dblab" }));
+    const fn = extractFn(s, "samohost_sync_clone_globals");
+    // Must derive the IN-clause from the clone's information_schema.tables.
+    expect(fn).toContain("_clone_tab_in");
+    expect(fn).toContain("information_schema.tables");
+  });
+
+  test("script text: step 3 grants query filters to clone-present tables only", () => {
+    const s = buildEnvCreateScript(app(), target({ dbBackend: "dblab" }));
+    const fn = extractFn(s, "samohost_sync_clone_globals");
+    // The grants SELECT (step 3) must include the _clone_tab_in IN-clause so
+    // GRANTs for tables absent from the snapshot are never emitted.
+    // Step 3 query emits GRANT statements from table_privileges; the scoped-roles
+    // query also references table_privileges but not in a SELECT 'GRANT' context.
+    const grantLine = fn
+      .split("\n")
+      .find(
+        (l) =>
+          l.includes("table_privileges") &&
+          l.includes("GRANT") &&
+          !l.trim().startsWith("#"),
+      );
+    expect(grantLine).toBeDefined();
+    expect(grantLine).toContain("_clone_tab_in");
+  });
+
+  test("script text: step 6 parity checks (grants + ownership) are scoped to clone-present tables", () => {
+    const s = buildEnvCreateScript(app(), target({ dbBackend: "dblab" }));
+    const fn = extractFn(s, "samohost_sync_clone_globals");
+    // Both parity sub-checks must scope their SQL to _clone_tab_in so the prod
+    // count only includes tables that also exist on the clone — making the
+    // comparison valid when the snapshot predates prod migrations.
+    const parityGrantsLine =
+      fn.match(/parity_check "table grants"[^\n]*/)?.[0] ?? "";
+    const parityOwnershipLine =
+      fn.match(/parity_check "table ownership"[^\n]*/)?.[0] ?? "";
+    expect(parityGrantsLine).toContain("_clone_tab_in");
+    expect(parityOwnershipLine).toContain("_clone_tab_in");
+  });
+
+  test("executed: sync SUCCEEDS when prod has a table absent from clone (IF EXISTS is a no-op)", () => {
+    // Scenario: prod has app_users + magic_links (migration 0007 ran on prod);
+    // the DBLab snapshot is stale and only has app_users.
+    // With IF EXISTS, the ownership DDL for magic_links is a no-op on the clone.
+    // apply_failures stays 0 → parity passes → exit 0.
+    const r = runSyncGlobals({
+      // prod_owner_ddl: matches what the prod-side SQL query NOW generates
+      // (the SELECT emits 'ALTER TABLE IF EXISTS …' because the fix changed the
+      // SQL string from 'ALTER TABLE ' to 'ALTER TABLE IF EXISTS ').
+      prodOwnerDdl:
+        "ALTER TABLE IF EXISTS public.app_users OWNER TO field_record;\n" +
+        "ALTER TABLE IF EXISTS public.magic_links OWNER TO field_record;\n",
+      // Parity counts scoped to clone-present tables (only app_users → 1 each).
+      prodOwnership: "1",
+      cloneOwnership: "1",
+      prodGrants: "1",
+      cloneGrants: "1",
+    });
+    expect(r.code).toBe(0);
+    // IF EXISTS DDL was sent to the clone psql (proving the path was exercised).
+    expect(r.applied).toContain("ALTER TABLE IF EXISTS");
+    // The absent table's DDL was applied as a no-op (IF EXISTS present).
+    expect(r.applied).toContain("magic_links");
+  });
+
+  test("executed: OLD ALTER TABLE (no IF EXISTS) FAILS CLOSED — proves the pre-fix outage", () => {
+    // Regression anchor: without IF EXISTS the apply fails when the table is
+    // absent from the clone, setting apply_failures > 0 and returning 1.
+    // "ALTER TABLE public.magic_links OWNER TO" is present in the batch WITHOUT
+    // "IF EXISTS", so CLONE_APPLY_FAIL_ON matches and psql returns 1.
+    const r = runSyncGlobals({
+      prodOwnerDdl:
+        "ALTER TABLE public.app_users OWNER TO field_record;\n" +
+        "ALTER TABLE public.magic_links OWNER TO field_record;\n",
+      cloneApplyFailOn: "ALTER TABLE public.magic_links OWNER TO",
+      prodOwnership: "1",
+      cloneOwnership: "1",
+      prodGrants: "1",
+      cloneGrants: "1",
+    });
+    // apply_failures > 0 → exit 1 → previews cannot be built (the outage).
+    expect(r.code).not.toBe(0);
   });
 });
 
