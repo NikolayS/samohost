@@ -317,6 +317,16 @@ export interface AppRecord extends AppSpec {
   deployedSha?: string;
   failedSha?: string;
   lastDeployAt?: string;
+  /**
+   * Highest release tag observed by the production tag channel. On first
+   * activation for an already-deployed app, samohost records the current tag
+   * here without deploying it; only a later, greater tag may advance prod.
+   * This prevents enabling tag delivery from rolling production back to an
+   * older historical tag.
+   */
+  releaseTagCursor?: string;
+  /** True once the tag channel has completed its rollback-safe first cycle. */
+  releaseTagChannelInitialized?: boolean;
 }
 
 /**

@@ -33,6 +33,7 @@ import { AppStore } from "../state/apps.ts";
 import { StateStore } from "../state/store.ts";
 import {
   runAppDeploy,
+  compareReleaseTags,
   defaultAppDeployDeps,
   defaultResolveLatestTag,
   type AppDeployInput,
@@ -423,6 +424,7 @@ export async function runTriggerRun(
       // matching app.releaseTagPattern. Everything downstream (up-to-date,
       // known-bad, CI gate, deploy) is ref-agnostic and reused verbatim.
       let resolvedSha: string;
+      let resolvedTag: string | undefined;
       if (
         app.releaseTagPattern !== undefined &&
         deps.resolveLatestTag !== undefined
@@ -434,6 +436,16 @@ export async function runTriggerRun(
         if (latest === null) {
           // "Tag ≠ ship": no matching tag → prod stays put. NEVER fall back to
           // the branch HEAD (that is the preview channel, PR2).
+          // Mark an existing production app as initialized so that the first
+          // tag cut AFTER this point is a release event, not mistaken for a
+          // historical tag that needs baselining.
+          if (
+            !input.dryRun &&
+            app.deployedSha !== undefined &&
+            app.releaseTagChannelInitialized !== true
+          ) {
+            appStore.upsert({ ...app, releaseTagChannelInitialized: true });
+          }
           results.push({
             app: app.name,
             vm: vmName,
@@ -442,13 +454,56 @@ export async function runTriggerRun(
           });
           continue;
         }
+        resolvedTag = latest.tag;
         resolvedSha = latest.sha;
       } else {
         resolvedSha = await deps.resolveRef(app.repo, app.branch);
       }
 
+      // Safe activation for apps that already have production state. Merely
+      // shipping support for releaseTagPattern must never roll a newer prod
+      // checkout back to the latest historical tag. The first live cycle
+      // records that tag as the cursor without deploying it. Later cycles may
+      // deploy only a strictly newer tag. A brand-new app (no deployedSha)
+      // still deploys its latest matching tag normally.
+      if (
+        resolvedTag !== undefined &&
+        app.deployedSha !== undefined &&
+        app.releaseTagChannelInitialized !== true &&
+        app.deployedSha !== resolvedSha
+      ) {
+        if (!input.dryRun) {
+          appStore.upsert({
+            ...app,
+            releaseTagCursor: resolvedTag,
+            releaseTagChannelInitialized: true,
+          });
+        }
+        results.push({
+          app: app.name,
+          vm: vmName,
+          action: "skipped",
+          sha: resolvedSha,
+          reason: input.dryRun
+            ? "release-tag-baseline-required"
+            : "release-tag-baselined",
+        });
+        continue;
+      }
+
       // up-to-date check
       if (app.deployedSha !== undefined && resolvedSha === app.deployedSha) {
+        if (
+          !input.dryRun &&
+          resolvedTag !== undefined &&
+          app.releaseTagChannelInitialized !== true
+        ) {
+          appStore.upsert({
+            ...app,
+            releaseTagCursor: resolvedTag,
+            releaseTagChannelInitialized: true,
+          });
+        }
         results.push({
           app: app.name,
           vm: vmName,
@@ -456,6 +511,24 @@ export async function runTriggerRun(
           sha: resolvedSha,
         });
         continue;
+      }
+
+      // A cursor is monotonic: deleting/repointing tags must not turn an older
+      // tag into a production rollback. Invalid cursor data also fails closed.
+      if (resolvedTag !== undefined && app.releaseTagCursor !== undefined) {
+        const order = compareReleaseTags(resolvedTag, app.releaseTagCursor);
+        if (order === null || order <= 0) {
+          results.push({
+            app: app.name,
+            vm: vmName,
+            action: "skipped",
+            sha: resolvedSha,
+            reason: order === null
+              ? "release-tag-cursor-invalid"
+              : "no-new-release-tag",
+          });
+          continue;
+        }
       }
 
       // known-bad early skip (avoids pointless SSH/CI round-trip)
@@ -543,6 +616,14 @@ export async function runTriggerRun(
       );
 
       if (deployExit === 0) {
+        if (resolvedTag !== undefined) {
+          const deployed = appStore.get(app.vmId, app.name) ?? app;
+          appStore.upsert({
+            ...deployed,
+            releaseTagCursor: resolvedTag,
+            releaseTagChannelInitialized: true,
+          });
+        }
         results.push({
           app: app.name,
           vm: vmName,

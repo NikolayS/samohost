@@ -2383,6 +2383,25 @@ export function buildHostPrepScript(
       "",
     );
 
+    const mainSiteAddress = isStatic && app.mainListen === "cp-http80"
+      ? `http://${app.mainHost}`
+      : app.mainHost;
+    const mainSiteBody = isStatic
+      ? [
+          `${mainSiteAddress} {`,
+          `\troot * ${app.appDir}`,
+          `\ttry_files {path} /index.html`,
+          `\tfile_server`,
+          `\tencode gzip`,
+          ...(app.mainListen === "cp-http80" ? [] : [`\ttls internal`]),
+          `}`,
+        ]
+      : [
+          `${app.mainHost} {`,
+          `\treverse_proxy localhost:${port}`,
+          `}`,
+        ];
+
     mainVhostLines.push(
       "",
       `#    Landmine guard: render the intended single-service vhost to a staged`,
@@ -2391,9 +2410,7 @@ export function buildHostPrepScript(
       `#    force=true was baked in via --force-main-vhost at host-prep time.`,
       `#    The 00- prefix sorts the live file first in sites.d.`,
       `cat > ${stagedPath} <<'CADDY'`,
-      `${app.mainHost} {`,
-      `\treverse_proxy localhost:${port}`,
-      `}`,
+      ...mainSiteBody,
       "CADDY",
       `samohost_apply_main_vhost \\`,
       `  ${stagedPath} \\`,

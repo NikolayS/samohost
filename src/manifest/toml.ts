@@ -152,8 +152,6 @@ const APP_KEYS = new Set<string>([
   "dbBackend",
   // Per-app default DB backend for auto-created PR-preview envs.
   "previewDbBackend",
-  // Issue #132: glob selecting release tags for the production deploy channel.
-  "releaseTagPattern",
   // Issue #97: OS user that owns the app checkout + envs root (clone + unit user).
   "appUser",
   // `provision` is the only allowed sub-table at top level
@@ -733,7 +731,6 @@ export function parseSamohostToml(text: string): ParseTomlResult {
   const mainHost = optionalString(raw, "mainHost", errors);
   const rlsUrlVar = optionalString(raw, "rlsUrlVar", errors);
   const appUser = optionalString(raw, "appUser", errors);
-  const releaseTagPattern = optionalString(raw, "releaseTagPattern", errors);
   const envDbVars = optionalStringArray(raw, "envDbVars", errors);
   const rlsNonSuperuser = optionalBoolean(raw, "rlsNonSuperuser", errors);
 
@@ -880,14 +877,6 @@ export function parseSamohostToml(text: string): ParseTomlResult {
           `(e.g. databaseUrlEnv = "DATABASE_URL")`,
       );
     }
-  }
-
-  // issue #132: releaseTagPattern (prod deploy channel) requires mainHost, so
-  // the production vhost is provisioned state rather than a hand-applied edit.
-  if (releaseTagPattern !== undefined && mainHost === undefined) {
-    errors.push(
-      `field releaseTagPattern requires mainHost to be set`,
-    );
   }
 
   // ---- 5. Validate [provision] table (optional) ----------------------------
@@ -1097,8 +1086,7 @@ export function parseSamohostToml(text: string): ParseTomlResult {
   }
 
   // ---- 9b. Validate releaseTagPattern (optional string, must be non-empty) ----
-  // accepted + persisted; the tag-gated deploy behavior is a separate,
-  // not-yet-shipped feature — prod deploys on main SHA + CI-green regardless of this value.
+  // Production tracks the latest matching stable semver tag when configured.
   let releaseTagPattern: string | undefined;
   {
     const rawRtp = raw["releaseTagPattern"];

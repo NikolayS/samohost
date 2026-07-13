@@ -624,6 +624,9 @@ export function buildHostBootstrapScript(
   // behind CF-locked :443, matching buildStaticEnvCreateScript's rationale.
   if (isStatic && app.mainHost !== undefined) {
     const caddySitePath = `/etc/caddy/sites.d/00-main-${app.name}.caddy`;
+    const siteAddress = app.mainListen === "cp-http80"
+      ? `http://${app.mainHost}`
+      : app.mainHost;
     push(
       `# ---------------------------------------------------------------------------`,
       `# §9b. Production Caddy file_server vhost for ${sq(app.mainHost)}.`,
@@ -633,10 +636,12 @@ export function buildHostBootstrapScript(
       `# ---------------------------------------------------------------------------`,
       "",
       `cat > ${sq(caddySitePath)} <<'CADDY_SITE'`,
-      `${app.mainHost} {`,
+      `${siteAddress} {`,
       `  root * ${app.appDir}`,
+      `  try_files {path} /index.html`,
       `  file_server`,
-      `  tls internal`,
+      `  encode gzip`,
+      ...(app.mainListen === "cp-http80" ? [] : [`  tls internal`]),
       `}`,
       `CADDY_SITE`,
       `caddy validate --config /etc/caddy/Caddyfile`,

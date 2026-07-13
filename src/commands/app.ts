@@ -78,13 +78,6 @@ export interface AppRegisterInput {
    */
   previewDbBackend?: EnvDbBackend;
   /**
-   * Glob selecting the git tags that drive the PRODUCTION deploy channel
-   * (issue #132). When set, prod tracks the latest matching semver tag instead
-   * of `branch` HEAD; requires {@link mainHost}. Absent → unchanged (branch
-   * HEAD). Mirrors {@link AppSpec.releaseTagPattern}.
-   */
-  releaseTagPattern?: string;
-  /**
    * OS user that owns the production app checkout and the envs root (created
    * by `samohost app bootstrap --app-user <user>`). When set, env-create runs
    * all git operations as this user via `sudo -u <appUser> GIT_CONFIG_GLOBAL=...`.
@@ -105,9 +98,8 @@ export interface AppRegisterInput {
    * Optional glob pattern for release tags (e.g. `"v*"`). Mirrors
    * {@link AppSpec.releaseTagPattern}.
    *
-   * IMPORTANT — accepted + persisted; the tag-gated deploy behavior is a
-   * separate, not-yet-shipped feature — prod deploys on main SHA + CI-green
-   * regardless of this value.
+   * When set, production tracks the latest matching stable semver tag instead
+   * of branch HEAD. The tag commit must still pass the ordinary CI gate.
    */
   releaseTagPattern?: string;
 
@@ -242,13 +234,6 @@ export function runAppRegister(
     }
   }
 
-  // issue #132: the release-tag prod channel needs a durable main vhost, so
-  // mainHost is required whenever releaseTagPattern is set.
-  if (input.releaseTagPattern !== undefined && input.mainHost === undefined) {
-    err(`error: releaseTagPattern requires mainHost to be set`);
-    return 1;
-  }
-
   const spec: AppSpec = {
     name: input.name,
     repo: input.repo,
@@ -271,15 +256,12 @@ export function runAppRegister(
       : {}),
     ...(input.dbBackend !== undefined ? { dbBackend: input.dbBackend } : {}),
     ...(input.previewDbBackend !== undefined ? { previewDbBackend: input.previewDbBackend } : {}),
-    ...(input.releaseTagPattern !== undefined ? { releaseTagPattern: input.releaseTagPattern } : {}),
     ...(input.appUser !== undefined ? { appUser: input.appUser } : {}),
     // Multi-service spec model (additive; absent = legacy single-service)
     ...(input.services !== undefined ? { services: input.services } : {}),
     ...(input.routes !== undefined ? { routes: input.routes } : {}),
     ...(input.defaultListener !== undefined ? { defaultListener: input.defaultListener } : {}),
     ...(input.mainListen !== undefined ? { mainListen: input.mainListen } : {}),
-    // accepted + persisted; the tag-gated deploy behavior is a separate,
-    // not-yet-shipped feature — prod deploys on main SHA + CI-green regardless of this value.
     ...(input.releaseTagPattern !== undefined ? { releaseTagPattern: input.releaseTagPattern } : {}),
     // PR-B/PR-C schema: accepted + persisted; secret generation and DB URL rewriting
     // are separate, not-yet-shipped features.
@@ -301,6 +283,14 @@ export function runAppRegister(
       : {}),
     ...(existing?.lastDeployAt !== undefined
       ? { lastDeployAt: existing.lastDeployAt }
+      : {}),
+    ...(existing?.releaseTagPattern === input.releaseTagPattern &&
+    existing?.releaseTagCursor !== undefined
+      ? { releaseTagCursor: existing.releaseTagCursor }
+      : {}),
+    ...(existing?.releaseTagPattern === input.releaseTagPattern &&
+    existing?.releaseTagChannelInitialized === true
+      ? { releaseTagChannelInitialized: true }
       : {}),
   };
 
@@ -383,7 +373,6 @@ export function runAppRegisterFromToml(
     ...(app.envDbVars !== undefined ? { envDbVars: app.envDbVars } : {}),
     ...(app.dbBackend !== undefined ? { dbBackend: app.dbBackend } : {}),
     ...(app.previewDbBackend !== undefined ? { previewDbBackend: app.previewDbBackend } : {}),
-    ...(app.releaseTagPattern !== undefined ? { releaseTagPattern: app.releaseTagPattern } : {}),
     ...(app.appUser !== undefined ? { appUser: app.appUser } : {}),
     // Multi-service spec model (additive; absent = legacy single-service)
     ...(app.services !== undefined ? { services: app.services } : {}),
@@ -903,7 +892,7 @@ export function tagGlobToRegExp(glob: string): RegExp {
 /** Parse a (possibly `v`-prefixed) tag name into semver parts, or null. */
 function parseSemver(name: string): Semver | null {
   const s = name.replace(/^v/, "");
-  const m = /^(\d+)(?:\.(\d+))?(?:\.(\d+))?(?:-([0-9A-Za-z.-]+))?/.exec(s);
+  const m = /^(\d+)(?:\.(\d+))?(?:\.(\d+))?(?:-([0-9A-Za-z.-]+))?(?:\+[0-9A-Za-z.-]+)?$/.exec(s);
   if (m === null) return null;
   return {
     major: Number(m[1]),
@@ -943,6 +932,13 @@ function compareSemver(a: Semver, b: Semver): number {
     }
   }
   return ap.length - bp.length;
+}
+
+/** Compare two tag names by semver precedence, or null if either is invalid. */
+export function compareReleaseTags(a: string, b: string): number | null {
+  const av = parseSemver(a);
+  const bv = parseSemver(b);
+  return av === null || bv === null ? null : compareSemver(av, bv);
 }
 
 /**

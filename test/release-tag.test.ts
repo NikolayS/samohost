@@ -20,8 +20,7 @@
  *          (i.e. NOT up-to-date); same tag as deployedSha → up-to-date.
  *  - §8 #7 a failed tag deploy sets failedSha → known-bad short-circuit next
  *          cycle (deploy not called, CI not checked).
- *  - §8 #8 releaseTagPattern without mainHost → validation error at both the
- *          TOML parse layer and the `app register` layer.
+ *  - §8 #8 releaseTagPattern remains independent of mainHost.
  */
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
@@ -29,6 +28,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
+  compareReleaseTags,
   selectLatestTag,
   makeResolveLatestTag,
   runAppRegister,
@@ -161,6 +161,19 @@ describe("selectLatestTag — semver ordering & prerelease policy", () => {
     expect(selectLatestTag(["nightly-2026", "latest"], "v*")).toBeNull();
     expect(selectLatestTag([], "v*")).toBeNull();
   });
+
+  test("rejects partial semver matches instead of treating garbage as stable", () => {
+    expect(selectLatestTag(["v1.2.3garbage"], "v*")).toBeNull();
+    expect(selectLatestTag(["v1.2.3+build.7"], "v*")).toBe(
+      "v1.2.3+build.7",
+    );
+  });
+
+  test("release tag comparison is semver-aware and fail-closed", () => {
+    expect(compareReleaseTags("v1.10.0", "v1.9.0")).toBeGreaterThan(0);
+    expect(compareReleaseTags("v1.8.0", "v1.9.0")).toBeLessThan(0);
+    expect(compareReleaseTags("garbage", "v1.9.0")).toBeNull();
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -275,6 +288,9 @@ describe("trigger run — release-tag production channel", () => {
     expect(callCount()).toBe(0);
     // Prod stays exactly where it was.
     expect(appStore.get("vm-1111", "field-record")?.deployedSha).toBe(SHA_OLD);
+    expect(
+      appStore.get("vm-1111", "field-record")?.releaseTagChannelInitialized,
+    ).toBe(true);
     expect(report.skipped).toBe(1);
     expect(code).toBe(0);
   });
@@ -324,6 +340,138 @@ describe("trigger run — release-tag production channel", () => {
     expect(code).toBe(0);
   });
 
+  test("first tag cut after an empty initialized channel deploys", async () => {
+    vmStore.upsert(makeVm());
+    appStore.upsert(
+      makeApp({
+        deployedSha: SHA_OLD,
+        mainHost: "field-record-1.samo.team",
+        releaseTagPattern: "v*",
+        releaseTagChannelInitialized: true,
+      }),
+    );
+    const { fetch: fakeFetch } = makeFakeFetch([
+      { status: "completed", conclusion: "success" },
+    ]);
+    let deployCalls = 0;
+    const deps: TriggerDeps = {
+      resolveRef: async () => {
+        throw new Error("branch path must not run");
+      },
+      resolveLatestTag: async () => ({ tag: "v1.0.0", sha: SHA_TAG }),
+      deploy: async () => {
+        deployCalls++;
+        return 0;
+      },
+      fetch: fakeFetch,
+      env: { GH_TOKEN: "ghp_test" },
+      now: () => new Date(),
+    };
+    const c = capture();
+    expect(await runTriggerRun(
+      { dryRun: false }, { json: true }, vmStore, appStore, deps, c.out, c.err,
+    )).toBe(0);
+    expect(deployCalls).toBe(1);
+    expect(appStore.get("vm-1111", "field-record")?.releaseTagCursor).toBe(
+      "v1.0.0",
+    );
+  });
+
+  test("safe activation baselines an old tag without rolling back existing prod", async () => {
+    vmStore.upsert(makeVm());
+    appStore.upsert(
+      makeApp({
+        // Production is already on a newer commit that no historical tag
+        // points at (the real Samograph rollout shape).
+        deployedSha: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        mainHost: "field-record-1.samo.team",
+        releaseTagPattern: "v*",
+      }),
+    );
+
+    let deployCalls = 0;
+    const { fetch: fakeFetch, callCount } = makeFakeFetch([]);
+    const deps: TriggerDeps = {
+      resolveRef: async () => {
+        throw new Error("branch path must not run");
+      },
+      resolveLatestTag: async () => ({ tag: "v0.7.1", sha: SHA_OLD }),
+      deploy: async () => {
+        deployCalls++;
+        return 0;
+      },
+      fetch: fakeFetch,
+      env: {},
+      now: () => new Date(),
+    };
+
+    const c1 = capture();
+    expect(await runTriggerRun(
+      { dryRun: false }, { json: true }, vmStore, appStore, deps, c1.out, c1.err,
+    )).toBe(0);
+    const report1: TriggerRunReport = JSON.parse(c1.o);
+    expect(report1.results[0]!.reason).toBe("release-tag-baselined");
+    expect(deployCalls).toBe(0);
+    expect(callCount()).toBe(0);
+    expect(appStore.get("vm-1111", "field-record")?.releaseTagCursor).toBe(
+      "v0.7.1",
+    );
+    expect(
+      appStore.get("vm-1111", "field-record")?.releaseTagChannelInitialized,
+    ).toBe(true);
+
+    // The same tag remains inert on later cycles.
+    const c2 = capture();
+    expect(await runTriggerRun(
+      { dryRun: false }, { json: true }, vmStore, appStore, deps, c2.out, c2.err,
+    )).toBe(0);
+    const report2: TriggerRunReport = JSON.parse(c2.o);
+    expect(report2.results[0]!.reason).toBe("no-new-release-tag");
+    expect(deployCalls).toBe(0);
+  });
+
+  test("a tag newer than the activation cursor deploys and advances the cursor", async () => {
+    vmStore.upsert(makeVm());
+    appStore.upsert(
+      makeApp({
+        deployedSha: SHA_OLD,
+        mainHost: "field-record-1.samo.team",
+        releaseTagPattern: "v*",
+        releaseTagCursor: "v0.7.1",
+        releaseTagChannelInitialized: true,
+      }),
+    );
+
+    const { fetch: fakeFetch } = makeFakeFetch([
+      { status: "completed", conclusion: "success" },
+    ]);
+    let deployCalls = 0;
+    const deps: TriggerDeps = {
+      resolveRef: async () => {
+        throw new Error("branch path must not run");
+      },
+      resolveLatestTag: async () => ({ tag: "v0.8.0", sha: SHA_TAG }),
+      deploy: async () => {
+        deployCalls++;
+        return 0;
+      },
+      fetch: fakeFetch,
+      env: { GH_TOKEN: "ghp_test" },
+      now: () => new Date(),
+    };
+
+    const c = capture();
+    expect(await runTriggerRun(
+      { dryRun: false }, { json: true }, vmStore, appStore, deps, c.out, c.err,
+    )).toBe(0);
+    const report: TriggerRunReport = JSON.parse(c.o);
+    expect(report.results[0]!.action).toBe("deployed");
+    expect(deployCalls).toBe(1);
+    expect(appStore.get("vm-1111", "field-record")?.releaseTagCursor).toBe(
+      "v0.8.0",
+    );
+  });
+
   test("§8 #6 a new latest tag advances prod: deploy once, action=deployed", async () => {
     vmStore.upsert(makeVm());
     appStore.upsert(
@@ -331,6 +479,8 @@ describe("trigger run — release-tag production channel", () => {
         deployedSha: SHA_OLD,
         mainHost: "field-record-1.samo.team",
         releaseTagPattern: "v*",
+        releaseTagCursor: "v1.1.0",
+        releaseTagChannelInitialized: true,
       }),
     );
 
@@ -379,6 +529,8 @@ describe("trigger run — release-tag production channel", () => {
         deployedSha: SHA_TAG, // already on the latest tag's commit
         mainHost: "field-record-1.samo.team",
         releaseTagPattern: "v*",
+        releaseTagCursor: "v1.2.0",
+        releaseTagChannelInitialized: true,
       }),
     );
 
@@ -424,6 +576,8 @@ describe("trigger run — release-tag production channel", () => {
         deployedSha: SHA_OLD,
         mainHost: "field-record-1.samo.team",
         releaseTagPattern: "v*",
+        releaseTagCursor: "v1.1.0",
+        releaseTagChannelInitialized: true,
       }),
     );
 
@@ -500,11 +654,11 @@ describe("trigger run — release-tag production channel", () => {
 });
 
 // ---------------------------------------------------------------------------
-// §8 #8 — validation: releaseTagPattern requires mainHost
+// §8 #8 — schema compatibility: releaseTagPattern is independent of mainHost
 // ---------------------------------------------------------------------------
 
-describe("validation — releaseTagPattern requires mainHost", () => {
-  test("§8 #8 TOML: releaseTagPattern without mainHost → error", () => {
+describe("validation — releaseTagPattern remains independent of mainHost", () => {
+  test("§8 #8 TOML: releaseTagPattern without mainHost remains valid", () => {
     const toml = [
       'name = "field-record"',
       'repo = "Tanya301/field-record-1"',
@@ -516,11 +670,9 @@ describe("validation — releaseTagPattern requires mainHost", () => {
       'releaseTagPattern = "v*"',
     ].join("\n");
     const res = parseSamohostToml(toml);
-    expect(res.ok).toBe(false);
-    if (!res.ok) {
-      expect(
-        res.errors.some((e) => /releaseTagPattern requires mainHost/.test(e)),
-      ).toBe(true);
+    expect(res.ok).toBe(true);
+    if (res.ok) {
+      expect(res.app.releaseTagPattern).toBe("v*");
     }
   });
 
@@ -564,7 +716,7 @@ describe("validation — releaseTagPattern requires mainHost", () => {
     }
   });
 
-  test("§8 #8 app register: releaseTagPattern without mainHost → exit 1", () => {
+  test("§8 #8 app register: releaseTagPattern without mainHost persists", () => {
     const dir = mkdtempSync(join(tmpdir(), "samohost-reltag-reg-"));
     try {
       const vmStore = new StateStore(join(dir, "state.json"));
@@ -591,10 +743,10 @@ describe("validation — releaseTagPattern requires mainHost", () => {
         c.out,
         c.err,
       );
-      expect(code).toBe(1);
-      expect(c.e).toContain("releaseTagPattern requires mainHost");
-      // Nothing persisted.
-      expect(appStore.get("vm-1111", "field-record")).toBeUndefined();
+      expect(code).toBe(0);
+      expect(appStore.get("vm-1111", "field-record")?.releaseTagPattern).toBe(
+        "v*",
+      );
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
@@ -632,6 +784,43 @@ describe("validation — releaseTagPattern requires mainHost", () => {
       expect(appStore.get("vm-1111", "field-record")?.releaseTagPattern).toBe(
         "v*",
       );
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("changing releaseTagPattern resets the internal activation cursor", () => {
+    const dir = mkdtempSync(join(tmpdir(), "samohost-reltag-reg3-"));
+    try {
+      const vmStore = new StateStore(join(dir, "state.json"));
+      const appStore = new AppStore(join(dir, "apps.json"));
+      vmStore.upsert(makeVm());
+      appStore.upsert(makeApp({
+        releaseTagPattern: "v*",
+        releaseTagCursor: "v1.2.0",
+        releaseTagChannelInitialized: true,
+      }));
+
+      const c = capture();
+      expect(runAppRegister(
+        {
+          vm: "samo-we-field-record",
+          name: "field-record",
+          repo: "Tanya301/field-record-1",
+          branch: "main",
+          appDir: "/opt/field-record/app",
+          buildCmd: "npm run build",
+          serviceUnit: "field-record",
+          healthUrl: "http://localhost:3000/api/version",
+          rlsNonSuperuser: false,
+          releaseTagPattern: "release-*",
+        },
+        { json: false }, vmStore, appStore, c.out, c.err,
+      )).toBe(0);
+      const saved = appStore.get("vm-1111", "field-record");
+      expect(saved?.releaseTagPattern).toBe("release-*");
+      expect(saved?.releaseTagCursor).toBeUndefined();
+      expect(saved?.releaseTagChannelInitialized).toBeUndefined();
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }

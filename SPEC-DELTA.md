@@ -483,11 +483,17 @@ production channel**:
   on a new matching tag ("Tag ≠ ship" honored — a tag that does not advance the
   resolved sha is a no-op).
 
-**Validation:** when `releaseTagPattern` is set, `mainHost` is REQUIRED (the
-prod channel needs the durable main vhost from §3/ITEM C to be provisioned
-state, not a hand-applied edit). Enforced at BOTH the TOML parse layer
-(`parseSamohostToml`) and the `app register` layer (`runAppRegister`). A
+`releaseTagPattern` is independent of vhost management: existing registered
+apps may opt into tag delivery whether or not they declare `mainHost`. A
 non-string `releaseTagPattern` is rejected with a type error.
+
+Activation is rollback-safe. For an app that already has `deployedSha`, the
+first trigger cycle records the latest existing matching tag as a monotonic
+cursor without deploying it. Only a strictly newer semver tag advances
+production. If no tag exists during activation, the channel is armed empty and
+the first subsequently-created matching tag is deployable. Re-registering with
+a different pattern resets this internal cursor. This prevents enabling the
+feature from rolling a newer production checkout back to a historical tag.
 
 #### Tag resolution (`resolveLatestTag`)
 
@@ -544,5 +550,5 @@ known-bad short-circuit, `--dry-run`, `checkCiGreen` on the resolved sha, and
   once with the tag's sha); a tag already at `deployedSha` → `up-to-date`.
 - **§8 #7** a failed tag deploy sets `failedSha`, which the known-bad
   short-circuit honors on the next cycle (no re-deploy, no CI round-trip).
-- **§8 #8** `releaseTagPattern` without `mainHost` → validation error at both
-  the TOML parse and `app register` layers.
+- **§8 #8** existing schema behavior remains compatible:
+  `releaseTagPattern` does not require `mainHost`.

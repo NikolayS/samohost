@@ -2008,6 +2008,21 @@ describe("static host-prep path (kind='static')", () => {
     expect(bashSyntaxOk(buildHostPrepScript(app({ kind: "static" }), "agent"))).toBe(true);
   });
 
+  test("static cp-http80 main vhost serves appDir directly instead of proxying to itself", () => {
+    const s = buildHostPrepScript(app({
+      kind: "static",
+      mainHost: "game-changers.samo.team",
+      mainListen: "cp-http80",
+      appDir: "/opt/gc1/app",
+    }), "samo");
+    expect(s).toContain("http://game-changers.samo.team {");
+    expect(s).toContain("root * /opt/gc1/app");
+    expect(s).toContain("try_files {path} /index.html");
+    expect(s).toContain("file_server");
+    expect(s).not.toContain("reverse_proxy localhost:80");
+    expect(bashSyntaxOk(s)).toBe(true);
+  });
+
   test("static host-prep contains caddy reload grant", () => {
     const s = buildHostPrepScript(app({ kind: "static" }), "agent");
     expect(s).toContain("NOPASSWD: /usr/bin/systemctl reload caddy");
