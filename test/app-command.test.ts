@@ -778,7 +778,7 @@ describe("issue #98 — appUser threading through runAppRegister / --from-toml",
     expect(rec?.appUser).toBe("samohost-fixture");
   });
 
-  test("reg-au-3: AppRecord.appUser drives sudo-based git in buildEnvCreateScript", () => {
+  test("reg-au-3: registered appUser is never reused for untrusted preview git", () => {
     // End-to-end consequence: a correctly-registered app (appUser set) must
     // produce a clone script that uses `sudo -u <appUser> ... /usr/bin/git`
     // rather than plain git — preventing the dubious-ownership failure.
@@ -802,10 +802,9 @@ describe("issue #98 — appUser threading through runAppRegister / --from-toml",
       dbBackend: "none",
     };
     const script = buildEnvCreateScript(rec!, envTarget);
-    // Fails today: rec.appUser is undefined → buildCloneFnLines generates
-    // plain `git clone` instead of `sudo -u 'samohost-fixture' ... /usr/bin/git`.
-    expect(script).toContain("sudo -u 'samohost-fixture'");
-    expect(script).toContain("/usr/bin/git");
+    expect(script).toContain("/usr/local/sbin/samohost-preview-");
+    expect(script).not.toContain("sudo -u 'samohost-fixture'");
+    expect(script).not.toContain(".gh-token");
   });
 
   test("reg-au-4: absent appUser leaves AppRecord.appUser undefined (no regression)", () => {

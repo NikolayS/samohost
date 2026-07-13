@@ -178,6 +178,8 @@ describe("(2) DNS_RETRY: re-ensures DNS when env lacks lastDeployedSha", () => {
     const failedEnv = makeEnvRecord(branch, {
       port: DEFAULT_POOL.base,
       vhost: `pgtest-app-feat-dns-retry-test.samo.cat`,
+      dbBackend: "dblab",
+      dbName: "pgtest-app-feat-dns-retry-test",
       // NO lastDeployedSha — this is the retry scenario
     });
     envStore.upsert(failedEnv);
@@ -343,6 +345,128 @@ describe("(3) PORT_GUARD: fail-closed when Phase-1 reveals squatted alloc port",
       .find((r) => r.prNumber === pr.number);
     expect(prResult).toBeDefined();
     expect(prResult?.action).toBe("failed");
+  });
+
+  test("multi-service PR fails when only a secondary allocated listener is bound", async () => {
+    appStore.upsert(makeApp({
+      services: [
+        {
+          name: "web",
+          unit: "pgtest-app",
+          listeners: [{ name: "web", port: 3000, portEnv: "PORT", healthPath: "/" }],
+        },
+        {
+          name: "app-api",
+          unit: "pgtest-api",
+          listeners: [{ name: "app-api", port: 3001, portEnv: "APP_API_PORT", healthPath: "/health" }],
+        },
+      ],
+      defaultListener: "web",
+    }));
+
+    const cloneId = "pgtest-existing-clone";
+    envStore.upsert(makeEnvRecord("feat/existing-clone", {
+      id: "env-existing-clone",
+      name: cloneId,
+      port: DEFAULT_POOL.base + 2,
+      ports: { web: DEFAULT_POOL.base + 2, "app-api": DEFAULT_POOL.base + 3 },
+      dbBackend: "dblab",
+      dbName: cloneId,
+    }));
+
+    const pr = { number: 303, headRef: "feat/secondary-squatter", headSha: "secondary-sha" };
+    const probeStdout = [
+      `${HEAL_PROBE_CLONE_BEGIN}${cloneId}`,
+      JSON.stringify({ status: { code: "OK" }, db: { port: DEFAULT_POOL.base + 2 } }),
+      `${HEAL_PROBE_CLONE_END}${cloneId}`,
+      HEAL_PROBE_PORTS_BEGIN,
+      // 3100 (the default listener) is free; only 3101 (app-api) is foreign-bound.
+      `LISTEN 0 0 0.0.0.0:${DEFAULT_POOL.base + 1} 0.0.0.0:*`,
+      `LISTEN 0 0 0.0.0.0:${DEFAULT_POOL.base + 2} 0.0.0.0:*`,
+      HEAL_PROBE_PORTS_END,
+    ].join("\n");
+
+    const deps = defaultTriggerDeps({
+      envStore,
+      listOpenPrs: async () => [pr],
+      remote: async (_vm, script) => ({
+        code: 0,
+        stdout: script.includes(HEAL_PROBE_PORTS_BEGIN) ? probeStdout : "",
+        stderr: "",
+      }),
+      resolveRef: fastResolveRef,
+      ensurePreviewDns: async () => {},
+      httpProbe: async () => ({ status: 200, ok: true }),
+      sleep: async () => {},
+    });
+
+    let outJson = "";
+    await runTriggerRun(
+      { prPreviews: true, heal: false, dryRun: false },
+      { json: true },
+      vmStore, appStore, deps,
+      (s) => { outJson += s; },
+      noop,
+    );
+
+    const report = JSON.parse(outJson) as {
+      prPreviews?: Array<{ results: Array<{ action: string; error?: string }> }>;
+    };
+    const result = report.prPreviews?.[0]?.results[0];
+    expect(result?.action).toBe("failed");
+    expect(result?.error).toContain("listener port 3101");
+  });
+
+  test("same-cycle multi-service PRs atomically reserve and persist every listener port", async () => {
+    appStore.upsert(makeApp({
+      services: [
+        {
+          name: "web",
+          unit: "pgtest-app",
+          listeners: [{ name: "web", port: 3000, portEnv: "PORT", healthPath: "/" }],
+        },
+        {
+          name: "app-api",
+          unit: "pgtest-api",
+          listeners: [{ name: "app-api", port: 3001, portEnv: "APP_API_PORT", healthPath: "/health" }],
+        },
+      ],
+      defaultListener: "web",
+    }));
+
+    const prs = [
+      { number: 304, headRef: "feat/atomic-one", headSha: "atomic-one-sha" },
+      { number: 305, headRef: "feat/atomic-two", headSha: "atomic-two-sha" },
+    ];
+    const batchStdout = [
+      fakeBatchSuccess("pr-304-feat-atomic-one"),
+      fakeBatchSuccess("pr-305-feat-atomic-two"),
+    ].join("\n");
+    const deps = defaultTriggerDeps({
+      envStore,
+      listOpenPrs: async () => prs,
+      remote: async () => ({ code: 0, stdout: batchStdout, stderr: "" }),
+      resolveRef: fastResolveRef,
+      ensurePreviewDns: async () => {},
+      httpProbe: async () => ({ status: 200, ok: true }),
+      sleep: async () => {},
+    });
+
+    await runTriggerRun(
+      { prPreviews: true, heal: false, dryRun: false },
+      { json: false },
+      vmStore, appStore, deps,
+      noop, noop,
+    );
+
+    const first = envStore.get("vm-pg134", "pgtest-app", "feat/atomic-one");
+    const second = envStore.get("vm-pg134", "pgtest-app", "feat/atomic-two");
+    expect(first?.ports).toEqual({ web: 3100, "app-api": 3101 });
+    expect(second?.ports).toEqual({ web: 3102, "app-api": 3103 });
+    expect(new Set([
+      ...Object.values(first?.ports ?? {}),
+      ...Object.values(second?.ports ?? {}),
+    ]).size).toBe(4);
   });
 
   test("non-squatted port: PR deploys successfully when Phase-1 port is free", async () => {
@@ -537,6 +661,10 @@ describe("(4) PREREQ_CONSISTENT: no silent wildcard-degrade when CF token absent
 
 describe("(5a) REPORTING_DERIVETARGET: deriveTarget error in PrPreviewSummary", () => {
   test("port-pool exhaustion → failed result with real error (not 'item not found')", async () => {
+    // The planted pool-fill records use dbBackend=none; make this fixture an
+    // explicit no-database app so the test reaches its allocation concern.
+    appStore.upsert(makeApp({ dbBackend: "none" }));
+
     // Exhaust the port pool by planting 100 envs (DEFAULT_POOL.size = 100).
     for (let i = 0; i < DEFAULT_POOL.size; i++) {
       envStore.upsert({
@@ -605,6 +733,10 @@ describe("(5a) REPORTING_DERIVETARGET: deriveTarget error in PrPreviewSummary", 
 
 describe("(5b) REPORTING_PRLIST: prList failure produces listError field", () => {
   test("PrPreviewSummary has listError when listOpenPrs throws", async () => {
+    // This case exercises PR-list reporting, not DB policy. Make the fixture an
+    // explicit no-database app so its stored `none` preview is policy-safe.
+    appStore.upsert(makeApp({ dbBackend: "none" }));
+
     // Plant a PR-managed env to show the summary exists (not empty report).
     const plantedEnv = makeEnvRecord("feat/plant-pr", {
       prNumber: 600,

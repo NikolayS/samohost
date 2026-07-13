@@ -446,6 +446,8 @@ Refs: NikolayS/samohost#127
     ...(app.mainHost          !== undefined ? { mainHost:          app.mainHost }          : {}),
     ...(app.rlsUrlVar         !== undefined ? { rlsUrlVar:         app.rlsUrlVar }         : {}),
     ...(app.envDbVars         !== undefined ? { envDbVars:         app.envDbVars }         : {}),
+    ...(app.previewEnvAllowlist !== undefined ? { previewEnvAllowlist: app.previewEnvAllowlist } : {}),
+    ...(app.previewEnvUnset   !== undefined ? { previewEnvUnset:   app.previewEnvUnset }   : {}),
     ...(app.dbBackend         !== undefined ? { dbBackend:         app.dbBackend }         : {}),
     ...(app.previewDbBackend  !== undefined ? { previewDbBackend:  app.previewDbBackend }  : {}),
     ...(app.appUser           !== undefined ? { appUser:           app.appUser }           : {}),

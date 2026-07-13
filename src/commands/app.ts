@@ -33,6 +33,7 @@ import {
 } from "../ssh/runner.ts";
 import type { AppRecord, AppSpec, EnvDbBackend, ServiceSpec, RouteSpec, VmRecord } from "../types.ts";
 import { parseSamohostToml, validateServicesTopology } from "../manifest/toml.ts";
+import { resolvePreviewDbBackend, validatePreviewEnvIsolation } from "../preview/db-policy.ts";
 
 // ---------------------------------------------------------------------------
 // Parsed inputs (produced by the CLI parser)
@@ -56,6 +57,8 @@ export interface AppRegisterInput {
   /** Repeatable --env-db-var (issue #11): env vars whose DB URLs are rewired
    * per preview env. Absent → the env script defaults to ["DATABASE_URL"]. */
   envDbVars?: string[];
+  previewEnvAllowlist?: string[];
+  previewEnvUnset?: string[];
   rlsNonSuperuser: boolean;
   /** Env var holding the NON-superuser URL for the RLS probe (issue #2). */
   rlsUrlVar?: string;
@@ -251,6 +254,12 @@ export function runAppRegister(
     ...(input.envDbVars !== undefined && input.envDbVars.length > 0
       ? { envDbVars: input.envDbVars }
       : {}),
+    ...(input.previewEnvAllowlist !== undefined
+      ? { previewEnvAllowlist: input.previewEnvAllowlist }
+      : {}),
+    ...(input.previewEnvUnset !== undefined
+      ? { previewEnvUnset: input.previewEnvUnset }
+      : {}),
     ...(input.rlsUrlVar !== undefined ? { rlsUrlVar: input.rlsUrlVar } : {}),
     ...(input.rlsNonSuperuser
       ? { assertions: { rlsNonSuperuser: true } }
@@ -271,6 +280,14 @@ export function runAppRegister(
     ...(input.secrets !== undefined ? { secrets: input.secrets } : {}),
     ...(input.databaseUrlEnv !== undefined ? { databaseUrlEnv: input.databaseUrlEnv } : {}),
   };
+
+  try {
+    resolvePreviewDbBackend(spec);
+    validatePreviewEnvIsolation(spec);
+  } catch (e) {
+    err(`error: invalid preview database policy: ${e instanceof Error ? e.message : String(e)}`);
+    return 1;
+  }
 
   const existing = appStore.get(vm.id, input.name);
   const record: AppRecord = {
@@ -366,6 +383,8 @@ export function runAppRegisterFromToml(
     ...(app.mainHost !== undefined ? { mainHost: app.mainHost } : {}),
     ...(app.rlsUrlVar !== undefined ? { rlsUrlVar: app.rlsUrlVar } : {}),
     ...(app.envDbVars !== undefined ? { envDbVars: app.envDbVars } : {}),
+    ...(app.previewEnvAllowlist !== undefined ? { previewEnvAllowlist: app.previewEnvAllowlist } : {}),
+    ...(app.previewEnvUnset !== undefined ? { previewEnvUnset: app.previewEnvUnset } : {}),
     ...(app.dbBackend !== undefined ? { dbBackend: app.dbBackend } : {}),
     ...(app.previewDbBackend !== undefined ? { previewDbBackend: app.previewDbBackend } : {}),
     ...(app.appUser !== undefined ? { appUser: app.appUser } : {}),

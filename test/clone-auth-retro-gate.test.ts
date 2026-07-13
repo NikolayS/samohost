@@ -33,6 +33,8 @@ import { tmpdir } from "node:os";
 import { spawnSync } from "node:child_process";
 import {
   buildEnvCreateScript,
+  buildHostPrepScript,
+  previewHelperPathFor,
   type EnvScriptTarget,
 } from "../src/env/script.ts";
 import type { AppRecord } from "../src/types.ts";
@@ -89,6 +91,13 @@ function extractCredFn(s: string): string {
   return m[1]!;
 }
 
+/** Extract the root helper's URL-role parser installed by host-prep. */
+function extractUrlRoleFn(s: string): string {
+  const m = s.match(/(url_role\(\) \{[^\n]*\})/);
+  if (m === null) throw new Error("url_role() not found in host-prep script");
+  return m[1]!;
+}
+
 // ---------------------------------------------------------------------------
 // 1a. REGRESSION: DBROLE extraction — sed pipeline must produce non-empty role
 //
@@ -102,40 +111,19 @@ function extractCredFn(s: string): string {
 // ---------------------------------------------------------------------------
 
 describe("RETRO 1a. DBROLE extraction: pipeline extracts non-empty role from both URL forms", () => {
-  /**
-   * Run the SAMOHOST_CLONE_APP_DBROLE assignment from the generated script
-   * against a synthetic template file containing the given DATABASE_URL, then
-   * return the value the script assigns to SAMOHOST_CLONE_APP_DBROLE.
-   *
-   * This runs the ACTUAL generated sed pipeline, not a hand-rolled replica —
-   * so any regression in the sed command is caught directly.
-   */
+  /** Run the root boundary's role parser against a synthetic template line. */
   function evalDbrole(templateUrl: string, databaseUrlEnv = "DATABASE_URL"): { value: string; status: number } {
-    const s = buildEnvCreateScript(
+    const s = buildHostPrepScript(
       app({ databaseUrlEnv, appUser: "samograph-user" }),
-      target({ dbBackend: "dblab" }),
+      "operator",
     );
-    const scriptLines = s.split("\n");
-    const assignLine = scriptLines.find((l) =>
-      l.startsWith("SAMOHOST_CLONE_APP_DBROLE="),
-    );
-    if (assignLine === undefined) {
-      throw new Error("SAMOHOST_CLONE_APP_DBROLE= line not found in generated script");
-    }
-    const dir = mkdtempSync(join(tmpdir(), "samohost-dbrole-"));
-    try {
-      const templatePath = join(dir, "template.env");
-      writeFileSync(templatePath, `${databaseUrlEnv}=${templateUrl}\n`, { mode: 0o600 });
-      const prog = [
-        `SAMOHOST_ENV_TEMPLATE=${JSON.stringify(templatePath)}`,
-        assignLine,
-        `printf '%s\\n' "$SAMOHOST_CLONE_APP_DBROLE"`,
-      ].join("\n");
-      const res = spawnSync("bash", ["-c", prog], { encoding: "utf8" });
-      return { value: res.stdout.trim(), status: res.status ?? 1 };
-    } finally {
-      rmSync(dir, { recursive: true, force: true });
-    }
+    const fn = extractUrlRoleFn(s);
+    const prog = [
+      fn,
+      `url_role ${JSON.stringify(`${databaseUrlEnv}=${templateUrl}`)}`,
+    ].join("\n");
+    const res = spawnSync("bash", ["-c", prog], { encoding: "utf8" });
+    return { value: res.stdout.trim(), status: res.status ?? 1 };
   }
 
   test("URL WITH password postgresql://samo:pw@host/db → role = 'samo' (non-empty)", () => {
@@ -173,20 +161,14 @@ describe("RETRO 1a. DBROLE extraction: pipeline extracts non-empty role from bot
     expect(res.stdout.trim()).toBe("");
   });
 
-  test("generated script uses sed -E (not sed -nE) for the first sed in the DBROLE pipeline", () => {
-    const s = buildEnvCreateScript(
+  test("generated role parser uses sed -nE with an explicit print suffix", () => {
+    const s = buildHostPrepScript(
       app({ databaseUrlEnv: "DATABASE_URL", appUser: "samograph-user" }),
-      target({ dbBackend: "dblab" }),
+      "operator",
     );
-    const assignLine = s.split("\n").find((l) =>
-      l.startsWith("SAMOHOST_CLONE_APP_DBROLE="),
-    );
-    expect(assignLine).toBeDefined();
-    // Must use `sed -E` (no -n) as the first sed to emit output.
-    // `sed -nE` without /p would suppress output → empty DBROLE → broken ALTER ROLE.
-    expect(assignLine).toMatch(/sed -E 's\/\^\[/);
-    // Must NOT have `sed -nE` as the first sed (the bug form).
-    expect(assignLine).not.toMatch(/tail -n 1 \| sed -nE 's/);
+    const fn = extractUrlRoleFn(s);
+    expect(fn).toContain("sed -nE");
+    expect(fn).toMatch(/\\1\|p/);
   });
 });
 
@@ -204,40 +186,44 @@ describe("RETRO 1a. DBROLE extraction: pipeline extracts non-empty role from bot
 // the no-appUser path.
 // ---------------------------------------------------------------------------
 
-describe("RETRO 1b. no-appUser path: credentialed rewrite called after hostport in envfile phase", () => {
+describe("RETRO 1b. clone credentials stay wired through the root envfile boundary", () => {
   /** App with databaseUrlEnv but WITHOUT appUser (the samograph case). */
   const noUserAppWithDbUrl = () =>
     app({ databaseUrlEnv: "DATABASE_URL" /* no appUser */ });
 
-  test("no-appUser + databaseUrlEnv → generated script contains samohost_rewire_db_credentialed", () => {
-    const s = buildEnvCreateScript(noUserAppWithDbUrl(), target({ dbBackend: "dblab" }));
-    expect(s).toContain("samohost_rewire_db_credentialed");
+  test("no-appUser + databaseUrlEnv → create delegates envfile materialisation to the app helper", () => {
+    const a = noUserAppWithDbUrl();
+    const s = buildEnvCreateScript(a, target({ dbBackend: "dblab" }));
+    expect(s).toContain(
+      `sudo -n '${previewHelperPathFor(a)}' envfile 'samograph-feat-retro' 'feat/retro' ` +
+        `'samograph-feat-retro.samo.cat' 'dblab' "$SAMOHOST_DB_PORT" 'PORT=40200'`,
+    );
   });
 
-  test("no-appUser + databaseUrlEnv → credentialed call AFTER hostport call in script order", () => {
+  test("no-appUser + databaseUrlEnv → helper envfile call remains after DB clone credential setup", () => {
     const s = buildEnvCreateScript(noUserAppWithDbUrl(), target({ dbBackend: "dblab" }));
-    const hostportIdx = s.indexOf('samohost_rewire_db_hostport "$SAMOHOST_ENV_DIR/.env"');
-    const credIdx = s.indexOf('samohost_rewire_db_credentialed "$SAMOHOST_ENV_DIR/.env"');
-    expect(hostportIdx).toBeGreaterThan(-1);
-    expect(credIdx).toBeGreaterThan(-1);
-    // Credentialed rewrite must follow hostport rewrite (hostport sets the correct
-    // host:port; credentialed then adds user:pw on top of that).
-    expect(credIdx).toBeGreaterThan(hostportIdx);
+    const dbOkIdx = s.indexOf("<<<SAMOHOST_PHASE:db:ok>>>");
+    const envfileCallIdx = s.indexOf(" envfile 'samograph-feat-retro'");
+    expect(dbOkIdx).toBeGreaterThan(-1);
+    expect(envfileCallIdx).toBeGreaterThan(dbOkIdx);
   });
 
-  test("no-appUser + databaseUrlEnv → credentialed call is in the envfile phase &&-chain", () => {
+  test("no-appUser + databaseUrlEnv → helper call is inside the envfile phase", () => {
     const s = buildEnvCreateScript(noUserAppWithDbUrl(), target({ dbBackend: "dblab" }));
-    // Both calls must appear within the same envfile-phase &&-chain.
-    const envfilePhasesIdx = s.indexOf("<<<SAMOHOST_PHASE:envfile:start>>>");
-    const credIdx = s.indexOf('samohost_rewire_db_credentialed "$SAMOHOST_ENV_DIR/.env"');
-    expect(envfilePhasesIdx).toBeGreaterThan(-1);
-    expect(credIdx).toBeGreaterThan(envfilePhasesIdx);
+    const envfileStartIdx = s.indexOf("<<<SAMOHOST_PHASE:envfile:start>>>");
+    const envfileCallIdx = s.indexOf(" envfile 'samograph-feat-retro'");
+    const envfileOkIdx = s.indexOf("<<<SAMOHOST_PHASE:envfile:ok>>>");
+    expect(envfileCallIdx).toBeGreaterThan(envfileStartIdx);
+    expect(envfileCallIdx).toBeLessThan(envfileOkIdx);
   });
 
-  test("no-appUser + NO databaseUrlEnv → credentialed rewrite NOT in envfile phase (no-op path)", () => {
-    // Apps without databaseUrlEnv should NOT get credentialed rewrite.
-    const s = buildEnvCreateScript(app( /* no databaseUrlEnv, no appUser */), target({ dbBackend: "dblab" }));
-    expect(s).not.toContain('samohost_rewire_db_credentialed "$SAMOHOST_ENV_DIR/.env"');
+  test("no-appUser + implicit DATABASE_URL still receives clone-only credentials", () => {
+    // databaseUrlEnv is only a compatibility alias; the root helper defaults
+    // envDbVars to DATABASE_URL and rewrites it from the clone-only secret.
+    const prep = buildHostPrepScript(app( /* no databaseUrlEnv, no appUser */), "operator");
+    expect(prep).toContain("DB_VARS=('DATABASE_URL')");
+    expect(prep).toContain('PW=$(grep -E "^SAMOHOST_CLONE_ROLE_PW_${ROLE}="');
+    expect(prep).toContain("@127.0.0.1:%s%s\\n");
   });
 });
 
@@ -252,107 +238,90 @@ describe("RETRO 1b. no-appUser path: credentialed rewrite called after hostport 
 // before touching psql, with a clear actionable message.
 // ---------------------------------------------------------------------------
 
-describe("HARDEN 2a. empty-DBROLE guard: fail loud before ALTER ROLE", () => {
+describe("HARDEN 2a. unsafe per-variable DBROLE guard: fail loud before ALTER ROLE", () => {
   const appWithDbUrl = () =>
     app({ databaseUrlEnv: "DATABASE_URL", appUser: "samograph-user" });
 
-  test("samohost_set_clone_role_password contains [[ -n \"$SAMOHOST_CLONE_APP_DBROLE\" ]] guard", () => {
+  test("samohost_set_clone_role_password validates every extracted role", () => {
     const s = buildEnvCreateScript(appWithDbUrl(), target({ dbBackend: "dblab" }));
     const fn = extractSetPwFn(s);
-    // Guard must check that SAMOHOST_CLONE_APP_DBROLE is non-empty.
-    expect(fn).toMatch(/\[\[ -n "\$SAMOHOST_CLONE_APP_DBROLE"/);
+    expect(fn).toContain('[[ "$role" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]');
   });
 
   test("guard appears BEFORE the psql invocation in the function body", () => {
     const s = buildEnvCreateScript(appWithDbUrl(), target({ dbBackend: "dblab" }));
     const fn = extractSetPwFn(s);
-    const guardIdx = fn.search(/\[\[ -n "\$SAMOHOST_CLONE_APP_DBROLE"/);
+    const guardIdx = fn.indexOf('[[ "$role" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]');
     const psqlIdx = fn.indexOf("/usr/bin/psql");
     expect(guardIdx).toBeGreaterThan(-1);
     expect(psqlIdx).toBeGreaterThan(-1);
     expect(guardIdx).toBeLessThan(psqlIdx);
   });
 
-  test("executed: empty SAMOHOST_CLONE_APP_DBROLE → non-zero exit", () => {
+  test("executed: URL with an empty role → non-zero exit", () => {
     const s = buildEnvCreateScript(appWithDbUrl(), target({ dbBackend: "dblab" }));
     const fn = extractSetPwFn(s);
-    // Patch out the sudo calls so the test does not require a privileged env.
-    // Replace sudo init/get with no-ops; leave the guard untouched.
-    const patched = fn
-      .replace(
-        /sudo \/usr\/local\/sbin\/samohost-secrets init[^\n]+/,
-        ": # (patched) sudo samohost-secrets init",
-      )
-      .replace(
-        /SAMOHOST_CLONE_ROLE_PW="\$\(sudo[^\n]+\)"/,
-        "SAMOHOST_CLONE_ROLE_PW='fakepw'",
-      );
-    const prog = [
-      "SAMOHOST_ENV_NAME='test-env'",
-      "SAMOHOST_SECRETS_ENV_USER='testuser'",
-      // Empty role — the guard must catch this.
-      "SAMOHOST_CLONE_APP_DBROLE=''",
-      "SAMOHOST_DB_PASSWORD='pw'",
-      "SAMOHOST_DB_PORT='5433'",
-      patched,
-      "samohost_set_clone_role_password",
-    ].join("\n");
-    const res = spawnSync("bash", ["-c", prog], { encoding: "utf8" });
-    expect(res.status).not.toBe(0);
+    const dir = mkdtempSync(join(tmpdir(), "samohost-empty-role-"));
+    try {
+      const templatePath = join(dir, "template.env");
+      writeFileSync(templatePath, "DATABASE_URL=postgresql://@host/db\n", { mode: 0o600 });
+      const prog = [
+        `SAMOHOST_ENV_TEMPLATE=${JSON.stringify(templatePath)}`,
+        "SAMOHOST_ENV_DB_VARS=(DATABASE_URL)",
+        fn,
+        "samohost_set_clone_role_password",
+      ].join("\n");
+      const res = spawnSync("bash", ["-c", prog], { encoding: "utf8" });
+      expect(res.status).not.toBe(0);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 
-  test("executed: empty SAMOHOST_CLONE_APP_DBROLE → error message mentions SAMOHOST_CLONE_APP_DBROLE", () => {
+  test("executed: empty role error names the affected env var", () => {
     const s = buildEnvCreateScript(appWithDbUrl(), target({ dbBackend: "dblab" }));
     const fn = extractSetPwFn(s);
-    const patched = fn
-      .replace(
-        /sudo \/usr\/local\/sbin\/samohost-secrets init[^\n]+/,
-        ": # (patched) sudo samohost-secrets init",
-      )
-      .replace(
-        /SAMOHOST_CLONE_ROLE_PW="\$\(sudo[^\n]+\)"/,
-        "SAMOHOST_CLONE_ROLE_PW='fakepw'",
-      );
-    const prog = [
-      "SAMOHOST_ENV_NAME='test-env'",
-      "SAMOHOST_SECRETS_ENV_USER='testuser'",
-      "SAMOHOST_CLONE_APP_DBROLE=''",
-      "SAMOHOST_DB_PASSWORD='pw'",
-      "SAMOHOST_DB_PORT='5433'",
-      patched,
-      "samohost_set_clone_role_password 2>&1 || true",
-    ].join("\n");
-    const res = spawnSync("bash", ["-c", prog], { encoding: "utf8" });
-    // The error message must be actionable: mention the variable name.
-    expect(res.stdout + res.stderr).toMatch(/SAMOHOST_CLONE_APP_DBROLE/);
+    const dir = mkdtempSync(join(tmpdir(), "samohost-empty-role-msg-"));
+    try {
+      const templatePath = join(dir, "template.env");
+      writeFileSync(templatePath, "DATABASE_URL=postgresql://@host/db\n", { mode: 0o600 });
+      const prog = [
+        `SAMOHOST_ENV_TEMPLATE=${JSON.stringify(templatePath)}`,
+        "SAMOHOST_ENV_DB_VARS=(DATABASE_URL)",
+        fn,
+        "samohost_set_clone_role_password 2>&1 || true",
+      ].join("\n");
+      const res = spawnSync("bash", ["-c", prog], { encoding: "utf8" });
+      expect(res.stdout + res.stderr).toMatch(/DATABASE_URL.*no safe database role/);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 
-  test("executed: non-empty SAMOHOST_CLONE_APP_DBROLE does NOT trigger the guard", () => {
-    // With a valid role, the guard must not fire — only the psql call may fail
-    // (we patch psql away to avoid needing a real database).
+  test("executed: a safe extracted role reaches psql and succeeds", () => {
     const dir = mkdtempSync(join(tmpdir(), "samohost-guard-ok-"));
     try {
       const fakePsql = join(dir, "psql");
       writeFileSync(fakePsql, "#!/bin/bash\ncat >/dev/null\nexit 0\n");
       chmodSync(fakePsql, 0o755);
+      const fakeSudo = join(dir, "sudo");
+      writeFileSync(fakeSudo, "#!/bin/bash\n[[ \"$2\" == get ]] && printf 'aabb\\n'\nexit 0\n");
+      chmodSync(fakeSudo, 0o755);
+      const templatePath = join(dir, "template.env");
+      writeFileSync(templatePath, "DATABASE_URL=postgresql://samo@host/db\n", { mode: 0o600 });
 
       const s = buildEnvCreateScript(appWithDbUrl(), target({ dbBackend: "dblab" }));
       const fn = extractSetPwFn(s);
-      const patched = fn
-        .replace(
-          /sudo \/usr\/local\/sbin\/samohost-secrets init[^\n]+/,
-          ": # (patched) sudo samohost-secrets init",
-        )
-        .replace(
-          /SAMOHOST_CLONE_ROLE_PW="\$\(sudo[^\n]+\)"/,
-          "SAMOHOST_CLONE_ROLE_PW='fakepw'",
-        )
-        .replace(/\/usr\/bin\/psql\b/, fakePsql);
+      const patched = fn.replace(/\/usr\/bin\/psql\b/, fakePsql);
 
       const prog = [
+        `PATH=${JSON.stringify(dir)}:"$PATH"`,
+        `SAMOHOST_ENV_TEMPLATE=${JSON.stringify(templatePath)}`,
+        "SAMOHOST_ENV_DB_VARS=(DATABASE_URL)",
+        "declare -A SAMOHOST_CLONE_ROLE_BY_VAR=()",
+        "declare -A SAMOHOST_CLONE_PW_BY_VAR=()",
         "SAMOHOST_ENV_NAME='test-env'",
         "SAMOHOST_SECRETS_ENV_USER='testuser'",
-        "SAMOHOST_CLONE_APP_DBROLE='samo'",
         "SAMOHOST_DB_PASSWORD='pw'",
         "SAMOHOST_DB_PORT='5433'",
         patched,
@@ -393,24 +362,24 @@ describe("HARDEN 2b. ON_ERROR_STOP=1 on ALTER ROLE psql: SQL errors propagate no
       const fakePsql = join(dir, "psql");
       writeFileSync(fakePsql, "#!/bin/bash\ncat >/dev/null\nexit 3\n");
       chmodSync(fakePsql, 0o755);
+      const fakeSudo = join(dir, "sudo");
+      writeFileSync(fakeSudo, "#!/bin/bash\n[[ \"$2\" == get ]] && printf 'aabb\\n'\nexit 0\n");
+      chmodSync(fakeSudo, 0o755);
+      const templatePath = join(dir, "template.env");
+      writeFileSync(templatePath, "DATABASE_URL=postgresql://samo@host/db\n", { mode: 0o600 });
 
       const s = buildEnvCreateScript(appWithDbUrl(), target({ dbBackend: "dblab" }));
       const fn = extractSetPwFn(s);
-      const patched = fn
-        .replace(
-          /sudo \/usr\/local\/sbin\/samohost-secrets init[^\n]+/,
-          ": # (patched) sudo samohost-secrets init",
-        )
-        .replace(
-          /SAMOHOST_CLONE_ROLE_PW="\$\(sudo[^\n]+\)"/,
-          "SAMOHOST_CLONE_ROLE_PW='fakepw'",
-        )
-        .replace(/\/usr\/bin\/psql\b/, fakePsql);
+      const patched = fn.replace(/\/usr\/bin\/psql\b/, fakePsql);
 
       const prog = [
+        `PATH=${JSON.stringify(dir)}:"$PATH"`,
+        `SAMOHOST_ENV_TEMPLATE=${JSON.stringify(templatePath)}`,
+        "SAMOHOST_ENV_DB_VARS=(DATABASE_URL)",
+        "declare -A SAMOHOST_CLONE_ROLE_BY_VAR=()",
+        "declare -A SAMOHOST_CLONE_PW_BY_VAR=()",
         "SAMOHOST_ENV_NAME='test-env'",
         "SAMOHOST_SECRETS_ENV_USER='testuser'",
-        "SAMOHOST_CLONE_APP_DBROLE='samo'",
         "SAMOHOST_DB_PASSWORD='pw'",
         "SAMOHOST_DB_PORT='5433'",
         patched,

@@ -26,8 +26,10 @@
  */
 
 import type { AppRecord, EnvDbBackend, EnvRecord } from "../types.ts";
+import { createHash } from "node:crypto";
 import { servicesOf } from "../app/services.ts";
 import { planFromEnv, renderVhost } from "../caddy/render.ts";
+import { fnv1a } from "./name.ts";
 
 /** Same marker prefix as deploy scripts — one parser convention everywhere. */
 export const ENV_PHASE_PREFIX = "<<<SAMOHOST_PHASE:";
@@ -132,79 +134,15 @@ const PORT_CHECK_FN_LINES: string[] = [
   "}",
 ];
 
-/**
- * Build the bash function `samohost_clone_env_dir` — two-strategy branch
- * checkout (issue #11 finding 5). A `git clone --reference` off the
- * production checkout is cheap, but git rejects SHALLOW (or otherwise
- * unusable) reference repos; explicit fallback to a plain clone of the same
- * origin URL, with a message NAMING which strategy failed and why.
- *
- * Issue #97 fix: when `appUser` is supplied all git operations run as that
- * user via `sudo -u <appUser> GIT_CONFIG_GLOBAL=<gitSafeConf> /usr/bin/git`
- * instead of plain `git` (the SSH user). Two failure modes prevented:
- *   1. `fatal: detected dubious ownership in repository` — git ≥ 2.35.2
- *      rejects a checkout whose directory owner differs from the calling
- *      process user; running as the owner avoids this.
- *   2. The 600 `.gh-token` is unreadable by the SSH user; running as appUser
- *      (which bootstrap wrote the token for) enables the credential helper.
- * The credential helper embeds the token file path as a LITERAL string (not
- * `$TOKEN_FILE`) so it is available in the credential helper subprocess even
- * without an exported variable.
- *
- * When `appUser` is absent: backward-compatible plain-`git` behavior (for
- * AppRecords that predate the appUser field).
- *
- * (Closing brace at column 0 — tests extract and execute this function.)
- */
-function buildCloneFnLines(
-  appUser?: string,
-  gitSafeConf?: string,
-  tokenFile?: string,
-): string[] {
-  // Prefix for every git invocation: when appUser is set, delegate via sudo
-  // with GIT_CONFIG_GLOBAL (env var passes through thanks to the SETENV:
-  // sudoers tag emitted by buildHostPrepScript) and use the full /usr/bin/git
-  // path (required for exact-path NOPASSWD grants).
-  const gitCmd = appUser !== undefined && gitSafeConf !== undefined
-    ? `sudo -u ${sq(appUser)} GIT_CONFIG_GLOBAL=${sq(gitSafeConf)} /usr/bin/git`
-    : "git";
-
-  // Inline credential helper: embeds the token file path as a LITERAL so
-  // the helper subprocess can read it without $TOKEN_FILE in scope (proven
-  // bootstrap.ts §12 / samorev #83 pattern). Only emitted when appUser is
-  // set — without an appUser the old path had no token handling either.
-  const credHelper = appUser !== undefined && tokenFile !== undefined
-    ? ` -c 'credential.helper=!f() { echo username=x-access-token; echo "password=$(cat ${tokenFile})"; }; f'`
-    : "";
-
+/** Delegate the fresh clone to the root-owned, app-specific boundary. */
+function buildCloneFnLines(helperPath: string): string[] {
   return [
     "samohost_clone_env_dir() {",
-    "  local origin_url",
-    `  origin_url="$(${gitCmd} -C "$SAMOHOST_APP_DIR" remote get-url origin)" || {`,
-    '    echo "samohost: cannot read the origin URL from $SAMOHOST_APP_DIR" >&2',
+    `  if ! sudo -n ${sq(helperPath)} check ${sq(PREVIEW_IDENTITY_PROTOCOL)}; then`,
+    '    echo "samohost: hardened preview host support is absent or stale — re-run this app\'s generated `samohost env plan --host-prep` script as root before creating/rebuilding previews" >&2',
     "    return 1",
-    "  }",
-    '  if [[ -d "$SAMOHOST_ENV_DIR/.git" ]]; then',
-    // Issue #98 follow-up: the fetch path must also carry the credential helper
-    // so that private-repo re-fetches authenticate. The clone strategies already
-    // carry credHelper; the fetch path was the odd one out (samorev finding).
-    `    ${gitCmd}${credHelper} -C "$SAMOHOST_ENV_DIR" fetch origin "$SAMOHOST_BRANCH" \\`,
-    `      && ${gitCmd} -C "$SAMOHOST_ENV_DIR" checkout -B "$SAMOHOST_BRANCH" "origin/$SAMOHOST_BRANCH"`,
-    "    return",
     "  fi",
-    `  if ${gitCmd}${credHelper} clone --reference "$SAMOHOST_APP_DIR" --dissociate \\`,
-    '       --branch "$SAMOHOST_BRANCH" --single-branch \\',
-    '       "$origin_url" "$SAMOHOST_ENV_DIR"; then',
-    "    return 0",
-    "  fi",
-    '  echo "samohost: strategy 1 (git clone --reference $SAMOHOST_APP_DIR) failed — the production checkout is unusable as a clone reference (e.g. a shallow checkout); falling back to a plain clone of $origin_url" >&2',
-    '  rm -rf "$SAMOHOST_ENV_DIR"',
-    `  if ${gitCmd}${credHelper} clone --branch "$SAMOHOST_BRANCH" --single-branch \\`,
-    '       "$origin_url" "$SAMOHOST_ENV_DIR"; then',
-    "    return 0",
-    "  fi",
-    '  echo "samohost: strategy 2 (plain git clone of $origin_url, branch $SAMOHOST_BRANCH) ALSO failed — clone phase cannot proceed" >&2',
-    "  return 1",
+    `  sudo -n ${sq(helperPath)} clone "$SAMOHOST_ENV_NAME" "$SAMOHOST_BRANCH"`,
     "}",
   ];
 }
@@ -372,45 +310,37 @@ const REWIRE_DB_HOSTPORT_FN_LINES: string[] = [
  *     the db phase fails instead of silently proceeding with an unset password.
  */
 const SET_CLONE_ROLE_PASSWORD_FN_LINES: string[] = [
+  "declare -A SAMOHOST_CLONE_ROLE_BY_VAR=()",
+  "declare -A SAMOHOST_CLONE_PW_BY_VAR=()",
+  "declare -A SAMOHOST_CLONE_PW_BY_ROLE=()",
   "samohost_set_clone_role_password() {",
-  "  # GUARD: fail loud if DBROLE is empty (extraction pipeline produced no output,",
-  "  # e.g. because the template URL has no user component, or a future sed regression).",
-  "  # Catching this here surfaces the configuration error before any psql call and",
-  "  # prevents a silent password-set failure on an empty role name.",
-  "  [[ -n \"$SAMOHOST_CLONE_APP_DBROLE\" ]] || {",
-  "    echo \"samohost: SAMOHOST_CLONE_APP_DBROLE is empty — the databaseUrlEnv URL in the operator template has no user component; cannot set clone-role password\" >&2",
-  "    return 1",
-  "  }",
-  "  # Init the clone-role password (reuse-or-generate; 'init' preserves the existing",
-  "  # value so a clone RESET re-applies the SAME password → DATABASE_URL stays stable).",
-  "  sudo /usr/local/sbin/samohost-secrets init \"$SAMOHOST_ENV_NAME\" \"$SAMOHOST_SECRETS_ENV_USER\" SAMOHOST_CLONE_ROLE_PW",
-  "  SAMOHOST_CLONE_ROLE_PW=\"$(sudo /usr/local/sbin/samohost-secrets get \"$SAMOHOST_ENV_NAME\" SAMOHOST_CLONE_ROLE_PW)\"",
-  "  # Apply the password to the clone's app role via the privileged clone role (samohost_env).",
-  "  # ARGV FIX: SQL is fed via STDIN (-f -), never via -c, so the secret is absent",
-  "  #   from /proc/<pid>/cmdline and 'ps aux' for the lifetime of the psql process.",
-  "  # SERVER-LOG FIX: SET log_statement/log_min_duration_statement suppress DDL",
-  "  #   logging in this session BEFORE the ALTER ROLE, so the plaintext password",
-  "  #   never reaches the pg server log even when log_statement=ddl/all is set.",
-  "  #   SET log_min_error_statement TO 'panic' additionally prevents the failing",
-  "  #   statement text (which may include the password) from being written to the",
-  "  #   pg server log when an error occurs in this session (e.g., role not found).",
-  "  # -v ON_ERROR_STOP=1: SQL errors cause psql to exit non-zero so the caller",
-  "  #   knows ALTER ROLE failed and does not silently proceed with an unset password.",
-  "  # >/dev/null suppresses psql rowcount/notice output only (NOT the argv-leak",
-  "  #   protection — that comes from -f - above; >/dev/null alone does not close",
-  "  #   the /proc/<pid>/cmdline surface).",
-  "  printf \"SET log_statement TO 'none';\\nSET log_min_duration_statement TO -1;\\nSET log_min_error_statement TO 'panic';\\nALTER ROLE %s WITH LOGIN PASSWORD '%s';\\n\" \\",
-  "    \"$SAMOHOST_CLONE_APP_DBROLE\" \"$SAMOHOST_CLONE_ROLE_PW\" \\",
-  "    | PGPASSWORD=\"$SAMOHOST_DB_PASSWORD\" /usr/bin/psql -h 127.0.0.1 -p \"$SAMOHOST_DB_PORT\" \\",
-  "        -U samohost_env -d postgres -X -v ON_ERROR_STOP=1 -f - >/dev/null",
+  "  local var line role secret_key pw",
+  '  for var in "${SAMOHOST_ENV_DB_VARS[@]}"; do',
+  '    role=""; if declare -p SAMOHOST_PROD_ROLE_BY_VAR >/dev/null 2>&1; then role="${SAMOHOST_PROD_ROLE_BY_VAR[$var]:-}"; fi',
+  '    if [[ -z "$role" && -n "${SAMOHOST_ENV_TEMPLATE:-}" ]]; then line="$(grep -E "^${var}=" "$SAMOHOST_ENV_TEMPLATE" | tail -n 1 || true)"; role="$(printf \'%s\\n\' "${line#*=}" | sed -nE \'s|^"?[A-Za-z0-9+]+://([^:/@?"]+)(:[^@/]*)?@.*|\\1|p\')"; fi',
+  '    [[ "$role" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || { echo "samohost: ${var} has no safe database role; cannot create clone-only credentials" >&2; return 1; }',
+  '    pw="${SAMOHOST_CLONE_PW_BY_ROLE[$role]:-}"',
+  '    if [[ -z "$pw" ]]; then',
+  '      secret_key="SAMOHOST_CLONE_ROLE_PW_${role}"',
+  '      sudo /usr/local/sbin/samohost-secrets init "$SAMOHOST_ENV_NAME" "$secret_key"',
+  '      pw="$(sudo /usr/local/sbin/samohost-secrets get "$SAMOHOST_ENV_NAME" "$secret_key")"',
+  '      [[ "$pw" =~ ^[0-9a-f]+$ ]] || { echo "samohost: invalid generated clone credential for ${var}" >&2; return 1; }',
+  "      printf \"SET log_statement TO 'none';\\nSET log_min_duration_statement TO -1;\\nSET log_min_error_statement TO 'panic';\\nALTER ROLE %s WITH LOGIN PASSWORD '%s';\\n\" \\",
+  '        "$role" "$pw" | PGPASSWORD="$SAMOHOST_DB_PASSWORD" /usr/bin/psql -h 127.0.0.1 -p "$SAMOHOST_DB_PORT" -U samohost_env -d postgres -X -v ON_ERROR_STOP=1 -f - >/dev/null || return 1',
+  '      SAMOHOST_CLONE_PW_BY_ROLE["$role"]="$pw"',
+  "    fi",
+  '    SAMOHOST_CLONE_APP_DBROLE="$role"',
+  '    SAMOHOST_CLONE_ROLE_PW="$pw"',
+  '    SAMOHOST_CLONE_ROLE_BY_VAR["$var"]="$role"',
+  '    SAMOHOST_CLONE_PW_BY_VAR["$var"]="$pw"',
+  "  done",
   "}",
 ];
 
 /**
- * Bash function: rewrite the credentialed DATABASE_URL (the specific var named
- * by manifest `databaseUrlEnv`) to include the clone-role password. Called in
- * the envfile phase AFTER samohost_rewire_db_hostport has already rewritten
- * host:port.
+ * Bash function: rewrite every mapped envDbVars URL to include its clone-only
+ * role password. Called in the envfile phase AFTER
+ * samohost_rewire_db_hostport has already rewritten host:port.
  *
  * Placed AFTER the db phase in the generated script so the first occurrence
  * of the function name is post-db:ok (ordering test invariant).
@@ -421,24 +351,21 @@ const SET_CLONE_ROLE_PASSWORD_FN_LINES: string[] = [
  */
 const REWIRE_DB_CREDENTIALED_FN_LINES: string[] = [
   "samohost_rewire_db_credentialed() {",
-  "  local envfile=\"$1\"",
-  "  # No-op when credential rewire is not configured (no databaseUrlEnv on the app).",
-  "  [[ -n \"${SAMOHOST_CLONE_CRED_VAR:-}\" ]] || return 0",
-  "  local var=\"$SAMOHOST_CLONE_CRED_VAR\"",
-  "  local line val scheme dbpath rewritten",
-  "  line=\"$(grep -E \"^${var}=\" \"$envfile\" | tail -n 1 || true)\"",
-  "  if [[ -z \"$line\" ]]; then",
-  "    echo \"samohost: envfile is missing ${var} (declared as databaseUrlEnv) — cannot rewrite credentialed URL\" >&2",
-  "    return 1",
-  "  fi",
-  "  val=\"${line#*=}\"",
+  '  local envfile="$1" var line val scheme dbpath rewritten role pw',
+  '  for var in "${SAMOHOST_ENV_DB_VARS[@]}"; do',
+  '  line="$(grep -E "^${var}=" "$envfile" | tail -n 1 || true)"',
+  '  [[ -n "$line" ]] || { echo "samohost: envfile is missing ${var}; cannot rewrite clone-only credentials" >&2; return 1; }',
+  '  role="${SAMOHOST_CLONE_ROLE_BY_VAR[$var]:-}"',
+  '  pw="${SAMOHOST_CLONE_PW_BY_VAR[$var]:-}"',
+  '  [[ -n "$role" && -n "$pw" ]] || { echo "samohost: clone-only credentials missing for ${var}" >&2; return 1; }',
+  '  val="${line#*=}"',
   "  # Extract scheme component (e.g. 'postgresql://'), stripping optional leading quote.",
   "  scheme=\"$(printf '%s' \"$val\" | sed -nE 's|^(\"?[A-Za-z0-9+]+://).*|\\1|p')\"",
   "  scheme=\"${scheme#\\\"}\"",
   "  # Extract DB path: /dbname[?params] — everything after the host:port component.",
   "  dbpath=\"$(printf '%s' \"$val\" | sed -nE 's|^\"?[A-Za-z0-9+]+://[^/]*(/[^\"]*)$|\\1|p')\"",
   "  # Build the credentialed URL: scheme + role:password@127.0.0.1:port + /dbname.",
-  "  rewritten=\"${scheme}${SAMOHOST_CLONE_APP_DBROLE}:${SAMOHOST_CLONE_ROLE_PW}@127.0.0.1:${SAMOHOST_DB_PORT}${dbpath}\"",
+  "  rewritten=\"${scheme}${role}:${pw}@127.0.0.1:${SAMOHOST_DB_PORT}${dbpath}\"",
   "  # Strip-then-append prevents duplicate entries (same pattern as rewire_db_hostport).",
   // UMASK FIX: pre-create the temp file at 0600 with install before the bare `>`
   // redirect fills it. A bare `>` creates the file at umask permissions (typically
@@ -448,6 +375,7 @@ const REWIRE_DB_CREDENTIALED_FN_LINES: string[] = [
   "  printf '%s=%s\\n' \"$var\" \"$rewritten\" >> \"${envfile}.credrew\"",
   "  mv \"${envfile}.credrew\" \"$envfile\"",
   "  chmod 600 \"$envfile\"",
+  "  done",
   "}",
 ];
 
@@ -461,12 +389,11 @@ const REWIRE_DB_CREDENTIALED_FN_LINES: string[] = [
  */
 const APP_URL_ROLES_FN_LINES: string[] = [
   "samohost_app_url_roles() {",
-  "  local var line",
+  "  local var role line",
   '  for var in "${SAMOHOST_ENV_DB_VARS[@]}"; do',
-  '    line="$(grep -E "^${var}=" "$SAMOHOST_ENV_TEMPLATE" | tail -n 1)"',
-  '    [[ -n "$line" ]] || continue',
-  "    printf '%s\\n' \"${line#*=}\" \\",
-  "      | sed -nE 's|^\"?[A-Za-z0-9+]+://([^:/@?\"]+)(:[^@/]*)?@.*|\\1|p'",
+  '    role=""; if declare -p SAMOHOST_PROD_ROLE_BY_VAR >/dev/null 2>&1; then role="${SAMOHOST_PROD_ROLE_BY_VAR[$var]:-}"; fi',
+  '    if [[ -z "$role" && -n "${SAMOHOST_ENV_TEMPLATE:-}" ]]; then line="$(grep -E "^${var}=" "$SAMOHOST_ENV_TEMPLATE" | tail -n 1 || true)"; role="$(printf \'%s\\n\' "${line#*=}" | sed -nE \'s|^"?[A-Za-z0-9+]+://([^:/@?"]+)(:[^@/]*)?@.*|\\1|p\')"; fi',
+  '    [[ -n "$role" ]] && printf \'%s\\n\' "$role"',
   "  done",
   "}",
 ];
@@ -574,8 +501,8 @@ const SYNC_CLONE_GLOBALS_FN_LINES: string[] = [
   "  local prod_db scoped_roles apply_failures=0",
   "  # The production database the operator template points at (path component",
   "  # of the first mapped var) — the same database name exists in the clone.",
-  '  prod_db="$(grep -E "^${SAMOHOST_ENV_DB_VARS[0]}=" "$SAMOHOST_ENV_TEMPLATE" | tail -n 1 \\',
-  "    | sed -nE 's|^[^=]*=\"?[A-Za-z0-9+]+://[^/]+/([^?\"]*).*|\\1|p')\"",
+  '  prod_db="${SAMOHOST_PROD_DB_NAME:-}"',
+  '  if [[ -z "$prod_db" && -n "${SAMOHOST_ENV_TEMPLATE:-}" ]]; then prod_db="$(grep -E "^${SAMOHOST_ENV_DB_VARS[0]}=" "$SAMOHOST_ENV_TEMPLATE" | tail -n 1 | sed -nE \'s|^[^=]*="?[A-Za-z0-9+]+://[^/]+/([^?"]*).*|\\1|p\')"; fi',
   '  if ! [[ "$prod_db" =~ ^[A-Za-z0-9_][A-Za-z0-9_-]*$ ]]; then',
   '    echo "samohost: cannot derive a valid production database name from ${SAMOHOST_ENV_DB_VARS[0]} in the env template (no plain database path component; the derived value is never echoed because a mis-parse can capture credentials) — refusing the globals sync" >&2',
   "    return 1",
@@ -767,6 +694,304 @@ function sq(s: string): string {
   return `'${s.replace(/'/g, `'\\''`)}'`;
 }
 
+const PREVIEW_IDENTITY_PROTOCOL = "env-user-v2";
+
+function identityDigest(...parts: string[]): string {
+  const hash = createHash("sha256");
+  parts.forEach((part, i) => {
+    if (i > 0) hash.update("\0");
+    hash.update(part);
+  });
+  return hash.digest("hex");
+}
+
+function previewUserPrefixFor(app: Pick<AppRecord, "name">): string {
+  return `se-${identityDigest(app.name).slice(0, 10)}-`;
+}
+
+/**
+ * Dedicated, non-login Unix identity for one preview environment. The caller
+ * supplies only the already-derived env id; both TypeScript and the privileged
+ * helper independently validate it and derive the same bounded username.
+ */
+export function previewUserForEnv(
+  app: Pick<AppRecord, "name">,
+  envName: string,
+): string {
+  if (!/^[a-z0-9][a-z0-9-]*$/.test(envName) || !envName.startsWith(`${app.name}-`)) {
+    throw new Error(`invalid preview id ${JSON.stringify(envName)} for app '${app.name}'`);
+  }
+  return `${previewUserPrefixFor(app)}${envName.slice(0, 6)}-${identityDigest(app.name, envName).slice(0, 10)}`;
+}
+
+/** Identity used by the first #149 attempt; removed only after old envs stop. */
+function legacyPreviewUserFor(app: Pick<AppRecord, "name">): string {
+  const label = app.name.toLowerCase().replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "").slice(0, 15) || "app";
+  return `smp-${label}-${fnv1a(app.name)}`;
+}
+
+/** Root-owned, app-specific privileged helper. */
+export function previewHelperPathFor(app: Pick<AppRecord, "name">): string {
+  return `/usr/local/sbin/samohost-preview-${fnv1a(app.name)}`;
+}
+
+/**
+ * Render the root helper used as the only bridge from trusted orchestration to
+ * production credentials.  It accepts no filesystem path or command from the
+ * caller: app/repo/token/template/root/user policy is baked into this root-owned
+ * file by host-prep.  Every action validates the app-specific preview id before
+ * deriving a path below ENVS_ROOT.
+ */
+function buildPreviewHelperLines(app: AppRecord): string[] {
+  const root = envsRoot(app);
+  const helperName = previewHelperPathFor(app).split("/").pop()!;
+  const appBase = app.appDir.replace(/\/+$/, "").split("/").slice(0, -1).join("/");
+  const tokenFile = `${appBase}/.gh-token`;
+  const templateFile = `${root}.template.env`;
+  const allow = app.previewEnvAllowlist ?? [];
+  const unset = app.previewEnvUnset ?? [];
+  const dbVars = app.envDbVars ?? [...DEFAULT_ENV_DB_VARS];
+  const { services } = servicesOf(app);
+  const units = app.kind === "static"
+    ? []
+    : [...new Set(services.map((service) => service.unit))];
+  const portVars = [...new Set(services.flatMap((svc) =>
+    svc.listeners.map((listener) => listener.portEnv)
+  ))];
+  if (!/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(app.repo)) {
+    throw new Error(`invalid GitHub repository ${JSON.stringify(app.repo)} for hardened preview clone`);
+  }
+  const repoUrl = `https://github.com/${app.repo}.git`;
+
+  return [
+    "#!/usr/bin/env bash",
+    `# ${helperName} — root-only preview boundary for ${app.name}.`,
+    "set -euo pipefail",
+    "PATH=/usr/sbin:/usr/bin:/sbin:/bin",
+    "export PATH",
+    "umask 077",
+    `APP_NAME=${sq(app.name)}`,
+    `PROTOCOL=${sq(PREVIEW_IDENTITY_PROTOCOL)}`,
+    `IDENTITY_PREFIX=${sq(previewUserPrefixFor(app))}`,
+    "IDENTITY_ROOT='/var/lib/samohost/preview-identities'",
+    `ENVS_ROOT=${sq(root)}`,
+    `RAW_TEMPLATE=${sq(templateFile)}`,
+    `TOKEN_FILE=${sq(tokenFile)}`,
+    `REPO_URL=${sq(repoUrl)}`,
+    `IS_STATIC=${app.kind === "static" ? "1" : "0"}`,
+    "STATIC_READER_GROUP='caddy'",
+    `ALLOW_VARS=(${allow.map(sq).join(" ")})`,
+    `UNSET_VARS=(${unset.map(sq).join(" ")})`,
+    `DB_VARS=(${dbVars.map(sq).join(" ")})`,
+    `PORT_VARS=(${portVars.map(sq).join(" ")})`,
+    `UNITS=(${units.map(sq).join(" ")})`,
+    "",
+    "die() { echo \"samohost-preview: $1\" >&2; exit 1; }",
+    "contains() { local needle=\"$1\" item; shift; for item in \"$@\"; do [[ \"$item\" == \"$needle\" ]] && return 0; done; return 1; }",
+    "validate_env() {",
+    "  local value=\"$1\"",
+    "  [[ \"$value\" =~ ^[a-z0-9][a-z0-9-]*$ ]] || die \"invalid preview id\"",
+    "  [[ \"$value\" == \"${APP_NAME}-\"* ]] || die \"preview id does not belong to this app\"",
+    "}",
+    "validate_branch() {",
+    "  local value=\"$1\"",
+    "  [[ -n \"$value\" && ${#value} -le 255 ]] || die \"invalid branch\"",
+    "  [[ \"$value\" != *$'\\n'* && \"$value\" != *$'\\r'* ]] || die \"invalid branch\"",
+    "}",
+    "identity_for() {",
+    "  local value=\"$1\" label hash",
+    "  validate_env \"$value\"",
+    "  label=${value:0:6}",
+    "  hash=$(printf '%s\\0%s' \"$APP_NAME\" \"$value\" | /usr/bin/sha256sum | /usr/bin/cut -c1-10)",
+    "  [[ \"$hash\" =~ ^[0-9a-f]{10}$ ]] || die \"cannot derive preview identity\"",
+    "  printf '%s%s-%s\\n' \"$IDENTITY_PREFIX\" \"$label\" \"$hash\"",
+    "}",
+    "registry_for() { printf '%s/%s\\n' \"$IDENTITY_ROOT\" \"$1\"; }",
+    "verify_account() {",
+    "  local user=\"$1\" passwd name _ uid gid gecos home shell",
+    "  passwd=$(getent passwd \"$user\" || true); [[ -n \"$passwd\" ]] || die \"preview identity is missing\"",
+    "  IFS=: read -r name _ uid gid gecos home shell <<< \"$passwd\"",
+    "  [[ \"$name\" == \"$user\" && \"$home\" == \"/var/lib/samohost/users/$user\" && \"$shell\" == /usr/sbin/nologin ]] || die \"preview identity account contract mismatch\"",
+    "  [[ -d \"$home\" && ! -L \"$home\" && \"$(stat -c %U:%G \"$home\")\" == \"$user:$user\" ]] || die \"preview identity home contract mismatch\"",
+    "}",
+    "verify_identity() {",
+    "  local env_name=\"$1\" user record reg_app reg_env reg_user extra",
+    "  user=$(identity_for \"$env_name\"); record=$(registry_for \"$env_name\")",
+    "  [[ -f \"$record\" && ! -L \"$record\" && \"$(stat -c %U:%G \"$record\")\" == root:root && \"$(stat -c %a \"$record\")\" == 600 ]] || die \"preview identity registry is missing or unsafe\"",
+    "  IFS=$'\\t' read -r reg_app reg_env reg_user extra < \"$record\" || die \"preview identity registry is unreadable\"",
+    "  [[ \"$reg_app\" == \"$APP_NAME\" && \"$reg_env\" == \"$env_name\" && \"$reg_user\" == \"$user\" && -z \"${extra:-}\" ]] || die \"preview identity registry mismatch\"",
+    "  verify_account \"$user\"; printf '%s\\n' \"$user\"",
+    "}",
+    "ensure_identity() {",
+    "  local env_name=\"$1\" user record tmp",
+    "  user=$(identity_for \"$env_name\"); record=$(registry_for \"$env_name\")",
+    "  install -d -m 700 -o root -g root \"$IDENTITY_ROOT\"; install -d -m 711 -o root -g root /var/lib/samohost/users",
+    "  if [[ -e \"$record\" ]]; then verify_identity \"$env_name\" >/dev/null; printf '%s\\n' \"$user\"; return 0; fi",
+    "  if ! id \"$user\" >/dev/null 2>&1; then useradd --system --user-group --create-home --home-dir \"/var/lib/samohost/users/$user\" --shell /usr/sbin/nologin \"$user\"; fi",
+    "  install -d -m 700 -o \"$user\" -g \"$user\" \"/var/lib/samohost/users/$user\"; verify_account \"$user\"",
+    "  tmp=$(mktemp \"$IDENTITY_ROOT/.identity.XXXXXXXX\"); printf '%s\\t%s\\t%s\\n' \"$APP_NAME\" \"$env_name\" \"$user\" > \"$tmp\"; chown root:root \"$tmp\"; chmod 600 \"$tmp\"; mv -fT \"$tmp\" \"$record\"",
+    "  printf '%s\\n' \"$user\"",
+    "}",
+    "assert_root() {",
+    "  [[ -d \"$ENVS_ROOT\" && ! -L \"$ENVS_ROOT\" ]] || die \"preview root missing or symlinked; re-run host-prep\"",
+    "  [[ \"$(readlink -f -- \"$ENVS_ROOT\")\" == \"$ENVS_ROOT\" ]] || die \"preview root is not canonical\"",
+    "  [[ \"$(stat -c %U:%G \"$ENVS_ROOT\")\" == root:root ]] || die \"preview root must be root-owned; re-run host-prep\"",
+    "  [[ -d \"$IDENTITY_ROOT\" && ! -L \"$IDENTITY_ROOT\" && \"$(stat -c %U:%G \"$IDENTITY_ROOT\")\" == root:root && \"$(stat -c %a \"$IDENTITY_ROOT\")\" == 700 ]] || die \"preview identity registry is unsafe; re-run host-prep\"",
+    "}",
+    "assert_template() {",
+    "  [[ \"$IS_STATIC\" == 1 ]] && return 0",
+    "  [[ -f \"$RAW_TEMPLATE\" && ! -L \"$RAW_TEMPLATE\" ]] || die \"root-only preview template missing or symlinked\"",
+    "  [[ \"$(stat -c %U:%G \"$RAW_TEMPLATE\")\" == root:root ]] || die \"preview template must be root-owned\"",
+    "  [[ \"$(stat -c %a \"$RAW_TEMPLATE\")\" == 600 ]] || die \"preview template must be mode 600\"",
+    "}",
+    "raw_line() { local key=\"$1\"; grep -E \"^${key}=\" \"$RAW_TEMPLATE\" | tail -n 1 || true; }",
+    "url_role() { printf '%s\\n' \"${1#*=}\" | sed -nE 's|^\"?[A-Za-z0-9+]+://([^:/@?\"]+)(:[^@/]*)?@.*|\\1|p'; }",
+    "url_db() { printf '%s\\n' \"${1#*=}\" | sed -nE 's|^\"?[A-Za-z0-9+]+://[^/]+/([^?\"]*).*|\\1|p'; }",
+    "strip_key() { local key=\"$1\" file=\"$2\" next=\"${2}.next\"; install -m 600 /dev/null \"$next\"; grep -vE \"^${key}=\" \"$file\" > \"$next\" || true; mv -fT \"$next\" \"$file\"; }",
+    "safe_remove_env() {",
+    "  local dir=\"$ENVS_ROOT/$1\"",
+    "  if [[ -L \"$dir\" ]]; then rm -f -- \"$dir\"; elif [[ -e \"$dir\" ]]; then [[ -d \"$dir\" ]] || die \"preview path is not a directory\"; rm -rf --one-file-system -- \"$dir\"; fi",
+    "}",
+    "install_unit_overrides() {",
+    "  local env_name=\"$1\" user=\"$2\" unit dir",
+    "  for unit in \"${UNITS[@]}\"; do dir=\"/etc/systemd/system/${unit}@${env_name}.service.d\"; install -d -m 755 -o root -g root \"$dir\"; printf '[Service]\\nUser=%s\\nGroup=%s\\n' \"$user\" \"$user\" > \"$dir/10-samohost-preview-identity.conf\"; chown root:root \"$dir/10-samohost-preview-identity.conf\"; chmod 644 \"$dir/10-samohost-preview-identity.conf\"; done",
+    "  [[ ${#UNITS[@]} -eq 0 ]] || /usr/bin/systemctl daemon-reload",
+    "}",
+    "remove_unit_overrides() {",
+    "  local env_name=\"$1\" unit",
+    "  for unit in \"${UNITS[@]}\"; do rm -rf -- \"/etc/systemd/system/${unit}@${env_name}.service.d\"; done",
+    "  [[ ${#UNITS[@]} -eq 0 ]] || /usr/bin/systemctl daemon-reload",
+    "}",
+    "delete_identity_if_unused() {",
+    "  local env_name=\"$1\" user record home leftover path",
+    "  user=$(verify_identity \"$env_name\"); record=$(registry_for \"$env_name\"); home=\"/var/lib/samohost/users/$user\"",
+    "  if /usr/bin/pgrep -u \"$user\" >/dev/null 2>&1; then die \"preview identity still owns running processes; stop the env before cleanup\"; fi",
+    "  for path in /tmp /var/tmp /dev/shm; do [[ -d \"$path\" ]] && find \"$path\" -xdev -depth -user \"$user\" -delete 2>/dev/null || true; done",
+    "  leftover=$(find / -xdev -user \"$user\" ! -path \"$home\" ! -path \"$home/*\" -print -quit 2>/dev/null || true)",
+    "  [[ -z \"$leftover\" ]] || die \"preview identity still owns files outside its managed home\"",
+    "  userdel --remove \"$user\" >/dev/null 2>&1 || die \"failed to delete preview identity\"",
+    "  getent group \"$user\" >/dev/null 2>&1 && groupdel \"$user\" >/dev/null 2>&1 || true",
+    "  rm -f -- \"$record\"",
+    "}",
+    "clean_env() {",
+    "  local env_name=\"$1\"",
+    "  verify_identity \"$env_name\" >/dev/null",
+    "  safe_remove_env \"$env_name\"",
+    "  rm -rf --one-file-system -- \"/var/lib/samohost/envs/$env_name\"",
+    "  remove_unit_overrides \"$env_name\"",
+    "  delete_identity_if_unused \"$env_name\"",
+    "}",
+    "",
+    "ACTION=${1:-}",
+    "case \"$ACTION\" in",
+    "  check)",
+    "    [[ $# -eq 2 && \"$2\" == \"$PROTOCOL\" ]] || die \"host helper protocol mismatch; destroy old previews and re-run host-prep\"",
+    "    assert_root; assert_template",
+    "    ;;",
+    "  clone)",
+    "    [[ $# -eq 3 ]] || die \"clone requires preview id and branch\"",
+    "    ENV_NAME=$2; BRANCH=$3; validate_env \"$ENV_NAME\"; validate_branch \"$BRANCH\"; assert_root; ENV_USER=$(ensure_identity \"$ENV_NAME\")",
+    "    STAGE=$(mktemp -d \"$ENVS_ROOT/.samohost-clone.XXXXXXXX\")",
+    "    ASKPASS=$(mktemp \"$ENVS_ROOT/.samohost-askpass.XXXXXXXX\")",
+    "    CLONE_COMMITTED=0",
+    "    cleanup_clone() { rm -rf --one-file-system -- \"${STAGE:-}\" 2>/dev/null || true; rm -f -- \"${ASKPASS:-}\" 2>/dev/null || true; if [[ \"${CLONE_COMMITTED:-0}\" == 0 && ! -e \"$ENVS_ROOT/$ENV_NAME\" && -e \"$(registry_for \"$ENV_NAME\")\" ]]; then clean_env \"$ENV_NAME\" >/dev/null 2>&1 || true; fi; }",
+    "    trap cleanup_clone EXIT",
+    "    if [[ -e \"$TOKEN_FILE\" ]]; then",
+    "      [[ -f \"$TOKEN_FILE\" && ! -L \"$TOKEN_FILE\" ]] || die \"repository token must be a regular non-symlink file\"",
+    "      [[ \"$(stat -c %a \"$TOKEN_FILE\")\" == 600 ]] || die \"repository token must be mode 600\"",
+    "      cat > \"$ASKPASS\" <<ASKPASS_EOF",
+    "#!/bin/sh",
+    "case \"\\$1\" in",
+    "  *Username*) printf '%s\\n' x-access-token ;;",
+    "  *Password*) /bin/cat -- \"$TOKEN_FILE\" ;;",
+    "  *) exit 1 ;;",
+    "esac",
+    "ASKPASS_EOF",
+    "      chmod 700 \"$ASKPASS\"",
+    "    else",
+    "      printf '#!/bin/sh\\nexit 1\\n' > \"$ASKPASS\"; chmod 700 \"$ASKPASS\"",
+    "    fi",
+    "    rmdir \"$STAGE\"",
+    "    env -i PATH=\"$PATH\" HOME=/root GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_TERMINAL_PROMPT=0 GIT_ASKPASS=\"$ASKPASS\" \\",
+    "      /usr/bin/git -c credential.helper= clone --no-tags --single-branch --branch \"$BRANCH\" -- \"$REPO_URL\" \"$STAGE\" >/dev/null 2>&1 \\",
+    "      || die \"fresh repository clone failed\"",
+    "    /usr/bin/git -C \"$STAGE\" remote set-url origin \"$REPO_URL\" >/dev/null 2>&1",
+    "    /usr/bin/git -C \"$STAGE\" config --local --unset-all credential.helper >/dev/null 2>&1 || true",
+    "    safe_remove_env \"$ENV_NAME\"",
+    "    mv -T \"$STAGE\" \"$ENVS_ROOT/$ENV_NAME\"",
+    "    STAGE=",
+    "    if [[ \"$IS_STATIC\" == 1 ]]; then",
+    "      getent group \"$STATIC_READER_GROUP\" >/dev/null 2>&1 || die \"static reader group is missing; re-run platform provisioning\"",
+    "      chown -R --no-dereference \"$ENV_USER:$STATIC_READER_GROUP\" \"$ENVS_ROOT/$ENV_NAME\"",
+    "      chmod -R u=rwX,g=rX,o= \"$ENVS_ROOT/$ENV_NAME\"",
+    "    else",
+    "      chown -R --no-dereference \"$ENV_USER:$ENV_USER\" \"$ENVS_ROOT/$ENV_NAME\"; chmod 700 \"$ENVS_ROOT/$ENV_NAME\"",
+    "    fi",
+    "    install_unit_overrides \"$ENV_NAME\" \"$ENV_USER\"",
+    "    CLONE_COMMITTED=1",
+    "    ;;",
+    "  metadata)",
+    "    [[ $# -eq 1 ]] || die \"metadata takes no arguments\"; assert_root; assert_template",
+    "    [[ ${#DB_VARS[@]} -gt 0 ]] || die \"no database variables configured\"",
+    "    FIRST_LINE=$(raw_line \"${DB_VARS[0]}\"); [[ -n \"$FIRST_LINE\" ]] || die \"database metadata unavailable\"",
+    "    PROD_DB=$(url_db \"$FIRST_LINE\"); [[ \"$PROD_DB\" =~ ^[A-Za-z0-9_][A-Za-z0-9_-]*$ ]] || die \"database metadata is invalid\"",
+    "    printf 'DB\\t%s\\n' \"$PROD_DB\"",
+    "    for VAR in \"${DB_VARS[@]}\"; do LINE=$(raw_line \"$VAR\"); ROLE=$(url_role \"$LINE\"); [[ \"$ROLE\" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || die \"database role metadata is invalid\"; printf 'ROLE\\t%s\\t%s\\n' \"$VAR\" \"$ROLE\"; done",
+    "    ;;",
+    "  envfile)",
+    "    [[ $# -ge 6 ]] || die \"envfile requires id, branch, vhost, backend, and DB port\"",
+    "    ENV_NAME=$2; BRANCH=$3; VHOST=$4; BACKEND=$5; DB_PORT=$6; shift 6",
+    "    validate_env \"$ENV_NAME\"; validate_branch \"$BRANCH\"; assert_root; assert_template; ENV_USER=$(verify_identity \"$ENV_NAME\")",
+    "    [[ \"$IS_STATIC\" == 0 ]] || die \"static previews do not have env files\"",
+    "    [[ \"$VHOST\" =~ ^[a-z0-9][a-z0-9.-]*[a-z0-9]$ ]] || die \"invalid preview vhost\"",
+    "    [[ \"$BACKEND\" == dblab || \"$BACKEND\" == none ]] || die \"insecure preview database backend refused\"",
+    "    if [[ \"$BACKEND\" == dblab ]]; then [[ \"$DB_PORT\" =~ ^[0-9]+$ ]] || die \"invalid clone port\"; else [[ \"$DB_PORT\" == - ]] || die \"unexpected database port\"; fi",
+    "    ENV_DIR=\"$ENVS_ROOT/$ENV_NAME\"; [[ -d \"$ENV_DIR\" && ! -L \"$ENV_DIR\" ]] || die \"preview checkout missing or symlinked\"",
+    "    [[ \"$(readlink -f -- \"$ENV_DIR\")\" == \"$ENV_DIR\" ]] || die \"preview checkout is not canonical\"",
+    "    [[ \"$(stat -c %U:%G \"$ENV_DIR\")\" == \"$ENV_USER:$ENV_USER\" ]] || die \"preview checkout identity mismatch\"",
+    "    OUT=$(mktemp \"$ENVS_ROOT/.samohost-env.XXXXXXXX\"); trap 'rm -f -- \"${OUT:-}\" \"${OUT:-}.next\"' EXIT",
+    "    for VAR in \"${ALLOW_VARS[@]}\"; do",
+    "      contains \"$VAR\" \"${UNSET_VARS[@]}\" && continue",
+    "      if [[ \"$BACKEND\" == none ]] && contains \"$VAR\" \"${DB_VARS[@]}\"; then continue; fi",
+    "      LINE=$(raw_line \"$VAR\"); [[ -z \"$LINE\" ]] || printf '%s\\n' \"$LINE\" >> \"$OUT\"",
+    "    done",
+    "    declare -A PORT_SEEN=()",
+    "    for ASSIGN in \"$@\"; do VAR=${ASSIGN%%=*}; VALUE=${ASSIGN#*=}; contains \"$VAR\" \"${PORT_VARS[@]}\" || die \"unexpected port variable\"; [[ \"$VALUE\" =~ ^[0-9]+$ ]] || die \"invalid preview port\"; [[ -z \"${PORT_SEEN[$VAR]:-}\" ]] || die \"duplicate port variable\"; PORT_SEEN[$VAR]=1; strip_key \"$VAR\" \"$OUT\"; printf '%s=%s\\n' \"$VAR\" \"$VALUE\" >> \"$OUT\"; done",
+    "    for VAR in \"${PORT_VARS[@]}\"; do [[ -n \"${PORT_SEEN[$VAR]:-}\" ]] || die \"missing port variable\"; done",
+    "    if [[ \"$BACKEND\" == dblab ]]; then",
+    "      SECRETS_FILE=\"/var/lib/samohost/envs/$ENV_NAME/secrets.env\"",
+    "      [[ -f \"$SECRETS_FILE\" && ! -L \"$SECRETS_FILE\" && \"$(stat -c %U:%G \"$SECRETS_FILE\")\" == \"$ENV_USER:$ENV_USER\" && \"$(stat -c %a \"$SECRETS_FILE\")\" == 600 ]] || die \"clone credentials missing or owned by the wrong preview identity\"",
+    "      for VAR in \"${DB_VARS[@]}\"; do",
+    "        contains \"$VAR\" \"${ALLOW_VARS[@]}\" || die \"database variable is not allowlisted\"",
+    "        LINE=$(raw_line \"$VAR\"); [[ -n \"$LINE\" ]] || die \"database variable missing from template\"",
+    "        ROLE=$(url_role \"$LINE\"); [[ \"$ROLE\" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || die \"database role metadata is invalid\"",
+    "        PW=$(grep -E \"^SAMOHOST_CLONE_ROLE_PW_${ROLE}=\" \"$SECRETS_FILE\" | tail -n 1 | cut -d= -f2- || true); [[ \"$PW\" =~ ^[0-9a-f]+$ ]] || die \"clone credential is invalid\"",
+    "        VAL=${LINE#*=}; SCHEME=$(printf '%s' \"$VAL\" | sed -nE 's|^\"?([A-Za-z0-9+]+://).*|\\1|p'); DBPATH=$(printf '%s' \"$VAL\" | sed -nE 's|^\"?[A-Za-z0-9+]+://[^/]*(/[^\"]*)$|\\1|p')",
+    "        [[ -n \"$SCHEME\" && -n \"$DBPATH\" ]] || die \"database URL is invalid\"",
+    "        strip_key \"$VAR\" \"$OUT\"; printf '%s=%s%s:%s@127.0.0.1:%s%s\\n' \"$VAR\" \"$SCHEME\" \"$ROLE\" \"$PW\" \"$DB_PORT\" \"$DBPATH\" >> \"$OUT\"",
+    "      done",
+    "    fi",
+    "    strip_key BASE_URL \"$OUT\"; printf 'SAMO_ENV=preview\\nSAMO_BRANCH=%s\\nBASE_URL=https://%s\\n' \"$BRANCH\" \"$VHOST\" >> \"$OUT\"",
+    "    chown \"$ENV_USER:$ENV_USER\" \"$OUT\"; chmod 600 \"$OUT\"; mv -fT \"$OUT\" \"$ENV_DIR/.env\"; OUT=",
+    "    ;;",
+    "  static-config)",
+    "    [[ $# -eq 3 ]] || die \"static-config requires id and branch\"; ENV_NAME=$2; BRANCH=$3; validate_env \"$ENV_NAME\"; validate_branch \"$BRANCH\"; assert_root",
+    "    [[ \"$IS_STATIC\" == 1 ]] || die \"static-config is static-only\"; ENV_USER=$(verify_identity \"$ENV_NAME\"); ENV_DIR=\"$ENVS_ROOT/$ENV_NAME\"; [[ -d \"$ENV_DIR\" && ! -L \"$ENV_DIR\" && \"$(stat -c %U:%G \"$ENV_DIR\")\" == \"$ENV_USER:$ENV_USER\" ]] || die \"preview checkout identity mismatch\"",
+    "    OUT=$(mktemp \"$ENVS_ROOT/.samohost-config.XXXXXXXX\"); trap 'rm -f -- \"${OUT:-}\"' EXIT; printf 'window.__GC1_CONFIG__ = { version: \"\", preview: true, branch: \"%s\" };\\n' \"$BRANCH\" > \"$OUT\"; chown \"$ENV_USER:$ENV_USER\" \"$OUT\"; chmod 644 \"$OUT\"; mv -fT \"$OUT\" \"$ENV_DIR/config.js\"; OUT=",
+    "    ;;",
+    "  clean)",
+    "    [[ $# -eq 3 && \"$3\" == \"$PROTOCOL\" ]] || die \"clean requires preview id and protocol\"; validate_env \"$2\"; assert_root; clean_env \"$2\"",
+    "    ;;",
+    "  reconcile)",
+    "    [[ $# -eq 2 && \"$2\" == \"$PROTOCOL\" ]] || die \"reconcile requires protocol\"; assert_root",
+    "    for RECORD in \"$IDENTITY_ROOT\"/*; do [[ -f \"$RECORD\" && ! -L \"$RECORD\" ]] || continue; IFS=$'\\t' read -r REG_APP REG_ENV REG_USER EXTRA < \"$RECORD\" || continue; [[ \"$REG_APP\" == \"$APP_NAME\" ]] || continue; validate_env \"$REG_ENV\"; [[ \"$(basename \"$RECORD\")\" == \"$REG_ENV\" && \"$REG_USER\" == \"$(identity_for \"$REG_ENV\")\" && -z \"${EXTRA:-}\" ]] || die \"unsafe preview identity registry entry\"; [[ -e \"$ENVS_ROOT/$REG_ENV\" ]] || clean_env \"$REG_ENV\"; done",
+    "    ;;",
+    "  *) die \"unknown action\" ;;",
+    "esac",
+  ];
+}
+
 function marker(phase: EnvPhaseName, status: "start" | "ok" | "fail"): string {
   return `echo "${ENV_PHASE_PREFIX}${phase}:${status}>>>"`;
 }
@@ -783,16 +1008,16 @@ function marker(phase: EnvPhaseName, status: "start" | "ok" | "fail"): string {
  * constructing any path, preventing path-separator and glob-char injection.
  *
  * Actions:
- *   init   <env-name> <env-user> [name...]  — reuse-or-generate (create path)
- *   rotate <env-name> <env-user> [name...]  — rm-then-generate-all (no reuse)
+ *   init   <env-name> [name...]  — reuse-or-generate (create path)
+ *   rotate <env-name> [name...]  — rm-then-generate-all (no reuse)
  *   clean  <env-name>                       — rm -rf the env secrets dir
  */
 const SAMOHOST_SECRETS_HELPER_LINES: string[] = [
   "#!/usr/bin/env bash",
   "# samohost-secrets — per-env secrets helper, run as root via ONE sudoers grant.",
   "# Usage:",
-  "#   samohost-secrets init   <env-name> <env-user> [name1 name2 ...]",
-  "#   samohost-secrets rotate <env-name> <env-user> [name1 name2 ...]",
+  "#   samohost-secrets init   <env-name> [name1 name2 ...]",
+  "#   samohost-secrets rotate <env-name> [name1 name2 ...]",
   "#   samohost-secrets clean  <env-name>",
   "set -euo pipefail",
   "",
@@ -808,15 +1033,27 @@ const SAMOHOST_SECRETS_HELPER_LINES: string[] = [
   "",
   "SECRETS_DIR=\"/var/lib/samohost/envs/${ENV_NAME}\"",
   "SECRETS_FILE=\"${SECRETS_DIR}/secrets.env\"",
+  "IDENTITY_RECORD=\"/var/lib/samohost/preview-identities/${ENV_NAME}\"",
+  "resolve_identity() {",
+  "  local reg_app reg_env reg_user extra passwd name _ uid gid gecos home shell",
+  "  [[ -f \"$IDENTITY_RECORD\" && ! -L \"$IDENTITY_RECORD\" && \"$(stat -c %U:%G \"$IDENTITY_RECORD\")\" == root:root && \"$(stat -c %a \"$IDENTITY_RECORD\")\" == 600 ]] || { echo \"samohost-secrets: safe preview identity is not registered\" >&2; exit 1; }",
+  "  IFS=$'\\t' read -r reg_app reg_env reg_user extra < \"$IDENTITY_RECORD\" || exit 1",
+  "  [[ \"$reg_env\" == \"$ENV_NAME\" && \"$reg_user\" =~ ^se-[0-9a-f]{10}-[a-z0-9-]{1,6}-[0-9a-f]{10}$ && -z \"${extra:-}\" ]] || { echo \"samohost-secrets: preview identity registry mismatch\" >&2; exit 1; }",
+  "  passwd=$(getent passwd \"$reg_user\" || true); IFS=: read -r name _ uid gid gecos home shell <<< \"$passwd\"",
+  "  [[ \"$name\" == \"$reg_user\" && \"$home\" == \"/var/lib/samohost/users/$reg_user\" && \"$shell\" == /usr/sbin/nologin ]] || { echo \"samohost-secrets: preview identity account mismatch\" >&2; exit 1; }",
+  "  ENV_USER=$reg_user",
+  "}",
   "",
   "case \"$ACTION\" in",
   "  init)",
-  "    ENV_USER=\"${3:-root}\"",
-  "    shift 3 2>/dev/null || true",
-  "    mkdir -p \"$SECRETS_DIR\"",
+  "    resolve_identity",
+  "    shift 2 2>/dev/null || true",
+  "    install -d -m 711 -o root -g root \"$SECRETS_DIR\"",
   "    if [[ ! -f \"$SECRETS_FILE\" ]]; then",
-  "      install -m 600 -o \"$ENV_USER\" /dev/null \"$SECRETS_FILE\"",
+  "      [[ ! -e \"$SECRETS_FILE\" ]] || { echo \"samohost-secrets: unsafe secrets path\" >&2; exit 1; }",
+  "      install -m 600 -o \"$ENV_USER\" -g \"$ENV_USER\" /dev/null \"$SECRETS_FILE\"",
   "    fi",
+  "    [[ ! -L \"$SECRETS_FILE\" && \"$(stat -c %U:%G \"$SECRETS_FILE\")\" == \"$ENV_USER:$ENV_USER\" && \"$(stat -c %a \"$SECRETS_FILE\")\" == 600 ]] || { echo \"samohost-secrets: secrets ownership mismatch\" >&2; exit 1; }",
   "    for _name in \"$@\"; do",
   "      if ! grep -qE \"^${_name}[=]\" \"$SECRETS_FILE\" 2>/dev/null; then",
   "        _val=\"$(openssl rand -hex 32)\"",
@@ -827,11 +1064,11 @@ const SAMOHOST_SECRETS_HELPER_LINES: string[] = [
   "    chmod 600 \"$SECRETS_FILE\"",
   "    ;;",
   "  rotate)",
-  "    ENV_USER=\"${3:-root}\"",
-  "    shift 3 2>/dev/null || true",
-  "    mkdir -p \"$SECRETS_DIR\"",
+  "    resolve_identity",
+  "    shift 2 2>/dev/null || true",
+  "    install -d -m 711 -o root -g root \"$SECRETS_DIR\"",
   "    rm -f \"$SECRETS_FILE\"",
-  "    install -m 600 -o \"$ENV_USER\" /dev/null \"$SECRETS_FILE\"",
+  "    install -m 600 -o \"$ENV_USER\" -g \"$ENV_USER\" /dev/null \"$SECRETS_FILE\"",
   "    for _name in \"$@\"; do",
   "      _val=\"$(openssl rand -hex 32)\"",
   "      printf '%s=%s\\n' \"$_name\" \"$_val\" >> \"$SECRETS_FILE\"",
@@ -843,6 +1080,7 @@ const SAMOHOST_SECRETS_HELPER_LINES: string[] = [
   "    rm -rf \"$SECRETS_DIR\"",
   "    ;;",
   "  get)",
+  "    resolve_identity",
   "    _get_var=\"${3:-}\"",
   "    if [[ -z \"$_get_var\" ]]; then",
   "      echo \"samohost-secrets: get requires a secret name argument\" >&2",
@@ -936,6 +1174,7 @@ function buildStaticEnvCreateScript(
   t: EnvScriptTarget,
 ): string {
   const root = envsRoot(app);
+  const previewHelper = previewHelperPathFor(app);
   const lines: string[] = [
     "#!/usr/bin/env bash",
     "# samohost env-create script (generated; static-site path; pushed over ssh stdin to `bash -s`).",
@@ -956,16 +1195,10 @@ function buildStaticEnvCreateScript(
     "",
   ];
 
-  // ----- clone: use app user when registered (issue #97) -------------------
-  // Derive bootstrap-written paths from appDir at generation time (same as
-  // bootstrap.ts §12: appBase = dirname(appDir)).
-  const appBase = app.appDir.replace(/\/+$/, "").split("/").slice(0, -1).join("/");
-  const gitSafeConf = `${appBase}/git-safe.conf`;
-  const tokenFile = `${appBase}/.gh-token`;
-  lines.push(...buildCloneFnLines(app.appUser, gitSafeConf, tokenFile), "");
+  // ----- clone: root helper reads the private token; preview code never does -
+  lines.push(...buildCloneFnLines(previewHelper), "");
   lines.push(
     ...phaseBlock("clone", "branch checkout into the env dir", [
-      'mkdir -p "$SAMOHOST_ENVS_ROOT"',
       "if samohost_clone_env_dir; ",
     ]),
   );
@@ -985,8 +1218,8 @@ function buildStaticEnvCreateScript(
   // $SAMOHOST_BRANCH is already sq()-escaped at the top of the script; a slash
   // in the branch value (e.g. demo/red-bg) is safe inside a JS string literal.
   lines.push(
-    "# --- config.js: overwrite with preview marker so the SPA banner fires ---",
-    `printf 'window.__GC1_CONFIG__ = { version: "", preview: true, branch: "%s" };\\n' "$SAMOHOST_BRANCH" > "$SAMOHOST_ENV_DIR/config.js"`,
+    "# --- config.js: root helper atomically writes the public preview marker ---",
+    `sudo -n ${sq(previewHelper)} static-config "$SAMOHOST_ENV_NAME" "$SAMOHOST_BRANCH"`,
     "",
   );
 
@@ -1048,156 +1281,14 @@ function buildStaticEnvCreateScript(
 }
 
 /**
- * Resolve the first token of a build command to its canonical absolute path on
- * Ubuntu so that an exact-path sudoers NOPASSWD grant can match it. Unknown
- * names are returned as-is (the operator must arrange the grant manually for
- * non-standard toolchains).
- *
- * Used by buildEnvCreateScript when wrapping install / build under
- * `sudo -u <appUser>` (issue #98 follow-up).
+ * Run the entire configured shell expression as previewUser.  Wrapping only
+ * the first binary is unsafe for commands such as `cd apps/web && npm build`:
+ * the shell would execute the suffix as the outer SSH/production identity.
+ * A bash grant is safe here because previewUser is the deliberately untrusted,
+ * non-login identity with no production files or sudo rights.
  */
-function resolveBuildBin(buildCmd: string): string {
-  const first = buildCmd.split(/\s+/)[0] ?? "";
-  const UBUNTU_PATHS: Record<string, string> = {
-    npm: "/usr/bin/npm",
-    node: "/usr/bin/node",
-    npx: "/usr/bin/npx",
-    // bun: system-wide path (matches ExecStart in docs/control-plane-setup.md
-    // and the ExecStart used in app-bootstrap tests). Without this mapping,
-    // `bun packages/shared/db/migrate.ts` as migrateCmd produces
-    // `NOPASSWD: bun` (relative path) — visudo -cf rejects it and the
-    // host-prep script aborts. `sudo -u <appUser> bun ...` also matches no
-    // grant → migrate always fails on the appUser path.
-    bun: "/usr/bin/bun",
-  };
-  return UBUNTU_PATHS[first] ?? first;
-}
-
-/**
- * Wrap a build command under `sudo -u <appUser>`, replacing the leading bare
- * binary name with its Ubuntu absolute path (e.g. `npm` → `/usr/bin/npm`).
- * Preserves all arguments verbatim.
- *
- * Used by buildEnvCreateScript for the build phase when appUser is set.
- */
-function sudoWrapBuildCmd(buildCmd: string, appUser: string): string {
-  const tokens = buildCmd.split(/\s+/);
-  const first = tokens[0] ?? "";
-  const bin = resolveBuildBin(first);
-  const resolved = [bin, ...tokens.slice(1)].join(" ");
-  return `sudo -u ${sq(appUser)} ${resolved}`;
-}
-
-/**
- * Generate the envfile phase body lines for the scoped file-write approach
- * (samorev security fix for issue #101).
- *
- * Security rationale: the prior implementation wrapped the entire compose in
- * `sudo -u <appUser> /usr/bin/bash -s << 'HEREDOC'`, which required a broad
- * `SETENV: /usr/bin/bash` sudoers grant — letting the SSH user `samo` run
- * ARBITRARY commands as appUser. This is replaced by composing the .env
- * content entirely in the outer bash (as samo, using a samo-owned temp file
- * in /tmp) and then writing it to the appUser-owned envfile via three
- * specific, non-executing binaries:
- *
- *   1. sudo -u appUser /usr/bin/install -m 600 /dev/null <envfile>
- *      Pre-create the envfile at mode 600 as appUser before any content is
- *      written, closing the brief world-readable window that bare tee would
- *      leave (tee creates files at umask-derived 644 if the file is absent).
- *
- *   2. sudo -u appUser /usr/bin/tee <envfile> >/dev/null < <tmpfile>
- *      Write the composed content atomically from stdin. The file already
- *      exists at 600 so tee does not change permissions.
- *
- *   3. sudo -u appUser /usr/bin/chmod 600 <envfile>
- *      Belt-and-suspenders re-assertion of mode 600.
- *
- * The rewire functions (samohost_rewire_db_vars / samohost_rewire_db_hostport)
- * operate on the samo-owned temp file in /tmp — they are already defined in
- * the outer bash from the db-phase setup for template/dblab backends. For the
- * dblab backend, SAMOHOST_DB_PORT is already set in the outer bash (by
- * `samohost_clone_port` in the db phase); no KEY=val sudo prefix is needed.
- *
- * Sudoers changes required in buildHostPrepScript:
- *   REMOVE: sshUser ALL=(appUser) NOPASSWD: SETENV: /usr/bin/bash
- *   ADD:    sshUser ALL=(appUser) NOPASSWD: /usr/bin/install -m 600 /dev/null ROOT-star-.env
- *           sshUser ALL=(appUser) NOPASSWD: /usr/bin/tee ROOT-star-.env
- *           sshUser ALL=(appUser) NOPASSWD: /usr/bin/chmod 600 ROOT-star-.env
- *   (where ROOT = envsRoot(app) and star = env-name wildcard)
- */
-function buildEnvfileScopedBodyLines(
-  app: AppRecord,
-  t: EnvScriptTarget,
-  portMap: Map<string, number>,
-  allListeners: Array<{ listener: import("../types.ts").ListenerSpec; unit: string }>,
-): string[] {
-  const root = envsRoot(app);
-  const envDir = `${root}/${t.name}`;
-  const templatePath = `${root}.template.env`;
-  const envFile = `${envDir}/.env`;
-
-  // Build the &&-chain as the body of the `if` condition that phaseBlock wraps.
-  // All intermediate operations (cp, printf, grep, mv) run as samo on a
-  // samo-owned temp file in /tmp; only the final install/tee/chmod write to
-  // the appUser-owned envfile.
-  const lines: string[] = [
-    // Create a samo-owned temp file (mktemp mode 600 by default).
-    `if _sh_env="$(mktemp)" \\`,
-    `   && cp ${sq(templatePath)} "$_sh_env" \\`,
-    `   && chmod 600 "$_sh_env" \\`,
-  ];
-
-  // Per-listener portEnv strip-then-append in the samo-owned temp file.
-  // Operator templates carry prod port values; strip-then-append prevents
-  // duplicate entries and ensures the allocated preview port wins.
-  for (const { listener } of allListeners) {
-    const allocatedPort = portMap.get(listener.name) ?? t.port;
-    lines.push(
-      `   && _sh_env2="$(mktemp)" \\`,
-      `   && { grep -vE ${sq(`^${listener.portEnv}=`)} "$_sh_env" >> "$_sh_env2" || true; } \\`,
-      `   && mv "$_sh_env2" "$_sh_env" \\`,
-      `   && chmod 600 "$_sh_env" \\`,
-      `   && printf ${sq(`${listener.portEnv}=${String(allocatedPort)}\\n`)} >> "$_sh_env" \\`,
-    );
-  }
-
-  // Rewire functions are already defined in the outer bash (db-phase setup).
-  // SAMOHOST_ENV_DB_VARS and SAMOHOST_DB_NAME / SAMOHOST_DB_PORT are set there.
-  if (t.dbBackend === "template") {
-    lines.push(`   && samohost_rewire_db_vars "$_sh_env" \\`);
-  } else if (t.dbBackend === "dblab") {
-    // SAMOHOST_DB_PORT is already in the outer bash from samohost_clone_port.
-    // No KEY=val forwarding prefix needed.
-    lines.push(`   && samohost_rewire_db_hostport "$_sh_env" \\`);
-    if (app.databaseUrlEnv !== undefined) {
-      // Credentialed URL rewrite: replaces user:pw@host:port in the var named
-      // by databaseUrlEnv with the clone-role credentials (set in the db phase).
-      // Runs AFTER hostport rewire so the host:port is already correct.
-      lines.push(`   && samohost_rewire_db_credentialed "$_sh_env" \\`);
-    }
-  }
-
-  lines.push(
-    `   && printf '\\nSAMO_ENV=preview\\nSAMO_BRANCH=%s\\n' ${sq(t.branch)} >> "$_sh_env" \\`,
-    // BASE_URL strip: use a second temp file to avoid in-place rewrite on an
-    // appUser-owned file. Both temp files are samo-owned (mktemp creates 600).
-    `   && _sh_env2="$(mktemp)" \\`,
-    `   && { grep -vE '^BASE_URL=' "$_sh_env" >> "$_sh_env2" || true; } \\`,
-    `   && mv "$_sh_env2" "$_sh_env" \\`,
-    `   && chmod 600 "$_sh_env" \\`,
-    `   && printf 'BASE_URL=https://%s\\n' ${sq(t.vhost)} >> "$_sh_env" \\`,
-    // Pre-create the envfile at 600 as appUser BEFORE tee writes content,
-    // avoiding the brief world-readable window that bare tee would create.
-    `   && sudo -u ${sq(app.appUser!)} /usr/bin/install -m 600 /dev/null ${sq(envFile)} \\`,
-    // Write composed content from stdin via scoped tee (file already 600).
-    `   && sudo -u ${sq(app.appUser!)} /usr/bin/tee ${sq(envFile)} >/dev/null < "$_sh_env" \\`,
-    // Belt-and-suspenders re-assertion of 600 after tee.
-    `   && sudo -u ${sq(app.appUser!)} /usr/bin/chmod 600 ${sq(envFile)} \\`,
-    // Clean up samo-owned temp files.
-    `   && rm -f "$_sh_env" "$_sh_env2"; `,
-  );
-
-  return lines;
+function sudoWrapBuildCmd(buildCmd: string, previewUser: string, setHome = false): string {
+  return `sudo${setHome ? " -H" : ""} -u ${sq(previewUser)} /usr/bin/bash -c ${sq(buildCmd)}`;
 }
 
 /**
@@ -1220,6 +1311,8 @@ export function buildEnvCreateScript(
   }
 
   const root = envsRoot(app);
+  const previewUser = previewUserForEnv(app, t.name);
+  const previewHelper = previewHelperPathFor(app);
 
   // Resolve the service topology via servicesOf() so that legacy single-service
   // apps and multi-service apps share one code path. For a legacy app (no
@@ -1259,7 +1352,7 @@ export function buildEnvCreateScript(
     `SAMOHOST_ENV_DIR=${sq(`${root}/${t.name}`)}`,
     `SAMOHOST_REPO=${sq(app.repo)}`,
     `SAMOHOST_APP_DIR=${sq(app.appDir)}`,
-    `SAMOHOST_ENV_TEMPLATE=${sq(`${root}.template.env`)}`,
+    `SAMOHOST_PREVIEW_HELPER=${sq(previewHelper)}`,
     `SAMOHOST_CADDY_SNIPPET=${sq(`/etc/caddy/sites.d/${t.name}.caddy`)}`,
     "",
   ];
@@ -1321,17 +1414,11 @@ export function buildEnvCreateScript(
     "",
   );
 
-  // ----- clone: reference clone from the production checkout (cheap) with an
-  // explicit plain-clone fallback for shallow/unusable references (issue #11
-  // finding 5); existing env dirs take the fetch+checkout path.
-  // Issue #97: delegate git ops to the app user when appUser is registered.
-  const appBase = app.appDir.replace(/\/+$/, "").split("/").slice(0, -1).join("/");
-  const gitSafeConf = `${appBase}/git-safe.conf`;
-  const tokenFile = `${appBase}/.gh-token`;
-  lines.push(...buildCloneFnLines(app.appUser, gitSafeConf, tokenFile), "");
+  // ----- clone: always fresh via the root boundary.  Existing hostile git
+  // config/hooks are deleted before root transfers the checkout to previewUser.
+  lines.push(...buildCloneFnLines(previewHelper), "");
   lines.push(
     ...phaseBlock("clone", "branch checkout into the env dir", [
-      'mkdir -p "$SAMOHOST_ENVS_ROOT"',
       "if samohost_clone_env_dir; ",
     ]),
   );
@@ -1345,15 +1432,13 @@ export function buildEnvCreateScript(
   // set -euo pipefail aborts the whole script before .env/systemd/Caddy are
   // written → no :443 listener → CF 521).
   //
-  // Issue #98 follow-up: when appUser is registered the env dir is owned by
-  // appUser (the sudo-u-appUser clone created it that way). npm writes
-  // node_modules into the env dir; running npm as the SSH user (samo) →
-  // EACCES. Wrap both npm invocations under sudo -u <appUser> /usr/bin/npm so
-  // they run as the owner. The exact-path grant is added in buildHostPrepScript.
-  const npmPrefix = app.appUser !== undefined
-    ? `sudo -u ${sq(app.appUser)} /usr/bin/npm`
-    : "npm";
-  lines.push(
+  // All untrusted lifecycle commands run as the dedicated preview identity,
+  // never as the production app/SSH identity.  Keep these lines aside until
+  // AFTER DB isolation and root-helper env materialisation: npm lifecycle and
+  // build scripts are arbitrary PR code and must never run while only a raw
+  // production template exists.
+  const npmPrefix = `sudo -H -u ${sq(previewUser)} /usr/bin/npm`;
+  const installAndBuildLines: string[] = [
     ...phaseBlock(
       "install",
       "lockfile-aware install (npm ci if lockfile present, npm install otherwise)",
@@ -1361,14 +1446,20 @@ export function buildEnvCreateScript(
         `if (if [ -f package-lock.json ] || [ -f npm-shrinkwrap.json ]; then ${npmPrefix} ci; else ${npmPrefix} install; fi); `,
       ],
     ),
-  );
+  ];
 
-  // Issue #98 follow-up: build command inherits the same appUser delegation so
-  // the build output lands in the app-user-owned dir without EACCES.
-  const buildCmdExpr = app.appUser !== undefined
-    ? `if ${sudoWrapBuildCmd(app.buildCmd, app.appUser)}; `
-    : `if ${app.buildCmd}; `;
-  lines.push(
+  // sudo starts a new shell with a reset environment, so the outer shell's
+  // unexported PORT variables are not visible there. Bake the already-
+  // validated numeric allocations into the isolated shell before evaluating
+  // buildCmd; this preserves multi-service build-time port substitution while
+  // keeping the entire configured expression under previewUser.
+  const buildPortExports = allListeners.map(({ listener }) => {
+    const allocatedPort = portMap.get(listener.name) ?? t.port;
+    return `export ${listener.portEnv}=${allocatedPort}`;
+  }).join("; ");
+  const isolatedBuildCmd = `${buildPortExports}; ${app.buildCmd}`;
+  const buildCmdExpr = `if ${sudoWrapBuildCmd(isolatedBuildCmd, previewUser, true)}; `;
+  installAndBuildLines.push(
     ...phaseBlock("build", "build", [buildCmdExpr]),
   );
 
@@ -1377,6 +1468,10 @@ export function buildEnvCreateScript(
     const dbName = t.dbName ?? t.name;
     const envDbVars = app.envDbVars ?? [...DEFAULT_ENV_DB_VARS];
     const leaseMinutes = readDblabLeaseMinutes();
+    const requiresDblab = app.dbBackend !== "none" ||
+      app.previewDbBackend === "dblab" || app.previewDbBackend === "template" ||
+      app.migrateCmd !== undefined || app.databaseUrlEnv !== undefined ||
+      (app.envDbVars?.length ?? 0) > 0;
     lines.push(
       ...DBLAB_BIN_RESOLVE_LINES,
       "",
@@ -1393,16 +1488,11 @@ export function buildEnvCreateScript(
         ],
         [
           '  echo "DBLab engine not confirmed running: healthz (http://127.0.0.1:2345/healthz) did not answer, or no dblab CLI on PATH / at ~/bin/dblab — refusing to attempt a clone." >&2',
-          // SAFETY: do NOT suggest `--db none` for apps that declare a
-          // migrateCmd or explicit envDbVars. Using --db none skips all DB
-          // rewiring — migrateCmd would run against the PROD DATABASE_URL and
-          // envDbVars URLs would still point at PROD. Point those apps to
-          // installing dblab or using --db template (a real per-env DB) only.
-          // Apps with neither migrateCmd nor envDbVars (e.g. static sites) are
-          // safe with the full fallback list.
-          ...((app.migrateCmd !== undefined || (app.envDbVars !== undefined && app.envDbVars.length > 0))
-            ? ['  echo "Diagnose with: samohost env preflight <vm>; install per docs/dblab-install-runbook.md (apps with migrateCmd or envDbVars require a real per-env DB; use --db template if dblab is unavailable)" >&2']
-            : ['  echo "Diagnose with: samohost env preflight <vm>; install per docs/dblab-install-runbook.md (or use --db template|none)" >&2']),
+          // Database-backed previews are DBLab-only. Never advertise template
+          // or none as a fallback: both bypass the enforced isolation policy.
+          ...(requiresDblab
+            ? ['  echo "Diagnose with: samohost env preflight <vm>; DBLab is required for database-backed previews; install it per docs/dblab-install-runbook.md" >&2']
+            : ['  echo "Diagnose with: samohost env preflight <vm>; this app is stateless, so rerun with --db none or install DBLab per docs/dblab-install-runbook.md" >&2']),
           "  exit 1",
         ],
       ),
@@ -1415,6 +1505,18 @@ export function buildEnvCreateScript(
       'SAMOHOST_DB_PASSWORD="$(openssl rand -hex 16)"',
       "# Env vars whose URLs are repointed at the clone (AppRecord.envDbVars).",
       `SAMOHOST_ENV_DB_VARS=(${envDbVars.map(sq).join(" ")})`,
+      "SAMOHOST_PROD_DB_NAME=",
+      "declare -A SAMOHOST_PROD_ROLE_BY_VAR=()",
+      "samohost_load_db_metadata() {",
+      "  local metadata kind key value var",
+      '  metadata="$(sudo -n "$SAMOHOST_PREVIEW_HELPER" metadata)" || return 1',
+      "  while IFS=$'\\t' read -r kind key value; do",
+      '    if [[ "$kind" == DB ]]; then SAMOHOST_PROD_DB_NAME="$key"; elif [[ "$kind" == ROLE ]]; then SAMOHOST_PROD_ROLE_BY_VAR["$key"]="$value"; else return 1; fi',
+      '  done <<< "$metadata"',
+      '  [[ "$SAMOHOST_PROD_DB_NAME" =~ ^[A-Za-z0-9_][A-Za-z0-9_-]*$ ]] || return 1',
+      '  for var in "${SAMOHOST_ENV_DB_VARS[@]}"; do [[ "${SAMOHOST_PROD_ROLE_BY_VAR[$var]:-}" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || return 1; done',
+      "  unset metadata",
+      "}",
       "",
       ...CLONE_PORT_FN_LINES,
       "",
@@ -1428,26 +1530,14 @@ export function buildEnvCreateScript(
       "",
       ...REWIRE_DB_HOSTPORT_FN_LINES,
       "",
-      // Clone-role password setup: when databaseUrlEnv is declared, emit the
-      // variables and function that set a password on the clone's app role.
+      // Clone-role password setup: emit the variables and function that set a
+      // clone-only password for every role referenced by envDbVars.
       // The SET_CLONE_ROLE_PASSWORD function is defined BEFORE the db phase
       // (must be in scope when the db &&-chain calls it). The companion
       // REWIRE_DB_CREDENTIALED function is defined AFTER the db phase so its
       // first occurrence in the script is post-db:ok (ordering test invariant).
-      ...(app.databaseUrlEnv !== undefined
-        ? [
-            // The specific env var to rewrite with credentials.
-            `SAMOHOST_CLONE_CRED_VAR=${sq(app.databaseUrlEnv)}`,
-            // User to own the secrets file (same as the app user for secrets[]).
-            `SAMOHOST_SECRETS_ENV_USER=${sq(app.appUser ?? "root")}`,
-            // Derive the app role name from the template's databaseUrlEnv URL.
-            // Parsed at runtime: strips VAR= prefix then extracts the user component.
-            `SAMOHOST_CLONE_APP_DBROLE="$(grep -E "^${app.databaseUrlEnv}=" "$SAMOHOST_ENV_TEMPLATE" | tail -n 1 | sed -E 's/^[^=]+=//' | sed -nE 's|^"?[A-Za-z0-9+]+://([^:/@?"]+)(:[^@/]*)?@.*|\\1|p')"`,
-            "",
-            ...SET_CLONE_ROLE_PASSWORD_FN_LINES,
-            "",
-          ]
-        : []),
+      ...SET_CLONE_ROLE_PASSWORD_FN_LINES,
+      "",
       // Idempotent re-create (issue #59): destroy any prior clone of this id
       // FIRST, so a re-create over an existing clone succeeds instead of failing
       // at the engine with "clone already exists". This mirrors the template
@@ -1484,17 +1574,17 @@ export function buildEnvCreateScript(
         "db",
         "DBLab thin clone (destroy-if-exists + create) + .db.port extraction + prod globals sync (issue #7, #59)",
         [
-          'if "$SAMOHOST_DBLAB_BIN" clone create --id "$SAMOHOST_CLONE_ID" \\',
+          'if samohost_load_db_metadata \\',
+          '   && "$SAMOHOST_DBLAB_BIN" clone create --id "$SAMOHOST_CLONE_ID" \\',
           '     --username samohost_env --password "$SAMOHOST_DB_PASSWORD" \\',
           `     --protected ${leaseMinutes} \\`,
           "     >/dev/null \\",
           '   && SAMOHOST_DB_PORT="$(samohost_clone_port)" \\',
           '   && [[ "$SAMOHOST_DB_PORT" =~ ^[0-9]+$ ]] \\',
-          // When databaseUrlEnv is set, extend the &&-chain to set the clone-role
-          // password AFTER the globals sync (roles must exist before ALTER ROLE).
-          ...(app.databaseUrlEnv !== undefined
-            ? ["   && samohost_sync_clone_globals \\", "   && samohost_set_clone_role_password"]
-            : ["   && samohost_sync_clone_globals"]),
+          // Set clone-role passwords AFTER globals sync (roles must exist
+          // before ALTER ROLE).
+          "   && samohost_sync_clone_globals \\",
+          "   && samohost_set_clone_role_password",
         ],
         [
           '  echo "samohost: dblab clone create/status failed, no numeric port at .db.port in the clone status JSON, or the prod globals sync failed parity" >&2',
@@ -1504,7 +1594,7 @@ export function buildEnvCreateScript(
       // Credentialed rewrite function placed AFTER the db phase so the first
       // occurrence of "samohost_rewire_db_credentialed" in the script is
       // post-db:ok (ordering test invariant: envfile phase follows db phase).
-      ...(app.databaseUrlEnv !== undefined ? ["", ...REWIRE_DB_CREDENTIALED_FN_LINES, ""] : []),
+      "", ...REWIRE_DB_CREDENTIALED_FN_LINES, "",
     );
   } else if (t.dbBackend === "template") {
     const dbName = t.dbName ?? t.name.replace(/-/g, "_");
@@ -1535,103 +1625,25 @@ export function buildEnvCreateScript(
   }
 
   // ----- envfile ---------------------------------------------------------------
-  // Issue #101: when `appUser` is registered the env dir is owned by appUser
-  // (the sudo-u-appUser clone created it); running cp/chmod/printf/install/mv
-  // as the SSH user (samo) → EACCES.
-  //
-  // samorev security fix: the prior approach used a broad
-  // `sudo -u appUser /usr/bin/bash -s << 'HEREDOC'` that let samo run
-  // arbitrary commands as appUser. Replaced by composing .env content in a
-  // samo-owned temp file (mktemp, /tmp) and writing it via scoped ops:
-  //   install -m 600 /dev/null → pre-create at 600
-  //   tee < tmpfile >/dev/null → write content
-  //   chmod 600                → re-assert mode
-  // See buildEnvfileScopedBodyLines() for full design rationale.
-  //
-  // When appUser is absent: the original &&-chain body is used unchanged
-  // (backward compatibility for AppRecords that predate the appUser field).
-  let envfileBody: string[];
-  if (app.appUser !== undefined) {
-    envfileBody = buildEnvfileScopedBodyLines(app, t, portMap, allListeners);
-  } else {
-    // Original &&-chain body (no appUser — backward compat).
-    // Set the preview-env marker so the banner fires. env create is
-    // preview-ONLY by construction (prod ships via app/script.ts, a separate
-    // path). SAMO_BRANCH uses $SAMOHOST_BRANCH (already sq()-escaped at the
-    // top of the script) so branch values with slashes (e.g. demo/red-login)
-    // are interpolated safely without further quoting in an env-file value.
-    // BASE_URL: the app builds the magic-link sign-in URL as
-    //   `${BASE_URL}/api/auth/magic-link/verify?token=...`
-    // (field-record src/app.ts). The operator template carries PROD's BASE_URL
-    // (e.g. https://field-record-1.samo.team), so a verbatim copy makes every
-    // preview magic link point at PROD — clicking it logs the user into prod,
-    // not the preview. Rewrite BASE_URL to the preview's OWN vhost. STRIP any
-    // template BASE_URL first (dotenv loaders are not all last-wins;
-    // append-only is unsafe). The intermediate file is PRE-CREATED at mode 600
-    // (install -m 600 /dev/null) BEFORE the redirect: a bare `> file` would
-    // create it under the umask (typically 644 = world-readable), and it
-    // carries every credential except BASE_URL. `grep -v` exits non-zero when
-    // NO line matches (template carries no BASE_URL at all — current prod
-    // template state); `|| true` keeps the && chain alive under `set -e`.
-    envfileBody = [
-      "if cp \"$SAMOHOST_ENV_TEMPLATE\" \"$SAMOHOST_ENV_DIR/.env\" \\",
-      "   && chmod 600 \"$SAMOHOST_ENV_DIR/.env\" \\",
-    ];
-    // Per-listener portEnv strip-then-append: operator templates legitimately
-    // carry prod port values (e.g. WS_HUB_PORT=8788); append-only would let
-    // dotenv order decide the winner (unsafe). Strip the stale prod value first,
-    // then append the allocated preview port. Same idiom as the BASE_URL strip.
-    for (const { listener } of allListeners) {
-      const allocatedPort = portMap.get(listener.name) ?? t.port;
-      envfileBody.push(
-        `   && _sh_env_tmp="$(mktemp)" \\`,
-        `   && { grep -vE ${sq(`^${listener.portEnv}=`)} "$SAMOHOST_ENV_DIR/.env" >> "$_sh_env_tmp" || true; } \\`,
-        `   && mv "$_sh_env_tmp" "$SAMOHOST_ENV_DIR/.env" \\`,
-        `   && chmod 600 "$SAMOHOST_ENV_DIR/.env" \\`,
-        `   && printf ${sq(`${listener.portEnv}=${String(allocatedPort)}\\n`)} >> "$SAMOHOST_ENV_DIR/.env" \\`,
-      );
-    }
-    if (t.dbBackend === "template") {
-      // Rewire every mapped var to the per-env db ON THE HOST (issue #11).
-      envfileBody.push('   && samohost_rewire_db_vars "$SAMOHOST_ENV_DIR/.env" \\');
-    } else if (t.dbBackend === "dblab") {
-      // Rewire every mapped var's host:port at the clone ON THE HOST (issue #7,
-      // closing the PR #12 TODO): the clone is a physical copy of prod, so the
-      // template's credentials and database name stay valid inside it.
-      envfileBody.push(
-        '   && samohost_rewire_db_hostport "$SAMOHOST_ENV_DIR/.env" \\',
-      );
-      if (app.databaseUrlEnv !== undefined) {
-        // Credentialed URL rewrite: replaces user:pw@host:port with clone-role
-        // credentials (set in the db phase via samohost_set_clone_role_password).
-        // Runs AFTER hostport rewire so the host:port is already correct.
-        envfileBody.push(
-          '   && samohost_rewire_db_credentialed "$SAMOHOST_ENV_DIR/.env" \\',
-        );
-      }
-    }
-    envfileBody.push(
-      '   && printf \'\\nSAMO_ENV=preview\\nSAMO_BRANCH=%s\\n\' "$SAMOHOST_BRANCH" >> "$SAMOHOST_ENV_DIR/.env" \\',
-    );
-    envfileBody.push(
-      '   && install -m 600 /dev/null "$SAMOHOST_ENV_DIR/.env.baseurl" \\',
-    );
-    envfileBody.push(
-      '   && { grep -vE \'^BASE_URL=\' "$SAMOHOST_ENV_DIR/.env" >> "$SAMOHOST_ENV_DIR/.env.baseurl" || true; } \\',
-    );
-    envfileBody.push('   && mv "$SAMOHOST_ENV_DIR/.env.baseurl" "$SAMOHOST_ENV_DIR/.env" \\');
-    envfileBody.push(
-      '   && printf \'BASE_URL=https://%s\\n\' "$SAMOHOST_VHOST" >> "$SAMOHOST_ENV_DIR/.env" \\',
-    );
-    envfileBody.push('   && chmod 600 "$SAMOHOST_ENV_DIR/.env" \\');
-    envfileBody.push("   && true; ");
-  }
+  // The root helper alone reads the raw production-derived template.  It writes
+  // a filtered, clone-credentialed file atomically, then transfers that final
+  // file to previewUser.  The SSH and preview identities never receive the raw
+  // template or an intermediate containing production DB credentials.
+  const portAssignments = allListeners.map(({ listener }) => {
+    const allocatedPort = portMap.get(listener.name) ?? t.port;
+    return `${listener.portEnv}=${allocatedPort}`;
+  });
+  const helperDbPort = t.dbBackend === "dblab" ? '"$SAMOHOST_DB_PORT"' : sq("-");
+  const envfileBody = [
+    `if sudo -n ${sq(previewHelper)} envfile ${sq(t.name)} ${sq(t.branch)} ${sq(t.vhost)} ${sq(t.dbBackend)} ${helperDbPort} ${portAssignments.map(sq).join(" ")}; `,
+  ];
   lines.push(
     ...phaseBlock(
       "envfile",
-      "compose .env ON-HOST from the operator template (samohost never sees values)",
+      "root helper materialises an allowlisted, preview-only .env atomically",
       envfileBody,
     ),
+    ...installAndBuildLines,
   );
 
   // ----- secrets-preflight + secrets ------------------------------------------
@@ -1648,7 +1660,6 @@ export function buildEnvCreateScript(
   //      this script's stdout; all file ops run inside the helper.
   //      The phase is wrapped in phaseBlock so failures emit secrets:fail.
   if ((app.secrets ?? []).length > 0) {
-    const secretsEnvUser = app.appUser ?? "root";
     const secretNames = app.secrets!;
     // All unique service unit template paths that must carry the secrets
     // EnvironmentFile line.  For legacy single-service apps this is just the
@@ -1690,7 +1701,7 @@ export function buildEnvCreateScript(
         "secrets",
         "generate per-env secrets via samohost-secrets helper (values on-VM only; never echoed)",
         [
-          `if sudo /usr/local/sbin/samohost-secrets init ${sq(t.name)} ${sq(secretsEnvUser)} ${secretNames.map(sq).join(" ")}; `,
+          `if sudo /usr/local/sbin/samohost-secrets init ${sq(t.name)} ${secretNames.map(sq).join(" ")}; `,
         ],
       ),
     );
@@ -1710,27 +1721,15 @@ export function buildEnvCreateScript(
   // When `migrateCmd` is absent, or when dbBackend is `none`, the generated
   // script is byte-identical to pre-feature output — the phase is absent.
   //
-  // Environment sourcing: same principle as src/app/script.ts:141.
-  //   no-appUser path: samo owns SAMOHOST_ENV_DIR/.env (0600); source it in a
-  //     subshell before migrateCmd so DATABASE_URL (clone URL) is visible.
-  //   appUser path: appUser owns the .env and reads it; wrap migrateCmd with
-  //     sudo -u <appUser> (same pattern as install/build). The migration tool
-  //     runs as appUser in SAMOHOST_ENV_DIR where .env is readable by appUser.
+  // Environment sourcing: the isolated preview user owns and reads the final
+  // 0600 .env, then runs migrateCmd in the checkout with the clone URL loaded.
   //
   // Fail-closed: a non-zero exit from migrateCmd emits migrate:fail + exit 1,
   // same as every other phase. Idempotent runners no-op when already current.
   if (app.migrateCmd !== undefined && (t.dbBackend === "dblab" || t.dbBackend === "template")) {
-    const migrateCmdExpr = app.appUser !== undefined
-      // appUser case: wrap with sudo -u <appUser>, same pattern as build.
-      // The migration tool (appUser-owned env dir) loads .env from cwd.
-      ? `if ${sudoWrapBuildCmd(app.migrateCmd, app.appUser)}; `
-      // no-appUser case: source composed .env in a subshell before migrateCmd
-      // so DATABASE_URL (rewritten to the clone) is available to the command.
-      // cd to SAMOHOST_ENV_DIR first: buildCmd may have done `cd apps/web` (or
-      // similar) which changes the outer shell's CWD; the subshell inherits it.
-      // migrateCmd paths (e.g. `bun packages/shared/db/migrate.ts`) are relative
-      // to the repo root, not a sub-directory, so we must reset before running.
-      : `if (cd "$SAMOHOST_ENV_DIR" && set -a && . "$SAMOHOST_ENV_DIR/.env" && set +a && ${app.migrateCmd}); `;
+    const migrateShell = `SAMOHOST_ENV_DIR=${sq(`${root}/${t.name}`)}; ` +
+      `cd "$SAMOHOST_ENV_DIR" && set -a && . "$SAMOHOST_ENV_DIR/.env" && set +a && ${app.migrateCmd}`;
+    const migrateCmdExpr = `if ${sudoWrapBuildCmd(migrateShell, previewUser, true)}; `;
     lines.push(
       ...phaseBlock(
         "migrate",
@@ -1943,6 +1942,7 @@ export function buildEnvDestroyScript(
 ): string {
   const isStatic = app.kind === "static";
   const root = envsRoot(app);
+  const previewHelper = previewHelperPathFor(app);
   const lines: string[] = [
     "#!/usr/bin/env bash",
     "# samohost env-destroy script (generated; idempotent — safe after a failed create).",
@@ -2027,7 +2027,7 @@ export function buildEnvDestroyScript(
   // recreated.  Runs via the samohost-secrets helper (same grant as env-create).
   // `|| true` keeps destroy idempotent when the dir is already gone or the
   // helper is absent (e.g. on a host that was prepped before PR-B shipped).
-  if (!isStatic && (app.secrets ?? []).length > 0) {
+  if (!isStatic) {
     lines.push(
       `# --- secrets-cleanup: remove per-env secrets dir (prevents stale value inheritance) ---`,
       `sudo /usr/local/sbin/samohost-secrets clean ${sq(t.name)} 2>/dev/null || true`,
@@ -2038,8 +2038,21 @@ export function buildEnvDestroyScript(
   lines.push(
     `# --- dir-remove ---`,
     marker("dir-remove", "start"),
-    'rm -rf "$SAMOHOST_ENV_DIR"',
-    marker("dir-remove", "ok"),
+    "dir_remove_ok=1",
+    `if sudo -n ${sq(previewHelper)} check ${sq(PREVIEW_IDENTITY_PROTOCOL)} >/dev/null 2>&1; then`,
+    `  sudo -n ${sq(previewHelper)} clean "$SAMOHOST_ENV_NAME" ${sq(PREVIEW_IDENTITY_PROTOCOL)} || dir_remove_ok=0`,
+    "else",
+    "  # Explicit old-host migration path: remove the shared-user checkout so",
+    "  # host-prep can retire that identity. A v2 helper failure never falls",
+    "  # through here and therefore cannot bypass identity cleanup checks.",
+    '  rm -rf "$SAMOHOST_ENV_DIR" || dir_remove_ok=0',
+    "fi",
+    'if [[ "$dir_remove_ok" == 1 ]]; then',
+    `  ${marker("dir-remove", "ok")}`,
+    "else",
+    `  ${marker("dir-remove", "fail")}`,
+    "  exit 1",
+    "fi",
     "",
     'echo "env destroyed: ${SAMOHOST_ENV_NAME}"',
     "",
@@ -2074,7 +2087,6 @@ export function buildSecretsRotateScript(
   app: AppRecord,
   t: EnvScriptTarget,
 ): string {
-  const envUser = app.appUser ?? "root";
   const secrets = app.secrets ?? [];
   const { services } = servicesOf(app);
 
@@ -2088,7 +2100,7 @@ export function buildSecretsRotateScript(
     `# 1. Rotate all secrets via the samohost-secrets helper.`,
     `#    The helper rm-then-recreates the file, generates ALL names unconditionally`,
     `#    (no reuse on rotate), and sets mode 0600. Values are generated on-VM.`,
-    `sudo /usr/local/sbin/samohost-secrets rotate ${sq(t.name)} ${sq(envUser)} ${secrets.map(sq).join(" ")}`,
+    `sudo /usr/local/sbin/samohost-secrets rotate ${sq(t.name)} ${secrets.map(sq).join(" ")}`,
     ``,
     `# 2. Restart ACTIVE unit instances so new secrets take effect.`,
     `#    disable--now + enable--now is the universally-granted restart pattern`,
@@ -2306,10 +2318,60 @@ export function buildHostPrepScript(
 ): string {
   const isStatic = app.kind === "static";
   const root = envsRoot(app);
-  // Issue #97: the preview unit and the envs root must be owned by the app
-  // user when appUser is registered. Fall back to sshUser for back-compat with
-  // AppRecords that predate the appUser field.
-  const envUser = app.appUser ?? sshUser;
+  const previewHelper = previewHelperPathFor(app);
+  const legacyPreviewUser = legacyPreviewUserFor(app);
+  const previewUserPrefix = previewUserPrefixFor(app);
+
+  const previewBoundaryLines: string[] = [
+    "# 0. Untrusted preview boundary: every env gets its own non-login Unix",
+    "#    identity. Refuse an in-place upgrade while any old per-app-owned",
+    "#    checkout exists: destroy those previews, run host-prep, then recreate.",
+    "if id samohost-preview-disabled >/dev/null 2>&1; then echo 'samohost host-prep: reserved fail-closed preview identity unexpectedly exists' >&2; exit 1; fi",
+    `install -d -m 711 -o root -g root ${sq(root)}`,
+    "install -d -m 700 -o root -g root /var/lib/samohost/preview-identities",
+    "install -d -m 711 -o root -g root /var/lib/samohost/users",
+    `SAMOHOST_IDENTITY_APP=${sq(app.name)}`,
+    `SAMOHOST_IDENTITY_PREFIX=${sq(previewUserPrefix)}`,
+    "samohost_preview_identity_for() {",
+    "  local env_name=\"$1\" label hash",
+    `  [[ "$env_name" =~ ^[a-z0-9][a-z0-9-]*$ && "$env_name" == ${sq(`${app.name}-`)}* ]] || return 1`,
+    "  label=${env_name:0:6}",
+    "  hash=$(printf '%s\\0%s' \"$SAMOHOST_IDENTITY_APP\" \"$env_name\" | /usr/bin/sha256sum | /usr/bin/cut -c1-10)",
+    "  [[ \"$hash\" =~ ^[0-9a-f]{10}$ ]] || return 1",
+    "  printf '%s%s-%s\\n' \"$SAMOHOST_IDENTITY_PREFIX\" \"$label\" \"$hash\"",
+    "}",
+    `for SAMOHOST_EXISTING_DIR in ${sq(root)}/*; do`,
+    "  [[ -e \"$SAMOHOST_EXISTING_DIR\" ]] || continue",
+    "  [[ -d \"$SAMOHOST_EXISTING_DIR\" && ! -L \"$SAMOHOST_EXISTING_DIR\" ]] || { echo \"samohost host-prep: unsafe entry in preview root; refusing migration\" >&2; exit 1; }",
+    "  SAMOHOST_EXISTING_ENV=$(basename \"$SAMOHOST_EXISTING_DIR\")",
+    "  SAMOHOST_EXPECTED_USER=$(samohost_preview_identity_for \"$SAMOHOST_EXISTING_ENV\") || { echo \"samohost host-prep: invalid existing preview id; refusing migration\" >&2; exit 1; }",
+    "  SAMOHOST_RECORD=\"/var/lib/samohost/preview-identities/$SAMOHOST_EXISTING_ENV\"",
+    "  SAMOHOST_REG_APP= SAMOHOST_REG_ENV= SAMOHOST_REG_USER= SAMOHOST_REG_EXTRA=",
+    "  [[ -f \"$SAMOHOST_RECORD\" && ! -L \"$SAMOHOST_RECORD\" ]] && IFS=$'\\t' read -r SAMOHOST_REG_APP SAMOHOST_REG_ENV SAMOHOST_REG_USER SAMOHOST_REG_EXTRA < \"$SAMOHOST_RECORD\" || true",
+    "  if [[ \"$(stat -c %U:%G \"$SAMOHOST_EXISTING_DIR\")\" != \"$SAMOHOST_EXPECTED_USER:$SAMOHOST_EXPECTED_USER\" || \"$SAMOHOST_REG_APP\" != \"$SAMOHOST_IDENTITY_APP\" || \"$SAMOHOST_REG_ENV\" != \"$SAMOHOST_EXISTING_ENV\" || \"$SAMOHOST_REG_USER\" != \"$SAMOHOST_EXPECTED_USER\" || -n \"$SAMOHOST_REG_EXTRA\" ]]; then",
+    "    echo \"samohost host-prep: old shared-user preview detected ($SAMOHOST_EXISTING_ENV); destroy all old previews, rerun host-prep, then recreate them\" >&2",
+    "    exit 1",
+    "  fi",
+    "done",
+    `if id ${sq(legacyPreviewUser)} >/dev/null 2>&1; then`,
+    `  /usr/bin/pgrep -u ${sq(legacyPreviewUser)} >/dev/null 2>&1 && { echo 'samohost host-prep: legacy shared preview processes still run; destroy old previews first' >&2; exit 1; }`,
+    `  SAMOHOST_LEGACY_PASSWD=$(getent passwd ${sq(legacyPreviewUser)})`,
+    "  IFS=: read -r SAMOHOST_LEGACY_NAME _ _ _ _ SAMOHOST_LEGACY_HOME SAMOHOST_LEGACY_SHELL <<< \"$SAMOHOST_LEGACY_PASSWD\"",
+    `  [[ "$SAMOHOST_LEGACY_NAME" == ${sq(legacyPreviewUser)} && "$SAMOHOST_LEGACY_HOME" == ${sq(`/var/lib/samohost/users/${legacyPreviewUser}`)} && "$SAMOHOST_LEGACY_SHELL" == /usr/sbin/nologin ]] || { echo 'samohost host-prep: legacy preview account contract mismatch; refusing removal' >&2; exit 1; }`,
+    `  for SAMOHOST_LEGACY_SCRATCH in /tmp /var/tmp /dev/shm; do [[ -d "$SAMOHOST_LEGACY_SCRATCH" ]] && find "$SAMOHOST_LEGACY_SCRATCH" -xdev -depth -user ${sq(legacyPreviewUser)} -delete 2>/dev/null || true; done`,
+    `  SAMOHOST_LEGACY_LEFTOVER=$(find / -xdev -user ${sq(legacyPreviewUser)} ! -path ${sq(`/var/lib/samohost/users/${legacyPreviewUser}`)} ! -path ${sq(`/var/lib/samohost/users/${legacyPreviewUser}/*`)} -print -quit 2>/dev/null || true)`,
+    `  [[ -z "$SAMOHOST_LEGACY_LEFTOVER" ]] || { echo 'samohost host-prep: legacy preview identity still owns unmanaged files; refusing removal' >&2; exit 1; }`,
+    `  userdel --remove ${sq(legacyPreviewUser)} >/dev/null 2>&1`,
+    `  getent group ${sq(legacyPreviewUser)} >/dev/null 2>&1 && groupdel ${sq(legacyPreviewUser)} >/dev/null 2>&1 || true`,
+    "fi",
+    `cat > ${sq(previewHelper)} <<'SAMOHOST_PREVIEW_HELPER'`,
+    ...buildPreviewHelperLines(app),
+    "SAMOHOST_PREVIEW_HELPER",
+    `chown root:root ${sq(previewHelper)}`,
+    `chmod 750 ${sq(previewHelper)}`,
+    `${sq(previewHelper)} reconcile ${sq(PREVIEW_IDENTITY_PROTOCOL)}`,
+    "",
+  ];
 
   // Durable MAIN-env vhost (field-record-1#117 ITEM C, 7th drift class): the
   // production vhost must be provisioned state in sites.d, not a hand-applied
@@ -2408,16 +2470,22 @@ export function buildHostPrepScript(
     const envDbVars = app.envDbVars ?? [...DEFAULT_ENV_DB_VARS];
     const defaultTemplateDb = `${app.name.replace(/-/g, "_")}_template`;
     nodeOnlyLines.push(
-      `# 1. Env template file: base env vars (secrets) for every preview env.`,
-      `#    Copy from the production env file (MINUS PORT) and adjust; chmod 600.`,
-      `#    samohost env-create copies it on-host, appends PORT, and rewrites the`,
+      `# 1. Root-only raw template: operator-selected inputs for preview envs.`,
+      `#    Populate only values named by previewEnvAllowlist; chmod 600.`,
+      `#    The root helper filters it, appends PORT, and rewrites the`,
       `#    DATABASE NAME of each var in the app's envDbVars to the per-env db`,
       `#    (issue #11): this app's envDbVars = ${envDbVars.join(", ")}.`,
       `#    Each of those vars MUST be present in the template, pointing at the`,
       `#    production-shaped URL (scheme://user:pass@host[:port]/dbname[?params]).`,
       `#    Expected template database for --db template: ${defaultTemplateDb}`,
       `#    (override per env with --template-db).`,
-      `install -m 600 -o ${sshUser} -g ${sshUser} /dev/null ${root}.template.env`,
+      `if [[ -L ${sq(`${root}.template.env`)} ]]; then echo 'samohost host-prep: refusing symlinked raw preview template' >&2; exit 1; fi`,
+      `if [[ -e ${sq(`${root}.template.env`)} ]]; then`,
+      `  chown root:root ${sq(`${root}.template.env`)}`,
+      `  chmod 600 ${sq(`${root}.template.env`)}`,
+      `else`,
+      `  install -m 600 -o root -g root /dev/null ${sq(`${root}.template.env`)}`,
+      `fi`,
       `echo 'EDIT ${root}.template.env: populate base env vars for previews' >&2`,
       "",
     );
@@ -2438,16 +2506,17 @@ export function buildHostPrepScript(
       const svc0 = uniqueHostPrepUnits[0]!;
       nodeOnlyLines.push(
         `# 2. systemd template unit: one instance per env (%i = env name).`,
-        `#    User= is the app user (${envUser}) — the user that owns the env dir`,
-        `#    and the cloned code (issue #97: was sshUser which cannot read the`,
-        `#    appUser-owned checkout or the 600 .gh-token).`,
+        `#    The base user is deliberately nonexistent. The root preview helper`,
+        `#    installs a per-instance drop-in with that env's isolated identity.`,
         `cat > /etc/systemd/system/${svc0.unit}@.service <<'UNIT'`,
         "[Unit]",
         `Description=${app.name} preview env %i`,
         "After=network.target",
         "",
         "[Service]",
-        `User=${envUser}`,
+        "User=samohost-preview-disabled",
+        "Group=samohost-preview-disabled",
+        "UMask=0077",
         `WorkingDirectory=${root}/%i`,
         `EnvironmentFile=${root}/%i/.env`,
         // When the app declares secrets[], add a second EnvironmentFile that loads
@@ -2474,7 +2543,7 @@ export function buildHostPrepScript(
       // ALL unit instances carry the EnvironmentFile for secrets (BLOCKER 1a).
       nodeOnlyLines.push(
         `# 2. systemd template units: one instance per env (%i = env name), per service.`,
-        `#    User= is the app user (${envUser}).`,
+        `#    Per-instance root-helper drop-ins select isolated env identities.`,
       );
       for (const svc of uniqueHostPrepUnits) {
         const execStart = svc.execStart ?? "/usr/bin/npm start";
@@ -2485,7 +2554,9 @@ export function buildHostPrepScript(
           "After=network.target",
           "",
           "[Service]",
-          `User=${envUser}`,
+          "User=samohost-preview-disabled",
+          "Group=samohost-preview-disabled",
+          "UMask=0077",
           `WorkingDirectory=${root}/%i`,
           `EnvironmentFile=${root}/%i/.env`,
           ...((app.secrets ?? []).length > 0
@@ -2502,12 +2573,13 @@ export function buildHostPrepScript(
       nodeOnlyLines.push("systemctl daemon-reload", "");
     }
 
-    // Step 2b: install the samohost-secrets helper when the app declares secrets[]
-    // OR when databaseUrlEnv is set (the clone-role password uses the same helper).
+    // Step 2b: install the samohost-secrets helper when the app declares
+    // secrets[] OR has effective envDbVars (clone-role passwords use it too).
     // Installed here (before sudoers) so the helper binary exists when visudo
     // validates the NOPASSWD grant for it.  Single-quoted heredoc: no expansion
     // in the helper body during host-prep execution.
-    const needsSecretsHelper = (app.secrets ?? []).length > 0 || app.databaseUrlEnv !== undefined;
+    const needsSecretsHelper = (app.secrets ?? []).length > 0 ||
+      (app.envDbVars ?? DEFAULT_ENV_DB_VARS).length > 0;
     if (needsSecretsHelper) {
       nodeOnlyLines.push(
         `# 2b. samohost-secrets helper: validates env-name, performs all per-env`,
@@ -2556,66 +2628,25 @@ export function buildHostPrepScript(
     sudoersLines.push(
       `${sshUser} ALL=(postgres) NOPASSWD: /usr/bin/createdb, /usr/bin/dropdb, /usr/bin/psql`,
     );
-  }
-  // Issue #97: when appUser is registered, grant sshUser the right to run
-  // /usr/bin/git as appUser with SETENV so that GIT_CONFIG_GLOBAL passes
-  // through to the git subprocess. Without SETENV, sudo strips the variable
-  // and git loses the safe.directory override.
-  //
-  // Issue #98 follow-up: also grant /usr/bin/npm so that the install phase
-  // (npm ci / npm install) and build phase (npm run build) can run as appUser.
-  // A single /usr/bin/npm entry covers all three. The npm grant does NOT need
-  // SETENV (no environment variable is forwarded to npm); a separate plain
-  // NOPASSWD line is cleaner and avoids unnecessarily widening SETENV scope.
-  //
-  // samorev security fix (#101): the prior broad `SETENV: /usr/bin/bash` grant
-  // let samo run ARBITRARY commands as appUser. It is replaced by three scoped
-  // file-write-only grants tied to the envs-root path pattern:
-  //   /usr/bin/install -m 600 /dev/null <root>/*/.env — pre-create at 600
-  //   /usr/bin/tee <root>/*/.env                      — write content
-  //   /usr/bin/chmod 600 <root>/*/.env                — re-assert mode
-  // None of these binaries execute arbitrary code. The compose logic runs as
-  // samo in a mktemp temp file; only the final write touches the appUser dir.
-  if (app.appUser !== undefined) {
-    // Resolve the build-command binary so a non-npm build tool also gets a
-    // grant (e.g. `node ./build.js` → /usr/bin/node). When buildCmd is already
-    // npm-based the resolved binary equals /usr/bin/npm and we omit the
-    // duplicate; the single /usr/bin/npm line covers install + build.
-    const buildBin = resolveBuildBin(app.buildCmd);
-    // Resolve the migrate-command binary (migrateCmd may use a different binary
-    // than buildCmd, e.g. `npx prisma migrate deploy` vs `npm run build`).
-    // When migrateCmd is absent or resolves to the same binary as buildCmd or npm,
-    // no duplicate line is added.
-    const migrateBin = app.migrateCmd !== undefined
-      ? resolveBuildBin(app.migrateCmd)
-      : undefined;
+    // Untrusted npm/build/migrate commands run only as a reserved per-env user.
+    // The generated create script derives that user from its validated env id.
+    // intentionally no ssh→production-appUser git/npm/bash/env-write grant.
     sudoersLines.push(
-      `${sshUser} ALL=(${app.appUser}) NOPASSWD: SETENV: /usr/bin/git`,
-      `${sshUser} ALL=(${app.appUser}) NOPASSWD: /usr/bin/npm`,
-      ...(buildBin !== "/usr/bin/npm"
-        ? [`${sshUser} ALL=(${app.appUser}) NOPASSWD: ${buildBin}`]
-        : []),
-      // migrateCmd binary grant: only when it differs from npm and buildBin
-      // (avoid duplicate sudoers lines for the same exact path).
-      ...(migrateBin !== undefined &&
-        migrateBin !== "/usr/bin/npm" &&
-        migrateBin !== buildBin
-        ? [`${sshUser} ALL=(${app.appUser}) NOPASSWD: ${migrateBin}`]
-        : []),
-      // Scoped envfile write grants (samorev security fix — replaces the broad
-      // /usr/bin/bash SETENV grant). Path pattern uses the envs root so the
-      // sudoers glob covers any env name without allowing writes elsewhere.
-      `${sshUser} ALL=(${app.appUser}) NOPASSWD: /usr/bin/install -m 600 /dev/null ${root}/*/.env`,
-      `${sshUser} ALL=(${app.appUser}) NOPASSWD: /usr/bin/tee ${root}/*/.env`,
-      `${sshUser} ALL=(${app.appUser}) NOPASSWD: /usr/bin/chmod 600 ${root}/*/.env`,
+      `${sshUser} ALL=(${previewUserPrefix}*) NOPASSWD: /usr/bin/npm`,
+      `${sshUser} ALL=(${previewUserPrefix}*) NOPASSWD: /usr/bin/bash`,
     );
   }
+  sudoersLines.push(
+    `# Root helper: validates action/id and derives every path from baked config.`,
+    `${sshUser} ALL=(root) NOPASSWD: ${previewHelper}`,
+  );
   // Grant ONE exact-path NOPASSWD for the samohost-secrets helper when:
   //   - the app declares secrets[] (init/get for app secrets), OR
-  //   - databaseUrlEnv is set (init/get for the clone-role password).
+  //   - effective envDbVars exist (init/get for clone-role passwords).
   // The helper validates the env-name argument before touching any path.
   // (BLOCKER 2 fix + clone-role password extension.)
-  if ((app.secrets ?? []).length > 0 || app.databaseUrlEnv !== undefined) {
+  if ((app.secrets ?? []).length > 0 ||
+      (app.envDbVars ?? DEFAULT_ENV_DB_VARS).length > 0) {
     sudoersLines.push(
       `# Secrets: ONE exact-path grant for the samohost-secrets helper.`,
       `# The helper validates env-name (^[a-z0-9][a-z0-9-]*$) before touching any path.`,
@@ -2637,6 +2668,7 @@ export function buildHostPrepScript(
     // Guard function definition (only when mainHost is set); placed early so
     // it is in scope before the Caddy step that calls it.
     ...guardFnLines,
+    ...previewBoundaryLines,
     ...nodeOnlyLines,
     `# ${isStatic ? "1" : "3"}. Caddy: include per-env vhost snippets + the durable MAIN-env vhost`,
     `#    (field-record-1#117 ITEM C, 7th drift class).`,
@@ -2648,14 +2680,6 @@ export function buildHostPrepScript(
     // reload internally.  When mainHost is absent, emit the top-level reload
     // to activate the 'import sites.d/*.caddy' addition.
     ...(app.mainHost === undefined ? ["systemctl reload caddy"] : []),
-    "",
-    // The env-create script runs later as the non-root env user, so the envs
-    // root must already exist and be writable by that user regardless of how
-    // /opt/<app> was provisioned (e.g. root-owned when not via app bootstrap).
-    // Issue #97: when appUser is registered the envs root is owned by appUser
-    // so that `sudo -u appUser git clone` can create the env subdir inside it
-    // (mode 755 + sshUser owner → appUser has no write permission → EACCES).
-    `install -d -m 755 -o ${envUser} -g ${envUser} ${sq(root)}`,
     "",
     ...sudoersLines,
     "",

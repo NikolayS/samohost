@@ -68,6 +68,7 @@ function appRec(o: Partial<AppRecord> = {}): AppRecord {
     buildCmd: "npm run build",
     healthUrl: "http://localhost:3000/api/version",
     serviceUnit: "myapp",
+    dbBackend: "none",
     ...o,
   };
 }

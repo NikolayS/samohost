@@ -1,6 +1,6 @@
 import { describe, expect, test, afterEach } from "bun:test";
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import * as net from "node:net";
@@ -13,6 +13,8 @@ import {
   buildControlPlaneCustomDomainVhostScript,
   buildControlPlaneCustomDomainVhostRemoveScript,
   envsRoot,
+  previewUserForEnv,
+  previewHelperPathFor,
   type EnvScriptTarget,
 } from "../src/env/script.ts";
 import { buildDeployScript } from "../src/app/script.ts";
@@ -241,10 +243,10 @@ describe("buildEnvCreateScript", () => {
     expect(s).not.toContain("DATABASE_URL");
   });
 
-  test("env file composed on-host from the operator template", () => {
+  test("env file is materialised only by the root-owned app helper", () => {
     const s = buildEnvCreateScript(app(), target());
-    expect(s).toContain("/opt/field-record/envs.template.env");
-    expect(s).toContain('chmod 600 "$SAMOHOST_ENV_DIR/.env"');
+    expect(s).toContain(`${previewHelperPathFor(app())}' envfile`);
+    expect(s).not.toContain("/opt/field-record/envs.template.env");
     expect(s).toContain("<<<SAMOHOST_PHASE:envfile:start>>>");
   });
 
@@ -657,7 +659,8 @@ describe("issue #11 findings 1+2+3: per-env DB var mapping (template backend)", 
     const s = buildEnvCreateScript(appWithVars(), tpl());
     expect(s).toContain("SAMOHOST_ENV_DB_VARS=('DATABASE_URL' 'APP_DATABASE_URL')");
     expect(s).toContain("samohost_rewire_db_vars() {");
-    expect(s).toContain('samohost_rewire_db_vars "$SAMOHOST_ENV_DIR/.env"');
+    expect(s).toContain(" envfile 'field-record-1-feat-x' 'feat/x'");
+    expect(s).not.toContain("envs.template.env");
     expect(bashSyntaxOk(s)).toBe(true);
   });
 
@@ -747,94 +750,24 @@ describe("issue #11 finding 4: template db phase is re-run idempotent", () => {
   });
 });
 
-describe("issue #11 finding 5: clone fallback when the appDir checkout is shallow", () => {
-  test("script defines a two-strategy clone with explicit failure messages", () => {
+describe("hardened preview clone boundary", () => {
+  test("create delegates check + fresh clone to the app-specific root helper", () => {
     const s = buildEnvCreateScript(app(), target());
-    expect(s).toContain("samohost_clone_env_dir() {");
-    expect(s).toContain("falling back to a plain clone");
+    const helper = previewHelperPathFor(app());
+    expect(s).toContain(`sudo -n '${helper}' check`);
+    expect(s).toContain(`sudo -n '${helper}' clone`);
+    expect(s).not.toContain("git clone");
+    expect(s).not.toContain(".gh-token");
   });
 
-  interface CloneFixture {
-    dir: string;
-    origin: string;
-  }
-
-  function gitFixture(): CloneFixture {
-    const dir = mkdtempSync(join(tmpdir(), "samohost-clone-"));
-    const origin = join(dir, "origin");
-    const git = (args: string[], cwd: string) => {
-      const r = spawnSync(
-        "git",
-        ["-c", "user.email=t@example.com", "-c", "user.name=t", ...args],
-        { cwd, encoding: "utf8" },
-      );
-      if (r.status !== 0) throw new Error(`git ${args.join(" ")}: ${r.stderr}`);
-    };
-    spawnSync("mkdir", ["-p", origin]);
-    git(["init", "-b", "main"], origin);
-    writeFileSync(join(origin, "f.txt"), "v1\n");
-    git(["add", "f.txt"], origin);
-    git(["commit", "-m", "c1"], origin);
-    git(["branch", "sbx/docs-readme"], origin);
-    return { dir, origin };
-  }
-
-  function runClone(appDir: string, envDir: string, branch: string) {
-    const fn = extractFn(buildEnvCreateScript(app(), target()), "samohost_clone_env_dir");
-    const prog = [
-      "set -uo pipefail",
-      `SAMOHOST_APP_DIR='${appDir}'`,
-      `SAMOHOST_ENV_DIR='${envDir}'`,
-      `SAMOHOST_BRANCH='${branch}'`,
-      fn,
-      "samohost_clone_env_dir",
-    ].join("\n");
-    return spawnSync("bash", ["-c", prog], { encoding: "utf8" });
-  }
-
-  test("executed: SHALLOW appDir → reference clone fails → plain clone succeeds, message names the failed strategy", () => {
-    const fx = gitFixture();
-    try {
-      const appDir = join(fx.dir, "appdir");
-      const sc = spawnSync(
-        "git",
-        ["clone", "--depth", "1", `file://${fx.origin}`, appDir],
-        { encoding: "utf8" },
-      );
-      expect(sc.status).toBe(0);
-      const envDir = join(fx.dir, "envs", "e1");
-      const r = runClone(appDir, envDir, "sbx/docs-readme");
-      expect(r.status).toBe(0);
-      expect(r.stderr).toContain("--reference");
-      expect(r.stderr).toContain("falling back to a plain clone");
-      const head = spawnSync("git", ["-C", envDir, "rev-parse", "--abbrev-ref", "HEAD"], {
-        encoding: "utf8",
-      });
-      expect(head.stdout.trim()).toBe("sbx/docs-readme");
-    } finally {
-      rmSync(fx.dir, { recursive: true, force: true });
-    }
-  });
-
-  test("executed: FULL appDir → reference clone path, no fallback message", () => {
-    const fx = gitFixture();
-    try {
-      const appDir = join(fx.dir, "appdir");
-      const sc = spawnSync("git", ["clone", `file://${fx.origin}`, appDir], {
-        encoding: "utf8",
-      });
-      expect(sc.status).toBe(0);
-      const envDir = join(fx.dir, "envs", "e1");
-      const r = runClone(appDir, envDir, "sbx/docs-readme");
-      expect(r.status).toBe(0);
-      expect(r.stderr).not.toContain("falling back");
-      const head = spawnSync("git", ["-C", envDir, "rev-parse", "--abbrev-ref", "HEAD"], {
-        encoding: "utf8",
-      });
-      expect(head.stdout.trim()).toBe("sbx/docs-readme");
-    } finally {
-      rmSync(fx.dir, { recursive: true, force: true });
-    }
+  test("host helper always removes hostile existing checkout state before a fresh clone", () => {
+    const prep = buildHostPrepScript(app({ appUser: "prod-app" }), "operator");
+    expect(prep).toContain('safe_remove_env "$ENV_NAME"');
+    expect(prep).toContain("GIT_CONFIG_NOSYSTEM=1");
+    expect(prep).toContain("GIT_CONFIG_GLOBAL=/dev/null");
+    expect(prep).toContain("credential.helper=");
+    expect(prep).toContain('remote set-url origin "$REPO_URL"');
+    expect(prep).not.toContain("--reference");
   });
 });
 
@@ -1012,7 +945,8 @@ describe("issue #7 (closing the PR #12 TODO): dblab envDbVars host:port mapping"
     );
     expect(s).toContain("SAMOHOST_ENV_DB_VARS=('DATABASE_URL' 'APP_DATABASE_URL')");
     expect(s).toContain("samohost_rewire_db_hostport() {");
-    expect(s).toContain('samohost_rewire_db_hostport "$SAMOHOST_ENV_DIR/.env"');
+    expect(s).toContain(" envfile 'field-record-1-feat-x' 'feat/x'");
+    expect(s).not.toContain("envs.template.env");
     // The old append-only DATABASE_URL shape is GONE: the clone is a physical
     // copy carrying prod's roles, so the template's credentials stay and only
     // host:port is repointed at the clone.
@@ -1120,7 +1054,7 @@ describe("issue #7: clone globals sync (logical retrieval drops cluster roles/gr
   test("sync runs INSIDE the db phase, after port extraction, before envfile", () => {
     const s = dblabScript();
     const dbStart = s.indexOf("<<<SAMOHOST_PHASE:db:start>>>");
-    const sync = s.indexOf("samohost_sync_clone_globals\n");
+    const sync = s.indexOf("&& samohost_sync_clone_globals");
     const envfileStart = s.indexOf("<<<SAMOHOST_PHASE:envfile:start>>>");
     expect(sync).toBeGreaterThan(dbStart);
     expect(sync).toBeLessThan(envfileStart);
@@ -1375,9 +1309,15 @@ interface SyncGlobalsRun {
 function runSyncGlobals(opts: SyncGlobalsOpts = {}): SyncGlobalsRun {
   const dir = mkdtempSync(join(tmpdir(), "samohost-syncglobals-"));
   try {
+    const template = opts.template ?? SYNC_TEMPLATE_DEFAULT;
+    const dbUrl = template.match(/^DATABASE_URL=(.*)$/m)?.[1] ?? "";
+    const appUrl = template.match(/^APP_DATABASE_URL=(.*)$/m)?.[1] ?? "";
+    const dbName = dbUrl.match(/\/([^/?]+)(?:\?|$)/)?.[1] ?? "";
+    const dbRole = dbUrl.match(/^[A-Za-z0-9+]+:\/\/([^:/@?]+)/)?.[1] ?? "";
+    const appRole = appUrl.match(/^[A-Za-z0-9+]+:\/\/([^:/@?]+)/)?.[1] ?? "";
     const fix = (name: string, content: string) =>
       writeFileSync(join(dir, name), content);
-    fix("template.env", opts.template ?? SYNC_TEMPLATE_DEFAULT);
+    fix("template.env", template);
     fix(
       "prod_authid_rows",
       opts.prodAuthidRows ?? readFileSync(AUTHID_ROWS_FIXTURE, "utf8"),
@@ -1437,8 +1377,11 @@ function runSyncGlobals(opts: SyncGlobalsOpts = {}): SyncGlobalsRun {
       // CLONE_TAB_LIST_FAIL: "1" → psql returns 1 → fail-closed path.
       `CLONE_TAB_LIST=${JSON.stringify(opts.cloneTabList ?? "")}`,
       `CLONE_TAB_LIST_FAIL=${opts.cloneTabListFail ? '"1"' : '""'}`,
-      `SAMOHOST_ENV_TEMPLATE='${join(dir, "template.env")}'`,
       "SAMOHOST_ENV_DB_VARS=('DATABASE_URL' 'APP_DATABASE_URL')",
+      `SAMOHOST_PROD_DB_NAME=${JSON.stringify(dbName)}`,
+      "declare -A SAMOHOST_PROD_ROLE_BY_VAR=()",
+      `SAMOHOST_PROD_ROLE_BY_VAR[DATABASE_URL]=${JSON.stringify(dbRole)}`,
+      `SAMOHOST_PROD_ROLE_BY_VAR[APP_DATABASE_URL]=${JSON.stringify(appRole)}`,
       "SAMOHOST_DB_PASSWORD='harness-stub-pw'",
       "SAMOHOST_DB_PORT='6000'",
       SUDO_STUB,
@@ -1599,26 +1542,19 @@ describe("PR #22 review finding 2 (MAJOR): role replay scoped to app roles, supe
       target({ dbBackend: "dblab" }),
     );
     const fn = extractFn(s, "samohost_app_url_roles");
-    const dir = mkdtempSync(join(tmpdir(), "samohost-urlroles-"));
-    try {
-      const tpl = join(dir, "template.env");
-      writeFileSync(tpl, SYNC_TEMPLATE_DEFAULT);
-      const prog = [
-        "set -uo pipefail",
-        `SAMOHOST_ENV_TEMPLATE='${tpl}'`,
-        "SAMOHOST_ENV_DB_VARS=('DATABASE_URL' 'APP_DATABASE_URL')",
-        fn,
-        "samohost_app_url_roles",
-      ].join("\n");
-      const r = spawnSync("bash", ["-c", prog], { encoding: "utf8" });
-      expect(r.status).toBe(0);
-      const lines = r.stdout.trim().split("\n").sort();
-      expect(lines).toEqual(["app_user", "field_record"]);
-      expect(r.stdout + r.stderr).not.toContain("admin-pw-X");
-      expect(r.stdout + r.stderr).not.toContain("app-pw-9");
-    } finally {
-      rmSync(dir, { recursive: true, force: true });
-    }
+    const prog = [
+      "set -uo pipefail",
+      "SAMOHOST_ENV_DB_VARS=('DATABASE_URL' 'APP_DATABASE_URL')",
+      "declare -A SAMOHOST_PROD_ROLE_BY_VAR=([DATABASE_URL]=field_record [APP_DATABASE_URL]=app_user)",
+      fn,
+      "samohost_app_url_roles",
+    ].join("\n");
+    const r = spawnSync("bash", ["-c", prog], { encoding: "utf8" });
+    expect(r.status).toBe(0);
+    const lines = r.stdout.trim().split("\n").sort();
+    expect(lines).toEqual(["app_user", "field_record"]);
+    expect(r.stdout + r.stderr).not.toContain("admin-pw-X");
+    expect(r.stdout + r.stderr).not.toContain("app-pw-9");
   });
 
   test("script text: the unscoped pg_authid attribute passthrough is GONE", () => {
@@ -2084,22 +2020,21 @@ describe("static host-prep path (kind='static')", () => {
 // envs root exists AND is owned by the env user before env create ever runs.
 // ---------------------------------------------------------------------------
 
-describe("issue #43: host-prep creates + owns the envs root dir", () => {
+describe("host-prep creates a root-owned preview root", () => {
   // For the test app: appDir = '/opt/field-record/app' → envsRoot = '/opt/field-record/envs'
   // sq('/opt/field-record/envs') = "'/opt/field-record/envs'"
 
   test("node app host-prep emits idempotent install -d for the envs root (node path)", () => {
     const s = buildHostPrepScript(app(), "agent");
-    // install -d -m 755 -o <sshUser> -g <sshUser> <sq(envsRoot)>
     expect(s).toContain(
-      "install -d -m 755 -o agent -g agent '/opt/field-record/envs'",
+      "install -d -m 711 -o root -g root '/opt/field-record/envs'",
     );
   });
 
   test("static app host-prep emits idempotent install -d for the envs root (static path)", () => {
     const s = buildHostPrepScript(app({ kind: "static" }), "samo");
     expect(s).toContain(
-      "install -d -m 755 -o samo -g samo '/opt/field-record/envs'",
+      "install -d -m 711 -o root -g root '/opt/field-record/envs'",
     );
   });
 
@@ -2120,16 +2055,14 @@ describe("issue #43: host-prep creates + owns the envs root dir", () => {
 describe("preview-flag: node env create appends SAMO_ENV=preview and SAMO_BRANCH", () => {
   test("node create script contains printf lines appending SAMO_ENV=preview to the .env", () => {
     const s = buildEnvCreateScript(app(), target());
-    // The envfile phase must append SAMO_ENV=preview after the PORT append.
-    expect(s).toContain("SAMO_ENV=preview");
+    expect(s).toContain(`${previewHelperPathFor(app())}' envfile`);
   });
 
   test("node create script contains a printf line appending SAMO_BRANCH from $SAMOHOST_BRANCH", () => {
     const s = buildEnvCreateScript(app(), target());
     // SAMO_BRANCH value comes from the shell var $SAMOHOST_BRANCH, not a
     // hardcoded literal, so branch values with slashes round-trip correctly.
-    expect(s).toContain("SAMO_BRANCH");
-    expect(s).toContain("$SAMOHOST_BRANCH");
+    expect(s).toContain(" envfile 'field-record-1-feat-x' 'feat/x'");
   });
 
   test("node create bash syntax still valid after SAMO_ENV/SAMO_BRANCH additions", () => {
@@ -2194,10 +2127,7 @@ describe("preview-flag: node env create appends SAMO_ENV=preview and SAMO_BRANCH
     // builder and executes them — verifying the generated bash text round-trips.
     const slashBranch = "demo/red-login";
     const s = buildEnvCreateScript(app(), target({ branch: slashBranch }));
-    // The generated script must contain both SAMO_ENV=preview and a SAMO_BRANCH
-    // append that uses $SAMOHOST_BRANCH (the shell var holding the branch value).
-    expect(s).toContain("SAMO_ENV=preview");
-    expect(s).toContain("SAMO_BRANCH");
+    expect(s).toContain(` envfile 'field-record-1-feat-x' '${slashBranch}'`);
     // Additionally, SAMOHOST_BRANCH is set at the top of the script to the
     // single-quoted branch value (including the slash).
     expect(s).toContain(`SAMOHOST_BRANCH='${slashBranch}'`);
@@ -2218,25 +2148,18 @@ describe("preview-flag: static env create writes config.js with preview:true", (
 
   test("static create script contains a printf that writes config.js with preview: true", () => {
     const s = buildEnvCreateScript(staticApp(), target());
-    expect(s).toContain("preview: true");
+    expect(s).toContain(" static-config ");
   });
 
   test("static create script writes config.js into $SAMOHOST_ENV_DIR", () => {
     const s = buildEnvCreateScript(staticApp(), target());
-    expect(s).toContain('$SAMOHOST_ENV_DIR/config.js');
+    expect(s).toContain(`${previewHelperPathFor(staticApp())}' static-config`);
   });
 
   test("static create script OVERWRITES config.js with > (not >>)", () => {
     const s = buildEnvCreateScript(staticApp(), target());
-    // Must use > (overwrite) not >> (append): the repo ships a default
-    // config.js with preview:false that must be replaced.
-    expect(s).toContain('> "$SAMOHOST_ENV_DIR/config.js"');
-    // Verify it's not an append.
-    const configJsLine = s
-      .split("\n")
-      .find((l) => l.includes("config.js"));
-    expect(configJsLine).toBeDefined();
-    expect(configJsLine).not.toMatch(/>>/);
+    expect(s).toContain(" static-config ");
+    expect(s).not.toContain('>> "$SAMOHOST_ENV_DIR/config.js"');
   });
 
   test("static create script embeds the branch from $SAMOHOST_BRANCH in config.js", () => {
@@ -2427,123 +2350,20 @@ describe("preview-flag: prod deploy path stays clean (SAMO_ENV=preview must NOT 
 // RESEND_API_KEY + MAGIC_LINK_FROM_EMAIL (the send credentials) ride along from
 // the operator template via the verbatim `cp`; samohost never sees their values.
 // ---------------------------------------------------------------------------
-describe("magic-link: preview env-create sets BASE_URL to the preview's own vhost", () => {
-  test("node create script appends BASE_URL=https://<vhost> (printf %s of $SAMOHOST_VHOST) to the composed .env", () => {
-    const s = buildEnvCreateScript(app(), target());
-    // The append is a printf with %s bound to $SAMOHOST_VHOST so vhost values
-    // are interpolated safely (no shell metachar surprises).
-    expect(s).toContain("printf 'BASE_URL=https://%s\\n' \"$SAMOHOST_VHOST\"");
-  });
-
-  test("BASE_URL append is present for every db backend", () => {
+describe("magic-link: root helper replaces production BASE_URL", () => {
+  test("create passes the preview vhost to the materialiser for every backend", () => {
     for (const db of ["dblab", "template", "none"] as const) {
       const s = buildEnvCreateScript(app(), target({ dbBackend: db }));
-      expect(s).toContain("printf 'BASE_URL=https://%s\\n' \"$SAMOHOST_VHOST\"");
+      expect(s).toContain("'field-record-1-feat-x.samo.cat'");
+      expect(s).toContain(" envfile ");
     }
   });
 
-  test("the envfile phase STRIPS any template BASE_URL before appending the preview one (no prod BASE_URL leaks through)", () => {
-    // grep -v removes the template's BASE_URL line so a last-wins-only loader
-    // (dotenv variants) can't pick up prod's value. We assert the strip step
-    // targets BASE_URL inside the envfile phase.
-    const s = buildEnvCreateScript(app(), target());
-    expect(s).toMatch(/grep -vE [^\n]*BASE_URL/);
-  });
-
-  test("the BASE_URL strip pre-creates the intermediate file at mode 600 (no world-readable credential window)", () => {
-    const s = buildEnvCreateScript(app(), target());
-    // The intermediate .env.baseurl must be created via `install -m 600` BEFORE
-    // the grep redirect; a bare `> file` would inherit the umask (644).
-    expect(s).toContain('install -m 600 /dev/null "$SAMOHOST_ENV_DIR/.env.baseurl"');
-    // And the strip APPENDS (>>) into that pre-created file, preserving 600.
-    expect(s).toMatch(/grep -vE [^\n]*BASE_URL[^\n]*>> "\$SAMOHOST_ENV_DIR\/\.env\.baseurl"/);
-  });
-
-  test("node create bash syntax still valid after BASE_URL addition (all backends)", () => {
-    for (const db of ["dblab", "template", "none"] as const) {
-      expect(bashSyntaxOk(buildEnvCreateScript(app(), target({ dbBackend: db })))).toBe(true);
-    }
-  });
-
-  test("node create is deterministic after BASE_URL addition", () => {
-    expect(buildEnvCreateScript(app(), target())).toBe(
-      buildEnvCreateScript(app(), target()),
-    );
-  });
-
-  test("executed: the ACTUAL generated envfile phase produces .env with BASE_URL=https://<vhost> and STRIPS the template's prod BASE_URL", () => {
-    // Round-trip the REAL generated envfile-phase composition — NOT a hand-coded
-    // parallel. We extract the envfile-phase `if <composition>; then` condition
-    // straight out of buildEnvCreateScript and execute it against a temp dir, so
-    // a subtly-wrong generated fragment (quoting, ordering, missing `|| true`,
-    // wrong redirect) would fail HERE. The `none` backend is used so the
-    // composition references no db-rewire helper function (isolating the
-    // BASE_URL behaviour). A template carrying a PROD BASE_URL + send
-    // credentials must come out with the preview vhost BASE_URL, exactly one
-    // BASE_URL line, send credentials preserved, prod host absent.
-    const vhost = "field-record-1-feat-x.samo.cat";
-    const s = buildEnvCreateScript(app(), target({ dbBackend: "none", vhost }));
-
-    // Extract the envfile-phase `if ... ; then` condition from the real script.
-    const startMarker = '<<<SAMOHOST_PHASE:envfile:start>>>';
-    const startIdx = s.indexOf(startMarker);
-    expect(startIdx).toBeGreaterThanOrEqual(0);
-    const ifIdx = s.indexOf("\nif ", startIdx);
-    expect(ifIdx).toBeGreaterThan(startIdx);
-    const thenIdx = s.indexOf("\nthen", ifIdx);
-    expect(thenIdx).toBeGreaterThan(ifIdx);
-    // The condition is everything between the `if` and the `then` (inclusive of
-    // the `if`). Drop the leading `if ` so it runs as a plain &&-chain command.
-    const condition = s.slice(ifIdx + 1, thenIdx).replace(/^if\s+/, "");
-    // Sanity: the extracted condition is the real BASE_URL composition.
-    expect(condition).toContain("BASE_URL=https://%s");
-    expect(condition).toMatch(/grep -vE [^\n]*BASE_URL/);
-
-    const dir = mkdtempSync(join(tmpdir(), "samohost-baseurl-"));
-    try {
-      const envDir = join(dir, "envdir");
-      const templateEnv = join(dir, "template.env");
-      writeFileSync(
-        templateEnv,
-        [
-          "NODE_ENV=production",
-          "BASE_URL=https://field-record-1.samo.team",
-          "RESEND_API_KEY=re_TEST_FAKE_KEY",
-          "MAGIC_LINK_FROM_EMAIL=no-reply@samo.cat",
-          "",
-        ].join("\n"),
-        { mode: 0o600 },
-      );
-      const prog = [
-        "set -euo pipefail",
-        `SAMOHOST_ENV_DIR='${envDir}'`,
-        `SAMOHOST_ENV_TEMPLATE='${templateEnv}'`,
-        `SAMOHOST_VHOST='${vhost}'`,
-        `SAMOHOST_PORT='3100'`,
-        `SAMOHOST_BRANCH='feat/x'`,
-        `mkdir -p '${envDir}'`,
-        condition, // ← the REAL generated envfile composition
-      ].join("\n");
-      const syntaxCheck = spawnSync("bash", ["-n"], { input: prog, encoding: "utf8" });
-      expect(syntaxCheck.status).toBe(0);
-      const r = spawnSync("bash", ["-c", prog], { encoding: "utf8" });
-      if (r.status !== 0) console.error("baseurl round-trip stderr:", r.stderr);
-      expect(r.status).toBe(0);
-      const env = readFileSync(join(envDir, ".env"), "utf8");
-      // Exactly one BASE_URL, and it is the preview vhost.
-      expect(env.match(/^BASE_URL=/gm)).toHaveLength(1);
-      expect(env).toContain(`BASE_URL=https://${vhost}`);
-      // Prod host is GONE.
-      expect(env).not.toContain("field-record-1.samo.team");
-      // Send credentials ride along from the template untouched.
-      expect(env).toContain("RESEND_API_KEY=re_TEST_FAKE_KEY");
-      expect(env).toContain("MAGIC_LINK_FROM_EMAIL=no-reply@samo.cat");
-      // The composed .env is mode 600 (intermediate .env.baseurl pre-created at
-      // 600; final chmod re-asserts it) — no world-readable credential window.
-      expect(statSync(join(envDir, ".env")).mode & 0o777).toBe(0o600);
-    } finally {
-      rmSync(dir, { recursive: true, force: true });
-    }
+  test("root helper strips BASE_URL then writes the preview URL atomically", () => {
+    const prep = buildHostPrepScript(app(), "operator");
+    expect(prep).toContain('strip_key BASE_URL "$OUT"');
+    expect(prep).toContain("BASE_URL=https://%s");
+    expect(prep).toContain('mv -fT "$OUT" "$ENV_DIR/.env"');
   });
 });
 
@@ -2698,8 +2518,7 @@ describe("port-check phase — foreign-occupant detection", () => {
   // (d) SAMO_ENV/SAMO_BRANCH regression guard (extend existing content check)
   test("(d) node-path script still sets SAMO_ENV=preview and SAMO_BRANCH= in the envfile", () => {
     const s = buildEnvCreateScript(app(), target());
-    expect(s).toContain("SAMO_ENV=preview");
-    expect(s).toContain("SAMO_BRANCH=");
+    expect(s).toContain(" envfile 'field-record-1-feat-x' 'feat/x'");
   });
 
   // (e) bash syntax still valid with port-check phase included
@@ -2945,519 +2764,349 @@ describe("unit phase restarts an already-active instance via disable--now+enable
 // GIT_CONFIG_GLOBAL passes through sudo.
 // ---------------------------------------------------------------------------
 
-describe("issue #97: env-create clone + preview unit must use the registered app user", () => {
-  // Fixture: samohost-fixture owns /opt/samohost-fixture/app.
-  // The SSH user (samo) runs env-create but cannot access the app checkout
-  // or read the 600 token; all git ops must delegate to samohost-fixture.
-  const APP_USER = "samohost-fixture";
-  const appWithUser = () =>
-    app({ appUser: APP_USER, appDir: "/opt/samohost-fixture/app" });
-
-  // Paths derived from appDir at generation time (mirrors bootstrap.ts §12):
-  //   appBase    = /opt/samohost-fixture
-  //   gitSafeConf = /opt/samohost-fixture/git-safe.conf
-  //   tokenFile  = /opt/samohost-fixture/.gh-token
-  const SAFE_CONF = "/opt/samohost-fixture/git-safe.conf";
-  const TOKEN_FILE = "/opt/samohost-fixture/.gh-token";
-
-  test("clone function runs ALL git ops with sudo -u <appUser> (not plain git as samo)", () => {
-    const s = buildEnvCreateScript(appWithUser(), target());
-    // Every git invocation in the generated clone function must delegate to
-    // the app user so git does not see a dubious-ownership mismatch.
-    expect(s).toContain(`sudo -u '${APP_USER}'`);
-    // Full-path /usr/bin/git is required for the NOPASSWD sudoers grant.
-    expect(s).toContain("/usr/bin/git");
-    // The sudo invocations must include GIT_CONFIG_GLOBAL so they use the
-    // bootstrap-written safe.directory config (verified in separate test).
-    expect(s).toContain(`sudo -u '${APP_USER}' GIT_CONFIG_GLOBAL=`);
-    // Confirm bash validity.
-    expect(bashSyntaxOk(s)).toBe(true);
+describe("untrusted preview Unix boundary (#149)", () => {
+  const prodUser = "samohost-fixture";
+  const isolatedApp = () => app({
+    appUser: prodUser,
+    appDir: "/opt/samohost-fixture/app",
+    envFile: "/opt/samohost-fixture/.env",
+    previewEnvAllowlist: ["DATABASE_URL", "NODE_ENV"],
   });
 
-  test("clone function uses GIT_CONFIG_GLOBAL pointing at the bootstrap-written git-safe.conf", () => {
-    const s = buildEnvCreateScript(appWithUser(), target());
-    // GIT_CONFIG_GLOBAL lets git bypass the safe.directory check that git
-    // ≥ 2.35.2 enforces even for the checkout owner when running via sudo.
-    // The path is derived from appDir at generation time (literal, not a
-    // shell variable), mirroring bootstrap.ts §12.
-    expect(s).toContain(`GIT_CONFIG_GLOBAL='${SAFE_CONF}'`);
+  test("identity is deterministic, bounded, and distinct for sibling envs", () => {
+    const a = previewUserForEnv(isolatedApp(), "field-record-1-feat-x");
+    const b = previewUserForEnv(isolatedApp(), "field-record-1-feat-y");
+    expect(a).toBe(previewUserForEnv(isolatedApp(), "field-record-1-feat-x"));
+    expect(a.length).toBeLessThanOrEqual(32);
+    expect(a).not.toBe(prodUser);
+    expect(a).not.toBe(b);
+    expect(previewHelperPathFor(isolatedApp())).not.toBe(
+      previewHelperPathFor(app({ name: "sibling-app" })),
+    );
+    expect(() => previewUserForEnv(isolatedApp(), "sibling-app-feat-x")).toThrow();
+    expect(() => previewUserForEnv(isolatedApp(), "field-record-1/feat-x")).toThrow();
   });
 
-  test("clone uses a literal-path credential helper (not unexported $TOKEN_FILE)", () => {
-    const s = buildEnvCreateScript(appWithUser(), target());
-    // The inline credential helper must embed the TOKEN FILE PATH as a literal
-    // string — not $TOKEN_FILE (which is not exported into the credential
-    // helper subprocess). `cat <literal>` is the proven bootstrap.ts §12
-    // pattern (samorev #32 + #83).
-    expect(s).toContain(`cat ${TOKEN_FILE}`);
-    // The shell variable form must NOT appear in the credential helper.
-    expect(s).not.toContain("cat $TOKEN_FILE");
+  test("create/heal/destroy/static/stateless retain one env identity lifecycle", () => {
+    const configured = isolatedApp();
+    const env = target({ dbBackend: "none" });
+    const envUser = previewUserForEnv(configured, env.name);
+    const create = buildEnvCreateScript(configured, env);
+    const heal = buildEnvCreateScript(configured, env);
+    const destroy = buildEnvDestroyScript(configured, env);
+    const prep = buildHostPrepScript(configured, "operator");
+    const staticPrep = buildHostPrepScript(
+      { ...configured, kind: "static" },
+      "operator",
+    );
+
+    expect(create).toBe(heal);
+    expect(create).toContain(`sudo -H -u '${envUser}' /usr/bin/npm ci`);
+    expect(create).toContain("check 'env-user-v2'");
+    expect(prep).toContain("if [[ -e \"$record\" ]]; then verify_identity");
+    expect(prep).toContain("reconcile 'env-user-v2'");
+    expect(prep).toContain("old shared-user preview detected");
+    expect(destroy.indexOf("SAMOHOST_PHASE:unit-stop:ok")).toBeLessThan(
+      destroy.indexOf("SAMOHOST_PHASE:dir-remove:start"),
+    );
+    expect(destroy).toContain("clean \"$SAMOHOST_ENV_NAME\" 'env-user-v2'");
+    expect(staticPrep).toContain("UNITS=()");
+    expect(staticPrep).toContain("ENV_USER=$(ensure_identity \"$ENV_NAME\")");
+    expect(staticPrep).toContain('chown -R --no-dereference "$ENV_USER:$STATIC_READER_GROUP"');
+    expect(staticPrep).toContain('chmod -R u=rwX,g=rX,o= "$ENVS_ROOT/$ENV_NAME"');
+    expect(staticPrep).not.toContain('chmod 755 "$ENVS_ROOT/$ENV_NAME"');
   });
 
-  test("static env-create with appUser also uses sudo -u <appUser> for the clone", () => {
-    const s = buildEnvCreateScript({ ...appWithUser(), kind: "static" }, target({ dbBackend: "none" }));
-    expect(s).toContain(`sudo -u '${APP_USER}'`);
-    expect(s).toContain("/usr/bin/git");
-    expect(bashSyntaxOk(s)).toBe(true);
+  test("host-prep preserves then root-locks the raw template and installs a root helper", () => {
+    const prep = buildHostPrepScript(isolatedApp(), "operator");
+    const helper = previewHelperPathFor(isolatedApp());
+    expect(prep).toContain("chown root:root '/opt/samohost-fixture/envs.template.env'");
+    expect(prep).toContain("chmod 600 '/opt/samohost-fixture/envs.template.env'");
+    expect(prep).toContain("if [[ -e '/opt/samohost-fixture/envs.template.env' ]]");
+    expect(prep).toContain(`cat > '${helper}' <<'SAMOHOST_PREVIEW_HELPER'`);
+    expect(prep).toContain(`chown root:root '${helper}'`);
+    expect(prep).toContain(`chmod 750 '${helper}'`);
+    expect(prep).toContain("install -d -m 711 -o root -g root '/opt/samohost-fixture/envs'");
   });
 
-  test("preview template unit User= matches the app user, not the SSH user", () => {
-    const s = buildHostPrepScript(appWithUser(), "samo");
-    // The preview systemd instance runs as the app user so it can access files
-    // created by the sudo-u-appUser clone (owned by appUser).
-    expect(s).toContain(`User=${APP_USER}`);
-    // Must NOT set User= to the SSH user (samo).
-    // Use a line-anchored regex: "User=samo" would match as a substring of
-    // "User=samohost-fixture", so we need to ensure the SSH user's name ends
-    // the line (no further characters that would make it the app user).
-    expect(s).not.toMatch(/^User=samo$/m);
-    expect(bashSyntaxOk(s)).toBe(true);
+  test("helper accepts no caller path/command and validates an app-scoped preview id", () => {
+    const prep = buildHostPrepScript(isolatedApp(), "operator");
+    expect(prep).toContain('[[ "$value" == "${APP_NAME}-"* ]]');
+    expect(prep).toContain('ENV_DIR="$ENVS_ROOT/$ENV_NAME"');
+    expect(prep).toContain('[[ "$(readlink -f -- "$ENV_DIR")" == "$ENV_DIR" ]]');
+    expect(prep).toContain("safe_remove_env");
+    expect(prep).not.toContain("eval ");
+    expect(prep).not.toContain("bash -c");
   });
 
-  test("host-prep sudoers grants samo the SETENV: /usr/bin/git right to run as appUser", () => {
-    const s = buildHostPrepScript(appWithUser(), "samo");
-    // SETENV: is required so GIT_CONFIG_GLOBAL passes through sudo to git.
-    // Without it, sudo strips the env var and git falls back to the default
-    // global config, losing the safe.directory override.
-    expect(s).toContain(`samo ALL=(${APP_USER}) NOPASSWD: SETENV: /usr/bin/git`);
+  test("node lifecycle and runtime use previewUser, never prod appUser/SSH user", () => {
+    const previewUser = previewUserForEnv(isolatedApp(), target().name);
+    const previewPrefix = previewUser.match(/^(se-[0-9a-f]{10}-)/)?.[1];
+    expect(previewPrefix).toBeDefined();
+    const create = buildEnvCreateScript(isolatedApp(), target());
+    const prep = buildHostPrepScript(isolatedApp(), "operator");
+    expect(create).toContain(`sudo -H -u '${previewUser}' /usr/bin/npm ci`);
+    expect(create).toContain(
+      `sudo -H -u '${previewUser}' /usr/bin/bash -c 'export PORT=3100; npm run build'`,
+    );
+    expect(prep).toContain("User=samohost-preview-disabled");
+    expect(prep).toContain("Group=samohost-preview-disabled");
+    expect(prep).toContain("10-samohost-preview-identity.conf");
+    expect(prep).toContain("printf '[Service]\\nUser=%s\\nGroup=%s\\n'");
+    expect(prep).not.toContain(`User=${prodUser}`);
+    expect(prep).not.toContain(`operator ALL=(${prodUser})`);
+    expect(prep).toContain(`operator ALL=(${previewPrefix}*) NOPASSWD: /usr/bin/npm`);
+    expect(prep).toContain(`operator ALL=(${previewPrefix}*) NOPASSWD: /usr/bin/bash`);
   });
 
-  test("host-prep envs root is created owned by appUser (not sshUser) when appUser is set", () => {
-    // The envs root must be owned by appUser so that `sudo -u appUser git clone`
-    // can create the env subdirectory inside it. With sshUser ownership + mode 755,
-    // appUser has no write permission and clone fails with EACCES.
-    const s = buildHostPrepScript(appWithUser(), "samo");
-    const root = envsRoot(appWithUser());
+  test("compound build expressions cannot escape back to the SSH identity", () => {
+    const configured = isolatedApp();
+    configured.buildCmd = "cd apps/web && npm run build";
+    const s = buildEnvCreateScript(configured, target({ dbBackend: "none" }));
     expect(s).toContain(
-      `install -d -m 755 -o ${APP_USER} -g ${APP_USER} '${root}'`,
+      `/usr/bin/bash -c 'export PORT=3100; cd apps/web && npm run build'`,
     );
-    // sshUser (samo) must NOT be the owner when appUser is set.
-    expect(s).not.toContain(`install -d -m 755 -o samo -g samo '${root}'`);
-  });
-
-  test("backward compat: when appUser is absent, no sudo for git (old plain-git behavior)", () => {
-    // Existing AppRecords without appUser keep working — plain git is used,
-    // which matches the pre-#97 behavior (and only breaks on hosts where the
-    // app dir is owned by a different user, i.e. the bug being fixed).
-    const s = buildEnvCreateScript(app(), target());
-    // No git-specific sudo delegation when appUser is not set.
-    expect(s).not.toMatch(/sudo -u '[^']+'\s.*\/usr\/bin\/git/);
-    // Plain git calls are still present (the old CLONE_FN_LINES behavior).
-    expect(s).toContain("git clone");
-  });
-
-  test("backward compat: when appUser is absent, host-prep User= still uses sshUser", () => {
-    const s = buildHostPrepScript(app(), "agent");
-    expect(s).toContain("User=agent");
-    expect(s).not.toContain("User=undefined");
-    expect(bashSyntaxOk(s)).toBe(true);
-  });
-});
-
-// ---------------------------------------------------------------------------
-// Issue #98 follow-up: install + build phases must run as the app user when
-// appUser is registered.
-//
-// Root cause: #98 fixed the CLONE phase by wrapping `git` invocations in
-// `sudo -u <appUser>`, so the env dir is created owned by the app user.
-// However the INSTALL phase (lockfile-aware npm ci / npm install) and the
-// BUILD phase (app.buildCmd) still ran as the SSH admin user `samo` — which
-// has no write permission to the app-user-owned node_modules dir → EACCES →
-// install:fail → exit 1 → no .env/unit/Caddy written → CF 521.
-//
-// PROVEN: running the same commands as the app user completes ('env ready,
-// port 3101'); running as `samo` fails with EACCES.
-//
-// Fix:
-//   1. When appUser is set, wrap install (npm ci / npm install) in
-//      `sudo -u <appUser> /usr/bin/npm ...`.
-//   2. When appUser is set, wrap the build command similarly.
-//   3. Add a `sshUser ALL=(appUser) NOPASSWD: /usr/bin/npm` sudoers grant
-//      in buildHostPrepScript (the existing git grant does NOT cover npm).
-//
-// Secondary (latent — same function, #98 missed it):
-//   4. The fetch path in buildCloneFnLines (re-create of an existing env dir)
-//      uses `sudo -u appUser git fetch origin` WITHOUT the credential helper
-//      that the initial clone uses → private-repo re-fetch fails with
-//      'could not read Username'. Add the same literal-path credential.helper
-//      to the fetch invocation.
-// ---------------------------------------------------------------------------
-
-describe("#98 follow-up: install + build run as the app user; fetch path carries credential helper", () => {
-  const APP_USER = "samohost-fixture";
-  const TOKEN_FILE = "/opt/samohost-fixture/.gh-token";
-  const appWithUser = () =>
-    app({ appUser: APP_USER, appDir: "/opt/samohost-fixture/app" });
-
-  // (A) install phase ---------------------------------------------------------
-  test("(A-install) install phase emits sudo -u appUser /usr/bin/npm when appUser is set", () => {
-    const s = buildEnvCreateScript(appWithUser(), target());
-    // Slice out just the install phase block.
-    const installStart = s.indexOf("<<<SAMOHOST_PHASE:install:start>>>");
-    const buildStart = s.indexOf("<<<SAMOHOST_PHASE:build:start>>>");
-    expect(installStart).toBeGreaterThan(-1);
-    expect(buildStart).toBeGreaterThan(installStart);
-    const installBlock = s.slice(installStart, buildStart);
-    // Both npm-ci and npm-install paths must delegate to the app user so the
-    // write into the app-user-owned env dir does not EACCES.
-    expect(installBlock).toContain(`sudo -u '${APP_USER}' /usr/bin/npm ci`);
-    expect(installBlock).toContain(`sudo -u '${APP_USER}' /usr/bin/npm install`);
-    // The bare (non-sudoed) form must NOT appear: running npm as samo →
-    // EACCES when writing node_modules into the appUser-owned env dir.
-    expect(installBlock).not.toContain("then npm ci");
-    expect(installBlock).not.toContain("else npm install");
-    expect(bashSyntaxOk(s)).toBe(true);
-  });
-
-  // (A) build phase -----------------------------------------------------------
-  test("(A-build) build phase emits sudo -u appUser when appUser is set", () => {
-    // Use dbBackend:none so the next phase after build is envfile (no db-preflight
-    // in between), making the slice boundary unambiguous.
-    const s = buildEnvCreateScript(appWithUser(), target({ dbBackend: "none" }));
-    const buildStart = s.indexOf("<<<SAMOHOST_PHASE:build:start>>>");
-    const envfileStart = s.indexOf("<<<SAMOHOST_PHASE:envfile:start>>>");
-    expect(buildStart).toBeGreaterThan(-1);
-    expect(envfileStart).toBeGreaterThan(buildStart);
-    const buildBlock = s.slice(buildStart, envfileStart);
-    // The build command must run as the app user.
-    expect(buildBlock).toContain(`sudo -u '${APP_USER}'`);
-    // Full-path npm is required for the exact-path NOPASSWD grant to match.
-    expect(buildBlock).toContain("/usr/bin/npm");
-    expect(bashSyntaxOk(s)).toBe(true);
-  });
-
-  // (B) backward compat -------------------------------------------------------
-  test("(B) install + build are plain (no sudo -u) when appUser is absent", () => {
-    const s = buildEnvCreateScript(app(), target({ dbBackend: "none" }));
-    const installStart = s.indexOf("<<<SAMOHOST_PHASE:install:start>>>");
-    const envfileStart = s.indexOf("<<<SAMOHOST_PHASE:envfile:start>>>");
-    expect(installStart).toBeGreaterThan(-1);
-    const installBuildBlock = s.slice(installStart, envfileStart);
-    // No appUser → install + build remain unwrapped (pre-#98 behavior preserved
-    // for AppRecords that predate the appUser field).
-    expect(installBuildBlock).not.toContain("sudo -u");
-    expect(installBuildBlock).toContain("npm ci");
-    expect(bashSyntaxOk(s)).toBe(true);
-  });
-
-  // (C) host-prep sudoers -----------------------------------------------------
-  test("(C) host-prep sudoers includes /usr/bin/npm NOPASSWD grant for appUser", () => {
-    const s = buildHostPrepScript(appWithUser(), "samo");
-    // A single /usr/bin/npm grant covers npm ci, npm install, and npm run build.
-    // Without this grant the `sudo -u appUser /usr/bin/npm` calls emitted by
-    // the install + build phases fail at runtime with 'a password is required'.
-    expect(s).toContain(`samo ALL=(${APP_USER}) NOPASSWD: /usr/bin/npm`);
-    expect(bashSyntaxOk(s)).toBe(true);
-  });
-
-  // (D) fetch path credential helper ------------------------------------------
-  test("(D) fetch path in clone fn carries credential helper when appUser + tokenFile set", () => {
-    const s = buildEnvCreateScript(appWithUser(), target());
-    // Locate the clone function body (from the opening line to the closing '}'.
-    // Tests extract and run this function — closing brace is at column 0.
-    const cloneFnStart = s.indexOf("samohost_clone_env_dir()");
-    expect(cloneFnStart).toBeGreaterThan(-1);
-    const cloneFnEnd = s.indexOf("\n}", cloneFnStart) + 2;
-    const cloneFn = s.slice(cloneFnStart, cloneFnEnd);
-    // Confirm the fetch line is present (it is the re-create path).
-    const fetchIdx = cloneFn.indexOf("fetch origin");
-    expect(fetchIdx).toBeGreaterThan(-1);
-    // The 300-char window around the fetch invocation must carry the literal
-    // token file path inside the credential helper substring (not $TOKEN_FILE,
-    // which is not in scope inside the helper subprocess — proven bootstrap.ts
-    // §12 / samorev #83 pattern).
-    const context = cloneFn.slice(Math.max(0, fetchIdx - 300), fetchIdx + 300);
-    expect(context).toContain(`cat ${TOKEN_FILE}`);
-    // The clone paths already carry it — verify fetch is not the odd one out.
-    expect(cloneFn.indexOf(`cat ${TOKEN_FILE}`)).toBeGreaterThan(-1);
-    expect(bashSyntaxOk(s)).toBe(true);
-  });
-});
-
-// ---------------------------------------------------------------------------
-// #101: envfile phase must run ALL env-dir writes as appUser when appUser is
-// registered — the whack-a-mole root cause.
-//
-// Root cause: #98 fixed the CLONE phase (sudo -u appUser git), #100 fixed the
-// INSTALL + BUILD phases (sudo -u appUser /usr/bin/npm + build binary), but
-// the ENVFILE phase — which does cp, chmod, printf>>, install -m 600, grep>>,
-// mv, chmod on the app-user-owned env dir — still ran as the SSH user (samo).
-//
-// samorev SECURITY BLOCKER: the original fix (MR #101 GREEN) wrapped the entire
-// compose in `sudo -u appUser /usr/bin/bash -s << 'HEREDOC'`, which required a
-// broad `SETENV: /usr/bin/bash` sudoers grant — letting samo run ARBITRARY
-// commands as appUser. This is the security gap the tests below gate against.
-//
-// Fix: compose .env content in a samo-owned temp file (mktemp, /tmp), then
-// write it to the appUser-owned envfile via:
-//   sudo -u appUser /usr/bin/install -m 600 /dev/null <envfile>   (pre-create at 600)
-//   sudo -u appUser /usr/bin/tee <envfile> >/dev/null < tmpfile   (write content)
-//   sudo -u appUser /usr/bin/chmod 600 <envfile>                  (re-assert mode)
-// Sudoers grants are SCOPED to these specific non-executing binaries at the
-// envs-root path pattern — no /usr/bin/bash SETENV grant at all.
-//
-// Phase audit (buildEnvCreateScript, appUser set):
-//   port-check   — B (read-only + root Caddy/systemctl ops; no env-dir writes)
-//   clone        — A FIXED in #98 (sudo -u appUser git)
-//   install      — A FIXED in #100 (sudo -u appUser /usr/bin/npm)
-//   build        — A FIXED in #100 (sudoWrapBuildCmd)
-//   db-preflight — B (curl + CLI resolve; no env-dir writes)
-//   db           — B (sudo -u postgres psql/createdb/dropdb; no env-dir writes)
-//   envfile      — A FIX HERE (scoped tee/chmod/install as appUser; no bash)
-//   unit         — B (sudo systemctl enable/disable; no env-dir writes)
-//   vhost        — B (sudo tee /etc/caddy/... + sudo systemctl reload; no env-dir writes)
-//   health       — B (curl localhost; no writes)
-// ---------------------------------------------------------------------------
-describe("#101: envfile phase runs all env-dir writes as appUser (complete whack-a-mole audit)", () => {
-  const APP_USER = "samohost-fixture";
-  const appWithUser = () =>
-    app({ appUser: APP_USER, appDir: "/opt/samohost-fixture/app" });
-
-  // (A) envfile phase delegates to appUser via scoped tee/chmod — NOT via bash subshell.
-  // Security fix: the broad /usr/bin/bash SETENV grant is replaced by scoped
-  // /usr/bin/tee and /usr/bin/chmod grants; the compose runs as samo in a temp
-  // file, and only the final write uses sudo -u appUser.
-  for (const db of ["dblab", "template", "none"] as const) {
-    test(`(A-${db}) envfile phase uses sudo -u appUser /usr/bin/tee (not bash) when appUser is set (${db})`, () => {
-      const s = buildEnvCreateScript(
-        appWithUser(),
-        target({ dbBackend: db, dbName: "test_env_name" }),
-      );
-      const envfileStart = s.indexOf("<<<SAMOHOST_PHASE:envfile:start>>>");
-      const envfileOk = s.indexOf("<<<SAMOHOST_PHASE:envfile:ok>>>");
-      expect(envfileStart).toBeGreaterThan(-1);
-      expect(envfileOk).toBeGreaterThan(envfileStart);
-      const envfileBlock = s.slice(envfileStart, envfileOk);
-      // Final write to the envfile MUST use scoped tee as appUser.
-      expect(envfileBlock).toContain(`sudo -u '${APP_USER}' /usr/bin/tee`);
-      // Must NOT use a bash subshell (that required the broad SETENV bash grant).
-      expect(envfileBlock).not.toContain(`sudo -u '${APP_USER}' /usr/bin/bash`);
-      // The heredoc sentinel must be absent (no bash subshell).
-      expect(envfileBlock).not.toContain("SAMOHOST_ENVFILE_EOF");
-      // Valid bash after the change.
-      expect(bashSyntaxOk(s)).toBe(true);
-    });
-  }
-
-  // (B) backward compat: no sudo -u in envfile when appUser is absent
-  test("(B) envfile phase has no sudo -u delegation when appUser is absent (backward compat)", () => {
-    for (const db of ["dblab", "template", "none"] as const) {
-      const s = buildEnvCreateScript(app(), target({ dbBackend: db }));
-      const envfileStart = s.indexOf("<<<SAMOHOST_PHASE:envfile:start>>>");
-      const envfileOk = s.indexOf("<<<SAMOHOST_PHASE:envfile:ok>>>");
-      expect(envfileStart).toBeGreaterThan(-1);
-      const envfileBlock = s.slice(envfileStart, envfileOk);
-      // No appUser → envfile body is unchanged (plain cp/chmod/printf as SSH user).
-      expect(envfileBlock).not.toContain(`sudo -u`);
-      expect(bashSyntaxOk(s)).toBe(true);
-    }
-  });
-
-  // (C) host-prep sudoers must grant scoped /usr/bin/tee and /usr/bin/chmod for
-  //     appUser (tied to the envs-root path pattern), NOT the broad bash grant.
-  test("(C) host-prep sudoers grants scoped /usr/bin/tee + /usr/bin/chmod for appUser — NO bash SETENV grant", () => {
-    const prep = buildHostPrepScript(appWithUser(), "samo");
-    const root = envsRoot(appWithUser());
-    // Scoped tee grant: write-only to the env file path pattern.
-    expect(prep).toContain(`samo ALL=(${APP_USER}) NOPASSWD: /usr/bin/tee ${root}/*/.env`);
-    // Scoped chmod grant: set mode 600 on the env file.
-    expect(prep).toContain(`samo ALL=(${APP_USER}) NOPASSWD: /usr/bin/chmod 600 ${root}/*/.env`);
-    // The broad bash grant that let samo run arbitrary commands as appUser must be GONE.
-    expect(prep).not.toContain(`SETENV: /usr/bin/bash`);
-    expect(prep).not.toContain(`/usr/bin/bash`);
-    expect(bashSyntaxOk(prep)).toBe(true);
-  });
-
-  // (D) structural: every write to the appUser-owned envDir path must itself be
-  //     a sudo -u appUser call (tee, chmod, install) — no bare write by samo.
-  test("(D) structural: every env-dir write in the generated script is a sudo -u appUser scoped call", () => {
-    const envDir = "/opt/samohost-fixture/envs/field-record-1-feat-x";
-    for (const db of ["dblab", "template", "none"] as const) {
-      const s = buildEnvCreateScript(
-        appWithUser(),
-        target({ dbBackend: db, dbName: "test_env", name: "field-record-1-feat-x" }),
-      );
-      // Scan every line that references the envDir AND is a write operation.
-      const lines = s.split("\n");
-      for (let i = 0; i < lines.length; i++) {
-        const line = lines[i]!;
-        if (!line.includes(envDir)) continue;
-        // Classify: is this line a write into the env dir?
-        const isWriteOp =
-          /\bcp\b/.test(line) ||
-          /\bchmod\b/.test(line) ||
-          /\binstall\b/.test(line) ||
-          /\btee\b/.test(line) ||
-          (/\bmv\b/.test(line) && !line.trimStart().startsWith("#")) ||
-          (/>/.test(line) && !/^#/.test(line.trimStart()));
-        if (!isWriteOp) continue;
-        // Every write to the envDir must itself be a sudo -u appUser call.
-        // (With the temp-file approach the intermediate cp/grep/mv all operate on
-        // $tmpfile in /tmp; only install, tee, and chmod reference the literal
-        // envDir path, and all three go through sudo -u appUser.)
-        expect(
-          line,
-          `db=${db}, line ${i}: un-delegated write to envDir: ${JSON.stringify(line)}`,
-        ).toContain(`sudo -u '${APP_USER}'`);
-      }
-    }
-  });
-
-  // (E) envfile block contains the actual compose operations
-  //     (cp, chmod, PORT, SAMO_ENV, BASE_URL must all be visible).
-  test("(E) envfile block contains cp, chmod, PORT append, and BASE_URL append when appUser set", () => {
-    for (const db of ["dblab", "template", "none"] as const) {
-      const s = buildEnvCreateScript(
-        appWithUser(),
-        target({ dbBackend: db, dbName: "test_env", name: "field-record-1-feat-x" }),
-      );
-      const envfileStart = s.indexOf("<<<SAMOHOST_PHASE:envfile:start>>>");
-      const envfileOk = s.indexOf("<<<SAMOHOST_PHASE:envfile:ok>>>");
-      const block = s.slice(envfileStart, envfileOk);
-      expect(block).toContain("cp ");
-      expect(block).toContain("chmod 600");
-      expect(block, `db=${db}: PORT missing`).toContain("PORT=");
-      expect(block, `db=${db}: SAMO_ENV missing`).toContain("SAMO_ENV=preview");
-      expect(block, `db=${db}: BASE_URL missing`).toContain("BASE_URL=");
-    }
-  });
-
-  // (F) executed round-trip: extract the envfile phase `if` condition from the
-  //     generated script, stub out sudo -u appUser (run commands directly as
-  //     the test user — no privilege needed in a temp dir), and verify that the
-  //     resulting .env has correct content and mode 600.
-  test("(F) executed round-trip: tee-based envfile phase (none backend) produces correct .env with BASE_URL and PORT", () => {
-    const vhost = "field-record-1-feat-x.samo.cat";
-    const port = 3100;
-    const branch = "feat/x";
-    const s = buildEnvCreateScript(
-      appWithUser(),
-      target({ dbBackend: "none", vhost, port, branch }),
+    expect(s).not.toContain(
+      `/usr/bin/bash -c 'cd apps/web' && npm run build`,
     );
-    // The envfile phase must NOT use the heredoc mechanism any more.
-    expect(s).not.toContain("SAMOHOST_ENVFILE_EOF");
+  });
 
-    // Extract the envfile `if` condition (from `\nif ` after the start marker
-    // to the `\nthen` that closes it).
-    const startMarker = '<<<SAMOHOST_PHASE:envfile:start>>>';
-    const startIdx = s.indexOf(startMarker);
-    expect(startIdx).toBeGreaterThanOrEqual(0);
-    const ifIdx = s.indexOf("\nif ", startIdx);
-    expect(ifIdx).toBeGreaterThan(startIdx);
-    const thenIdx = s.indexOf("\nthen", ifIdx);
-    expect(thenIdx).toBeGreaterThan(ifIdx);
-    const ifCondition = s.slice(ifIdx + 1, thenIdx);
+  test("DBLab + safe env materialisation complete before untrusted install/build", () => {
+    const s = buildEnvCreateScript(isolatedApp(), target({ dbBackend: "dblab" }));
+    const dbOk = s.indexOf("<<<SAMOHOST_PHASE:db:ok>>>");
+    const envOk = s.indexOf("<<<SAMOHOST_PHASE:envfile:ok>>>");
+    const install = s.indexOf("<<<SAMOHOST_PHASE:install:start>>>");
+    const build = s.indexOf("<<<SAMOHOST_PHASE:build:start>>>");
+    expect(dbOk).toBeGreaterThan(-1);
+    expect(envOk).toBeGreaterThan(dbOk);
+    expect(install).toBeGreaterThan(envOk);
+    expect(build).toBeGreaterThan(install);
+    expect(s).not.toContain("envs.template.env");
+    expect(s).not.toContain(".gh-token");
+  });
 
-    // Sanity: the extracted condition contains the tee call.
-    expect(ifCondition).toContain("/usr/bin/tee");
-    expect(ifCondition).toContain("cp ");
-    expect(ifCondition).toContain("chmod 600");
+  test("static previews also clone/configure through the helper and execute no lifecycle", () => {
+    const staticApp = { ...isolatedApp(), kind: "static" as const };
+    const s = buildEnvCreateScript(staticApp, target({ dbBackend: "none" }));
+    const helper = previewHelperPathFor(staticApp);
+    expect(s).toContain(`sudo -n '${helper}' clone`);
+    expect(s).toContain(`sudo -n '${helper}' static-config`);
+    expect(s).not.toContain("SAMOHOST_PHASE:install");
+    expect(s).not.toContain("SAMOHOST_PHASE:build");
+    expect(s).not.toContain("SAMOHOST_PHASE:db:");
+  });
 
-    const dir = mkdtempSync(join(tmpdir(), "samohost-envfile-tee-"));
+  test("destroy uses the helper but retains legacy-owner remediation fallback", () => {
+    const s = buildEnvDestroyScript(isolatedApp(), target());
+    expect(s).toContain(`sudo -n '${previewHelperPathFor(isolatedApp())}' clean`);
+    expect(s).toContain('rm -rf "$SAMOHOST_ENV_DIR"');
+    expect(bashSyntaxOk(s)).toBe(true);
+  });
+
+  test("executed helper: stateless env materialisation exposes allowlisted values only", () => {
+    const stateless = isolatedApp();
+    stateless.dbBackend = "none";
+    stateless.envDbVars = [];
+    stateless.previewEnvAllowlist = ["NODE_ENV"];
+    const prep = buildHostPrepScript(stateless, "operator");
+    const rendered = prep.match(
+      /<<'SAMOHOST_PREVIEW_HELPER'\n([\s\S]*?)\nSAMOHOST_PREVIEW_HELPER/,
+    )?.[1];
+    expect(rendered).toBeDefined();
+    const dir = mkdtempSync(join(tmpdir(), "samohost-helper-exec-"));
     try {
-      const envDir = join(dir, "envdir");
-      const templateEnv = join(dir, "template.env");
-      writeFileSync(
-        templateEnv,
-        [
-          "NODE_ENV=production",
-          "BASE_URL=https://field-record-1.samo.team",
-          "DATABASE_URL=postgres://app_user:secret@localhost:5432/prod_db",
-          "",
-        ].join("\n"),
-        { mode: 0o600 },
-      );
-      // Patch literal paths generated by TypeScript to point at the temp dir.
-      const envDirLiteral = "/opt/samohost-fixture/envs/field-record-1-feat-x";
-      const templateLiteral = "/opt/samohost-fixture/envs.template.env";
-      const patchedCondition = ifCondition
-        .replace(new RegExp(envDirLiteral.replace(/\//g, "\\/"), "g"), envDir)
-        .replace(new RegExp(templateLiteral.replace(/\//g, "\\/"), "g"), templateEnv);
-
-      // Stub sudo -u appUser: strip the `sudo -u '<user>'` prefix and run the
-      // remaining command directly (the test user has permission on the temp dir).
-      const sudoStub = [
-        "sudo() {",
-        '  if [[ "$1" == "-u" ]]; then shift 2; fi',
-        '  "$@"',
-        "}",
-      ].join("\n");
-
-      const prog = [
-        "set -euo pipefail",
-        sudoStub,
-        `mkdir -p '${envDir}'`,
-        // The extracted condition is the `if ...;` part; add then/fi to complete it.
-        patchedCondition,
-        "then",
-        "  true",
-        "fi",
-      ].join("\n");
-
-      const syntaxCheck = spawnSync("bash", ["-n"], { input: prog, encoding: "utf8" });
-      expect(syntaxCheck.status, `syntax check failed:\n${syntaxCheck.stderr}`).toBe(0);
-      const r = spawnSync("bash", ["-c", prog], { encoding: "utf8" });
-      if (r.status !== 0) {
-        console.error("tee round-trip stderr:", r.stderr);
-      }
-      expect(r.status).toBe(0);
-      const env = readFileSync(join(envDir, ".env"), "utf8");
-      expect(env).toContain(`PORT=${port}`);
-      expect(env).toContain("SAMO_ENV=preview");
-      expect(env).toContain(`SAMO_BRANCH=${branch}`);
-      expect(env.match(/^BASE_URL=/gm)).toHaveLength(1);
-      expect(env).toContain(`BASE_URL=https://${vhost}`);
-      expect(env).not.toContain("field-record-1.samo.team");
-      expect(statSync(join(envDir, ".env")).mode & 0o777).toBe(0o600);
+      const root = join(dir, "envs");
+      const raw = join(dir, "raw.env");
+      const envName = `${stateless.name}-feat-x`;
+      mkdirSync(join(root, envName), { recursive: true, mode: 0o700 });
+      writeFileSync(raw, [
+        "NODE_ENV=production",
+        "DATABASE_URL=postgresql://prod:secret@prod/prod",
+        "PROD_SECRET=do-not-copy",
+        "BASE_URL=https://prod.example",
+        "PORT=3000",
+        "",
+      ].join("\n"), { mode: 0o600 });
+      const owner = spawnSync("id", ["-un"], { encoding: "utf8" }).stdout.trim();
+      const group = spawnSync("id", ["-gn"], { encoding: "utf8" }).stdout.trim();
+      const helper = rendered!
+        .replace(/^ENVS_ROOT=.*$/m, `ENVS_ROOT='${root}'`)
+        .replace(/^RAW_TEMPLATE=.*$/m, `RAW_TEMPLATE='${raw}'`)
+        .replaceAll("== root:root", `== ${owner}:${group}`)
+        .replace(
+          /verify_identity\(\) \{[\s\S]*?\n\}\nensure_identity\(\)/,
+          `verify_identity() { printf '%s\\n' '${owner}'; }\nensure_identity()`,
+        )
+        .replace(
+          /assert_root\(\) \{[\s\S]*?\n\}\nassert_template\(\)/,
+          "assert_root() { return 0; }\nassert_template()",
+        )
+        // Ownership transfer is covered structurally in generated host-prep;
+        // this non-root execution harness focuses on filtering/atomic output.
+        .replace("umask 077", "umask 077\nchown() { return 0; }");
+      expect(bashSyntaxOk(helper)).toBe(true);
+      const run = spawnSync("bash", ["-c", helper, "samohost-preview", "envfile",
+        envName, "feat/x", `${envName}.samo.cat`, "none", "-", "PORT=3100"], {
+        encoding: "utf8",
+      });
+      expect(run.status, run.stderr).toBe(0);
+      expect(run.stdout).toBe("");
+      const finalEnv = readFileSync(join(root, envName, ".env"), "utf8");
+      expect(finalEnv).toContain("NODE_ENV=production");
+      expect(finalEnv).toContain("PORT=3100");
+      expect(finalEnv).toContain("SAMO_ENV=preview");
+      expect(finalEnv).toContain("SAMO_BRANCH=feat/x");
+      expect(finalEnv).toContain(`BASE_URL=https://${envName}.samo.cat`);
+      expect(finalEnv).not.toContain("PROD_SECRET");
+      expect(finalEnv).not.toContain("DATABASE_URL");
+      expect(finalEnv).not.toContain("prod.example");
+      expect(statSync(join(root, envName, ".env")).mode & 0o777).toBe(0o600);
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
   });
 
-  // (G) dblab backend: SAMOHOST_DB_PORT is already in the outer bash (set in the
-  //     db phase by samohost_clone_port). With the tee approach the rewire function
-  //     runs in the outer bash directly — no KEY=val sudo prefix is needed.
-  test("(G) dblab backend: envfile phase has NO KEY=val sudo prefix for SAMOHOST_DB_PORT (already in outer bash)", () => {
-    const s = buildEnvCreateScript(
-      appWithUser(),
-      target({ dbBackend: "dblab", dbName: "test_clone" }),
-    );
-    const envfileStart = s.indexOf("<<<SAMOHOST_PHASE:envfile:start>>>");
-    const envfileOk = s.indexOf("<<<SAMOHOST_PHASE:envfile:ok>>>");
-    const block = s.slice(envfileStart, envfileOk);
-    // With tee approach SAMOHOST_DB_PORT is already available in the outer bash
-    // (set by `SAMOHOST_DB_PORT="$(samohost_clone_port)"` in the db phase).
-    // The KEY=val forwarding prefix was only needed for the inner bash subshell.
-    expect(block).not.toContain(`SAMOHOST_DB_PORT="$SAMOHOST_DB_PORT"`);
-    // The rewire function IS called in the envfile block (as outer-bash call).
-    expect(block).toContain("samohost_rewire_db_hostport");
-    expect(bashSyntaxOk(s)).toBe(true);
+  test("executed adversarial probe: safe preview env readable; raw prod artifacts are not", () => {
+    const dir = mkdtempSync(join(tmpdir(), "samohost-preview-boundary-"));
+    try {
+      const previewEnv = join(dir, "preview.env");
+      const rawTemplate = join(dir, "raw-template.env");
+      const prodEnv = join(dir, "prod.env");
+      const token = join(dir, ".gh-token");
+      const sibling = join(dir, "sibling-secrets.env");
+      writeFileSync(previewEnv, "NODE_ENV=production\nSAMO_ENV=preview\n", { mode: 0o600 });
+      for (const p of [rawTemplate, prodEnv, token, sibling]) {
+        writeFileSync(p, "PROD_SECRET=must-not-be-readable\n", { mode: 0o000 });
+      }
+      const probe = spawnSync("bash", ["-c", [
+        "set -euo pipefail",
+        `test -r '${previewEnv}'`,
+        `test ! -r '${rawTemplate}'`,
+        `test ! -r '${prodEnv}'`,
+        `test ! -r '${token}'`,
+        `test ! -r '${sibling}'`,
+        `grep -q '^SAMO_ENV=preview$' '${previewEnv}'`,
+      ].join("\n")], { encoding: "utf8" });
+      expect(probe.status, probe.stderr).toBe(0);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 
-  // (H) template backend: the rewire function is called in the envfile block (it
-  //     is already defined in the outer bash from the db phase). No heredoc.
-  test("(H) template backend: envfile block calls samohost_rewire_db_vars (no heredoc sentinel)", () => {
-    const dbName = "feat_x_db";
-    const s = buildEnvCreateScript(
-      appWithUser(),
-      target({ dbBackend: "template", dbName }),
-    );
-    // No heredoc — the tee approach builds content in the outer bash.
-    expect(s).not.toContain("SAMOHOST_ENVFILE_EOF");
-    const envfileStart = s.indexOf("<<<SAMOHOST_PHASE:envfile:start>>>");
-    const envfileOk = s.indexOf("<<<SAMOHOST_PHASE:envfile:ok>>>");
-    const block = s.slice(envfileStart, envfileOk);
-    // The rewire function is called in the envfile block (outer bash already
-    // defines it with SAMOHOST_DB_NAME and SAMOHOST_ENV_DB_VARS from the db phase).
-    expect(block).toContain("samohost_rewire_db_vars");
-    expect(bashSyntaxOk(s)).toBe(true);
+  test("executed two-preview probe: A gets EACCES for B checkout/env/secrets/process", () => {
+    if (process.platform !== "linux" ||
+      spawnSync("sudo", ["-n", "true"]).status !== 0) return;
+
+    const boundaryApp = isolatedApp();
+    boundaryApp.name = `iso-${process.pid}`;
+    const envA = `${boundaryApp.name}-a`;
+    const envB = `${boundaryApp.name}-b`;
+    const userA = previewUserForEnv(boundaryApp, envA);
+    const userB = previewUserForEnv(boundaryApp, envB);
+    const dir = mkdtempSync(join(tmpdir(), "samohost-two-preview-"));
+    const checkoutA = join(dir, "checkout-a");
+    const checkoutB = join(dir, "checkout-b");
+    const secretsA = join(dir, "secrets-a");
+    const secretsB = join(dir, "secrets-b");
+    let processB = "";
+    const sudo = (args: string[]) => spawnSync("sudo", ["-n", ...args], {
+      encoding: "utf8",
+    });
+    const expectSudo = (args: string[]) => {
+      const result = sudo(args);
+      expect(result.status, result.stderr).toBe(0);
+      return result;
+    };
+    const writeAs = (user: string, path: string, value: string) =>
+      expectSudo([
+        "-u", user, "/bin/sh", "-c",
+        "umask 077; printf '%s' \"$2\" > \"$1\"",
+        "samohost-isolation-test", path, value,
+      ]);
+
+    try {
+      expect(userA).not.toBe(userB);
+      expectSudo([
+        "/usr/sbin/useradd", "--system", "--user-group", "--no-create-home",
+        "--home-dir", join(dir, "home-a"), "--shell", "/usr/sbin/nologin", userA,
+      ]);
+      expectSudo([
+        "/usr/sbin/useradd", "--system", "--user-group", "--no-create-home",
+        "--home-dir", join(dir, "home-b"), "--shell", "/usr/sbin/nologin", userB,
+      ]);
+      expectSudo(["/usr/bin/install", "-d", "-m", "711", "-o", "root", "-g", "root", dir]);
+      for (const [owner, path] of [
+        [userA, checkoutA], [userA, secretsA],
+        [userB, checkoutB], [userB, secretsB],
+      ]) {
+        expectSudo(["/usr/bin/install", "-d", "-m", "700", "-o", owner!, "-g", owner!, path!]);
+      }
+      writeAs(userA, join(checkoutA, "checkout.txt"), "A checkout\n");
+      writeAs(userA, join(checkoutA, ".env"), "A_ENV=1\n");
+      writeAs(userA, join(secretsA, "secrets.env"), "A_SECRET=1\n");
+      writeAs(userB, join(checkoutB, "checkout.txt"), "B checkout\n");
+      writeAs(userB, join(checkoutB, ".env"), "B_ENV=1\n");
+      writeAs(userB, join(secretsB, "secrets.env"), "B_SECRET=1\n");
+
+      const started = expectSudo([
+        "-u", userB, "/bin/sh", "-c",
+        "/usr/bin/setsid /usr/bin/sleep 60 >/dev/null 2>&1 & printf '%s\\n' \"$!\"",
+      ]);
+      processB = started.stdout.trim();
+      expect(processB).toMatch(/^[0-9]+$/);
+      expectSudo(["/bin/kill", "-0", processB]);
+
+      const probeScript = [
+        "set -u",
+        "cat \"$1/checkout.txt\" >/dev/null",
+        "cat \"$1/.env\" >/dev/null",
+        "cat \"$2/secrets.env\" >/dev/null",
+        "set +e",
+        "cat \"$3/checkout.txt\" >/dev/null 2>\"$1/read.err\"; read_rc=$?",
+        "printf x >> \"$3/checkout.txt\" 2>\"$1/write.err\"; write_rc=$?",
+        "cat \"$3/.env\" >/dev/null 2>\"$1/env.err\"; env_rc=$?",
+        "cat \"$4/secrets.env\" >/dev/null 2>\"$1/secrets.err\"; secrets_rc=$?",
+        "kill -0 \"$5\" 2>\"$1/probe.err\"; probe_rc=$?",
+        "cat \"/proc/$5/environ\" >/dev/null 2>\"$1/process-read.err\"; process_read_rc=$?",
+        "kill -TERM \"$5\" 2>\"$1/signal.err\"; signal_rc=$?",
+        "set -e",
+        "test \"$read_rc\" -ne 0 && test \"$write_rc\" -ne 0",
+        "test \"$env_rc\" -ne 0 && test \"$secrets_rc\" -ne 0",
+        "test \"$probe_rc\" -ne 0 && test \"$process_read_rc\" -ne 0 && test \"$signal_rc\" -ne 0",
+        "grep -qi 'permission denied' \"$1/read.err\"",
+        "grep -qi 'permission denied' \"$1/process-read.err\"",
+        "grep -Eqi 'operation not permitted|permission denied' \"$1/signal.err\"",
+      ].join("\n");
+      const probe = sudo([
+        "-u", userA, "/bin/bash", "-c", probeScript,
+        "samohost-isolation-test", checkoutA, secretsA, checkoutB, secretsB, processB,
+      ]);
+      expect(probe.status, `${probe.stdout}\n${probe.stderr}`).toBe(0);
+      expectSudo(["/bin/kill", "-0", processB]);
+    } finally {
+      if (processB !== "") sudo(["/bin/kill", "-KILL", processB]);
+      sudo(["/usr/bin/pkill", "-KILL", "-u", userA]);
+      sudo(["/usr/bin/pkill", "-KILL", "-u", userB]);
+      sudo(["/usr/sbin/userdel", userA]);
+      sudo(["/usr/sbin/userdel", userB]);
+      sudo(["/usr/sbin/groupdel", userA]);
+      sudo(["/usr/sbin/groupdel", userB]);
+      sudo(["/bin/rm", "-rf", "--", dir]);
+    }
+  });
+
+  test("generated node/static/host-prep programs remain valid bash", () => {
+    expect(bashSyntaxOk(buildEnvCreateScript(isolatedApp(), target()))).toBe(true);
+    expect(bashSyntaxOk(buildEnvCreateScript({ ...isolatedApp(), kind: "static" }, target({ dbBackend: "none" })))).toBe(true);
+    const prep = buildHostPrepScript(isolatedApp(), "operator");
+    expect(bashSyntaxOk(prep)).toBe(true);
+    const helper = prep.match(
+      /<<'SAMOHOST_PREVIEW_HELPER'\n([\s\S]*?)\nSAMOHOST_PREVIEW_HELPER/,
+    )?.[1];
+    expect(helper).toBeDefined();
+    expect(bashSyntaxOk(helper!)).toBe(true);
   });
 });
-
-// ---------------------------------------------------------------------------
-// Custom-domain vhost scripts (domain add / domain rm)
-// ---------------------------------------------------------------------------
-
 describe("buildCustomDomainVhostScript", () => {
   const nodeApp = (): AppRecord => ({
     id: "app-1",

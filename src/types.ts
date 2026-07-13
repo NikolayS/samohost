@@ -205,6 +205,15 @@ export interface AppSpec {
    */
   envDbVars?: string[];
   /**
+   * Exact env-var names that may be copied from the production env template
+   * into a preview. Required for every non-static app that declares envFile.
+   * An allowlist is used instead of a denylist because preview code is
+   * untrusted and new production secrets must not silently flow into it.
+   */
+  previewEnvAllowlist?: string[];
+  /** Additional names to strip after allowlist selection (defence in depth). */
+  previewEnvUnset?: string[];
+  /**
    * Env-var name holding the NON-superuser connection URL for the RLS probe
    * (issue #2: field-record's is APP_DATABASE_URL, while DATABASE_URL is the
    * superuser URL — probing via the wrong var falsely rolls back healthy

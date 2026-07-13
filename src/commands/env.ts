@@ -58,6 +58,11 @@ import type {
 } from "../types.ts";
 import { CloudflareDns, type DnsProviderPort } from "../dns/cloudflare.ts";
 import { ensurePreviewDns, removePreviewDns } from "../dns/ensure.ts";
+import {
+  assertStoredPreviewBackend,
+  resolvePreviewDbBackend,
+  validatePreviewEnvIsolation,
+} from "../preview/db-policy.ts";
 
 /** Default preview domain for the SOLO plan (issue #117). */
 export const DEFAULT_PREVIEW_DOMAIN = "samo.cat";
@@ -346,8 +351,26 @@ export function runEnvPlan(
     return 1;
   }
 
+  if (!input.destroy) {
+    try {
+      resolvePreviewDbBackend(r.app, input.db);
+      validatePreviewEnvIsolation(r.app);
+    } catch (e) {
+      err(`error: ${e instanceof Error ? e.message : String(e)}`);
+      return 1;
+    }
+  }
+
   // Prefer the persisted record (stable name/port) when the env exists.
   const existing = envStore.get(r.vm.id, r.app.name, input.branch);
+  if (!input.destroy && existing !== undefined) {
+    try {
+      assertStoredPreviewBackend(r.app, existing.dbBackend);
+    } catch (e) {
+      err(`error: ${e instanceof Error ? e.message : String(e)}`);
+      return 1;
+    }
+  }
   const target = existing
     ? targetFromRecord(existing)
     : deriveTarget(
@@ -665,6 +688,14 @@ export async function runEnvCreate(
   const r = resolve(vmStore, appStore, input.vm, input.app, err);
   if (r === undefined) return 1;
 
+  try {
+    resolvePreviewDbBackend(r.app, input.db);
+    validatePreviewEnvIsolation(r.app);
+  } catch (e) {
+    err(`error: ${e instanceof Error ? e.message : String(e)}`);
+    return 1;
+  }
+
   // Fail-loud: dblab and template backends rewrite the DATABASE_URL in the
   // clone/template env. Without databaseUrlEnv declared on the app, env-create
   // would push a script that cannot perform the credentialed URL rewrite —
@@ -687,6 +718,14 @@ export async function runEnvCreate(
   }
 
   const existing = envStore.get(r.vm.id, r.app.name, input.branch);
+  if (existing !== undefined) {
+    try {
+      assertStoredPreviewBackend(r.app, existing.dbBackend);
+    } catch (e) {
+      err(`error: ${e instanceof Error ? e.message : String(e)}`);
+      return 1;
+    }
+  }
   let target: EnvScriptTarget | { error: string };
   if (existing) {
     // Re-create reuses the recorded name/port (idempotent re-run after a failed

@@ -50,6 +50,11 @@ import type { HealSummary, HealResult } from "../preview/heal.ts";
 import type { EnvIdleGcDeps } from "./env-idle.ts";
 import type { AppRecord, EnvDbBackend, EnvRecord, VmRecord } from "../types.ts";
 import type { SpawnResult } from "../ssh/runner.ts";
+import {
+  assertStoredPreviewBackend,
+  resolvePreviewDbBackend,
+  validatePreviewEnvIsolation,
+} from "../preview/db-policy.ts";
 
 // ---------------------------------------------------------------------------
 // Public helpers
@@ -69,7 +74,8 @@ import type { SpawnResult } from "../ssh/runner.ts";
  * stated explicitly in the AppSpec.
  */
 export function previewDbBackendFor(app: AppRecord): EnvDbBackend {
-  return app.previewDbBackend ?? (app.dbBackend === "none" ? "none" : "dblab");
+  validatePreviewEnvIsolation(app);
+  return resolvePreviewDbBackend(app);
 }
 
 // ---------------------------------------------------------------------------
@@ -1415,6 +1421,22 @@ export function defaultTriggerDeps(opts: TriggerDepsOpts = {}): TriggerDeps {
       vmRecord: VmRecord,
       cycleOpts: { heal: boolean; prPreviews: boolean },
     ): Promise<{ heal: HealSummary; prPreview: PrPreviewSummary }> => {
+      // Fail closed before constructing a probe, heal, or existing-preview
+      // script. Legacy AppRecords can predate the preview env allowlist and
+      // would otherwise reach the batched path without calling
+      // previewDbBackendFor() (which is only needed for a brand-new target).
+      validatePreviewEnvIsolation(app);
+
+      // Audit every stored preview before any PR listing, probe, cap, or
+      // unchanged-SHA filter. Legacy records may predate prNumber provenance,
+      // and manual or closed-PR envs are still unsafe when a database-backed
+      // app recorded them with none/template. Explicit `env destroy`
+      // intentionally does not call this guard, so operators can still remove
+      // an unsafe record and recreate it with DBLab.
+      for (const stored of envStore.listFor(vmRecord.id, app.name)) {
+        assertStoredPreviewBackend(app, stored.dbBackend);
+      }
+
       // The injectable remote for counting in tests; prod uses the real runner.
       // NOTE: we import the factory here but build the WORK remote lazily after
       // computing the item count so it gets a proportionally scaled timeout
@@ -1614,6 +1636,7 @@ export function defaultTriggerDeps(opts: TriggerDepsOpts = {}): TriggerDeps {
         const isNewEnv = existing === undefined;
 
         if (existing !== undefined) {
+          assertStoredPreviewBackend(app, existing.dbBackend);
           targetForPr = localTargetFromRecord(existing);
         } else {
           // New env: derive target using store-only allocation (natural allocation).
@@ -1651,9 +1674,15 @@ export function defaultTriggerDeps(opts: TriggerDepsOpts = {}): TriggerDeps {
           // and either the squatter will be gone, or the cycle will fail again. We
           // do NOT try a different port — that would silently let the PR land on an
           // unexpected port while the squatter is still bound on the intended one.
-          if (phase1LivePorts.has(t.port)) {
+          const allocatedListenerPorts = t.ports !== undefined
+            ? Object.values(t.ports)
+            : [t.port];
+          const squattedPort = allocatedListenerPorts.find((port) =>
+            phase1LivePorts.has(port)
+          );
+          if (squattedPort !== undefined) {
             const errMsg =
-              `port ${t.port} is already bound on ${vmRecord.name} ` +
+              `listener port ${squattedPort} is already bound on ${vmRecord.name} ` +
               `(squatted by a foreign process per Phase-1 probe); ` +
               `skipping this PR — will retry next cycle after squatter vacates`;
             process.stderr.write(`samohost: batchedVmCycle: ${errMsg}\n`);
@@ -1674,6 +1703,9 @@ export function defaultTriggerDeps(opts: TriggerDepsOpts = {}): TriggerDeps {
               branch: pr.headRef,
               name: targetForPr.name,
               port: targetForPr.port,
+              ...(targetForPr.ports !== undefined
+                ? { ports: targetForPr.ports }
+                : {}),
               vhost: targetForPr.vhost,
               dbBackend: targetForPr.dbBackend,
               ...(targetForPr.dbName !== undefined ? { dbName: targetForPr.dbName } : {}),

@@ -18,6 +18,7 @@
 import { parse as parseToml } from "smol-toml";
 import type { TomlValueWithoutBigInt } from "smol-toml";
 import type { ListenerSpec, ServiceSpec, RouteSpec } from "../types.ts";
+import { resolvePreviewDbBackend } from "../preview/db-policy.ts";
 
 /** A plain TOML table returned by smol-toml's `parse()` (no bigint). */
 type TomlTableLike = Record<string, TomlValueWithoutBigInt>;
@@ -46,6 +47,8 @@ export interface AppManifest {
   mainHost?: string;
   rlsUrlVar?: string;
   envDbVars?: string[];
+  previewEnvAllowlist?: string[];
+  previewEnvUnset?: string[];
   /** Maps to assertions.rlsNonSuperuser when true. */
   rlsNonSuperuser?: boolean;
   /**
@@ -147,6 +150,8 @@ const APP_KEYS = new Set<string>([
   "mainHost",
   "rlsUrlVar",
   "envDbVars",
+  "previewEnvAllowlist",
+  "previewEnvUnset",
   "rlsNonSuperuser",
   // Issue #36: serve kind ("node" | "static")
   "kind",
@@ -734,7 +739,25 @@ export function parseSamohostToml(text: string): ParseTomlResult {
   const rlsUrlVar = optionalString(raw, "rlsUrlVar", errors);
   const appUser = optionalString(raw, "appUser", errors);
   const envDbVars = optionalStringArray(raw, "envDbVars", errors);
+  const previewEnvAllowlist = optionalStringArray(raw, "previewEnvAllowlist", errors);
+  const previewEnvUnset = optionalStringArray(raw, "previewEnvUnset", errors);
   const rlsNonSuperuser = optionalBoolean(raw, "rlsNonSuperuser", errors);
+
+  for (const [field, values] of [
+    ["previewEnvAllowlist", previewEnvAllowlist],
+    ["previewEnvUnset", previewEnvUnset],
+  ] as const) {
+    if (values === undefined) continue;
+    const seen = new Set<string>();
+    for (const value of values) {
+      if (!PORTENV_RE.test(value)) {
+        errors.push(`${field} entry "${value}" must match ^[A-Z_][A-Z0-9_]*$`);
+      } else if (seen.has(value)) {
+        errors.push(`duplicate ${field} entry: "${value}"`);
+      }
+      seen.add(value);
+    }
+  }
 
   // issue #36: optional enum field (must be "node" | "static" when present)
   let kind: "node" | "static" | undefined;
@@ -878,6 +901,44 @@ export function parseSamohostToml(text: string): ParseTomlResult {
           `declare which env var holds the DB connection URL so preview env-create can rewrite it per env ` +
           `(e.g. databaseUrlEnv = "DATABASE_URL")`,
       );
+    }
+  }
+
+  // databaseUrlEnv is the primary-URL compatibility field, while generated
+  // DBLab rewiring loops over envDbVars. They must describe one coherent set
+  // or the primary URL could keep production credentials.
+  if (databaseUrlEnv !== undefined) {
+    const effectiveDbVars = new Set(envDbVars ?? ["DATABASE_URL"]);
+    if (!effectiveDbVars.has(databaseUrlEnv)) {
+      errors.push(
+        `databaseUrlEnv "${databaseUrlEnv}" must also be present in envDbVars ` +
+          `so every preview DB URL is rewritten with clone-only credentials`,
+      );
+    }
+  }
+
+  // Preview envs execute untrusted branch code. Never copy a production env
+  // template wholesale: require an explicit allowlist and ensure every DB URL
+  // needed for clone rewiring survives the filter.
+  if (kind !== "static" && envFile !== undefined && previewEnvAllowlist === undefined) {
+    errors.push(
+      `"previewEnvAllowlist" is required for non-static apps with envFile — ` +
+        `preview code must not inherit the production environment wholesale`,
+    );
+  }
+  if (previewEnvAllowlist !== undefined) {
+    const allowed = new Set(previewEnvAllowlist);
+    const requiredDbVars = new Set(envDbVars ?? []);
+    if (databaseUrlEnv !== undefined) requiredDbVars.add(databaseUrlEnv);
+    for (const name of requiredDbVars) {
+      if (!allowed.has(name)) {
+        errors.push(`${name} must be present in previewEnvAllowlist because it is a declared preview DB URL`);
+      }
+    }
+    for (const name of previewEnvUnset ?? []) {
+      if (requiredDbVars.has(name)) {
+        errors.push(`${name} cannot be in previewEnvUnset because it is required for DBLab rewiring`);
+      }
     }
   }
 
@@ -1131,6 +1192,8 @@ export function parseSamohostToml(text: string): ParseTomlResult {
     ...(rlsUrlVar !== undefined ? { rlsUrlVar } : {}),
     ...(appUser !== undefined ? { appUser } : {}),
     ...(envDbVars !== undefined ? { envDbVars } : {}),
+    ...(previewEnvAllowlist !== undefined ? { previewEnvAllowlist } : {}),
+    ...(previewEnvUnset !== undefined ? { previewEnvUnset } : {}),
     ...(rlsNonSuperuser !== undefined ? { rlsNonSuperuser } : {}),
     ...(kind !== undefined ? { kind } : {}),
     ...(dbBackend !== undefined ? { dbBackend } : {}),
@@ -1143,6 +1206,15 @@ export function parseSamohostToml(text: string): ParseTomlResult {
     ...(secrets !== undefined ? { secrets } : {}),
     ...(databaseUrlEnv !== undefined ? { databaseUrlEnv } : {}),
   };
+
+  try {
+    resolvePreviewDbBackend(app);
+  } catch (e) {
+    return {
+      ok: false,
+      errors: [e instanceof Error ? e.message : String(e)],
+    };
+  }
 
   return {
     ok: true,

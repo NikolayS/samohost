@@ -26,6 +26,7 @@ import { describe, expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
 import {
   buildEnvCreateScript,
+  buildHostPrepScript,
   type EnvScriptTarget,
 } from "../src/env/script.ts";
 import type { AppRecord } from "../src/types.ts";
@@ -130,20 +131,19 @@ function bashOk(script: string): boolean {
 const BUILD_MARKER = "<<<SAMOHOST_PHASE:build:start>>>";
 
 /**
- * Extract portEnv → allocatedPort from the envfile strip-then-append lines.
+ * Extract portEnv → allocatedPort from the root helper's envfile call.
  *
- * The envfile phase emits (for each listener, in the &&-chain):
- *   printf 'PORTENV=PORT\n' >> "$SAMOHOST_ENV_DIR/.env"
+ * The envfile phase passes one validated `PORTENV=PORT` argument per listener
+ * to the root-only materialisation boundary.
  *
  * We read those to get the single source of truth for what the .env will carry.
  */
 function extractEnvfilePortValues(script: string): Map<string, number> {
   const result = new Map<string, number>();
-  // Matches: printf 'PORTENV=DIGITS\n'
-  // In the generated bash string, \n is a literal backslash-n.
-  const re = /printf\s+'([A-Z_][A-Z0-9_]*)=(\d+)\\n'/g;
+  const envfileCall = script.split("\n").find((line) => line.includes(" envfile ")) ?? "";
+  const re = /'([A-Z_][A-Z0-9_]*)=(\d+)'/g;
   let m: RegExpExecArray | null;
-  while ((m = re.exec(script)) !== null) {
+  while ((m = re.exec(envfileCall)) !== null) {
     result.set(m[1]!, parseInt(m[2]!, 10));
   }
   return result;
@@ -198,35 +198,24 @@ describe("ppb-ms: multi-service portEnv shell vars before build phase", () => {
     }
   });
 
-  test("ppb-ms-3: build phase can reference APP_API_PORT as a shell var (extract-and-exec)", () => {
-    // Verifies the isolation-leak is closed: $APP_API_PORT is set before the
-    // build phase marker, so a buildCmd like
-    //   APP_API_ORIGIN=http://127.0.0.1:${APP_API_PORT} npm run build
-    // gets the per-env port (3102), not the default 9000.
-    //
-    // We extract the bare-assignment lines from the pre-build header and run
-    // them in a minimal bash probe that echoes $APP_API_PORT.
-    const script = buildEnvCreateScript(multiApp(), multiTarget());
-    const buildPos = script.indexOf(BUILD_MARKER);
-    expect(buildPos).toBeGreaterThan(-1);
+  test("ppb-ms-3: isolated build shell receives APP_API_PORT (extract-and-exec)", () => {
+    // The build now runs in a sudo-created preview-user shell. Outer shell
+    // locals do not cross that boundary, so execute the actual generated
+    // inner payload and prove the allocated port was baked into it.
+    const probeApp = multiApp({
+      buildCmd: 'printf "APP_API_PORT=%s\\n" "$APP_API_PORT"',
+    });
+    const script = buildEnvCreateScript(probeApp, multiTarget());
+    const buildLine = script.split("\n").find((line) =>
+      line.includes("/usr/bin/bash -c") && line.includes("APP_API_PORT")
+    );
+    expect(buildLine).toBeDefined();
+    const payload = buildLine!.match(/\/usr\/bin\/bash -c '([^']+)'/)?.[1];
+    expect(payload).toBeDefined();
 
-    const preBuild = script.slice(0, buildPos);
-
-    // Collect all bare-assignment lines (VARNAME='VALUE').
-    const assignmentLines = preBuild
-      .split("\n")
-      .filter((l) => /^[A-Z_][A-Z0-9_]*='[^']*'$/.test(l.trim()));
-
-    const probe = [
-      "#!/usr/bin/env bash",
-      "set -euo pipefail",
-      ...assignmentLines,
-      'echo "APP_API_PORT=${APP_API_PORT}"',
-    ].join("\n");
-
-    const res = spawnSync("bash", ["-c", probe], { encoding: "utf8" });
+    const res = spawnSync("bash", ["-c", payload!], { encoding: "utf8" });
     expect(res.status).toBe(0);
-    expect(res.stdout.trim()).toContain("APP_API_PORT=3102");
+    expect(res.stdout.trim()).toBe("APP_API_PORT=3102");
   });
 });
 
@@ -263,20 +252,17 @@ describe("ppb-ss: single-service (legacy) PORT before build phase", () => {
     expect(hasBareAssignment(preBuild, "PORT", String(envfilePort))).toBe(true);
   });
 
-  test("ppb-ss-3: legacy envfile strip-then-append for PORT is still present (no regression)", () => {
+  test("ppb-ss-3: legacy PORT still crosses the strip-then-append helper boundary", () => {
     // The envfile phase must STILL strip-then-append PORT for the legacy app
     // (operator template may carry stale prod PORT=3000; allocated preview port
     // must win in .env). Emitting PORT in the pre-build header must not remove
     // or skip the envfile strip-then-append.
     const script = buildEnvCreateScript(legacyApp(), legacyTarget());
 
-    // Envfile strip: grep -vE '^PORT=' strips stale prod value from template.
-    // The generated line is: grep -vE '^PORT=' (with sq-quoting of the pattern).
-    expect(script).toContain("'^PORT='");
-
-    // Envfile append: printf 'PORT=3100\n' appends the allocated preview port.
-    // The \n in the printf arg is a literal backslash-n (bash single-quoted string).
-    expect(script).toContain("'PORT=3100\\n'");
+    expect(script).toContain("'PORT=3100'");
+    const prep = buildHostPrepScript(legacyApp(), "operator");
+    expect(prep).toContain('strip_key "$VAR" "$OUT"');
+    expect(prep).toContain("printf '%s=%s\\n' \"$VAR\" \"$VALUE\"");
   });
 });
 

@@ -59,6 +59,7 @@ import { describe, expect, test } from "bun:test";
 import {
   buildEnvCreateScript,
   buildEnvDestroyScript,
+  buildHostPrepScript,
   type EnvScriptTarget,
 } from "../src/env/script.ts";
 import {
@@ -283,6 +284,38 @@ describe("A. deriveTarget — multi-service port allocation", () => {
     expect(second.ports?.["ingest"]).toBe(DEFAULT_POOL.base + 5);
   });
 
+  test("ms-dt-2b: another app's secondary listener reserves that port VM-wide", () => {
+    const app = multiApp();
+    const existing: EnvRecord[] = [];
+
+    // Primary ports consume 3100..3109. The final record's secondary listener
+    // owns 3110 — the incident shape that previously let samograph choose 3110
+    // as its base because only EnvRecord.port was considered.
+    for (let offset = 0; offset < 10; offset++) {
+      existing.push(envRecord({
+        id: `other-${offset}`,
+        appName: "another-app",
+        branch: `feat/other-${offset}`,
+        name: `another-app-${offset}`,
+        port: DEFAULT_POOL.base + offset,
+        ...(offset === 9
+          ? { ports: { web: DEFAULT_POOL.base + offset, "app-api": DEFAULT_POOL.base + 10 } }
+          : {}),
+      }));
+    }
+
+    const result = deriveTarget(app, "feat/x", "none", "samo.cat", existing, DEFAULT_POOL);
+    if ("error" in result) throw new Error(result.error);
+
+    expect(result.port).toBe(DEFAULT_POOL.base + 11);
+    expect(Object.values(result.ports ?? {})).not.toContain(DEFAULT_POOL.base + 10);
+    expect(result.ports).toEqual({
+      web: DEFAULT_POOL.base + 11,
+      "ws-hub": DEFAULT_POOL.base + 12,
+      ingest: DEFAULT_POOL.base + 13,
+    });
+  });
+
   test("ms-dt-3: pool exhaustion when N ports can't be satisfied", () => {
     const app = multiApp();
     // Fill all but 2 slots (pool has 100 ports; a 3-listener app needs 3, but only 2 remain)
@@ -326,17 +359,15 @@ describe("B. envfile strip-append per listener portEnv", () => {
     const t = multiTarget();
     const script = buildEnvCreateScript(app, t);
 
-    // The script must strip-then-append WS_HUB_PORT with the allocated value (3101)
-    // Strip: grep -vE '^WS_HUB_PORT=' (removes stale prod value 8788)
-    expect(script).toContain("WS_HUB_PORT");
-    // Must include a grep-vE strip for WS_HUB_PORT
-    expect(script).toMatch(/grep\s+-v.*WS_HUB_PORT/);
-    // Must append the allocated port value
-    expect(script).toContain("WS_HUB_PORT=3101");
+    // Create passes only the allocated values to the root envfile helper.
+    expect(script).toContain("'WS_HUB_PORT=3101'");
+    expect(script).toContain("'INGEST_PORT=3102'");
 
-    // Same for INGEST_PORT
-    expect(script).toMatch(/grep\s+-v.*INGEST_PORT/);
-    expect(script).toContain("INGEST_PORT=3102");
+    // The installed helper owns the strip-then-append operation, so stale
+    // values from the root-only template cannot survive into the final file.
+    const prep = buildHostPrepScript(app, "operator");
+    expect(prep).toContain('strip_key "$VAR" "$OUT"');
+    expect(prep).toContain("printf '%s=%s\\n' \"$VAR\" \"$VALUE\"");
   });
 
   test("ms-ef-2: PORT strip-append present for web listener", () => {
@@ -344,9 +375,9 @@ describe("B. envfile strip-append per listener portEnv", () => {
     const t = multiTarget();
     const script = buildEnvCreateScript(app, t);
 
-    // The web listener (portEnv=PORT) must be handled
-    expect(script).toMatch(/grep\s+-v.*PORT=/);
-    expect(script).toContain("PORT=3100");
+    // The web listener (portEnv=PORT) must be passed to the helper.
+    expect(script).toContain("'PORT=3100'");
+    expect(buildHostPrepScript(app, "operator")).toContain('strip_key "$VAR" "$OUT"');
   });
 });
 
@@ -855,7 +886,7 @@ describe("J. EnvCreateReport.ports populated", () => {
       vmStore.upsert(vmRec);
 
       const appStore = new AppStore();
-      const appRec = multiApp();
+      const appRec = multiApp({ dbBackend: "none" });
       appStore.upsert(appRec);
 
       const envStore = new EnvStore();
@@ -909,7 +940,7 @@ describe("J. EnvCreateReport.ports populated", () => {
       vmStore.upsert(vm());
 
       const appStore = new AppStore();
-      appStore.upsert(multiApp());
+      appStore.upsert(multiApp({ dbBackend: "none" }));
 
       const envStore = new EnvStore();
       const deps = makeDeps(CREATE_OK);
