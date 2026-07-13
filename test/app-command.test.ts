@@ -607,6 +607,7 @@ describe("app register --kind integration (temp store)", () => {
         healthUrl: "http://localhost:3000/health",
         rlsNonSuperuser: false,
         kind: "static",
+        staticRoot: "dist",
       },
       { json: false },
       vmStore,
@@ -617,6 +618,7 @@ describe("app register --kind integration (temp store)", () => {
     expect(code).toBe(0);
     const rec = appStore.get("vm-1111", "gc1");
     expect(rec?.kind).toBe("static");
+    expect(rec?.staticRoot).toBe("dist");
   });
 
   test("--from-toml with kind in the toml persists it on the AppRecord", () => {
@@ -629,11 +631,12 @@ describe("app register --kind integration (temp store)", () => {
         'name = "gc1"',
         'repo = "samo-agent/gc1"',
         'branch = "main"',
-        'appDir = "/opt/gc1/dist"',
+        'appDir = "/opt/gc1/app"',
         'buildCmd = "npm run build"',
         'healthUrl = "http://localhost:3000/health"',
         'serviceUnit = "gc1"',
         'kind = "static"',
+        'staticRoot = "dist"',
       ].join("\n"),
     );
     const { runAppRegisterFromToml } = require("../src/commands/app.ts");
@@ -649,6 +652,7 @@ describe("app register --kind integration (temp store)", () => {
     expect(code).toBe(0);
     const rec = appStore.get("vm-1111", "gc1");
     expect(rec?.kind).toBe("static");
+    expect(rec?.staticRoot).toBe("dist");
   });
 });
 

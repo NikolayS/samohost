@@ -427,16 +427,17 @@ describe("buildDeployScript — static path (kind='static')", () => {
       git(["config", "user.name", "Samohost Test"], seed);
       git(["config", "user.email", "samohost@example.invalid"], seed);
 
-      writeFileSync(join(seed, "index.html"), "old\n");
-      git(["add", "index.html"], seed);
+      mkdirSync(join(seed, "dist"));
+      writeFileSync(join(seed, "dist", "index.html"), "old\n");
+      git(["add", "dist/index.html"], seed);
       git(["commit", "-m", "old"], seed);
       const oldSha = git(["rev-parse", "HEAD"], seed);
 
-      writeFileSync(join(seed, "index.html"), "release one\n");
+      writeFileSync(join(seed, "dist", "index.html"), "release one\n");
       git(["commit", "-am", "release one"], seed);
       const firstSha = git(["rev-parse", "HEAD"], seed);
 
-      writeFileSync(join(seed, "index.html"), "release two\n");
+      writeFileSync(join(seed, "dist", "index.html"), "release two\n");
       git(["commit", "-am", "release two"], seed);
       const secondSha = git(["rev-parse", "HEAD"], seed);
       git(["remote", "add", "origin", origin], seed);
@@ -446,7 +447,7 @@ describe("buildDeployScript — static path (kind='static')", () => {
       git(["clone", origin, appDir]);
       git(["checkout", "--detach", oldSha], appDir);
       const originalHead = git(["rev-parse", "HEAD"], appDir);
-      const originalContent = readFileSync(join(appDir, "index.html"), "utf8");
+      const originalContent = readFileSync(join(appDir, "dist", "index.html"), "utf8");
 
       mkdirSync(join(caddyDir, "sites.d"), { recursive: true });
       mkdirSync(binDir, { recursive: true });
@@ -488,6 +489,7 @@ describe("buildDeployScript — static path (kind='static')", () => {
 
       const releaseApp = staticApp({
         appDir,
+        staticRoot: "dist",
         mainListen: "cp-http80",
         releaseTagPattern: "v*",
         releaseTagFormat: "date",
@@ -563,7 +565,7 @@ describe("buildDeployScript — static path (kind='static')", () => {
       // Every attempt fetched and staged elsewhere; the original checkout was
       // never reset or rewritten before any candidate health check.
       expect(git(["rev-parse", "HEAD"], appDir)).toBe(originalHead);
-      expect(readFileSync(join(appDir, "index.html"), "utf8")).toBe(originalContent);
+      expect(readFileSync(join(appDir, "dist", "index.html"), "utf8")).toBe(originalContent);
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }

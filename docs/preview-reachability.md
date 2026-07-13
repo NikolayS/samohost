@@ -71,6 +71,12 @@ for the static `file_server` vhost (same `--resolve` SNI technique). The same
 external 200 gate then applies to the public URL. The first external probe may
 need the retry window for the same CF edge-cert reason.
 
+Static builds whose public files live below the repository root declare a
+repo-relative `staticRoot` (for example `staticRoot = "dist"`). Preview and
+production Caddy roots, `config.js`, and release identity then live in that
+directory. Samohost resolves it after checkout and refuses missing paths or
+symlinks that escape the checkout.
+
 ## DNS prerequisite
 
 `env create` ensures the per-preview A record **before** pushing the create

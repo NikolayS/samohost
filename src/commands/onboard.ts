@@ -440,6 +440,7 @@ Refs: NikolayS/samohost#127
     healthUrl: app.healthUrl,
     rlsNonSuperuser: app.rlsNonSuperuser === true,
     ...(app.kind              !== undefined ? { kind:              app.kind }              : {}),
+    ...(app.staticRoot        !== undefined ? { staticRoot:        app.staticRoot }        : {}),
     ...(app.migrateCmd        !== undefined ? { migrateCmd:        app.migrateCmd }        : {}),
     ...(app.seedCmd           !== undefined ? { seedCmd:           app.seedCmd }           : {}),
     ...(app.envFile           !== undefined ? { envFile:           app.envFile }           : {}),

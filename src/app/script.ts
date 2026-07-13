@@ -43,6 +43,7 @@
  */
 
 import type { AppRecord } from "../types.ts";
+import { staticRootOf } from "./static-root.ts";
 
 /** Marker prefix the parser keys on. */
 export const PHASE_PREFIX = "<<<SAMOHOST_PHASE:";
@@ -95,6 +96,7 @@ function marker(phase: PhaseName, status: "start" | "ok" | "fail"): string {
  * intended for `bash -s` over a single SSH connection.
  */
 export function buildDeployScript(app: AppRecord, target: DeployTarget): string {
+  const staticRoot = staticRootOf(app);
   // rlsUrlVar is interpolated into bash as `${<name>:-}` — it must be a valid
   // identifier (the CLI validates too; this guards hand-edited state files).
   if (
@@ -130,6 +132,9 @@ export function buildDeployScript(app: AppRecord, target: DeployTarget): string 
   const staticStagedCaddyfile = "/etc/caddy/.samohost-next-Caddyfile";
   const appBase = app.appDir.replace(/\/+$/, "").split("/").slice(0, -1).join("/");
   const staticReleasesDir = `${appBase}/releases`;
+  const staticServedDir = staticRoot === undefined
+    ? "${SAMOHOST_CANDIDATE_DIR}"
+    : "${SAMOHOST_STATIC_DIR}";
   const appDir = sq(app.appDir);
   const unit = sq(app.serviceUnit);
   const healthUrl = sq(app.healthUrl);
@@ -151,7 +156,12 @@ export function buildDeployScript(app: AppRecord, target: DeployTarget): string 
     `SAMOHOST_BRANCH=${branch}`,
     `SAMOHOST_UNIT=${unit}`,
     `SAMOHOST_HEALTH_URL=${healthUrl}`,
-    ...(app.kind === "static" ? [`SAMOHOST_RELEASE_TAG=${sq(releaseIdentity)}`] : []),
+    ...(app.kind === "static"
+      ? [
+          `SAMOHOST_RELEASE_TAG=${sq(releaseIdentity)}`,
+          `SAMOHOST_STATIC_ROOT=${sq(staticRoot ?? "")}`,
+        ]
+      : []),
     "",
     'cd "$SAMOHOST_APP_DIR"',
     "",
@@ -200,9 +210,14 @@ export function buildDeployScript(app: AppRecord, target: DeployTarget): string 
       'SAMOHOST_CANDIDATE_DIR=""',
       `SAMOHOST_RELEASES_DIR=${sq(staticReleasesDir)}`,
       'SAMOHOST_PREVIOUS_RELEASE_DIR=""',
+      'SAMOHOST_PREVIOUS_ROUTE_ROOT=""',
       'SAMOHOST_VHOST_BACKUP="$(mktemp)"',
       `if [[ -f ${sq(staticMainSnippet!)} ]]; then cat ${sq(staticMainSnippet!)} > "$SAMOHOST_VHOST_BACKUP"; SAMOHOST_OLD_VHOST_PRESENT=1; else SAMOHOST_OLD_VHOST_PRESENT=0; fi`,
-      'if [[ "$SAMOHOST_OLD_VHOST_PRESENT" == "1" ]]; then SAMOHOST_PREVIOUS_RELEASE_DIR=$(sed -n \'s/^[[:space:]]*root \\* "\\(.*\\)"$/\\1/p\' "$SAMOHOST_VHOST_BACKUP" | head -n 1); fi',
+      'if [[ "$SAMOHOST_OLD_VHOST_PRESENT" == "1" ]]; then SAMOHOST_PREVIOUS_ROUTE_ROOT=$(sed -n \'s/^[[:space:]]*root \\* "\\(.*\\)"$/\\1/p\' "$SAMOHOST_VHOST_BACKUP" | head -n 1); SAMOHOST_PREVIOUS_RELEASE_DIR=$(sed -n \'s/^[[:space:]]*# samohost-worktree "\\(.*\\)"$/\\1/p\' "$SAMOHOST_VHOST_BACKUP" | head -n 1); fi',
+      'if [[ -z "$SAMOHOST_PREVIOUS_RELEASE_DIR" && -n "$SAMOHOST_PREVIOUS_ROUTE_ROOT" ]]; then',
+      '  if [[ -z "$SAMOHOST_STATIC_ROOT" ]]; then SAMOHOST_PREVIOUS_RELEASE_DIR="$SAMOHOST_PREVIOUS_ROUTE_ROOT";',
+      '  elif [[ "$SAMOHOST_PREVIOUS_ROUTE_ROOT" == */"$SAMOHOST_STATIC_ROOT" ]]; then SAMOHOST_PREVIOUS_RELEASE_DIR="${SAMOHOST_PREVIOUS_ROUTE_ROOT%/$SAMOHOST_STATIC_ROOT}"; fi',
+      'fi',
       ...(isStaticReleaseChannel
         ? [
           'SAMOHOST_BASE_CHANGED=0',
@@ -264,7 +279,7 @@ export function buildDeployScript(app: AppRecord, target: DeployTarget): string 
       ...(app.mainHost !== undefined
         ? [`  rb_code=$(curl -s -k -H ${sq(`Host: ${app.mainHost}`)} -o /dev/null -w "%{http_code}" --max-time 10 ${app.mainListen === "cp-http80" ? "http" : "https"}://127.0.0.1/ || echo 000)`]
         : ['  rb_code=$(curl -s -k -o /dev/null -w "%{http_code}" --max-time 10 "${SAMOHOST_HEALTH_URL}" || echo 000)']),
-      '  if [[ "$rb_ok" == "1" && "$rb_code" == "200" && -n "${SAMOHOST_CANDIDATE_DIR:-}" && -d "$SAMOHOST_CANDIDATE_DIR" ]]; then',
+      '  if [[ -n "${SAMOHOST_CANDIDATE_DIR:-}" && -d "$SAMOHOST_CANDIDATE_DIR" ]]; then',
       '    git -C "$SAMOHOST_APP_DIR" worktree remove --force "$SAMOHOST_CANDIDATE_DIR" || rm -rf -- "$SAMOHOST_CANDIDATE_DIR" || rb_ok=0',
       "  fi",
       '  git -C "$SAMOHOST_APP_DIR" worktree prune || true',
@@ -319,7 +334,11 @@ export function buildDeployScript(app: AppRecord, target: DeployTarget): string 
       "# --- checkout: stage target in a separate versioned detached worktree ---",
       "# The currently served appDir is never reset or otherwise rewritten.",
       marker("checkout", "start"),
-      'if /usr/bin/install -d -m 0755 "$SAMOHOST_RELEASES_DIR" && SAMOHOST_CANDIDATE_DIR=$(mktemp -d "${SAMOHOST_RELEASES_DIR}/${SAMOHOST_SHA}.candidate.XXXXXX") && rmdir "$SAMOHOST_CANDIDATE_DIR" && git -C "$SAMOHOST_APP_DIR" worktree add --detach "$SAMOHOST_CANDIDATE_DIR" "$SAMOHOST_SHA" && chmod 0755 "$SAMOHOST_CANDIDATE_DIR"; then',
+      'if /usr/bin/install -d -m 0755 "$SAMOHOST_RELEASES_DIR" && SAMOHOST_CANDIDATE_DIR=$(mktemp -d "${SAMOHOST_RELEASES_DIR}/${SAMOHOST_SHA}.candidate.XXXXXX") && rmdir "$SAMOHOST_CANDIDATE_DIR" && git -C "$SAMOHOST_APP_DIR" worktree add --detach "$SAMOHOST_CANDIDATE_DIR" "$SAMOHOST_SHA" && chmod 0755 "$SAMOHOST_CANDIDATE_DIR" && SAMOHOST_CANDIDATE_REAL=$(realpath -e "$SAMOHOST_CANDIDATE_DIR"); then',
+      '  if [[ -n "$SAMOHOST_STATIC_ROOT" ]]; then SAMOHOST_STATIC_CANDIDATE="$SAMOHOST_CANDIDATE_DIR/$SAMOHOST_STATIC_ROOT"; else SAMOHOST_STATIC_CANDIDATE="$SAMOHOST_CANDIDATE_DIR"; fi',
+      '  if ! SAMOHOST_STATIC_DIR=$(realpath -e "$SAMOHOST_STATIC_CANDIDATE"); then echo "staticRoot does not exist: $SAMOHOST_STATIC_ROOT" >&2; rollback; fi',
+      '  case "$SAMOHOST_STATIC_DIR" in "$SAMOHOST_CANDIDATE_REAL"|"$SAMOHOST_CANDIDATE_REAL"/*) ;; *) echo "staticRoot escapes the candidate checkout: $SAMOHOST_STATIC_ROOT" >&2; rollback ;; esac',
+      '  if [[ ! -d "$SAMOHOST_STATIC_DIR" || ! -f "$SAMOHOST_STATIC_DIR/index.html" ]]; then echo "staticRoot must be a directory containing index.html: $SAMOHOST_STATIC_ROOT" >&2; rollback; fi',
       `  ${marker("checkout", "ok")}`,
       "else",
       `  ${marker("checkout", "fail")}`,
@@ -354,8 +373,8 @@ export function buildDeployScript(app: AppRecord, target: DeployTarget): string 
       "# --- static release identity + routing checkpoint ---",
       "# Publish identity inside the private candidate first. chmod 0644 is",
       "# mandatory: Caddy must be able to read /version.json after cutover.",
-      'if ! SAMOHOST_VERSION_NEXT=$(mktemp "${SAMOHOST_CANDIDATE_DIR}/.version.next.XXXXXX"); then rollback; fi',
-      'if printf \'{"version":"%s","tag":"%s","sha":"%s","environment":"production"}\\n\' "$SAMOHOST_RELEASE_TAG" "$SAMOHOST_RELEASE_TAG" "$SAMOHOST_SHA" > "$SAMOHOST_VERSION_NEXT" && chmod 0644 "$SAMOHOST_VERSION_NEXT" && [[ -r "$SAMOHOST_VERSION_NEXT" ]] && [[ "$(stat -c \'%a\' "$SAMOHOST_VERSION_NEXT")" == "644" ]] && /usr/bin/mv -f "$SAMOHOST_VERSION_NEXT" "${SAMOHOST_CANDIDATE_DIR}/version.json" && [[ -r "${SAMOHOST_CANDIDATE_DIR}/version.json" ]] && [[ "$(stat -c \'%a\' "${SAMOHOST_CANDIDATE_DIR}/version.json")" == "644" ]]; then :; else rollback; fi',
+      `if ! SAMOHOST_VERSION_NEXT=$(mktemp "${staticServedDir}/.version.next.XXXXXX"); then rollback; fi`,
+      `if printf '{"version":"%s","tag":"%s","sha":"%s","environment":"production"}\\n' "$SAMOHOST_RELEASE_TAG" "$SAMOHOST_RELEASE_TAG" "$SAMOHOST_SHA" > "$SAMOHOST_VERSION_NEXT" && chmod 0644 "$SAMOHOST_VERSION_NEXT" && [[ -r "$SAMOHOST_VERSION_NEXT" ]] && [[ "$(stat -c '%a' "$SAMOHOST_VERSION_NEXT")" == "644" ]] && /usr/bin/mv -f "$SAMOHOST_VERSION_NEXT" "${staticServedDir}/version.json" && [[ -r "${staticServedDir}/version.json" ]] && [[ "$(stat -c '%a' "${staticServedDir}/version.json")" == "644" ]]; then :; else rollback; fi`,
       ...(isStaticReleaseChannel
         ? [
           "# On the first tagged activation only, stage removal of one legacy",
@@ -460,7 +479,8 @@ export function buildDeployScript(app: AppRecord, target: DeployTarget): string 
       `sudo /usr/bin/rm -f ${sq(staticStagedSnippet!)} || rollback`,
       `sudo /usr/bin/tee ${sq(staticStagedSnippet!)} >/dev/null <<CADDY || rollback`,
       `${address} {`,
-      `\troot * "\${SAMOHOST_CANDIDATE_DIR}"`,
+      `\t# samohost-worktree "\${SAMOHOST_CANDIDATE_DIR}"`,
+      `\troot * "${staticServedDir}"`,
       `\ttry_files {path} /index.html`,
       `\tfile_server`,
       `\tencode gzip`,

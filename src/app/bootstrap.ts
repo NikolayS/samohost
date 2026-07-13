@@ -73,6 +73,7 @@
 
 import type { AppRecord } from "../types.ts";
 import { buildFirewallLines, type HostPrepFirewallOpts } from "../env/script.ts";
+import { staticRootOf } from "./static-root.ts";
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -212,6 +213,7 @@ export function buildHostBootstrapScript(
   app: AppRecord,
   opts: HostBootstrapOptions,
 ): string {
+  const staticRoot = staticRootOf(app);
   const isStatic = app.kind === "static";
   const isStaticReleaseChannel = isStatic && app.releaseTagPattern !== undefined;
 
@@ -246,6 +248,7 @@ export function buildHostBootstrapScript(
   const rlsUrlVar = app.rlsUrlVar ?? "APP_DATABASE_URL";
 
   const lines: string[] = [];
+  const staticBranchVhostLines: string[] = [];
   const push = (...l: string[]): void => {
     for (const x of l) lines.push(x);
   };
@@ -667,17 +670,27 @@ export function buildHostBootstrapScript(
     const siteAddress = app.mainListen === "cp-http80"
       ? `http://${app.mainHost}`
       : app.mainHost;
-    push(
+    staticBranchVhostLines.push(
       `# ---------------------------------------------------------------------------`,
       `# §9b. Production Caddy file_server vhost for ${sq(app.mainHost)}.`,
       `#      tls internal: CF Full-mode proxying; ACME cannot complete behind CF :443.`,
-      `#      file_server: serves the static checkout at ${sq(app.appDir)} directly.`,
+      `#      file_server: serves ${sq(staticRoot ?? "the repository root")} after containment checks.`,
       `#      Idempotent: overwrite with deterministic content.`,
       `# ---------------------------------------------------------------------------`,
       "",
-      `cat > ${sq(caddySitePath)} <<'CADDY_SITE'`,
+      ...(staticRoot !== undefined
+        ? [
+            `SAMOHOST_STATIC_ROOT=${sq(staticRoot)}`,
+            'SAMOHOST_CHECKOUT_REAL=$(realpath -e "$APP_DIR") || { echo "static checkout is missing" >&2; exit 1; }',
+            'SAMOHOST_STATIC_CANDIDATE="$APP_DIR/$SAMOHOST_STATIC_ROOT"',
+            'SAMOHOST_STATIC_DIR=$(realpath -e "$SAMOHOST_STATIC_CANDIDATE") || { echo "staticRoot does not exist: $SAMOHOST_STATIC_ROOT" >&2; exit 1; }',
+            'case "$SAMOHOST_STATIC_DIR" in "$SAMOHOST_CHECKOUT_REAL"|"$SAMOHOST_CHECKOUT_REAL"/*) ;; *) echo "staticRoot escapes the checkout: $SAMOHOST_STATIC_ROOT" >&2; exit 1 ;; esac',
+            '[[ -d "$SAMOHOST_STATIC_DIR" && -f "$SAMOHOST_STATIC_DIR/index.html" ]] || { echo "staticRoot must contain index.html: $SAMOHOST_STATIC_ROOT" >&2; exit 1; }',
+          ]
+        : []),
+      `cat > ${sq(caddySitePath)} <<${staticRoot === undefined ? "'CADDY_SITE'" : "CADDY_SITE"}`,
       `${siteAddress} {`,
-      `  root * ${app.appDir}`,
+      `  root * ${staticRoot === undefined ? app.appDir : '"${SAMOHOST_STATIC_DIR}"'}`,
       `  try_files {path} /index.html`,
       `  file_server`,
       `  encode gzip`,
@@ -686,7 +699,7 @@ export function buildHostBootstrapScript(
       `CADDY_SITE`,
       `caddy validate --config /etc/caddy/Caddyfile`,
       `/usr/bin/systemctl reload caddy || /usr/bin/systemctl restart caddy`,
-      `echo "Caddy: static file_server vhost ${app.mainHost} -> ${app.appDir} written."`,
+      `echo "Caddy: static file_server vhost ${app.mainHost} -> ${staticRoot === undefined ? app.appDir : "$SAMOHOST_STATIC_DIR"} written."`,
       "",
     );
   }
@@ -906,6 +919,12 @@ export function buildHostBootstrapScript(
     `fi`,
     "",
   );
+
+  // A static branch-channel route is activated only after §12 has produced a
+  // checkout and the runtime realpath containment guard above can inspect it.
+  if (staticBranchVhostLines.length > 0) {
+    push(...staticBranchVhostLines);
+  }
 
   // ---- section 13: extended self-check PASS/FAIL table (A1 + A2 rows) ------
   // §13 self-check is kind-aware: static apps omit node/pg/unit/db rows.

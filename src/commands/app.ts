@@ -19,6 +19,7 @@ import { spawnSync } from "node:child_process";
 import { checkCiGreen, type CiStatus } from "../app/cigate.ts";
 import { parseDeployOutcome, type DeployOutcome } from "../app/parse.ts";
 import { buildDeployScript } from "../app/script.ts";
+import { validateStaticRoot } from "../app/static-root.ts";
 import {
   CANONICAL_RELEASE_CI_WORKFLOW,
   isCanonicalReleaseCiWorkflow,
@@ -68,6 +69,8 @@ export interface AppRegisterInput {
    * Absent = node; all existing AppRecords are valid.
    */
   kind?: "node" | "static";
+  /** Repo-relative output directory served by Caddy for static apps. */
+  staticRoot?: string;
   /**
    * Persistent DB backend for this app's own production database.
    * `"none"` = app carries no database; preview envs must skip all DB phases.
@@ -239,6 +242,12 @@ export function runAppRegister(
     err("error: a static release-channel app requires mainHost for an owned production vhost");
     return 1;
   }
+  try {
+    validateStaticRoot(input.staticRoot, input.kind);
+  } catch (error) {
+    err(`error: ${error instanceof Error ? error.message : String(error)}`);
+    return 1;
+  }
 
   // Fix 6a: validate service topology on the programmatic path too.
   // The TOML path runs the same check via parseSamohostToml. Without this guard,
@@ -271,6 +280,7 @@ export function runAppRegister(
     healthUrl: input.healthUrl,
     serviceUnit: input.serviceUnit,
     ...(input.kind !== undefined ? { kind: input.kind } : {}),
+    ...(input.staticRoot !== undefined ? { staticRoot: input.staticRoot } : {}),
     ...(input.mainHost !== undefined ? { mainHost: input.mainHost } : {}),
     ...(input.migrateCmd !== undefined ? { migrateCmd: input.migrateCmd } : {}),
     ...(input.seedCmd !== undefined ? { seedCmd: input.seedCmd } : {}),
@@ -399,6 +409,7 @@ export function runAppRegisterFromToml(
     healthUrl: app.healthUrl,
     rlsNonSuperuser: app.rlsNonSuperuser === true,
     ...(app.kind !== undefined ? { kind: app.kind } : {}),
+    ...(app.staticRoot !== undefined ? { staticRoot: app.staticRoot } : {}),
     ...(app.migrateCmd !== undefined ? { migrateCmd: app.migrateCmd } : {}),
     ...(app.seedCmd !== undefined ? { seedCmd: app.seedCmd } : {}),
     ...(app.envFile !== undefined ? { envFile: app.envFile } : {}),

@@ -13,6 +13,7 @@
 
 import { readFileSync } from "node:fs";
 import type { Provider, ProvisionSpec } from "./types.ts";
+import { validateStaticRoot } from "./app/static-root.ts";
 import { runPreview } from "./commands/preview.ts";
 import {
   runAdopt,
@@ -267,6 +268,8 @@ app register options (write an AppRecord; offline, no network):
                              vhost (dotted lowercase DNS, e.g. app.samo.team)
   --kind <node|static>       serve kind (default: node; static = file_server vhost,
                              no service/db/build install)
+  --static-root <path>       repo-relative directory served for static apps
+                             (for example dist; default: repository root)
   --env-file <path>          remote env file; sourced (read-only) by the deploy
                              script before install — NEVER read/written by samohost
   --env-db-var <NAME>        env var whose DB URL must point at the per-env db in
@@ -1379,6 +1382,7 @@ function parseAppRegister(
   let rlsNonSuperuser = false;
   let rlsUrlVar: string | undefined;
   let kind: "node" | "static" | undefined;
+  let staticRoot: string | undefined;
   let json = false;
 
   for (let i = 0; i < args.length; i++) {
@@ -1436,6 +1440,7 @@ function parseAppRegister(
         i++;
         break;
       }
+      case "--static-root": staticRoot = takeValue(args, i, a); i++; break;
       case "--json": json = true; break;
       default:
         if (a.startsWith("-")) throw new UsageError(`unknown flag: ${a}`);
@@ -1473,6 +1478,11 @@ function parseAppRegister(
         `e.g. APP_DATABASE_URL)`,
     );
   }
+  try {
+    validateStaticRoot(staticRoot, kind);
+  } catch (error) {
+    throw new UsageError(error instanceof Error ? error.message : String(error));
+  }
   const resolvedAppDir = appDir ?? `/opt/${name}/app`;
 
   const input: AppRegisterInput = {
@@ -1486,6 +1496,7 @@ function parseAppRegister(
     healthUrl,
     rlsNonSuperuser,
     ...(kind !== undefined ? { kind } : {}),
+    ...(staticRoot !== undefined ? { staticRoot } : {}),
     ...(mainHost !== undefined ? { mainHost } : {}),
     ...(migrateCmd !== undefined ? { migrateCmd } : {}),
     ...(seedCmd !== undefined ? { seedCmd } : {}),

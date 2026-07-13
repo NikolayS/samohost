@@ -167,6 +167,11 @@ export interface AppSpec {
    * without this field are treated as `"node"`.
    */
   kind?: "node" | "static";
+  /**
+   * Repo-relative directory served for a static app (for example `dist`).
+   * Absent preserves the legacy behavior of serving the checkout root.
+   */
+  staticRoot?: string;
   /** GitHub repo in `owner/name` form (e.g. "Tanya301/field-record-1"). */
   repo: string;
   /** Git branch to track. Default "main". */

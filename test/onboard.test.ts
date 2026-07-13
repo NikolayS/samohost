@@ -316,6 +316,28 @@ describe("runOnboard app registration", () => {
     expect(appRecord!.serviceUnit).toBe("acme-web");
   });
 
+  test("retains staticRoot from an existing static-app manifest", async () => {
+    const deps = fakeDeps({
+      fetchRepoFile: async (_repo, path) =>
+        path === ".samohost.toml"
+          ? `${SAMPLE_TOML}\nkind = "static"\nstaticRoot = "dist"\n`
+          : null,
+    });
+    const report = await runOnboard(
+      { repo: "acme-org/acme-web", vm: "samo-we-acme" },
+      deps,
+      vmStore,
+      appStore,
+      () => {},
+      () => {},
+    );
+
+    expect(report.appRegistered).toBe(true);
+    const appRecord = appStore.get("vm-onboard-1", "acme-web");
+    expect(appRecord?.kind).toBe("static");
+    expect(appRecord?.staticRoot).toBe("dist");
+  });
+
   test("trigger coverage: registered app appears in store (trigger would pick it up)", async () => {
     const deps = fakeDeps();
     const c = capture();

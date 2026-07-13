@@ -27,6 +27,7 @@
 
 import type { AppRecord, EnvDbBackend, EnvRecord } from "../types.ts";
 import { servicesOf } from "../app/services.ts";
+import { staticRootOf } from "../app/static-root.ts";
 import { planFromEnv, renderVhost } from "../caddy/render.ts";
 
 /** Same marker prefix as deploy scripts — one parser convention everywhere. */
@@ -935,6 +936,8 @@ function buildStaticEnvCreateScript(
   app: AppRecord,
   t: EnvScriptTarget,
 ): string {
+  const staticRoot = staticRootOf(app);
+  const servedDir = staticRoot === undefined ? "$SAMOHOST_ENV_DIR" : "$SAMOHOST_STATIC_DIR";
   const root = envsRoot(app);
   const lines: string[] = [
     "#!/usr/bin/env bash",
@@ -952,6 +955,7 @@ function buildStaticEnvCreateScript(
     `SAMOHOST_ENV_DIR=${sq(`${root}/${t.name}`)}`,
     `SAMOHOST_REPO=${sq(app.repo)}`,
     `SAMOHOST_APP_DIR=${sq(app.appDir)}`,
+    `SAMOHOST_STATIC_ROOT=${sq(staticRoot ?? "")}`,
     `SAMOHOST_CADDY_SNIPPET=${sq(`/etc/caddy/sites.d/${t.name}.caddy`)}`,
     "",
   ];
@@ -970,7 +974,17 @@ function buildStaticEnvCreateScript(
     ]),
   );
 
-  lines.push('cd "$SAMOHOST_ENV_DIR"', "");
+  lines.push(
+    "# Resolve the served directory only after clone and fail closed if a",
+    "# repository symlink escapes the checkout.",
+    'SAMOHOST_CHECKOUT_REAL=$(realpath -e "$SAMOHOST_ENV_DIR") || { echo "static checkout is missing" >&2; exit 1; }',
+    'if [[ -n "$SAMOHOST_STATIC_ROOT" ]]; then SAMOHOST_STATIC_CANDIDATE="$SAMOHOST_ENV_DIR/$SAMOHOST_STATIC_ROOT"; else SAMOHOST_STATIC_CANDIDATE="$SAMOHOST_ENV_DIR"; fi',
+    'SAMOHOST_STATIC_DIR=$(realpath -e "$SAMOHOST_STATIC_CANDIDATE") || { echo "staticRoot does not exist: $SAMOHOST_STATIC_ROOT" >&2; exit 1; }',
+    'case "$SAMOHOST_STATIC_DIR" in "$SAMOHOST_CHECKOUT_REAL"|"$SAMOHOST_CHECKOUT_REAL"/*) ;; *) echo "staticRoot escapes the checkout: $SAMOHOST_STATIC_ROOT" >&2; exit 1 ;; esac',
+    '[[ -d "$SAMOHOST_STATIC_DIR" && -f "$SAMOHOST_STATIC_DIR/index.html" ]] || { echo "staticRoot must be a directory containing index.html: $SAMOHOST_STATIC_ROOT" >&2; exit 1; }',
+    'cd "$SAMOHOST_ENV_DIR"',
+    "",
+  );
 
   // ----- config.js: write the preview-env marker for the SPA banner -----------
   // The SPA reads window.__GC1_CONFIG__ from /config.js; the banner fires when
@@ -986,7 +1000,7 @@ function buildStaticEnvCreateScript(
   // in the branch value (e.g. demo/red-bg) is safe inside a JS string literal.
   lines.push(
     "# --- config.js: overwrite with preview marker so the SPA banner fires ---",
-    `printf 'window.__GC1_CONFIG__ = { version: "", preview: true, branch: "%s" };\\n' "$SAMOHOST_BRANCH" > "$SAMOHOST_ENV_DIR/config.js"`,
+    `printf 'window.__GC1_CONFIG__ = { version: "", preview: true, branch: "%s" };\\n' "$SAMOHOST_BRANCH" > "${servedDir}/config.js"`,
     "",
   );
 
@@ -1004,7 +1018,7 @@ function buildStaticEnvCreateScript(
       "Caddy file_server vhost snippet + reload (sites.d include applied in host-prep)",
       [
         "if printf '%s {\\n\\ttls internal\\n\\troot * %s\\n\\theader /config.js Cache-Control \"no-cache, no-store, must-revalidate\"\\n\\ttry_files {path} /index.html\\n\\tfile_server\\n\\tencode gzip\\n}\\n' \\",
-        '     "$SAMOHOST_VHOST" "$SAMOHOST_ENV_DIR" \\',
+        `     "$SAMOHOST_VHOST" "${servedDir}" \\`,
         '   | sudo /usr/bin/tee "$SAMOHOST_CADDY_SNIPPET" >/dev/null \\',
         "   && sudo /usr/bin/systemctl reload caddy; ",
       ],
@@ -1214,6 +1228,7 @@ export function buildEnvCreateScript(
   app: AppRecord,
   t: EnvScriptTarget,
 ): string {
+  staticRootOf(app);
   // issue #36: branch on kind for static sites.
   if (app.kind === "static") {
     return buildStaticEnvCreateScript(app, t);
@@ -2304,6 +2319,7 @@ export function buildHostPrepScript(
   sshUser: string,
   firewallOpts?: HostPrepFirewallOpts,
 ): string {
+  const staticRoot = staticRootOf(app);
   const isStatic = app.kind === "static";
   const isStaticReleaseChannel = isStatic && app.releaseTagPattern !== undefined;
   const managesMainVhost = app.mainHost !== undefined && !isStaticReleaseChannel;
@@ -2394,7 +2410,7 @@ export function buildHostPrepScript(
     const mainSiteBody = isStatic
       ? [
           `${mainSiteAddress} {`,
-          `\troot * ${app.appDir}`,
+          `\troot * ${staticRoot === undefined ? app.appDir : '"${SAMOHOST_STATIC_DIR}"'}`,
           `\ttry_files {path} /index.html`,
           `\tfile_server`,
           `\tencode gzip`,
@@ -2414,7 +2430,17 @@ export function buildHostPrepScript(
       `#    apply.  The guard refuses if the live file exists and differs — unless`,
       `#    force=true was baked in via --force-main-vhost at host-prep time.`,
       `#    The 00- prefix sorts the live file first in sites.d.`,
-      `cat > ${stagedPath} <<'CADDY'`,
+      ...(isStatic && staticRoot !== undefined
+        ? [
+            `SAMOHOST_STATIC_ROOT=${sq(staticRoot)}`,
+            `SAMOHOST_CHECKOUT_REAL=$(realpath -e ${sq(app.appDir)}) || { echo "static checkout is missing" >&2; exit 1; }`,
+            `if [[ -n "$SAMOHOST_STATIC_ROOT" ]]; then SAMOHOST_STATIC_CANDIDATE=${sq(`${app.appDir}/`)}"$SAMOHOST_STATIC_ROOT"; else SAMOHOST_STATIC_CANDIDATE=${sq(app.appDir)}; fi`,
+            'SAMOHOST_STATIC_DIR=$(realpath -e "$SAMOHOST_STATIC_CANDIDATE") || { echo "staticRoot does not exist: $SAMOHOST_STATIC_ROOT" >&2; exit 1; }',
+            'case "$SAMOHOST_STATIC_DIR" in "$SAMOHOST_CHECKOUT_REAL"|"$SAMOHOST_CHECKOUT_REAL"/*) ;; *) echo "staticRoot escapes the checkout: $SAMOHOST_STATIC_ROOT" >&2; exit 1 ;; esac',
+            '[[ -d "$SAMOHOST_STATIC_DIR" && -f "$SAMOHOST_STATIC_DIR/index.html" ]] || { echo "staticRoot must contain index.html: $SAMOHOST_STATIC_ROOT" >&2; exit 1; }',
+          ]
+        : []),
+      `cat > ${stagedPath} <<${isStatic && staticRoot !== undefined ? "CADDY" : "'CADDY'"}`,
       ...mainSiteBody,
       "CADDY",
       `samohost_apply_main_vhost \\`,
