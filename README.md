@@ -183,7 +183,7 @@ serviceUnit = "field-record-1"                      # systemd unit restarted on 
 # kind            = "node"                            # "node" (default) | "static"
 # releaseTagPattern = "v*"                            # opt in to tag-only production
 # releaseTagFormat  = "date"                          # required: vYYYYMMDD.N, real dates only
-# releaseCiWorkflow = "ci.yml"                        # required: exact trusted Actions workflow
+# releaseCiWorkflow = ".github/workflows/ci.yml"      # required: canonical trusted Actions workflow
 
 # [provision] — OPTIONAL; parsed + validated but NOT yet consumed by app register
 # (reserved for a future `provision --from-toml`). Allowed keys only:

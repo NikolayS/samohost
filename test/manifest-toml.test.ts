@@ -1823,7 +1823,7 @@ describe("parseSamohostToml — releaseTagPattern (parse-only, inert)", () => {
     const result = parseSamohostToml(minimal([
       'releaseTagPattern = "v*"',
       'releaseTagFormat = "date"',
-      'releaseCiWorkflow = "ci.yml"',
+      'releaseCiWorkflow = ".github/workflows/ci.yml"',
     ].join("\n")));
     if (!result.ok) throw new Error("expected ok=true; errors: " + result.errors.join(", "));
     expect(result.app.releaseTagPattern).toBe("v*");
@@ -1857,7 +1857,7 @@ describe("parseSamohostToml — releaseTagPattern (parse-only, inert)", () => {
     const result = parseSamohostToml(minimal([
       'releaseTagPattern = "v2026*"',
       'releaseTagFormat = "date"',
-      'releaseCiWorkflow = "ci.yml"',
+      'releaseCiWorkflow = ".github/workflows/ci.yml"',
     ].join("\n")));
     if (!result.ok) throw new Error("expected ok=true; errors: " + result.errors.join(", "));
     expect(result.app.releaseTagPattern).toBe("v2026*");
@@ -1914,7 +1914,7 @@ describe("runAppRegisterFromToml — releaseTagPattern threaded to AppRecord", (
     const tomlPath = writeToml([
       'releaseTagPattern = "v*"',
       'releaseTagFormat = "date"',
-      'releaseCiWorkflow = "ci.yml"',
+      'releaseCiWorkflow = ".github/workflows/ci.yml"',
     ].join("\n"));
     const c = capture();
     const code = runAppRegisterFromToml(

@@ -124,6 +124,8 @@ export function buildDeployScript(app: AppRecord, target: DeployTarget): string 
   const staticStagedSnippet = staticMainSnippet === undefined
     ? undefined
     : `/etc/caddy/sites.d/.samohost-next-00-main-${app.name}.caddy`;
+  const appBase = app.appDir.replace(/\/+$/, "").split("/").slice(0, -1).join("/");
+  const staticReleasesDir = `${appBase}/releases`;
   const appDir = sq(app.appDir);
   const unit = sq(app.serviceUnit);
   const healthUrl = sq(app.healthUrl);
@@ -183,29 +185,37 @@ export function buildDeployScript(app: AppRecord, target: DeployTarget): string 
   );
 
   // ----- checkpoint --------------------------------------------------------
-  // Record PRE_DEPLOY_SHA and preserve the current build dir for rollback.
-  // Mirrors deploy.sh: rollback must restore git state AND the (gitignored)
-  // dist/ together to avoid split-state corruption.
-  push(
-    "# --- checkpoint: record pre-deploy SHA + preserve current build ---",
-    marker("checkpoint", "start"),
-    "PRE_DEPLOY_SHA=$(git rev-parse HEAD)",
-    'echo "pre-deploy sha: ${PRE_DEPLOY_SHA}"',
-    'if [[ -d "${SAMOHOST_APP_DIR}/dist" ]]; then',
-    '  rm -rf "${SAMOHOST_APP_DIR}/dist.prev"',
-    '  cp -r "${SAMOHOST_APP_DIR}/dist" "${SAMOHOST_APP_DIR}/dist.prev"',
-    "fi",
-    ...(app.kind === "static"
-      ? [
-        'SAMOHOST_VHOST_BACKUP="$(mktemp)"',
-        'SAMOHOST_VERSION_BACKUP="$(mktemp)"',
-        `if [[ -f ${sq(staticMainSnippet!)} ]]; then cat ${sq(staticMainSnippet!)} > "$SAMOHOST_VHOST_BACKUP"; SAMOHOST_OLD_VHOST_PRESENT=1; else SAMOHOST_OLD_VHOST_PRESENT=0; fi`,
-        'if [[ -f "${SAMOHOST_APP_DIR}/version.json" ]]; then cp "${SAMOHOST_APP_DIR}/version.json" "$SAMOHOST_VERSION_BACKUP"; SAMOHOST_OLD_VERSION_PRESENT=1; else SAMOHOST_OLD_VERSION_PRESENT=0; fi',
-      ]
-      : []),
-    marker("checkpoint", "ok"),
-    "",
-  );
+  // Node deploys preserve their mutable checkout/build as before. Static
+  // deploys checkpoint only the routing file: the live checkout and its
+  // version.json remain completely untouched until a new candidate is healthy.
+  if (app.kind === "static") {
+    push(
+      "# --- checkpoint: preserve live static routing (served checkout stays untouched) ---",
+      marker("checkpoint", "start"),
+      "umask 022",
+      'SAMOHOST_CANDIDATE_DIR=""',
+      `SAMOHOST_RELEASES_DIR=${sq(staticReleasesDir)}`,
+      'SAMOHOST_PREVIOUS_RELEASE_DIR=""',
+      'SAMOHOST_VHOST_BACKUP="$(mktemp)"',
+      `if [[ -f ${sq(staticMainSnippet!)} ]]; then cat ${sq(staticMainSnippet!)} > "$SAMOHOST_VHOST_BACKUP"; SAMOHOST_OLD_VHOST_PRESENT=1; else SAMOHOST_OLD_VHOST_PRESENT=0; fi`,
+      'if [[ "$SAMOHOST_OLD_VHOST_PRESENT" == "1" ]]; then SAMOHOST_PREVIOUS_RELEASE_DIR=$(sed -n \'s/^[[:space:]]*root \\* "\\(.*\\)"$/\\1/p\' "$SAMOHOST_VHOST_BACKUP" | head -n 1); fi',
+      marker("checkpoint", "ok"),
+      "",
+    );
+  } else {
+    push(
+      "# --- checkpoint: record pre-deploy SHA + preserve current build ---",
+      marker("checkpoint", "start"),
+      "PRE_DEPLOY_SHA=$(git rev-parse HEAD)",
+      'echo "pre-deploy sha: ${PRE_DEPLOY_SHA}"',
+      'if [[ -d "${SAMOHOST_APP_DIR}/dist" ]]; then',
+      '  rm -rf "${SAMOHOST_APP_DIR}/dist.prev"',
+      '  cp -r "${SAMOHOST_APP_DIR}/dist" "${SAMOHOST_APP_DIR}/dist.prev"',
+      "fi",
+      marker("checkpoint", "ok"),
+      "",
+    );
+  }
 
   // A reusable rollback function. Invoked by the health / assert phases on
   // failure. Restores git to PRE_DEPLOY_SHA, restores dist.prev/ -> dist/,
@@ -213,22 +223,13 @@ export function buildDeployScript(app: AppRecord, target: DeployTarget): string 
   // re-probes health, emits the rollback marker, and exits 1.
   if (app.kind === "static") {
     push(
-      "# rollback(): restore the pre-deploy state coherently (git + dist), then",
-      "# reload Caddy (static site — no systemd unit to restart).",
+      "# rollback(): atomically restore the prior vhost. The previous checkout",
+      "# and public version.json were never modified, so restoring the route",
+      "# restores both content and identity as one operation.",
       "# Emits rollback:ok / rollback:fail and exits 1.",
       "rollback() {",
       "  local rb_ok=1",
       "  local rb_route_ok=1",
-      "  git reset --hard \"${PRE_DEPLOY_SHA}\" || rb_ok=0",
-      '  if [[ -d "${SAMOHOST_APP_DIR}/dist.prev" ]]; then',
-      '    rm -rf "${SAMOHOST_APP_DIR}/dist" || rb_ok=0',
-      '    cp -r "${SAMOHOST_APP_DIR}/dist.prev" "${SAMOHOST_APP_DIR}/dist" || rb_ok=0',
-      "  fi",
-      '  if [[ "${SAMOHOST_OLD_VERSION_PRESENT:-0}" == "1" ]]; then',
-      '    if rb_version_tmp=$(mktemp "${SAMOHOST_APP_DIR}/.version.rollback.XXXXXX"); then',
-      '      if cp "$SAMOHOST_VERSION_BACKUP" "$rb_version_tmp"; then /usr/bin/mv -f "$rb_version_tmp" "${SAMOHOST_APP_DIR}/version.json" || rb_ok=0; else rb_ok=0; fi',
-      '    else rb_ok=0; fi',
-      '  else rm -f "${SAMOHOST_APP_DIR}/version.json" || rb_ok=0; fi',
       `  sudo /usr/bin/rm -f ${sq(staticStagedSnippet!)} || rb_route_ok=0`,
       '  if [[ "${SAMOHOST_OLD_VHOST_PRESENT:-0}" == "1" ]]; then',
       `    if sudo /usr/bin/tee ${sq(staticStagedSnippet!)} >/dev/null < "$SAMOHOST_VHOST_BACKUP"; then sudo /usr/bin/mv -- ${sq(staticStagedSnippet!)} ${sq(staticMainSnippet!)} || rb_route_ok=0; else rb_route_ok=0; fi`,
@@ -243,6 +244,10 @@ export function buildDeployScript(app: AppRecord, target: DeployTarget): string 
       ...(app.mainHost !== undefined
         ? [`  rb_code=$(curl -s -k -H ${sq(`Host: ${app.mainHost}`)} -o /dev/null -w "%{http_code}" --max-time 10 ${app.mainListen === "cp-http80" ? "http" : "https"}://127.0.0.1/ || echo 000)`]
         : ['  rb_code=$(curl -s -k -o /dev/null -w "%{http_code}" --max-time 10 "${SAMOHOST_HEALTH_URL}" || echo 000)']),
+      '  if [[ "$rb_ok" == "1" && "$rb_code" == "200" && -n "${SAMOHOST_CANDIDATE_DIR:-}" && -d "$SAMOHOST_CANDIDATE_DIR" ]]; then',
+      '    git -C "$SAMOHOST_APP_DIR" worktree remove --force "$SAMOHOST_CANDIDATE_DIR" || rm -rf -- "$SAMOHOST_CANDIDATE_DIR" || rb_ok=0',
+      "  fi",
+      '  git -C "$SAMOHOST_APP_DIR" worktree prune || true',
       '  if [[ "$rb_ok" == "1" && "$rb_code" == "200" ]]; then',
       `    ${marker("rollback", "ok")}`,
       "  else",
@@ -250,7 +255,7 @@ export function buildDeployScript(app: AppRecord, target: DeployTarget): string 
       '    echo "rollback health re-check failed (HTTP $rb_code) — manual intervention required" >&2',
       "  fi",
       `  sudo /usr/bin/rm -f ${sq(staticStagedSnippet!)} || true`,
-      '  rm -f "${SAMOHOST_VERSION_NEXT:-}" "$SAMOHOST_VHOST_BACKUP" "$SAMOHOST_VERSION_BACKUP" || true',
+      '  rm -f "${SAMOHOST_VERSION_NEXT:-}" "$SAMOHOST_VHOST_BACKUP" || true',
       "  exit 1",
       "}",
       "",
@@ -283,17 +288,32 @@ export function buildDeployScript(app: AppRecord, target: DeployTarget): string 
   }
 
   // ----- checkout ----------------------------------------------------------
-  push(
-    "# --- checkout: hard reset the working tree to the target SHA ---",
-    marker("checkout", "start"),
-    'if git reset --hard "${SAMOHOST_SHA}"; then',
-    `  ${marker("checkout", "ok")}`,
-    "else",
-    `  ${marker("checkout", "fail")}`,
-    app.kind === "static" ? "  rollback" : "  exit 1",
-    "fi",
-    "",
-  );
+  if (app.kind === "static") {
+    push(
+      "# --- checkout: stage target in a separate versioned detached worktree ---",
+      "# The currently served appDir is never reset or otherwise rewritten.",
+      marker("checkout", "start"),
+      'if /usr/bin/install -d -m 0755 "$SAMOHOST_RELEASES_DIR" && SAMOHOST_CANDIDATE_DIR=$(mktemp -d "${SAMOHOST_RELEASES_DIR}/${SAMOHOST_SHA}.candidate.XXXXXX") && rmdir "$SAMOHOST_CANDIDATE_DIR" && git -C "$SAMOHOST_APP_DIR" worktree add --detach "$SAMOHOST_CANDIDATE_DIR" "$SAMOHOST_SHA" && chmod 0755 "$SAMOHOST_CANDIDATE_DIR"; then',
+      `  ${marker("checkout", "ok")}`,
+      "else",
+      `  ${marker("checkout", "fail")}`,
+      "  rollback",
+      "fi",
+      "",
+    );
+  } else {
+    push(
+      "# --- checkout: hard reset the working tree to the target SHA ---",
+      marker("checkout", "start"),
+      'if git reset --hard "${SAMOHOST_SHA}"; then',
+      `  ${marker("checkout", "ok")}`,
+      "else",
+      `  ${marker("checkout", "fail")}`,
+      "  exit 1",
+      "fi",
+      "",
+    );
+  }
 
   if (app.kind === "static") {
     // ===== STATIC SITE PATH =================================================
@@ -304,22 +324,22 @@ export function buildDeployScript(app: AppRecord, target: DeployTarget): string 
     // ========================================================================
 
     const address = app.mainListen === "cp-http80" ? `http://${app.mainHost}` : app.mainHost;
-    const vhostBody = [
+    push(
+      "# --- static release identity + routing checkpoint ---",
+      "# Publish identity inside the private candidate first. chmod 0644 is",
+      "# mandatory: Caddy must be able to read /version.json after cutover.",
+      'if ! SAMOHOST_VERSION_NEXT=$(mktemp "${SAMOHOST_CANDIDATE_DIR}/.version.next.XXXXXX"); then rollback; fi',
+      'if printf \'{"version":"%s","tag":"%s","sha":"%s","environment":"production"}\\n\' "$SAMOHOST_RELEASE_TAG" "$SAMOHOST_RELEASE_TAG" "$SAMOHOST_SHA" > "$SAMOHOST_VERSION_NEXT" && chmod 0644 "$SAMOHOST_VERSION_NEXT" && [[ -r "$SAMOHOST_VERSION_NEXT" ]] && [[ "$(stat -c \'%a\' "$SAMOHOST_VERSION_NEXT")" == "644" ]] && /usr/bin/mv -f "$SAMOHOST_VERSION_NEXT" "${SAMOHOST_CANDIDATE_DIR}/version.json" && [[ -r "${SAMOHOST_CANDIDATE_DIR}/version.json" ]] && [[ "$(stat -c \'%a\' "${SAMOHOST_CANDIDATE_DIR}/version.json")" == "644" ]]; then :; else rollback; fi',
+      `sudo /usr/bin/rm -f ${sq(staticStagedSnippet!)} || rollback`,
+      `sudo /usr/bin/tee ${sq(staticStagedSnippet!)} >/dev/null <<CADDY || rollback`,
       `${address} {`,
-      `\troot * ${app.appDir}`,
+      `\troot * "\${SAMOHOST_CANDIDATE_DIR}"`,
       `\ttry_files {path} /index.html`,
       `\tfile_server`,
       `\tencode gzip`,
       ...(app.mainListen === "cp-http80" ? [] : [`\ttls internal`]),
       `}`,
-      ``,
-    ].join("\n");
-    push(
-      "# --- static release identity + routing checkpoint ---",
-      'if ! SAMOHOST_VERSION_NEXT=$(mktemp "${SAMOHOST_APP_DIR}/.version.next.XXXXXX"); then rollback; fi',
-      'if printf \'{"version":"%s","tag":"%s","sha":"%s","environment":"production"}\\n\' "$SAMOHOST_RELEASE_TAG" "$SAMOHOST_RELEASE_TAG" "$SAMOHOST_SHA" > "$SAMOHOST_VERSION_NEXT"; then /usr/bin/mv -f "$SAMOHOST_VERSION_NEXT" "${SAMOHOST_APP_DIR}/version.json" || rollback; else rollback; fi',
-      `sudo /usr/bin/rm -f ${sq(staticStagedSnippet!)} || rollback`,
-      `printf %s ${sq(vhostBody)} | sudo /usr/bin/tee ${sq(staticStagedSnippet!)} >/dev/null || rollback`,
+      `CADDY`,
       `sudo /usr/bin/mv -- ${sq(staticStagedSnippet!)} ${sq(staticMainSnippet!)} || rollback`,
       "caddy validate --config /etc/caddy/Caddyfile >/dev/null || rollback",
       "",
@@ -356,7 +376,11 @@ export function buildDeployScript(app: AppRecord, target: DeployTarget): string 
       "done",
       'if [[ "$health_ok" == "1" ]]; then',
       `  ${marker("health", "ok")}`,
-      '  rm -f "$SAMOHOST_VHOST_BACKUP" "$SAMOHOST_VERSION_BACKUP" || true',
+      '  if [[ -n "$SAMOHOST_PREVIOUS_RELEASE_DIR" && "$SAMOHOST_PREVIOUS_RELEASE_DIR" == "$SAMOHOST_RELEASES_DIR/"* && "$SAMOHOST_PREVIOUS_RELEASE_DIR" != "$SAMOHOST_CANDIDATE_DIR" ]]; then',
+      '    git -C "$SAMOHOST_APP_DIR" worktree remove --force "$SAMOHOST_PREVIOUS_RELEASE_DIR" || true',
+      "  fi",
+      '  git -C "$SAMOHOST_APP_DIR" worktree prune || true',
+      '  rm -f "$SAMOHOST_VHOST_BACKUP" || true',
       "else",
       `  ${marker("health", "fail")}`,
       '  echo "health check failed after retries — rolling back" >&2',

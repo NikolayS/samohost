@@ -44,6 +44,10 @@ import {
   type CommitOnBranchVerifier,
 } from "./app.ts";
 import { checkCiGreen } from "../app/cigate.ts";
+import {
+  CANONICAL_RELEASE_CI_WORKFLOW,
+  isCanonicalReleaseCiWorkflow,
+} from "../app/release-policy.ts";
 import type { DeployOutcome } from "../app/parse.ts";
 import {
   runEnvGc,
@@ -431,8 +435,11 @@ export async function runTriggerRun(
       let resolvedSha: string;
       let resolvedTag: string | undefined;
       if (app.releaseTagPattern !== undefined) {
-        if (app.releaseTagFormat !== "date" || app.releaseCiWorkflow === undefined) {
-          throw new Error("release channel requires releaseTagFormat='date' and releaseCiWorkflow");
+        if (app.releaseTagFormat !== "date" || !isCanonicalReleaseCiWorkflow(app.releaseCiWorkflow)) {
+          throw new Error(
+            "release channel requires releaseTagFormat='date' and " +
+            `releaseCiWorkflow='${CANONICAL_RELEASE_CI_WORKFLOW}'`,
+          );
         }
         if (deps.resolveLatestTag === undefined) {
           throw new Error("releaseTagPattern is set but the release tag resolver is absent");

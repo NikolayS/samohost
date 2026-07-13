@@ -271,15 +271,16 @@ export interface AppSpec {
   mainListen?: "cp-http80" | "tls";
   /**
    * Optional glob pattern (normally `"v*"`) selecting production release tags.
-   * When set, releaseTagFormat="date" and an exact releaseCiWorkflow filename
-   * are mandatory. Production accepts only real-calendar `vYYYYMMDD.N` tags
+   * When set, releaseTagFormat="date" and the canonical trusted
+   * releaseCiWorkflow path `.github/workflows/ci.yml` are mandatory.
+   * Production accepts only real-calendar `vYYYYMMDD.N` tags
    * whose commit is on the configured main branch and whose exact workflow is
    * green; branch-head/manual deploys are refused.
    */
   releaseTagPattern?: string;
   /** Required release tag grammar when releaseTagPattern is set (`vYYYYMMDD.N`). */
   releaseTagFormat?: "date";
-  /** Exact trusted GitHub Actions workflow filename, e.g. `ci.yml`. */
+  /** Canonical trusted workflow path: `.github/workflows/ci.yml`. */
   releaseCiWorkflow?: string;
 
   /**

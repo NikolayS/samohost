@@ -18,6 +18,10 @@
 import { parse as parseToml } from "smol-toml";
 import type { TomlValueWithoutBigInt } from "smol-toml";
 import type { ListenerSpec, ServiceSpec, RouteSpec } from "../types.ts";
+import {
+  CANONICAL_RELEASE_CI_WORKFLOW,
+  isCanonicalReleaseCiWorkflow,
+} from "../app/release-policy.ts";
 
 /** A plain TOML table returned by smol-toml's `parse()` (no bigint). */
 type TomlTableLike = Record<string, TomlValueWithoutBigInt>;
@@ -83,9 +87,9 @@ export interface AppManifest {
    * Optional glob pattern (e.g. `"v*"`) for release tags. Maps to
    * {@link AppSpec.releaseTagPattern}. Must be a non-empty string when present.
    *
-   * When set, `releaseTagFormat = "date"` and an exact `releaseCiWorkflow`
-   * filename are required. Only real-calendar `vYYYYMMDD.N` tags on the main
-   * branch can ship production.
+   * When set, `releaseTagFormat = "date"` and the canonical trusted
+   * `releaseCiWorkflow = ".github/workflows/ci.yml"` are required. Only
+   * real-calendar `vYYYYMMDD.N` tags on the main branch can ship production.
    */
   releaseTagPattern?: string;
   releaseTagFormat?: "date";
@@ -1118,12 +1122,19 @@ export function parseSamohostToml(text: string): ParseTomlResult {
     }
   }
   const releaseCiWorkflow = optionalString(raw, "releaseCiWorkflow", errors);
-  if (releaseCiWorkflow !== undefined && !/^[A-Za-z0-9._-]+\.ya?ml$/.test(releaseCiWorkflow)) {
-    errors.push(`releaseCiWorkflow must be an exact workflow filename (for example "ci.yml")`);
+  if (releaseCiWorkflow !== undefined && !isCanonicalReleaseCiWorkflow(releaseCiWorkflow)) {
+    errors.push(
+      `releaseCiWorkflow must be the canonical trusted workflow path ` +
+      `"${CANONICAL_RELEASE_CI_WORKFLOW}"`,
+    );
   }
   if (releaseTagPattern !== undefined) {
     if (releaseTagFormat !== "date") errors.push(`releaseTagFormat = "date" is required with releaseTagPattern`);
-    if (releaseCiWorkflow === undefined) errors.push(`releaseCiWorkflow is required with releaseTagPattern`);
+    if (releaseCiWorkflow === undefined) {
+      errors.push(
+        `releaseCiWorkflow = "${CANONICAL_RELEASE_CI_WORKFLOW}" is required with releaseTagPattern`,
+      );
+    }
     if (kind === "static" && mainHost === undefined) {
       errors.push(`mainHost is required for a static release-channel app`);
     }

@@ -266,7 +266,7 @@ describe("trigger run — release-tag production channel", () => {
         mainHost: "field-record-1.samo.team",
         releaseTagPattern: "v*",
         releaseTagFormat: "date",
-        releaseCiWorkflow: "ci.yml",
+        releaseCiWorkflow: ".github/workflows/ci.yml",
       }),
     );
 
@@ -324,7 +324,7 @@ describe("trigger run — release-tag production channel", () => {
     appStore.upsert(makeApp({
       releaseTagPattern: "v*",
       releaseTagFormat: "date",
-      releaseCiWorkflow: "ci.yml",
+      releaseCiWorkflow: ".github/workflows/ci.yml",
       releaseTagChannelInitialized: true,
     }));
     const base = {
@@ -419,7 +419,7 @@ describe("trigger run — release-tag production channel", () => {
         mainHost: "field-record-1.samo.team",
         releaseTagPattern: "v*",
         releaseTagFormat: "date",
-        releaseCiWorkflow: "ci.yml",
+        releaseCiWorkflow: ".github/workflows/ci.yml",
         releaseTagChannelInitialized: true,
       }),
     );
@@ -461,7 +461,7 @@ describe("trigger run — release-tag production channel", () => {
         mainHost: "field-record-1.samo.team",
         releaseTagPattern: "v*",
         releaseTagFormat: "date",
-        releaseCiWorkflow: "ci.yml",
+        releaseCiWorkflow: ".github/workflows/ci.yml",
       }),
     );
 
@@ -515,7 +515,7 @@ describe("trigger run — release-tag production channel", () => {
         mainHost: "field-record-1.samo.team",
         releaseTagPattern: "v*",
         releaseTagFormat: "date",
-        releaseCiWorkflow: "ci.yml",
+        releaseCiWorkflow: ".github/workflows/ci.yml",
         releaseTagCursor: "v20260710.1",
         releaseTagChannelInitialized: true,
       }),
@@ -560,7 +560,7 @@ describe("trigger run — release-tag production channel", () => {
         mainHost: "field-record-1.samo.team",
         releaseTagPattern: "v*",
         releaseTagFormat: "date",
-        releaseCiWorkflow: "ci.yml",
+        releaseCiWorkflow: ".github/workflows/ci.yml",
         releaseTagCursor: "v20260712.1",
         releaseTagChannelInitialized: true,
       }),
@@ -615,7 +615,7 @@ describe("trigger run — release-tag production channel", () => {
         mainHost: "field-record-1.samo.team",
         releaseTagPattern: "v*",
         releaseTagFormat: "date",
-        releaseCiWorkflow: "ci.yml",
+        releaseCiWorkflow: ".github/workflows/ci.yml",
         releaseTagCursor: "v20260713.1",
         releaseTagChannelInitialized: true,
       }),
@@ -665,7 +665,7 @@ describe("trigger run — release-tag production channel", () => {
         mainHost: "field-record-1.samo.team",
         releaseTagPattern: "v*",
         releaseTagFormat: "date",
-        releaseCiWorkflow: "ci.yml",
+        releaseCiWorkflow: ".github/workflows/ci.yml",
         releaseTagCursor: "v20260712.1",
         releaseTagChannelInitialized: true,
       }),
@@ -757,7 +757,7 @@ describe("release deploy authority", () => {
     appStore.upsert(makeApp({
       releaseTagPattern: "v*",
       releaseTagFormat: "date",
-      releaseCiWorkflow: "ci.yml",
+      releaseCiWorkflow: ".github/workflows/ci.yml",
     }));
   });
   afterEach(() => rmSync(dir, { recursive: true, force: true }));
@@ -803,6 +803,42 @@ describe("release deploy authority", () => {
       { json: false }, vmStore, appStore, d, skipped.out, skipped.err,
     )).toBe(1);
     expect(skipped.e).toContain("--skip-ci-gate is forbidden");
+    expect(remoteCalls).toBe(0);
+  });
+
+  test("hand-edited state with a non-canonical workflow fails closed before CI or SSH", async () => {
+    appStore.upsert(makeApp({
+      releaseTagPattern: "v*",
+      releaseTagFormat: "date",
+      releaseCiWorkflow: ".github/workflows/release.yml",
+    }));
+    let fetchCalls = 0;
+    let remoteCalls = 0;
+    const c = capture();
+    expect(await runAppDeploy(
+      {
+        vm: makeVm().name,
+        app: "field-record",
+        sha: SHA_TAG,
+        releaseTag: "v20260713.1",
+        skipCiGate: false,
+      },
+      { json: false }, vmStore, appStore,
+      deps({
+        fetch: (async () => {
+          fetchCalls++;
+          throw new Error("must not fetch");
+        }) as unknown as typeof fetch,
+        remote: async () => {
+          remoteCalls++;
+          return { code: 0, stdout: "", stderr: "" };
+        },
+      }),
+      c.out,
+      c.err,
+    )).toBe(1);
+    expect(c.e).toContain(".github/workflows/ci.yml");
+    expect(fetchCalls).toBe(0);
     expect(remoteCalls).toBe(0);
   });
 
@@ -879,7 +915,7 @@ describe("release deploy authority", () => {
 // ---------------------------------------------------------------------------
 
 describe("validation — releaseTagPattern remains independent of mainHost", () => {
-  test("release channel requires date format and an exact workflow filename", () => {
+  test("release channel requires date format and the canonical trusted workflow path", () => {
     const base = [
       'name = "field-record"',
       'repo = "Tanya301/field-record-1"',
@@ -894,15 +930,56 @@ describe("validation — releaseTagPattern remains independent of mainHost", () 
     expect(missing.ok).toBe(false);
     if (!missing.ok) {
       expect(missing.errors.join("\n")).toContain('releaseTagFormat = "date"');
-      expect(missing.errors.join("\n")).toContain("releaseCiWorkflow is required");
+      expect(missing.errors.join("\n")).toContain(
+        'releaseCiWorkflow = ".github/workflows/ci.yml" is required',
+      );
     }
     const inexact = parseSamohostToml([
       ...base,
       'releaseTagFormat = "date"',
-      'releaseCiWorkflow = ".github/workflows/ci.yml"',
+      'releaseCiWorkflow = "ci.yml"',
     ].join("\n"));
     expect(inexact.ok).toBe(false);
-    if (!inexact.ok) expect(inexact.errors.join("\n")).toContain("exact workflow filename");
+    if (!inexact.ok) {
+      expect(inexact.errors.join("\n")).toContain("canonical trusted workflow path");
+    }
+  });
+
+  test("programmatic registration rejects filename-only and alternate workflow paths", () => {
+    const dir = mkdtempSync(join(tmpdir(), "samohost-release-ci-policy-"));
+    try {
+      const vmStore = new StateStore(join(dir, "state.json"));
+      const appStore = new AppStore(join(dir, "apps.json"));
+      vmStore.upsert(makeVm());
+      for (const releaseCiWorkflow of [
+        "ci.yml",
+        ".github/workflows/release.yml",
+        "../ci.yml",
+      ]) {
+        const c = capture();
+        expect(runAppRegister(
+          {
+            vm: "samo-we-field-record",
+            name: "field-record",
+            repo: "Tanya301/field-record-1",
+            branch: "main",
+            appDir: "/opt/field-record/app",
+            buildCmd: "npm run build",
+            serviceUnit: "field-record",
+            healthUrl: "http://localhost:3000/api/version",
+            rlsNonSuperuser: false,
+            releaseTagPattern: "v*",
+            releaseTagFormat: "date",
+            releaseCiWorkflow,
+          },
+          { json: false }, vmStore, appStore, c.out, c.err,
+        )).toBe(1);
+        expect(c.e).toContain(".github/workflows/ci.yml");
+        expect(appStore.get("vm-1111", "field-record")).toBeUndefined();
+      }
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 
   test("static release channel requires an owned mainHost", () => {
@@ -917,7 +994,7 @@ describe("validation — releaseTagPattern remains independent of mainHost", () 
       'kind = "static"',
       'releaseTagPattern = "v*"',
       'releaseTagFormat = "date"',
-      'releaseCiWorkflow = "ci.yml"',
+      'releaseCiWorkflow = ".github/workflows/ci.yml"',
     ].join("\n"));
     expect(res.ok).toBe(false);
     if (!res.ok) expect(res.errors.join("\n")).toContain("mainHost is required");
@@ -934,7 +1011,7 @@ describe("validation — releaseTagPattern remains independent of mainHost", () 
       'serviceUnit = "field-record"',
       'releaseTagPattern = "v*"',
       'releaseTagFormat = "date"',
-      'releaseCiWorkflow = "ci.yml"',
+      'releaseCiWorkflow = ".github/workflows/ci.yml"',
     ].join("\n");
     const res = parseSamohostToml(toml);
     expect(res.ok).toBe(true);
@@ -955,7 +1032,7 @@ describe("validation — releaseTagPattern remains independent of mainHost", () 
       'mainHost = "field-record-1.samo.team"',
       'releaseTagPattern = "v*"',
       'releaseTagFormat = "date"',
-      'releaseCiWorkflow = "ci.yml"',
+      'releaseCiWorkflow = ".github/workflows/ci.yml"',
     ].join("\n");
     const res = parseSamohostToml(toml);
     expect(res.ok).toBe(true);
@@ -1006,7 +1083,7 @@ describe("validation — releaseTagPattern remains independent of mainHost", () 
           rlsNonSuperuser: false,
           releaseTagPattern: "v*",
           releaseTagFormat: "date",
-          releaseCiWorkflow: "ci.yml",
+          releaseCiWorkflow: ".github/workflows/ci.yml",
         },
         { json: false },
         vmStore,
@@ -1045,7 +1122,7 @@ describe("validation — releaseTagPattern remains independent of mainHost", () 
           mainHost: "field-record-1.samo.team",
           releaseTagPattern: "v*",
           releaseTagFormat: "date",
-          releaseCiWorkflow: "ci.yml",
+          releaseCiWorkflow: ".github/workflows/ci.yml",
         },
         { json: false },
         vmStore,
@@ -1071,7 +1148,7 @@ describe("validation — releaseTagPattern remains independent of mainHost", () 
       appStore.upsert(makeApp({
         releaseTagPattern: "v*",
         releaseTagFormat: "date",
-        releaseCiWorkflow: "ci.yml",
+        releaseCiWorkflow: ".github/workflows/ci.yml",
         releaseTagCursor: "v20260712.1",
         releaseTagChannelInitialized: true,
       }));
@@ -1090,7 +1167,7 @@ describe("validation — releaseTagPattern remains independent of mainHost", () 
           rlsNonSuperuser: false,
           releaseTagPattern: "v2026*",
           releaseTagFormat: "date",
-          releaseCiWorkflow: "release.yml",
+          releaseCiWorkflow: ".github/workflows/ci.yml",
         },
         { json: false }, vmStore, appStore, c.out, c.err,
       )).toBe(0);

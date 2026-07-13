@@ -13,6 +13,10 @@
  * GITHUB_TOKEN). It is never stored on any record and never logged. `fetch` is
  * injected so the decision logic is unit-tested fully offline.
  */
+import {
+  CANONICAL_RELEASE_CI_WORKFLOW,
+  CANONICAL_RELEASE_CI_WORKFLOW_ID,
+} from "./release-policy.ts";
 
 export type CiStatus = "success" | "pending" | "failure" | "none";
 
@@ -64,9 +68,12 @@ export async function checkCiGreen(
   };
   if (token) headers["Authorization"] = `Bearer ${token}`;
 
-  const runsPath = workflow === undefined
+  const workflowId = workflow === CANONICAL_RELEASE_CI_WORKFLOW
+    ? CANONICAL_RELEASE_CI_WORKFLOW_ID
+    : workflow;
+  const runsPath = workflowId === undefined
     ? "actions/runs"
-    : `actions/workflows/${encodeURIComponent(workflow)}/runs`;
+    : `actions/workflows/${encodeURIComponent(workflowId)}/runs`;
   const url =
     `https://api.github.com/repos/${repo}/${runsPath}` +
     `?head_sha=${encodeURIComponent(sha)}&per_page=${workflow === undefined ? 20 : 1}`;

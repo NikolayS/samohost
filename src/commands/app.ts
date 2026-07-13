@@ -20,6 +20,10 @@ import { checkCiGreen, type CiStatus } from "../app/cigate.ts";
 import { parseDeployOutcome, type DeployOutcome } from "../app/parse.ts";
 import { buildDeployScript } from "../app/script.ts";
 import {
+  CANONICAL_RELEASE_CI_WORKFLOW,
+  isCanonicalReleaseCiWorkflow,
+} from "../app/release-policy.ts";
+import {
   buildHostBootstrapScript,
   type HostBootstrapOptions,
 } from "../app/bootstrap.ts";
@@ -99,7 +103,7 @@ export interface AppRegisterInput {
    * {@link AppSpec.releaseTagPattern}.
    *
    * When set, production accepts only real-calendar `vYYYYMMDD.N` release tags
-   * on the configured branch, gated by the exact configured workflow.
+   * on the configured branch, gated by `.github/workflows/ci.yml`.
    */
   releaseTagPattern?: string;
   releaseTagFormat?: "date";
@@ -216,13 +220,19 @@ export function runAppRegister(
     return 1;
   }
   if (input.releaseTagPattern !== undefined &&
-      (input.releaseTagFormat !== "date" || input.releaseCiWorkflow === undefined)) {
-    err("error: releaseTagPattern requires releaseTagFormat='date' and releaseCiWorkflow");
+      (input.releaseTagFormat !== "date" || !isCanonicalReleaseCiWorkflow(input.releaseCiWorkflow))) {
+    err(
+      "error: releaseTagPattern requires releaseTagFormat='date' and " +
+      `releaseCiWorkflow='${CANONICAL_RELEASE_CI_WORKFLOW}'`,
+    );
     return 1;
   }
   if (input.releaseCiWorkflow !== undefined &&
-      !/^[A-Za-z0-9._-]+\.ya?ml$/.test(input.releaseCiWorkflow)) {
-    err("error: releaseCiWorkflow must be an exact workflow filename (for example ci.yml)");
+      !isCanonicalReleaseCiWorkflow(input.releaseCiWorkflow)) {
+    err(
+      `error: releaseCiWorkflow must be the canonical trusted workflow path ` +
+      `'${CANONICAL_RELEASE_CI_WORKFLOW}'`,
+    );
     return 1;
   }
   if (input.kind === "static" && input.releaseTagPattern !== undefined && input.mainHost === undefined) {
@@ -649,8 +659,11 @@ export async function runAppDeploy(
     return 1;
   }
   if (app.releaseTagPattern !== undefined) {
-    if (app.releaseTagFormat !== "date" || app.releaseCiWorkflow === undefined) {
-      err("error: release-channel app is missing releaseTagFormat='date' or releaseCiWorkflow");
+    if (app.releaseTagFormat !== "date" || !isCanonicalReleaseCiWorkflow(app.releaseCiWorkflow)) {
+      err(
+        "error: release-channel app is missing releaseTagFormat='date' or canonical " +
+        `releaseCiWorkflow='${CANONICAL_RELEASE_CI_WORKFLOW}'`,
+      );
       return 1;
     }
     if (input.releaseTag === undefined) {
