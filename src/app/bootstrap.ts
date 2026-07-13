@@ -428,6 +428,7 @@ export function buildHostBootstrapScript(
     `# §3. Caddy via official apt repo (idempotent).`,
     `# ---------------------------------------------------------------------------`,
     "",
+    ...(isStaticReleaseChannel ? [`SAMOHOST_CADDY_INSTALLED_NOW=0`] : []),
     `if command -v caddy >/dev/null 2>&1; then`,
     `  echo "Caddy already present — skipping apt install."`,
     "else",
@@ -437,6 +438,7 @@ export function buildHostBootstrapScript(
     `    | tee /etc/apt/sources.list.d/caddy-stable.list`,
     `  apt-get update -qq`,
     `  apt-get install -y caddy`,
+    ...(isStaticReleaseChannel ? [`  SAMOHOST_CADDY_INSTALLED_NOW=1`] : []),
     "fi",
     "",
   );
@@ -506,6 +508,13 @@ export function buildHostBootstrapScript(
       `${appUser} ALL=(root) NOPASSWD: /usr/bin/tee /etc/caddy/sites.d/*.caddy`,
       `${appUser} ALL=(root) NOPASSWD: /usr/bin/mv -- /etc/caddy/sites.d/*.caddy /etc/caddy/sites.d/*.caddy`,
       `${appUser} ALL=(root) NOPASSWD: /usr/bin/rm -f /etc/caddy/sites.d/*.caddy`,
+      ...(isStaticReleaseChannel
+        ? [
+          `${appUser} ALL=(root) NOPASSWD: /usr/bin/tee /etc/caddy/.samohost-next-Caddyfile`,
+          `${appUser} ALL=(root) NOPASSWD: /usr/bin/mv -- /etc/caddy/.samohost-next-Caddyfile /etc/caddy/Caddyfile`,
+          `${appUser} ALL=(root) NOPASSWD: /usr/bin/rm -f /etc/caddy/.samohost-next-Caddyfile`,
+        ]
+        : []),
       `${appUser} ALL=(root) NOPASSWD: /usr/bin/journalctl *`,
       "SUDOERS",
       `chmod 440 ${sq(sudoersFile)}`,
@@ -606,18 +615,45 @@ export function buildHostBootstrapScript(
     "",
     `mkdir -p /etc/caddy/sites.d`,
     "",
-    `# Write a minimal-but-valid Caddyfile. Idempotent: overwrite with the`,
-    `# deterministic content — no append-drift.`,
-    `cat > /etc/caddy/Caddyfile <<'CADDYFILE'`,
-    ...caddyfileHeader,
-    "",
-    "import sites.d/*.caddy",
-    "CADDYFILE",
-    "",
+  );
+  if (isStaticReleaseChannel) {
+    push(
+      `# A release-channel static app may already be serving a legacy route`,
+      `# directly from this base file. Preserve it byte-for-byte and add only`,
+      `# the required import. The first healthy tagged deploy owns retirement.`,
+      `if [[ "\${SAMOHOST_CADDY_INSTALLED_NOW:-0}" == "1" || ! -f /etc/caddy/Caddyfile ]]; then`,
+      `  # A just-installed package Caddyfile is vendor sample content, not a`,
+      `  # legacy production route. Start fresh hosts from the canonical base.`,
+      `  cat > /etc/caddy/Caddyfile <<'CADDYFILE'`,
+      ...caddyfileHeader,
+      "",
+      "import sites.d/*.caddy",
+      "CADDYFILE",
+      `elif grep -Eq '^[[:space:]]*import[[:space:]]+(/etc/caddy/)?sites\\.d/\\*\\.caddy([[:space:]]*(#.*)?)?$' /etc/caddy/Caddyfile; then`,
+      `  echo "Caddy: existing sites.d import preserved."`,
+      `else`,
+      `  printf '\nimport sites.d/*.caddy\n' >> /etc/caddy/Caddyfile`,
+      `  echo "Caddy: sites.d import appended without replacing legacy routes."`,
+      `fi`,
+      "",
+    );
+  } else {
+    push(
+      `# Write a minimal-but-valid Caddyfile. Idempotent: overwrite with the`,
+      `# deterministic content — no append-drift.`,
+      `cat > /etc/caddy/Caddyfile <<'CADDYFILE'`,
+      ...caddyfileHeader,
+      "",
+      "import sites.d/*.caddy",
+      "CADDYFILE",
+      "",
+    );
+  }
+  push(
     `caddy validate --config /etc/caddy/Caddyfile`,
     `/usr/bin/systemctl enable caddy`,
     `/usr/bin/systemctl reload caddy || /usr/bin/systemctl restart caddy`,
-    `echo "Caddy: Caddyfile written (tls=${tlsMode}), validated, reloaded."`,
+    `echo "Caddy: Caddyfile ${isStaticReleaseChannel ? "ready" : "written"} (tls=${tlsMode}), validated, reloaded."`,
     "",
   );
 

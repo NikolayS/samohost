@@ -2574,6 +2574,13 @@ export function buildHostPrepScript(
     `${sshUser} ALL=(root) NOPASSWD: /usr/bin/tee /etc/caddy/sites.d/*.caddy`,
     `${sshUser} ALL=(root) NOPASSWD: /usr/bin/mv -- /etc/caddy/sites.d/*.caddy /etc/caddy/sites.d/*.caddy`,
     `${sshUser} ALL=(root) NOPASSWD: /usr/bin/rm -f /etc/caddy/sites.d/*.caddy`,
+    ...(isStaticReleaseChannel
+      ? [
+        `${sshUser} ALL=(root) NOPASSWD: /usr/bin/tee /etc/caddy/.samohost-next-Caddyfile`,
+        `${sshUser} ALL=(root) NOPASSWD: /usr/bin/mv -- /etc/caddy/.samohost-next-Caddyfile /etc/caddy/Caddyfile`,
+        `${sshUser} ALL=(root) NOPASSWD: /usr/bin/rm -f /etc/caddy/.samohost-next-Caddyfile`,
+      ]
+      : []),
   );
   if (!isStatic) {
     sudoersLines.push(
@@ -2666,7 +2673,7 @@ export function buildHostPrepScript(
       ? [`#    Release-channel host-prep never creates or replaces the production vhost.`]
       : [`#    (field-record-1#117 ITEM C, 7th drift class).`]),
     "mkdir -p /etc/caddy/sites.d",
-    `grep -q 'import sites.d/\\*.caddy' /etc/caddy/Caddyfile \\`,
+    `grep -Eq '^[[:space:]]*import[[:space:]]+(/etc/caddy/)?sites\\.d/\\*\\.caddy([[:space:]]*(#.*)?)?$' /etc/caddy/Caddyfile \\`,
     `  || printf '\\nimport sites.d/*.caddy\\n' >> /etc/caddy/Caddyfile`,
     ...mainVhostLines,
     // A managed main vhost reloads inside samohost_apply_main_vhost(). Every

@@ -78,14 +78,26 @@ function executeCaddySection(section: string, caddyDir: string, binDir: string):
 describe("static release-channel production vhost ownership", () => {
   test("regression: setup generators never render the mutable appDir production route", () => {
     const release = staticApp(true);
-    for (const script of [
+    const releaseScripts = [
       buildHostBootstrapScript(release, { appUser: "agent" }),
       buildHostPrepScript(release, "agent", { forceMainVhost: false }),
       buildHostPrepScript(release, "agent", { forceMainVhost: true }),
-    ]) {
+    ];
+    for (const script of releaseScripts) {
       expect(script).not.toContain("00-main-release-site.caddy");
       expect(script).not.toContain("root * /opt/release-site/app");
+      expect(script).toContain(
+        "/usr/bin/tee /etc/caddy/.samohost-next-Caddyfile",
+      );
+      expect(script).toContain(
+        "/usr/bin/mv -- /etc/caddy/.samohost-next-Caddyfile /etc/caddy/Caddyfile",
+      );
+      expect(script).toContain(
+        "/usr/bin/rm -f /etc/caddy/.samohost-next-Caddyfile",
+      );
     }
+    expect(releaseScripts[0]).toContain("SAMOHOST_CADDY_INSTALLED_NOW=0");
+    expect(releaseScripts[0]).toContain("SAMOHOST_CADDY_INSTALLED_NOW=1");
 
     // Backward compatibility: non-release static apps keep the established
     // bootstrap/host-prep-owned branch route.
@@ -106,7 +118,60 @@ describe("static release-channel production vhost ownership", () => {
       const binDir = join(dir, "bin");
       mkdirSync(sitesDir, { recursive: true });
       mkdirSync(binDir, { recursive: true });
-      writeFileSync(join(caddyDir, "Caddyfile"), "# initial\n");
+      writeFileSync(join(caddyDir, "Caddyfile"), [
+        ":80 {",
+        "\troot * /usr/share/caddy",
+        "\tfile_server",
+        "}",
+        "",
+      ].join("\n"));
+      writeFileSync(join(binDir, "caddy"), "#!/usr/bin/env bash\nexit 0\n");
+      writeFileSync(join(binDir, "systemctl"), "#!/usr/bin/env bash\nexit 0\n");
+      chmodSync(join(binDir, "caddy"), 0o755);
+      chmodSync(join(binDir, "systemctl"), 0o755);
+
+      const app = staticApp(true);
+      executeCaddySection(
+        `SAMOHOST_CADDY_INSTALLED_NOW=1\n${bootstrapCaddySection(app)}`,
+        caddyDir,
+        binDir,
+      );
+      expect(readFileSync(join(caddyDir, "Caddyfile"), "utf8")).toBe([
+        "# Caddy global options (ACME TLS — default).",
+        "",
+        "import sites.d/*.caddy",
+        "",
+      ].join("\n"));
+      executeCaddySection(hostPrepCaddySection(app, false), caddyDir, binDir);
+      executeCaddySection(hostPrepCaddySection(app, true), caddyDir, binDir);
+
+      expect(existsSync(join(sitesDir, "00-main-release-site.caddy"))).toBe(false);
+      expect(readdirSync(sitesDir)).toEqual([]);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("repeated setup preserves a GC-style legacy base route and one valid import", () => {
+    const dir = mkdtempSync(join(tmpdir(), "samohost-release-vhost-legacy-"));
+    try {
+      const caddyDir = join(dir, "caddy");
+      const sitesDir = join(caddyDir, "sites.d");
+      const binDir = join(dir, "bin");
+      mkdirSync(sitesDir, { recursive: true });
+      mkdirSync(binDir, { recursive: true });
+      const legacyBase = [
+        ":80 {",
+        "\troot * /opt/release-site/site",
+        "\ttry_files {path} /index.html",
+        "\tfile_server",
+        "}",
+        "",
+        "import sites.d/*.caddy # samohost",
+        "",
+      ].join("\n");
+      const baseFile = join(caddyDir, "Caddyfile");
+      writeFileSync(baseFile, legacyBase);
       writeFileSync(join(binDir, "caddy"), "#!/usr/bin/env bash\nexit 0\n");
       writeFileSync(join(binDir, "systemctl"), "#!/usr/bin/env bash\nexit 0\n");
       chmodSync(join(binDir, "caddy"), 0o755);
@@ -114,11 +179,19 @@ describe("static release-channel production vhost ownership", () => {
 
       const app = staticApp(true);
       executeCaddySection(bootstrapCaddySection(app), caddyDir, binDir);
-      executeCaddySection(hostPrepCaddySection(app, false), caddyDir, binDir);
+      executeCaddySection(bootstrapCaddySection(app), caddyDir, binDir);
       executeCaddySection(hostPrepCaddySection(app, true), caddyDir, binDir);
 
-      expect(existsSync(join(sitesDir, "00-main-release-site.caddy"))).toBe(false);
+      const after = readFileSync(baseFile, "utf8");
+      expect(after).toBe(legacyBase);
+      expect(after.match(/^\s*import\s+(?:\/etc\/caddy\/)?sites\.d\/\*\.caddy(?:\s*#.*)?$/gm))
+        .toHaveLength(1);
       expect(readdirSync(sitesDir)).toEqual([]);
+
+      const validation = spawnSync("caddy", ["validate", "--config", baseFile], {
+        encoding: "utf8",
+      });
+      expect(validation.status).toBe(0);
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }

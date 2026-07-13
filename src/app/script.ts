@@ -112,6 +112,8 @@ export function buildDeployScript(app: AppRecord, target: DeployTarget): string 
 
   const sha = target.sha;
   const releaseIdentity = target.tag ?? sha;
+  const isStaticReleaseChannel =
+    app.kind === "static" && app.releaseTagPattern !== undefined;
   if (app.kind === "static" && app.releaseTagPattern !== undefined && target.tag === undefined) {
     throw new Error("release-channel static deploy requires the resolved release tag");
   }
@@ -124,6 +126,8 @@ export function buildDeployScript(app: AppRecord, target: DeployTarget): string 
   const staticStagedSnippet = staticMainSnippet === undefined
     ? undefined
     : `/etc/caddy/sites.d/.samohost-next-00-main-${app.name}.caddy`;
+  const staticCaddyfile = "/etc/caddy/Caddyfile";
+  const staticStagedCaddyfile = "/etc/caddy/.samohost-next-Caddyfile";
   const appBase = app.appDir.replace(/\/+$/, "").split("/").slice(0, -1).join("/");
   const staticReleasesDir = `${appBase}/releases`;
   const appDir = sq(app.appDir);
@@ -199,6 +203,14 @@ export function buildDeployScript(app: AppRecord, target: DeployTarget): string 
       'SAMOHOST_VHOST_BACKUP="$(mktemp)"',
       `if [[ -f ${sq(staticMainSnippet!)} ]]; then cat ${sq(staticMainSnippet!)} > "$SAMOHOST_VHOST_BACKUP"; SAMOHOST_OLD_VHOST_PRESENT=1; else SAMOHOST_OLD_VHOST_PRESENT=0; fi`,
       'if [[ "$SAMOHOST_OLD_VHOST_PRESENT" == "1" ]]; then SAMOHOST_PREVIOUS_RELEASE_DIR=$(sed -n \'s/^[[:space:]]*root \\* "\\(.*\\)"$/\\1/p\' "$SAMOHOST_VHOST_BACKUP" | head -n 1); fi',
+      ...(isStaticReleaseChannel
+        ? [
+          'SAMOHOST_BASE_CHANGED=0',
+          'SAMOHOST_BASE_BACKUP="$(mktemp)"',
+          'SAMOHOST_BASE_FILTERED="$(mktemp)"',
+          `cat ${sq(staticCaddyfile)} > "$SAMOHOST_BASE_BACKUP"`,
+        ]
+        : []),
       marker("checkpoint", "ok"),
       "",
     );
@@ -223,9 +235,10 @@ export function buildDeployScript(app: AppRecord, target: DeployTarget): string 
   // re-probes health, emits the rollback marker, and exits 1.
   if (app.kind === "static") {
     push(
-      "# rollback(): atomically restore the prior vhost. The previous checkout",
-      "# and public version.json were never modified, so restoring the route",
-      "# restores both content and identity as one operation.",
+      "# rollback(): atomically restore the prior vhost and, on the first",
+      "# release-channel activation, the legacy route in the base Caddyfile.",
+      "# The previous checkout and public version.json were never modified, so",
+      "# restoring the routes restores content and identity as one operation.",
       "# Emits rollback:ok / rollback:fail and exits 1.",
       "rollback() {",
       "  local rb_ok=1",
@@ -234,6 +247,13 @@ export function buildDeployScript(app: AppRecord, target: DeployTarget): string 
       '  if [[ "${SAMOHOST_OLD_VHOST_PRESENT:-0}" == "1" ]]; then',
       `    if sudo /usr/bin/tee ${sq(staticStagedSnippet!)} >/dev/null < "$SAMOHOST_VHOST_BACKUP"; then sudo /usr/bin/mv -- ${sq(staticStagedSnippet!)} ${sq(staticMainSnippet!)} || rb_route_ok=0; else rb_route_ok=0; fi`,
       `  else sudo /usr/bin/rm -f ${sq(staticMainSnippet!)} || rb_route_ok=0; fi`,
+      ...(isStaticReleaseChannel
+        ? [
+          '  if [[ "${SAMOHOST_BASE_CHANGED:-0}" == "1" ]]; then',
+          `    if sudo /usr/bin/tee ${sq(staticStagedCaddyfile)} >/dev/null < "$SAMOHOST_BASE_BACKUP"; then sudo /usr/bin/mv -- ${sq(staticStagedCaddyfile)} ${sq(staticCaddyfile)} || rb_route_ok=0; else rb_route_ok=0; fi`,
+          `  else sudo /usr/bin/rm -f ${sq(staticStagedCaddyfile)} || rb_route_ok=0; fi`,
+        ]
+        : []),
       "  caddy validate --config /etc/caddy/Caddyfile >/dev/null || rb_route_ok=0",
       // Static rollback: reload caddy, not restart a unit that doesn't exist.
       // full-path systemctl: see header note (3).
@@ -255,7 +275,13 @@ export function buildDeployScript(app: AppRecord, target: DeployTarget): string 
       '    echo "rollback health re-check failed (HTTP $rb_code) — manual intervention required" >&2',
       "  fi",
       `  sudo /usr/bin/rm -f ${sq(staticStagedSnippet!)} || true`,
+      ...(isStaticReleaseChannel
+        ? [`  sudo /usr/bin/rm -f ${sq(staticStagedCaddyfile)} || true`]
+        : []),
       '  rm -f "${SAMOHOST_VERSION_NEXT:-}" "$SAMOHOST_VHOST_BACKUP" || true',
+      ...(isStaticReleaseChannel
+        ? ['  rm -f "$SAMOHOST_BASE_BACKUP" "$SAMOHOST_BASE_FILTERED" "${SAMOHOST_BASE_FILTERED}.status" || true']
+        : []),
       "  exit 1",
       "}",
       "",
@@ -330,6 +356,107 @@ export function buildDeployScript(app: AppRecord, target: DeployTarget): string 
       "# mandatory: Caddy must be able to read /version.json after cutover.",
       'if ! SAMOHOST_VERSION_NEXT=$(mktemp "${SAMOHOST_CANDIDATE_DIR}/.version.next.XXXXXX"); then rollback; fi',
       'if printf \'{"version":"%s","tag":"%s","sha":"%s","environment":"production"}\\n\' "$SAMOHOST_RELEASE_TAG" "$SAMOHOST_RELEASE_TAG" "$SAMOHOST_SHA" > "$SAMOHOST_VERSION_NEXT" && chmod 0644 "$SAMOHOST_VERSION_NEXT" && [[ -r "$SAMOHOST_VERSION_NEXT" ]] && [[ "$(stat -c \'%a\' "$SAMOHOST_VERSION_NEXT")" == "644" ]] && /usr/bin/mv -f "$SAMOHOST_VERSION_NEXT" "${SAMOHOST_CANDIDATE_DIR}/version.json" && [[ -r "${SAMOHOST_CANDIDATE_DIR}/version.json" ]] && [[ "$(stat -c \'%a\' "${SAMOHOST_CANDIDATE_DIR}/version.json")" == "644" ]]; then :; else rollback; fi',
+      ...(isStaticReleaseChannel
+        ? [
+          "# On the first tagged activation only, stage removal of one legacy",
+          "# app-owned top-level route from the base Caddyfile. The parser fails",
+          "# closed on ambiguity and preserves every unrelated byte and route.",
+          `if ! python3 - ${sq(staticCaddyfile)} "$SAMOHOST_BASE_FILTERED" "${'$'}{SAMOHOST_BASE_FILTERED}.status" ${sq(appBase)} ${sq(app.mainHost!)} ${sq(app.mainListen ?? "tls")} <<'PY'`,
+          "import re",
+          "import sys",
+          "",
+          "source_path, output_path, status_path, app_base, main_host, main_listen = sys.argv[1:]",
+          "with open(source_path, encoding=\"utf-8\", newline=\"\") as source:",
+          "    lines = source.readlines()",
+          "",
+          "def structural_braces(line):",
+          "    braces = []",
+          "    quote = None",
+          "    escaped = False",
+          "    for index, char in enumerate(line):",
+          "        if quote is not None:",
+          "            if escaped:",
+          "                escaped = False",
+          "            elif char == \"\\\\\" and quote != \"`\":",
+          "                escaped = True",
+          "            elif char == quote:",
+          "                quote = None",
+          "            continue",
+          "        if char in ('\"', \"'\", \"`\"):",
+          "            quote = char",
+          "        elif char == '#':",
+          "            break",
+          "        elif char in '{}':",
+          "            braces.append((index, char))",
+          "    return braces",
+          "",
+          "blocks = []",
+          "depth = 0",
+          "block_start = None",
+          "block_header = None",
+          "for line_number, line in enumerate(lines):",
+          "    for column, brace in structural_braces(line):",
+          "        if brace == '{':",
+          "            if depth == 0:",
+          "                block_start = line_number",
+          "                block_header = line[:column].strip()",
+          "            depth += 1",
+          "        else:",
+          "            depth -= 1",
+          "            if depth < 0:",
+          "                raise SystemExit('base Caddyfile has an unmatched closing brace')",
+          "            if depth == 0 and block_start is not None:",
+          "                blocks.append((block_start, line_number + 1, block_header or ''))",
+          "                block_start = None",
+          "                block_header = None",
+          "if depth != 0:",
+          "    raise SystemExit('base Caddyfile has an unmatched opening brace')",
+          "",
+          "if main_listen == 'cp-http80':",
+          "    allowed_headers = {':80', 'http://:80', main_host, f'http://{main_host}', f'{main_host}:80', f'http://{main_host}:80'}",
+          "else:",
+          "    allowed_headers = {':443', 'https://:443', main_host, f'https://{main_host}', f'{main_host}:443', f'https://{main_host}:443'}",
+          "root_re = re.compile(r'^\\s*root\\s+\\*\\s+(?:\"([^\"]+)\"|([^\\s#]+))')",
+          "candidates = []",
+          "for start, end, header in blocks:",
+          "    if header not in allowed_headers:",
+          "        continue",
+          "    roots = []",
+          "    for line in lines[start:end]:",
+          "        match = root_re.match(line)",
+          "        if match:",
+          "            roots.append(match.group(1) or match.group(2))",
+          "    if any(root == app_base or root.startswith(app_base.rstrip('/') + '/') for root in roots):",
+          "        candidates.append((start, end))",
+          "if len(candidates) > 1:",
+          "    raise SystemExit('multiple app-owned legacy routes found in base Caddyfile; refusing ambiguous migration')",
+          "",
+          "if candidates:",
+          "    start, end = candidates[0]",
+          "    filtered = lines[:start] + lines[end:]",
+          "    status = 'changed'",
+          "else:",
+          "    filtered = lines",
+          "    status = 'unchanged'",
+          "import_re = re.compile(r'^\\s*import\\s+(?:/etc/caddy/)?sites\\.d/\\*\\.caddy(?:\\s*(?:#.*)?)?$', re.MULTILINE)",
+          "rendered = ''.join(filtered)",
+          "if not import_re.search(rendered):",
+          "    raise SystemExit('base Caddyfile is missing the required sites.d import after migration')",
+          "with open(output_path, 'w', encoding='utf-8', newline='') as output:",
+          "    output.write(rendered)",
+          "with open(status_path, 'w', encoding='utf-8') as status_file:",
+          "    status_file.write(status)",
+          "PY",
+          "then",
+          "  rollback",
+          "fi",
+          `sudo /usr/bin/rm -f ${sq(staticStagedCaddyfile)} || rollback`,
+          'if [[ "$(cat "${SAMOHOST_BASE_FILTERED}.status")" == "changed" ]]; then',
+          "  SAMOHOST_BASE_CHANGED=1",
+          `  sudo /usr/bin/tee ${sq(staticStagedCaddyfile)} >/dev/null < "$SAMOHOST_BASE_FILTERED" || rollback`,
+          "fi",
+        ]
+        : []),
       `sudo /usr/bin/rm -f ${sq(staticStagedSnippet!)} || rollback`,
       `sudo /usr/bin/tee ${sq(staticStagedSnippet!)} >/dev/null <<CADDY || rollback`,
       `${address} {`,
@@ -341,6 +468,11 @@ export function buildDeployScript(app: AppRecord, target: DeployTarget): string 
       `}`,
       `CADDY`,
       `sudo /usr/bin/mv -- ${sq(staticStagedSnippet!)} ${sq(staticMainSnippet!)} || rollback`,
+      ...(isStaticReleaseChannel
+        ? [
+          `if [[ "$SAMOHOST_BASE_CHANGED" == "1" ]]; then sudo /usr/bin/mv -- ${sq(staticStagedCaddyfile)} ${sq(staticCaddyfile)} || rollback; fi`,
+        ]
+        : []),
       "caddy validate --config /etc/caddy/Caddyfile >/dev/null || rollback",
       "",
     );
@@ -380,7 +512,13 @@ export function buildDeployScript(app: AppRecord, target: DeployTarget): string 
       '    git -C "$SAMOHOST_APP_DIR" worktree remove --force "$SAMOHOST_PREVIOUS_RELEASE_DIR" || true',
       "  fi",
       '  git -C "$SAMOHOST_APP_DIR" worktree prune || true',
+      ...(isStaticReleaseChannel
+        ? [`  sudo /usr/bin/rm -f ${sq(staticStagedCaddyfile)} || true`]
+        : []),
       '  rm -f "$SAMOHOST_VHOST_BACKUP" || true',
+      ...(isStaticReleaseChannel
+        ? ['  rm -f "$SAMOHOST_BASE_BACKUP" "$SAMOHOST_BASE_FILTERED" "${SAMOHOST_BASE_FILTERED}.status" || true']
+        : []),
       "else",
       `  ${marker("health", "fail")}`,
       '  echo "health check failed after retries — rolling back" >&2',

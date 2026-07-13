@@ -450,15 +450,19 @@ describe("buildDeployScript — static path (kind='static')", () => {
 
       mkdirSync(join(caddyDir, "sites.d"), { recursive: true });
       mkdirSync(binDir, { recursive: true });
-      writeFileSync(join(caddyDir, "Caddyfile"), "import sites.d/*.caddy\n");
-      const siteFile = join(caddyDir, "sites.d", "00-main-my-static-site.caddy");
-      writeFileSync(siteFile, [
-        "http://my-static-site.example.com {",
+      const legacyBase = [
+        ":80 {",
         `\troot * "${appDir}"`,
+        "\ttry_files {path} /index.html",
         "\tfile_server",
         "}",
         "",
-      ].join("\n"));
+        "import sites.d/*.caddy",
+        "",
+      ].join("\n");
+      const baseFile = join(caddyDir, "Caddyfile");
+      writeFileSync(baseFile, legacyBase);
+      const siteFile = join(caddyDir, "sites.d", "00-main-my-static-site.caddy");
 
       writeFileSync(join(binDir, "sudo"), [
         "#!/usr/bin/env bash",
@@ -470,8 +474,8 @@ describe("buildDeployScript — static path (kind='static')", () => {
       writeFileSync(join(binDir, "sleep"), "#!/usr/bin/env bash\nexit 0\n");
       writeFileSync(join(binDir, "curl"), [
         "#!/usr/bin/env bash",
-        'root=$(sed -n \'s/^[[:space:]]*root \\* "\\(.*\\)"$/\\1/p\' "$CADDY_SITE" | head -n 1)',
         'if [[ "$*" == *"version.json"* ]]; then',
+        '  root=$(sed -n \'s/^[[:space:]]*root \\* "\\(.*\\)"$/\\1/p\' "$CADDY_SITE" | head -n 1)',
         '  if [[ "${FAIL_VERSION_HEALTH:-0}" == "1" ]]; then printf \'invalid\\n\'; else cat "$root/version.json"; fi',
         "else",
         "  printf '200'",
@@ -515,13 +519,23 @@ describe("buildDeployScript — static path (kind='static')", () => {
         return match[1];
       };
 
-      const firstScript = execute(firstSha, "v20260713.1");
+      // A failed first activation must restore the GC-style base-file route
+      // byte-for-byte and remove the unproven sites.d route.
+      execute(firstSha, "v20260713.1", true);
+      expect(readFileSync(baseFile, "utf8")).toBe(legacyBase);
+      expect(existsSync(siteFile)).toBe(false);
+
+      const firstScript = execute(firstSha, "v20260713.2");
       const firstRoot = routedRoot();
       expect(firstRoot).not.toBe(appDir);
+      const migratedBase = readFileSync(baseFile, "utf8");
+      expect(migratedBase).not.toContain(`root * "${appDir}"`);
+      expect(migratedBase.match(/^\s*import\s+sites\.d\/\*\.caddy\s*$/gm)).toHaveLength(1);
+      expect(spawnSync("caddy", ["validate", "--config", baseFile]).status).toBe(0);
       expect(readFileSync(join(firstRoot, "index.html"), "utf8")).toBe("release one\n");
       expect(JSON.parse(readFileSync(join(firstRoot, "version.json"), "utf8"))).toEqual({
-        version: "v20260713.1",
-        tag: "v20260713.1",
+        version: "v20260713.2",
+        tag: "v20260713.2",
         sha: firstSha,
         environment: "production",
       });
@@ -530,7 +544,7 @@ describe("buildDeployScript — static path (kind='static')", () => {
         firstScript.indexOf('worktree remove --force "$SAMOHOST_PREVIOUS_RELEASE_DIR"'),
       );
 
-      execute(secondSha, "v20260713.2");
+      execute(secondSha, "v20260713.3");
       const secondRoot = routedRoot();
       expect(secondRoot).not.toBe(firstRoot);
       expect(readFileSync(join(secondRoot, "index.html"), "utf8")).toBe("release two\n");
@@ -538,7 +552,7 @@ describe("buildDeployScript — static path (kind='static')", () => {
       expect(existsSync(firstRoot)).toBe(false);
 
       const secondIdentity = readFileSync(join(secondRoot, "version.json"), "utf8");
-      execute(firstSha, "v20260713.3", true);
+      execute(firstSha, "v20260713.4", true);
       expect(routedRoot()).toBe(secondRoot);
       expect(readFileSync(join(secondRoot, "index.html"), "utf8")).toBe("release two\n");
       expect(readFileSync(join(secondRoot, "version.json"), "utf8")).toBe(secondIdentity);
