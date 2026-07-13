@@ -35,10 +35,13 @@ import {
   runAppDeploy,
   compareReleaseTags,
   defaultAppDeployDeps,
+  defaultIsCommitOnBranch,
   defaultResolveLatestTag,
+  isDateReleaseTag,
   type AppDeployInput,
   type RefResolver,
   type LatestTagResolver,
+  type CommitOnBranchVerifier,
 } from "./app.ts";
 import { checkCiGreen } from "../app/cigate.ts";
 import type { DeployOutcome } from "../app/parse.ts";
@@ -214,6 +217,8 @@ export interface TriggerDeps {
    * `{resolveRef, deploy, fetch, now}` test fixtures continue to compile.
    */
   resolveLatestTag?: LatestTagResolver;
+  /** Verify the release commit is reachable from the configured main branch. */
+  isCommitOnBranch?: CommitOnBranchVerifier;
   /** CURRIED runAppDeploy — AppDeployDeps already bound inside. */
   deploy: TriggerDeploy;
   /**
@@ -425,13 +430,17 @@ export async function runTriggerRun(
       // known-bad, CI gate, deploy) is ref-agnostic and reused verbatim.
       let resolvedSha: string;
       let resolvedTag: string | undefined;
-      if (
-        app.releaseTagPattern !== undefined &&
-        deps.resolveLatestTag !== undefined
-      ) {
+      if (app.releaseTagPattern !== undefined) {
+        if (app.releaseTagFormat !== "date" || app.releaseCiWorkflow === undefined) {
+          throw new Error("release channel requires releaseTagFormat='date' and releaseCiWorkflow");
+        }
+        if (deps.resolveLatestTag === undefined) {
+          throw new Error("releaseTagPattern is set but the release tag resolver is absent");
+        }
         const latest = await deps.resolveLatestTag(
           app.repo,
           app.releaseTagPattern,
+          app.releaseTagFormat,
         );
         if (latest === null) {
           // "Tag ≠ ship": no matching tag → prod stays put. NEVER fall back to
@@ -456,6 +465,19 @@ export async function runTriggerRun(
         }
         resolvedTag = latest.tag;
         resolvedSha = latest.sha;
+        if (deps.isCommitOnBranch === undefined) {
+          throw new Error("release tag resolver is configured but main-ancestry verifier is absent");
+        }
+        if (!(await deps.isCommitOnBranch(app.repo, resolvedSha, app.branch))) {
+          results.push({
+            app: app.name,
+            vm: vmName,
+            action: "skipped",
+            sha: resolvedSha,
+            reason: "release-sha-not-on-main",
+          });
+          continue;
+        }
       } else {
         resolvedSha = await deps.resolveRef(app.repo, app.branch);
       }
@@ -516,7 +538,9 @@ export async function runTriggerRun(
       // A cursor is monotonic: deleting/repointing tags must not turn an older
       // tag into a production rollback. Invalid cursor data also fails closed.
       if (resolvedTag !== undefined && app.releaseTagCursor !== undefined) {
-        const order = compareReleaseTags(resolvedTag, app.releaseTagCursor);
+        const order = app.releaseTagFormat === "date" && !isDateReleaseTag(app.releaseTagCursor)
+          ? null
+          : compareReleaseTags(resolvedTag, app.releaseTagCursor);
         if (order === null || order <= 0) {
           results.push({
             app: app.name,
@@ -560,7 +584,7 @@ export async function runTriggerRun(
       const ciStatus = await checkCiGreen(app.repo, resolvedSha, {
         fetch: deps.fetch,
         env: deps.env,
-      });
+      }, resolvedTag !== undefined ? app.releaseCiWorkflow : undefined);
 
       if (ciStatus === "pending") {
         results.push({
@@ -604,6 +628,7 @@ export async function runTriggerRun(
         app: app.name,
         sha: resolvedSha,
         skipCiGate: false,
+        ...(resolvedTag !== undefined ? { releaseTag: resolvedTag } : {}),
       };
 
       const deployExit = await deps.deploy(
@@ -1012,6 +1037,7 @@ export interface TriggerDepsOpts {
    * Production: absent (undefined) → uses defaultAppDeployDeps().resolveRef.
    */
   resolveRef?: RefResolver;
+  isCommitOnBranch?: CommitOnBranchVerifier;
   /**
    * Injectable PR-listing function (for integration tests — avoids requiring
    * a live `gh` binary). When provided, batchedVmCycle uses it instead of
@@ -1084,6 +1110,7 @@ export function defaultTriggerDeps(opts: TriggerDepsOpts = {}): TriggerDeps {
 
     // Release-tag production channel (issue #132): latest matching tag → sha.
     resolveLatestTag: defaultResolveLatestTag(),
+    isCommitOnBranch: opts.isCommitOnBranch ?? defaultIsCommitOnBranch(),
 
     // Curried: AppDeployDeps already captured in closure.
     deploy: (input, opts, vmStore, appStore, out, err) =>

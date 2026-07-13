@@ -270,6 +270,63 @@ function staticApp(overrides: Partial<AppRecord> = {}): AppRecord {
 const STATIC_TARGET = { sha: "abc1234def5678901234567890abcdef12345678" };
 
 describe("buildDeployScript — static path (kind='static')", () => {
+  test("release static deploy requires a dated tag and owned main host", () => {
+    const releaseApp = staticApp({
+      releaseTagPattern: "v*",
+      releaseTagFormat: "date",
+      releaseCiWorkflow: "ci.yml",
+    });
+    expect(() => buildDeployScript(releaseApp, STATIC_TARGET)).toThrow(
+      "requires the resolved release tag",
+    );
+    expect(() => buildDeployScript(
+      staticApp({ mainHost: undefined }),
+      STATIC_TARGET,
+    )).toThrow("requires mainHost");
+  });
+
+  test("release static activation atomically writes identity and the owned main vhost", () => {
+    const script = buildDeployScript(staticApp({
+      releaseTagPattern: "v*",
+      releaseTagFormat: "date",
+      releaseCiWorkflow: "ci.yml",
+    }), { ...STATIC_TARGET, tag: "v20260713.1" });
+    expect(script).toContain(
+      '{"version":"%s","tag":"%s","sha":"%s","environment":"production"}',
+    );
+    expect(script).toContain(".version.next.");
+    expect(script).toContain('/usr/bin/mv -f "$SAMOHOST_VERSION_NEXT"');
+    expect(script).toContain(".samohost-next-00-main-my-static-site.caddy");
+    expect(script).toContain(
+      "root * /opt/my-static-site/app",
+    );
+    expect(script).toContain(
+      "sudo /usr/bin/mv -- '/etc/caddy/sites.d/.samohost-next-00-main-my-static-site.caddy' '/etc/caddy/sites.d/00-main-my-static-site.caddy'",
+    );
+  });
+
+  test("release static health uses intended Host identity and rollback restores route+metadata", () => {
+    const script = buildDeployScript(staticApp({
+      releaseTagPattern: "v*",
+      releaseTagFormat: "date",
+      releaseCiWorkflow: "ci.yml",
+    }), { ...STATIC_TARGET, tag: "v20260713.1" });
+    expect(script).toContain("-H 'Host: my-static-site.example.com'");
+    expect(script).toContain("/version.json");
+    expect(script).toContain('"environment":"production"');
+    const checkpoint = script.indexOf("SAMOHOST_VERSION_BACKUP");
+    const checkout = script.indexOf("<<<SAMOHOST_PHASE:checkout:start>>>");
+    expect(checkpoint).toBeLessThan(checkout);
+    const rollbackStart = script.indexOf("rollback() {");
+    const rollbackEnd = script.indexOf("\n}", rollbackStart);
+    const rollback = script.slice(rollbackStart, rollbackEnd);
+    expect(rollback).toContain('git reset --hard "${PRE_DEPLOY_SHA}"');
+    expect(rollback).toContain("SAMOHOST_VERSION_BACKUP");
+    expect(rollback).toContain("SAMOHOST_VHOST_BACKUP");
+    expect(rollback).toContain("caddy validate");
+    expect(rollback).toContain("reload caddy");
+  });
+
   test("static deploy script is valid bash", () => {
     // The generated script must be syntactically valid bash (bash -n).
     // This passes today (the output is syntactically valid even though semantically wrong).

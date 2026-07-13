@@ -29,9 +29,12 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   compareReleaseTags,
+  isDateReleaseTag,
   selectLatestTag,
   makeResolveLatestTag,
+  runAppDeploy,
   runAppRegister,
+  type AppDeployDeps,
   type GhTagIo,
 } from "../src/commands/app.ts";
 import { parseSamohostToml } from "../src/manifest/toml.ts";
@@ -106,16 +109,18 @@ function capture() {
 
 function makeFakeFetch(
   runs: Array<{ status?: string; conclusion?: string | null }>,
-): { fetch: typeof globalThis.fetch; callCount: () => number } {
+): { fetch: typeof globalThis.fetch; callCount: () => number; urls: string[] } {
   let count = 0;
-  const fakeFetch = (async () => {
+  const urls: string[] = [];
+  const fakeFetch = (async (input: string | URL | Request) => {
     count++;
+    urls.push(String(input));
     return {
       ok: true,
       json: async () => ({ workflow_runs: runs }),
     } as Response;
   }) as unknown as typeof globalThis.fetch;
-  return { fetch: fakeFetch, callCount: () => count };
+  return { fetch: fakeFetch, callCount: () => count, urls };
 }
 
 // ---------------------------------------------------------------------------
@@ -123,6 +128,23 @@ function makeFakeFetch(
 // ---------------------------------------------------------------------------
 
 describe("selectLatestTag — semver ordering & prerelease policy", () => {
+  test("date format accepts only real-calendar vYYYYMMDD.N releases", () => {
+    expect(isDateReleaseTag("v20260713.1")).toBe(true);
+    expect(isDateReleaseTag("v20240229.12")).toBe(true);
+    expect(isDateReleaseTag("v20260229.1")).toBe(false);
+    expect(isDateReleaseTag("v20261301.1")).toBe(false);
+    expect(isDateReleaseTag("v20260713.0")).toBe(false);
+    expect(isDateReleaseTag("v20260713.01")).toBe(false);
+    expect(isDateReleaseTag("v1.2.3")).toBe(false);
+  });
+
+  test("date-formatted selection rejects matching non-date semver tags", () => {
+    expect(selectLatestTag(
+      ["v99999999.1", "v20260712.2", "v20260713.1", "v1.2.3"],
+      "v*",
+      "date",
+    )).toBe("v20260713.1");
+  });
   test("§8 #1 picks the greatest by SEMVER, not lexical (v1.10.0 > v1.9.0)", () => {
     // Lexical sort would put "v1.9.0" after "v1.10.0" (wrong); semver must win.
     expect(selectLatestTag(["v1.2.0", "v1.10.0", "v1.9.0"], "v*")).toBe(
@@ -243,6 +265,8 @@ describe("trigger run — release-tag production channel", () => {
         deployedSha: SHA_OLD,
         mainHost: "field-record-1.samo.team",
         releaseTagPattern: "v*",
+        releaseTagFormat: "date",
+        releaseCiWorkflow: "ci.yml",
       }),
     );
 
@@ -293,6 +317,53 @@ describe("trigger run — release-tag production channel", () => {
     ).toBe(true);
     expect(report.skipped).toBe(1);
     expect(code).toBe(0);
+  });
+
+  test("release resolver/verifier absence and off-main tags fail closed", async () => {
+    vmStore.upsert(makeVm());
+    appStore.upsert(makeApp({
+      releaseTagPattern: "v*",
+      releaseTagFormat: "date",
+      releaseCiWorkflow: "ci.yml",
+      releaseTagChannelInitialized: true,
+    }));
+    const base = {
+      resolveRef: async () => { throw new Error("branch fallback forbidden"); },
+      deploy: async () => 0,
+      fetch: makeFakeFetch([{ conclusion: "success" }]).fetch,
+      env: { GH_TOKEN: "test" },
+      now: () => new Date(),
+    };
+
+    const noResolver = capture();
+    expect(await runTriggerRun(
+      { dryRun: false }, { json: true }, vmStore, appStore, base,
+      noResolver.out, noResolver.err,
+    )).toBe(1);
+    expect((JSON.parse(noResolver.o) as TriggerRunReport).results[0]!.error)
+      .toContain("resolver is absent");
+
+    const noVerifier = capture();
+    expect(await runTriggerRun(
+      { dryRun: false }, { json: true }, vmStore, appStore,
+      { ...base, resolveLatestTag: async () => ({ tag: "v20260713.1", sha: SHA_TAG }) },
+      noVerifier.out, noVerifier.err,
+    )).toBe(1);
+    expect((JSON.parse(noVerifier.o) as TriggerRunReport).results[0]!.error)
+      .toContain("ancestry verifier is absent");
+
+    const offMain = capture();
+    expect(await runTriggerRun(
+      { dryRun: false }, { json: true }, vmStore, appStore,
+      {
+        ...base,
+        resolveLatestTag: async () => ({ tag: "v20260713.1", sha: SHA_TAG }),
+        isCommitOnBranch: async () => false,
+      },
+      offMain.out, offMain.err,
+    )).toBe(0);
+    expect((JSON.parse(offMain.o) as TriggerRunReport).results[0]!.reason)
+      .toBe("release-sha-not-on-main");
   });
 
   test("§8 #5 app WITHOUT releaseTagPattern is unchanged (branch-HEAD path)", async () => {
@@ -347,6 +418,8 @@ describe("trigger run — release-tag production channel", () => {
         deployedSha: SHA_OLD,
         mainHost: "field-record-1.samo.team",
         releaseTagPattern: "v*",
+        releaseTagFormat: "date",
+        releaseCiWorkflow: "ci.yml",
         releaseTagChannelInitialized: true,
       }),
     );
@@ -358,7 +431,8 @@ describe("trigger run — release-tag production channel", () => {
       resolveRef: async () => {
         throw new Error("branch path must not run");
       },
-      resolveLatestTag: async () => ({ tag: "v1.0.0", sha: SHA_TAG }),
+      resolveLatestTag: async () => ({ tag: "v20260713.1", sha: SHA_TAG }),
+      isCommitOnBranch: async () => true,
       deploy: async () => {
         deployCalls++;
         return 0;
@@ -373,7 +447,7 @@ describe("trigger run — release-tag production channel", () => {
     )).toBe(0);
     expect(deployCalls).toBe(1);
     expect(appStore.get("vm-1111", "field-record")?.releaseTagCursor).toBe(
-      "v1.0.0",
+      "v20260713.1",
     );
   });
 
@@ -386,6 +460,8 @@ describe("trigger run — release-tag production channel", () => {
         deployedSha: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
         mainHost: "field-record-1.samo.team",
         releaseTagPattern: "v*",
+        releaseTagFormat: "date",
+        releaseCiWorkflow: "ci.yml",
       }),
     );
 
@@ -395,7 +471,8 @@ describe("trigger run — release-tag production channel", () => {
       resolveRef: async () => {
         throw new Error("branch path must not run");
       },
-      resolveLatestTag: async () => ({ tag: "v0.7.1", sha: SHA_OLD }),
+      resolveLatestTag: async () => ({ tag: "v20260710.1", sha: SHA_OLD }),
+      isCommitOnBranch: async () => true,
       deploy: async () => {
         deployCalls++;
         return 0;
@@ -414,7 +491,7 @@ describe("trigger run — release-tag production channel", () => {
     expect(deployCalls).toBe(0);
     expect(callCount()).toBe(0);
     expect(appStore.get("vm-1111", "field-record")?.releaseTagCursor).toBe(
-      "v0.7.1",
+      "v20260710.1",
     );
     expect(
       appStore.get("vm-1111", "field-record")?.releaseTagChannelInitialized,
@@ -437,7 +514,9 @@ describe("trigger run — release-tag production channel", () => {
         deployedSha: SHA_OLD,
         mainHost: "field-record-1.samo.team",
         releaseTagPattern: "v*",
-        releaseTagCursor: "v0.7.1",
+        releaseTagFormat: "date",
+        releaseCiWorkflow: "ci.yml",
+        releaseTagCursor: "v20260710.1",
         releaseTagChannelInitialized: true,
       }),
     );
@@ -450,7 +529,8 @@ describe("trigger run — release-tag production channel", () => {
       resolveRef: async () => {
         throw new Error("branch path must not run");
       },
-      resolveLatestTag: async () => ({ tag: "v0.8.0", sha: SHA_TAG }),
+      resolveLatestTag: async () => ({ tag: "v20260713.1", sha: SHA_TAG }),
+      isCommitOnBranch: async () => true,
       deploy: async () => {
         deployCalls++;
         return 0;
@@ -468,7 +548,7 @@ describe("trigger run — release-tag production channel", () => {
     expect(report.results[0]!.action).toBe("deployed");
     expect(deployCalls).toBe(1);
     expect(appStore.get("vm-1111", "field-record")?.releaseTagCursor).toBe(
-      "v0.8.0",
+      "v20260713.1",
     );
   });
 
@@ -479,13 +559,15 @@ describe("trigger run — release-tag production channel", () => {
         deployedSha: SHA_OLD,
         mainHost: "field-record-1.samo.team",
         releaseTagPattern: "v*",
-        releaseTagCursor: "v1.1.0",
+        releaseTagFormat: "date",
+        releaseCiWorkflow: "ci.yml",
+        releaseTagCursor: "v20260712.1",
         releaseTagChannelInitialized: true,
       }),
     );
 
     const deployInputs: AppDeployInput[] = [];
-    const { fetch: fakeFetch } = makeFakeFetch([
+    const { fetch: fakeFetch, urls } = makeFakeFetch([
       { status: "completed", conclusion: "success" },
     ]);
 
@@ -493,7 +575,8 @@ describe("trigger run — release-tag production channel", () => {
       resolveRef: async () => {
         throw new Error("branch path must not run for a tag-tracked app");
       },
-      resolveLatestTag: async () => ({ tag: "v1.2.0", sha: SHA_TAG }),
+      resolveLatestTag: async () => ({ tag: "v20260713.1", sha: SHA_TAG }),
+      isCommitOnBranch: async () => true,
       deploy: async (input) => {
         deployInputs.push(input);
         return 0;
@@ -517,6 +600,8 @@ describe("trigger run — release-tag production channel", () => {
 
     expect(deployInputs.length).toBe(1);
     expect(deployInputs[0]!.sha).toBe(SHA_TAG);
+    expect(deployInputs[0]!.releaseTag).toBe("v20260713.1");
+    expect(urls[0]).toContain("/actions/workflows/ci.yml/runs?");
     expect(report.results[0]!.action).toBe("deployed");
     expect(report.results[0]!.sha).toBe(SHA_TAG);
     expect(code).toBe(0);
@@ -529,7 +614,9 @@ describe("trigger run — release-tag production channel", () => {
         deployedSha: SHA_TAG, // already on the latest tag's commit
         mainHost: "field-record-1.samo.team",
         releaseTagPattern: "v*",
-        releaseTagCursor: "v1.2.0",
+        releaseTagFormat: "date",
+        releaseCiWorkflow: "ci.yml",
+        releaseTagCursor: "v20260713.1",
         releaseTagChannelInitialized: true,
       }),
     );
@@ -541,7 +628,8 @@ describe("trigger run — release-tag production channel", () => {
       resolveRef: async () => {
         throw new Error("branch path must not run");
       },
-      resolveLatestTag: async () => ({ tag: "v1.2.0", sha: SHA_TAG }),
+      resolveLatestTag: async () => ({ tag: "v20260713.1", sha: SHA_TAG }),
+      isCommitOnBranch: async () => true,
       deploy: async () => {
         deployCalls++;
         return 0;
@@ -576,7 +664,9 @@ describe("trigger run — release-tag production channel", () => {
         deployedSha: SHA_OLD,
         mainHost: "field-record-1.samo.team",
         releaseTagPattern: "v*",
-        releaseTagCursor: "v1.1.0",
+        releaseTagFormat: "date",
+        releaseCiWorkflow: "ci.yml",
+        releaseTagCursor: "v20260712.1",
         releaseTagChannelInitialized: true,
       }),
     );
@@ -606,7 +696,8 @@ describe("trigger run — release-tag production channel", () => {
       resolveRef: async () => {
         throw new Error("branch path must not run");
       },
-      resolveLatestTag: async () => ({ tag: "v1.2.0", sha: SHA_TAG }),
+      resolveLatestTag: async () => ({ tag: "v20260713.1", sha: SHA_TAG }),
+      isCommitOnBranch: async () => true,
       deploy: deployStampingFailure,
       fetch: fakeFetch,
       env: { GH_TOKEN: "ghp_test" },
@@ -653,11 +744,185 @@ describe("trigger run — release-tag production channel", () => {
   });
 });
 
+describe("release deploy authority", () => {
+  let dir: string;
+  let vmStore: StateStore;
+  let appStore: AppStore;
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), "samohost-release-authority-"));
+    vmStore = new StateStore(join(dir, "state.json"));
+    appStore = new AppStore(join(dir, "apps.json"));
+    vmStore.upsert(makeVm());
+    appStore.upsert(makeApp({
+      releaseTagPattern: "v*",
+      releaseTagFormat: "date",
+      releaseCiWorkflow: "ci.yml",
+    }));
+  });
+  afterEach(() => rmSync(dir, { recursive: true, force: true }));
+
+  function deps(overrides: Partial<AppDeployDeps> = {}): AppDeployDeps {
+    return {
+      remote: async () => ({
+        code: 0,
+        stdout: "<<<SAMOHOST_PHASE:health:start>>>\n<<<SAMOHOST_PHASE:health:ok>>>",
+        stderr: "",
+      }),
+      resolveRef: async () => SHA_TAG,
+      isCommitOnBranch: async () => true,
+      fetch: makeFakeFetch([{ status: "completed", conclusion: "success" }]).fetch,
+      now: () => new Date(),
+      env: { GH_TOKEN: "test" },
+      ...overrides,
+    };
+  }
+
+  test("manual and skip-CI release deploys are refused before remote execution", async () => {
+    let remoteCalls = 0;
+    const d = deps({ remote: async () => {
+      remoteCalls++;
+      return { code: 0, stdout: "", stderr: "" };
+    } });
+    const manual = capture();
+    expect(await runAppDeploy(
+      { vm: makeVm().name, app: "field-record", sha: SHA_TAG, skipCiGate: false },
+      { json: false }, vmStore, appStore, d, manual.out, manual.err,
+    )).toBe(1);
+    expect(manual.e).toContain("cannot be deployed manually");
+
+    const skipped = capture();
+    expect(await runAppDeploy(
+      {
+        vm: makeVm().name,
+        app: "field-record",
+        sha: SHA_TAG,
+        releaseTag: "v20260713.1",
+        skipCiGate: true,
+      },
+      { json: false }, vmStore, appStore, d, skipped.out, skipped.err,
+    )).toBe(1);
+    expect(skipped.e).toContain("--skip-ci-gate is forbidden");
+    expect(remoteCalls).toBe(0);
+  });
+
+  test("a forged tag/SHA pair or off-main release is refused", async () => {
+    const forged = capture();
+    expect(await runAppDeploy(
+      {
+        vm: makeVm().name,
+        app: "field-record",
+        sha: SHA_TAG,
+        releaseTag: "v20260713.1",
+        skipCiGate: false,
+      },
+      { json: false }, vmStore, appStore,
+      deps({ resolveRef: async () => SHA_OLD }), forged.out, forged.err,
+    )).toBe(1);
+    expect(forged.e).toContain("does not resolve to requested sha");
+
+    const offMain = capture();
+    expect(await runAppDeploy(
+      {
+        vm: makeVm().name,
+        app: "field-record",
+        sha: SHA_TAG,
+        releaseTag: "v20260713.1",
+        skipCiGate: false,
+      },
+      { json: false }, vmStore, appStore,
+      deps({ isCommitOnBranch: async () => false }), offMain.out, offMain.err,
+    )).toBe(1);
+    expect(offMain.e).toContain("not an ancestor");
+  });
+
+  test("verified release re-gates the exact configured workflow before SSH", async () => {
+    const seen: string[] = [];
+    let remoteCalls = 0;
+    const d = deps({
+      fetch: (async (input: string | URL | Request) => {
+        seen.push(String(input));
+        return {
+          ok: true,
+          json: async () => ({ workflow_runs: [{ status: "completed", conclusion: "success" }] }),
+        } as Response;
+      }) as unknown as typeof fetch,
+      remote: async () => {
+        remoteCalls++;
+        return {
+          code: 0,
+          stdout: "<<<SAMOHOST_PHASE:health:start>>>\n<<<SAMOHOST_PHASE:health:ok>>>",
+          stderr: "",
+        };
+      },
+    });
+    const c = capture();
+    expect(await runAppDeploy(
+      {
+        vm: makeVm().name,
+        app: "field-record",
+        sha: SHA_TAG,
+        releaseTag: "v20260713.1",
+        skipCiGate: false,
+      },
+      { json: true }, vmStore, appStore, d, c.out, c.err,
+    )).toBe(0);
+    expect(remoteCalls).toBe(1);
+    expect(seen).toHaveLength(1);
+    expect(seen[0]).toContain("/actions/workflows/ci.yml/runs?");
+    expect(seen[0]).toContain("per_page=1");
+  });
+});
+
 // ---------------------------------------------------------------------------
 // §8 #8 — schema compatibility: releaseTagPattern is independent of mainHost
 // ---------------------------------------------------------------------------
 
 describe("validation — releaseTagPattern remains independent of mainHost", () => {
+  test("release channel requires date format and an exact workflow filename", () => {
+    const base = [
+      'name = "field-record"',
+      'repo = "Tanya301/field-record-1"',
+      'branch = "main"',
+      'appDir = "/opt/field-record/app"',
+      'buildCmd = "npm run build"',
+      'healthUrl = "http://localhost:3000/api/version"',
+      'serviceUnit = "field-record"',
+      'releaseTagPattern = "v*"',
+    ];
+    const missing = parseSamohostToml(base.join("\n"));
+    expect(missing.ok).toBe(false);
+    if (!missing.ok) {
+      expect(missing.errors.join("\n")).toContain('releaseTagFormat = "date"');
+      expect(missing.errors.join("\n")).toContain("releaseCiWorkflow is required");
+    }
+    const inexact = parseSamohostToml([
+      ...base,
+      'releaseTagFormat = "date"',
+      'releaseCiWorkflow = ".github/workflows/ci.yml"',
+    ].join("\n"));
+    expect(inexact.ok).toBe(false);
+    if (!inexact.ok) expect(inexact.errors.join("\n")).toContain("exact workflow filename");
+  });
+
+  test("static release channel requires an owned mainHost", () => {
+    const res = parseSamohostToml([
+      'name = "site"',
+      'repo = "example/site"',
+      'branch = "main"',
+      'appDir = "/opt/site/app"',
+      'buildCmd = "true"',
+      'healthUrl = "http://localhost/"',
+      'serviceUnit = "site"',
+      'kind = "static"',
+      'releaseTagPattern = "v*"',
+      'releaseTagFormat = "date"',
+      'releaseCiWorkflow = "ci.yml"',
+    ].join("\n"));
+    expect(res.ok).toBe(false);
+    if (!res.ok) expect(res.errors.join("\n")).toContain("mainHost is required");
+  });
+
   test("§8 #8 TOML: releaseTagPattern without mainHost remains valid", () => {
     const toml = [
       'name = "field-record"',
@@ -668,6 +933,8 @@ describe("validation — releaseTagPattern remains independent of mainHost", () 
       'healthUrl = "http://localhost:3000/api/version"',
       'serviceUnit = "field-record"',
       'releaseTagPattern = "v*"',
+      'releaseTagFormat = "date"',
+      'releaseCiWorkflow = "ci.yml"',
     ].join("\n");
     const res = parseSamohostToml(toml);
     expect(res.ok).toBe(true);
@@ -687,6 +954,8 @@ describe("validation — releaseTagPattern remains independent of mainHost", () 
       'serviceUnit = "field-record"',
       'mainHost = "field-record-1.samo.team"',
       'releaseTagPattern = "v*"',
+      'releaseTagFormat = "date"',
+      'releaseCiWorkflow = "ci.yml"',
     ].join("\n");
     const res = parseSamohostToml(toml);
     expect(res.ok).toBe(true);
@@ -736,6 +1005,8 @@ describe("validation — releaseTagPattern remains independent of mainHost", () 
           healthUrl: "http://localhost:3000/api/version",
           rlsNonSuperuser: false,
           releaseTagPattern: "v*",
+          releaseTagFormat: "date",
+          releaseCiWorkflow: "ci.yml",
         },
         { json: false },
         vmStore,
@@ -773,6 +1044,8 @@ describe("validation — releaseTagPattern remains independent of mainHost", () 
           rlsNonSuperuser: false,
           mainHost: "field-record-1.samo.team",
           releaseTagPattern: "v*",
+          releaseTagFormat: "date",
+          releaseCiWorkflow: "ci.yml",
         },
         { json: false },
         vmStore,
@@ -797,7 +1070,9 @@ describe("validation — releaseTagPattern remains independent of mainHost", () 
       vmStore.upsert(makeVm());
       appStore.upsert(makeApp({
         releaseTagPattern: "v*",
-        releaseTagCursor: "v1.2.0",
+        releaseTagFormat: "date",
+        releaseCiWorkflow: "ci.yml",
+        releaseTagCursor: "v20260712.1",
         releaseTagChannelInitialized: true,
       }));
 
@@ -813,12 +1088,14 @@ describe("validation — releaseTagPattern remains independent of mainHost", () 
           serviceUnit: "field-record",
           healthUrl: "http://localhost:3000/api/version",
           rlsNonSuperuser: false,
-          releaseTagPattern: "release-*",
+          releaseTagPattern: "v2026*",
+          releaseTagFormat: "date",
+          releaseCiWorkflow: "release.yml",
         },
         { json: false }, vmStore, appStore, c.out, c.err,
       )).toBe(0);
       const saved = appStore.get("vm-1111", "field-record");
-      expect(saved?.releaseTagPattern).toBe("release-*");
+      expect(saved?.releaseTagPattern).toBe("v2026*");
       expect(saved?.releaseTagCursor).toBeUndefined();
       expect(saved?.releaseTagChannelInitialized).toBeUndefined();
     } finally {

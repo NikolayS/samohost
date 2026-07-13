@@ -98,10 +98,12 @@ export interface AppRegisterInput {
    * Optional glob pattern for release tags (e.g. `"v*"`). Mirrors
    * {@link AppSpec.releaseTagPattern}.
    *
-   * When set, production tracks the latest matching stable semver tag instead
-   * of branch HEAD. The tag commit must still pass the ordinary CI gate.
+   * When set, production accepts only real-calendar `vYYYYMMDD.N` release tags
+   * on the configured branch, gated by the exact configured workflow.
    */
   releaseTagPattern?: string;
+  releaseTagFormat?: "date";
+  releaseCiWorkflow?: string;
 
   /**
    * App-level secret env-var NAMES to auto-generate per preview env (PR-B).
@@ -146,6 +148,8 @@ export interface AppDeployInput {
   /** Git ref to resolve to a SHA via `gh api`. Defaults to the app branch. */
   ref?: string;
   skipCiGate: boolean;
+  /** Internal trigger proof that this deploy came from the resolved release tag. */
+  releaseTag?: string;
   /** Bypass the known-bad-SHA guard (issue #2: a FALSE rollback brands a good
    * SHA known-bad and wedges redeploys). Logged loudly when used. */
   force?: boolean;
@@ -211,6 +215,20 @@ export function runAppRegister(
     err(`error: VM not found in state: ${input.vm}`);
     return 1;
   }
+  if (input.releaseTagPattern !== undefined &&
+      (input.releaseTagFormat !== "date" || input.releaseCiWorkflow === undefined)) {
+    err("error: releaseTagPattern requires releaseTagFormat='date' and releaseCiWorkflow");
+    return 1;
+  }
+  if (input.releaseCiWorkflow !== undefined &&
+      !/^[A-Za-z0-9._-]+\.ya?ml$/.test(input.releaseCiWorkflow)) {
+    err("error: releaseCiWorkflow must be an exact workflow filename (for example ci.yml)");
+    return 1;
+  }
+  if (input.kind === "static" && input.releaseTagPattern !== undefined && input.mainHost === undefined) {
+    err("error: a static release-channel app requires mainHost for an owned production vhost");
+    return 1;
+  }
 
   // Fix 6a: validate service topology on the programmatic path too.
   // The TOML path runs the same check via parseSamohostToml. Without this guard,
@@ -263,6 +281,8 @@ export function runAppRegister(
     ...(input.defaultListener !== undefined ? { defaultListener: input.defaultListener } : {}),
     ...(input.mainListen !== undefined ? { mainListen: input.mainListen } : {}),
     ...(input.releaseTagPattern !== undefined ? { releaseTagPattern: input.releaseTagPattern } : {}),
+    ...(input.releaseTagFormat !== undefined ? { releaseTagFormat: input.releaseTagFormat } : {}),
+    ...(input.releaseCiWorkflow !== undefined ? { releaseCiWorkflow: input.releaseCiWorkflow } : {}),
     // PR-B/PR-C schema: accepted + persisted; secret generation and DB URL rewriting
     // are separate, not-yet-shipped features.
     ...(input.secrets !== undefined ? { secrets: input.secrets } : {}),
@@ -285,10 +305,14 @@ export function runAppRegister(
       ? { lastDeployAt: existing.lastDeployAt }
       : {}),
     ...(existing?.releaseTagPattern === input.releaseTagPattern &&
+    existing?.releaseTagFormat === input.releaseTagFormat &&
+    existing?.releaseCiWorkflow === input.releaseCiWorkflow &&
     existing?.releaseTagCursor !== undefined
       ? { releaseTagCursor: existing.releaseTagCursor }
       : {}),
     ...(existing?.releaseTagPattern === input.releaseTagPattern &&
+    existing?.releaseTagFormat === input.releaseTagFormat &&
+    existing?.releaseCiWorkflow === input.releaseCiWorkflow &&
     existing?.releaseTagChannelInitialized === true
       ? { releaseTagChannelInitialized: true }
       : {}),
@@ -380,6 +404,8 @@ export function runAppRegisterFromToml(
     ...(app.defaultListener !== undefined ? { defaultListener: app.defaultListener } : {}),
     ...(app.mainListen !== undefined ? { mainListen: app.mainListen } : {}),
     ...(app.releaseTagPattern !== undefined ? { releaseTagPattern: app.releaseTagPattern } : {}),
+    ...(app.releaseTagFormat !== undefined ? { releaseTagFormat: app.releaseTagFormat } : {}),
+    ...(app.releaseCiWorkflow !== undefined ? { releaseCiWorkflow: app.releaseCiWorkflow } : {}),
     ...(app.secrets !== undefined ? { secrets: app.secrets } : {}),
     ...(app.databaseUrlEnv !== undefined ? { databaseUrlEnv: app.databaseUrlEnv } : {}),
   };
@@ -588,6 +614,8 @@ export interface AppDeployDeps {
   now: () => Date;
   /** Env override for token lookup (tests). */
   env?: Record<string, string | undefined>;
+  /** Verify that a release commit is reachable from the configured main branch. */
+  isCommitOnBranch?: CommitOnBranchVerifier;
 }
 
 export interface AppDeployReport {
@@ -620,6 +648,31 @@ export async function runAppDeploy(
     err(`error: app not found on vm ${vm.name}: ${input.app}`);
     return 1;
   }
+  if (app.releaseTagPattern !== undefined) {
+    if (app.releaseTagFormat !== "date" || app.releaseCiWorkflow === undefined) {
+      err("error: release-channel app is missing releaseTagFormat='date' or releaseCiWorkflow");
+      return 1;
+    }
+    if (input.releaseTag === undefined) {
+      err("error: release-channel apps cannot be deployed manually by SHA/ref/branch; cut a reviewed release tag");
+      return 1;
+    }
+    if (!isDateReleaseTag(input.releaseTag)) {
+      err(`error: invalid dated release tag: ${input.releaseTag}`);
+      return 1;
+    }
+    if (!tagGlobToRegExp(app.releaseTagPattern).test(input.releaseTag)) {
+      err(`error: release tag ${input.releaseTag} does not match ${app.releaseTagPattern}`);
+      return 1;
+    }
+    if (input.skipCiGate) {
+      err("error: --skip-ci-gate is forbidden for release-channel apps");
+      return 1;
+    }
+  } else if (input.releaseTag !== undefined) {
+    err("error: internal releaseTag proof is invalid for a branch-channel app");
+    return 1;
+  }
 
   // ---- resolve the target SHA --------------------------------------------
   let sha: string;
@@ -638,6 +691,41 @@ export async function runAppDeploy(
     }
     if (!SHA_RE.test(sha)) {
       err(`error: resolved ref ${ref} to an invalid sha: ${sha}`);
+      return 1;
+    }
+  }
+
+  // A caller-provided `releaseTag` is not authority by itself. Re-resolve the
+  // immutable tag and prove that it names this exact SHA on the configured main
+  // branch before any CI or SSH side effect. This keeps the public app-deploy
+  // path from forging a tag proof around an arbitrary SHA.
+  if (input.releaseTag !== undefined) {
+    let taggedSha: string;
+    try {
+      taggedSha = (await deps.resolveRef(app.repo, input.releaseTag)).trim();
+    } catch (e) {
+      err(
+        `error: failed to verify release tag ${input.releaseTag}: ` +
+          `${e instanceof Error ? e.message : String(e)}`,
+      );
+      return 1;
+    }
+    if (!SHA_RE.test(taggedSha) || taggedSha !== sha) {
+      err(`error: release tag ${input.releaseTag} does not resolve to requested sha ${sha}`);
+      return 1;
+    }
+    if (deps.isCommitOnBranch === undefined) {
+      err("error: release ancestry verifier is unavailable; refusing deployment");
+      return 1;
+    }
+    let onMain = false;
+    try {
+      onMain = await deps.isCommitOnBranch(app.repo, sha, app.branch);
+    } catch {
+      onMain = false;
+    }
+    if (!onMain) {
+      err(`error: release sha ${sha} is not an ancestor of ${app.branch}`);
       return 1;
     }
   }
@@ -672,7 +760,7 @@ export async function runAppDeploy(
     ci = await checkCiGreen(app.repo, sha, {
       fetch: deps.fetch,
       ...(deps.env !== undefined ? { env: deps.env } : {}),
-    });
+    }, app.releaseTagPattern !== undefined ? app.releaseCiWorkflow : undefined);
     if (ci === "failure") {
       err(
         `error: CI gate refused ${sha}: GitHub Actions reports a failed/cancelled ` +
@@ -691,7 +779,10 @@ export async function runAppDeploy(
   }
 
   // ---- build + push the script over ONE connection -----------------------
-  const script = buildDeployScript(app, { sha });
+  const script = buildDeployScript(app, {
+    sha,
+    ...(input.releaseTag !== undefined ? { tag: input.releaseTag } : {}),
+  });
   let result: SpawnResult;
   try {
     result = await deps.remote(vm, script);
@@ -818,7 +909,15 @@ export interface TagRef {
 export type LatestTagResolver = (
   repo: string,
   pattern: string,
+  format?: "date",
 ) => Promise<TagRef | null>;
+
+/** Prove that `sha` is an ancestor of (or identical to) `branch`. */
+export type CommitOnBranchVerifier = (
+  repo: string,
+  sha: string,
+  branch: string,
+) => Promise<boolean>;
 
 /**
  * Low-level GitHub IO for the tag resolver, split out so the selection logic
@@ -950,6 +1049,7 @@ export function compareReleaseTags(a: string, b: string): number | null {
 export function selectLatestTag(
   names: string[],
   pattern: string,
+  format?: "date",
 ): string | null {
   const re = tagGlobToRegExp(pattern);
   // Opt into prereleases only on a hyphen that is part of the glob's matching
@@ -959,12 +1059,25 @@ export function selectLatestTag(
   let best: Semver | null = null;
   for (const name of names) {
     if (!re.test(name)) continue;
+    if (format === "date" && !isDateReleaseTag(name)) continue;
     const sv = parseSemver(name);
     if (sv === null) continue;
     if (!allowPrerelease && sv.prerelease.length > 0) continue;
     if (best === null || compareSemver(sv, best) > 0) best = sv;
   }
   return best === null ? null : best.raw;
+}
+
+/** Strict release tag shape: vYYYYMMDD.N with a real UTC calendar date. */
+export function isDateReleaseTag(name: string): boolean {
+  const match = /^v(\d{4})(\d{2})(\d{2})\.([1-9]\d*)$/.exec(name);
+  if (match === null) return false;
+  const year = Number(match[1]);
+  const month = Number(match[2]);
+  const day = Number(match[3]);
+  const date = new Date(Date.UTC(year, month - 1, day));
+  return date.getUTCFullYear() === year &&
+    date.getUTCMonth() === month - 1 && date.getUTCDate() === day;
 }
 
 /**
@@ -974,9 +1087,9 @@ export function selectLatestTag(
  * matches.
  */
 export function makeResolveLatestTag(io: GhTagIo): LatestTagResolver {
-  return async (repo, pattern) => {
+  return async (repo, pattern, format) => {
     const names = await io.listTags(repo);
-    const latest = selectLatestTag(names, pattern);
+    const latest = selectLatestTag(names, pattern, format);
     if (latest === null) return null;
     const sha = (await io.resolveCommitSha(repo, latest)).trim();
     return { tag: latest, sha };
@@ -1013,6 +1126,20 @@ export function defaultResolveLatestTag(): LatestTagResolver {
   return makeResolveLatestTag(defaultGhTagIo());
 }
 
+/** GitHub-backed ancestry verifier. Any API/tooling error fails closed. */
+export function defaultIsCommitOnBranch(): CommitOnBranchVerifier {
+  return (repo, sha, branch) => {
+    const res = spawnSync(
+      "gh",
+      ["api", `repos/${repo}/compare/${encodeURIComponent(sha)}...${encodeURIComponent(branch)}`, "--jq", ".status"],
+      { encoding: "utf8", maxBuffer: 1024 * 1024 },
+    );
+    if (res.status !== 0) return Promise.resolve(false);
+    const status = (res.stdout ?? "").trim();
+    return Promise.resolve(status === "ahead" || status === "identical");
+  };
+}
+
 /** Default production deploy deps. */
 export function defaultAppDeployDeps(): AppDeployDeps {
   return {
@@ -1020,6 +1147,7 @@ export function defaultAppDeployDeps(): AppDeployDeps {
     resolveRef: defaultRefResolver(),
     fetch: globalThis.fetch,
     now: () => new Date(),
+    isCommitOnBranch: defaultIsCommitOnBranch(),
   };
 }
 

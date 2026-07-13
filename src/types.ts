@@ -270,13 +270,17 @@ export interface AppSpec {
    */
   mainListen?: "cp-http80" | "tls";
   /**
-   * Optional glob pattern (e.g. `"v*"`) that the client repo carries to declare
-   * which git tags correspond to release events.
-   *
-   * When set, production tracks the latest matching stable semver tag instead
-   * of the branch head. The tag commit must still pass the ordinary CI gate.
+   * Optional glob pattern (normally `"v*"`) selecting production release tags.
+   * When set, releaseTagFormat="date" and an exact releaseCiWorkflow filename
+   * are mandatory. Production accepts only real-calendar `vYYYYMMDD.N` tags
+   * whose commit is on the configured main branch and whose exact workflow is
+   * green; branch-head/manual deploys are refused.
    */
   releaseTagPattern?: string;
+  /** Required release tag grammar when releaseTagPattern is set (`vYYYYMMDD.N`). */
+  releaseTagFormat?: "date";
+  /** Exact trusted GitHub Actions workflow filename, e.g. `ci.yml`. */
+  releaseCiWorkflow?: string;
 
   /**
    * App-level secret env-var NAMES samohost will auto-generate per preview env

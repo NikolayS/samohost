@@ -53,6 +53,7 @@ export async function checkCiGreen(
   repo: string,
   sha: string,
   deps: CiGateDeps,
+  workflow?: string,
 ): Promise<CiStatus> {
   const env = deps.env ?? process.env;
   const token = tokenFrom(env);
@@ -63,9 +64,12 @@ export async function checkCiGreen(
   };
   if (token) headers["Authorization"] = `Bearer ${token}`;
 
+  const runsPath = workflow === undefined
+    ? "actions/runs"
+    : `actions/workflows/${encodeURIComponent(workflow)}/runs`;
   const url =
-    `https://api.github.com/repos/${repo}/actions/runs` +
-    `?head_sha=${encodeURIComponent(sha)}&per_page=20`;
+    `https://api.github.com/repos/${repo}/${runsPath}` +
+    `?head_sha=${encodeURIComponent(sha)}&per_page=${workflow === undefined ? 20 : 1}`;
 
   let body: RunsResponse;
   try {
@@ -77,7 +81,9 @@ export async function checkCiGreen(
   }
 
   const runs = Array.isArray(body.workflow_runs) ? body.workflow_runs : [];
-  return decide(runs);
+  // A release app names one trusted workflow. GitHub returns newest first; the
+  // newest run for the exact SHA is authoritative after a rerun.
+  return decide(workflow === undefined ? runs : runs.slice(0, 1));
 }
 
 /** Reduce the run list to a single status (deploy.sh decision table). */
@@ -92,7 +98,7 @@ function decide(runs: WorkflowRun[]): CiStatus {
     const status = (run.status ?? "").toLowerCase();
 
     // Any failed/cancelled run is decisive: refuse.
-    if (conclusion === "failure" || conclusion === "cancelled") {
+    if (conclusion !== "" && conclusion !== "success") {
       return "failure";
     }
     if (conclusion === "success") anySuccess = true;

@@ -471,21 +471,28 @@ production the moment CI goes green.
 
 #### The channel
 
-A new OPTIONAL `AppSpec.releaseTagPattern?: string` (mirrored in the
-`.samohost.toml` manifest and `app register`) opts an app into a **release-tag
-production channel**:
+An OPTIONAL `AppSpec.releaseTagPattern?: string` opts an app into a
+**release-tag production channel**. Opted-in apps MUST also declare
+`releaseTagFormat = "date"` and an exact `releaseCiWorkflow` filename:
 
 - **ABSENT (default)** — behavior is byte-for-byte unchanged: production tracks
   `branch` HEAD via the existing `resolveRef(repo, branch)` path. Every existing
   `AppRecord` is untouched.
-- **SET** — production tracks the **latest git tag matching the glob** instead
-  of `branch` HEAD. Branch/`main` keep driving previews (PR2); prod ships ONLY
-  on a new matching tag ("Tag ≠ ship" honored — a tag that does not advance the
-  resolved sha is a no-op).
+- **SET** — production tracks the latest matching, real-calendar
+  `vYYYYMMDD.N` tag instead of `branch` HEAD. The tag must resolve to a commit
+  reachable from the configured main branch and the exact named workflow must
+  be green at that SHA. Branch/`main` keep driving previews; prod ships only on
+  a new valid tag.
 
-`releaseTagPattern` is independent of vhost management: existing registered
-apps may opt into tag delivery whether or not they declare `mainHost`. A
-non-string `releaseTagPattern` is rejected with a type error.
+Node apps remain independent of vhost management. A static release app must
+declare `mainHost`, because samohost atomically owns the production vhost and
+serves the registered `appDir` directly.
+
+The public `app deploy` command cannot deploy an opted-in app by branch, ref,
+or arbitrary SHA, and `--skip-ci-gate` is forbidden. The internal trigger proof
+is independently re-verified by the deploy authority: tag grammar/pattern,
+tag-to-SHA equality, main-branch ancestry, and exact workflow CI must all pass
+before SSH. There is no unaudited release bypass.
 
 Activation is rollback-safe. For an app that already has `deployedSha`, the
 first trigger cycle records the latest existing matching tag as a monotonic
@@ -502,9 +509,9 @@ A new GitHub client `resolveLatestTag(repo, pattern): Promise<{tag, sha} | null>
 
 1. Lists tags via `gh api --paginate repos/<repo>/tags`.
 2. Filters names by the glob (`*`, `?`, `[...]` supported).
-3. Sorts survivors by **SEMVER DESCENDING** — a leading `v` is stripped, so
-   `v1.10.0 > v1.9.0 > v1.2.0` (numeric, not lexical). **Prereleases**
-   (`-rc.1`, …) are EXCLUDED unless the pattern opts in (contains a `-`).
+3. Rejects everything except a real UTC-calendar `vYYYYMMDD.N` tag (for
+   example `v20260713.1`; invalid dates and `.0`/leading-zero sequences fail),
+   then sorts survivors by semantic numeric order.
 4. Takes the greatest, then **DEREFERENCES to a COMMIT sha** via
    `gh api repos/<repo>/commits/<tag>` — this resolves both lightweight AND
    annotated tags to the target commit (an annotated tag's own object sha is
@@ -518,20 +525,25 @@ prerelease policy, and annotated-tag deref are unit-tested fully offline.
 
 #### Trigger wiring (surgical; downstream reused verbatim)
 
-`TriggerDeps` gains an OPTIONAL `resolveLatestTag?` (wired in
-`defaultTriggerDeps` from the `app.ts` sibling; optional keeps every existing
-test fixture valid). At the single resolve step in `runTriggerRun`:
+`TriggerDeps` gains injectable tag resolution and main-ancestry verification.
+At the single resolve step in `runTriggerRun`:
 
-- If `app.releaseTagPattern` is set AND `deps.resolveLatestTag` is wired →
-  resolve the latest tag. `null` → record `action=skipped`, `reason=no-matching-tag`
-  and continue (prod stays put; no branch fallback, no CI round-trip). Otherwise
-  use its sha.
+- If `app.releaseTagPattern` is set, both dependencies and all release config
+  are mandatory. Missing plumbing/config is an error (fail closed). Resolve the
+  latest valid tag; `null` skips with no branch fallback. A tag SHA outside main
+  is skipped before CI/deploy.
 - Else → the existing `resolveRef(repo, branch)` branch-HEAD path, EXACTLY as
   before.
 
-Everything downstream — the `deployedSha` up-to-date compare, the `failedSha`
-known-bad short-circuit, `--dry-run`, `checkCiGreen` on the resolved sha, and
-`runAppDeploy` — is REUSED UNCHANGED and already ref-agnostic.
+The trigger and deploy authority both query only `releaseCiWorkflow` at the
+exact SHA. The deploy authority re-resolves the tag and ancestry, so a forged
+internal input cannot turn an arbitrary SHA into a release.
+
+For static apps, activation checkpoints checkout, `/version.json`, and the
+owned `00-main-<app>.caddy` route. It atomically installs metadata
+`{version,tag,sha,environment:"production"}` and the appDir file-server vhost,
+reloads Caddy, then probes `/version.json` through the intended production Host
+identity. Any failure restores checkout, routing, and metadata before reloading.
 
 #### Acceptance criteria (each traces to a red test in `test/release-tag.test.ts`)
 
@@ -551,4 +563,11 @@ known-bad short-circuit, `--dry-run`, `checkCiGreen` on the resolved sha, and
 - **§8 #7** a failed tag deploy sets `failedSha`, which the known-bad
   short-circuit honors on the next cycle (no re-deploy, no CI round-trip).
 - **§8 #8** existing schema behavior remains compatible:
-  `releaseTagPattern` does not require `mainHost`.
+  node release apps do not require `mainHost`; static release apps do.
+- **§8 #9** only real-calendar `vYYYYMMDD.N` tags qualify; date format and an
+  exact workflow filename are mandatory.
+- **§8 #10** missing resolver/verifier, off-main tag, forged tag/SHA, manual
+  deploy, and `--skip-ci-gate` all fail closed.
+- **§8 #11** static activation atomically owns the main vhost, publishes exact
+  release identity, verifies it through the production Host, and rolls back
+  checkout+routing+metadata on failure.

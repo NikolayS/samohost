@@ -83,10 +83,13 @@ export interface AppManifest {
    * Optional glob pattern (e.g. `"v*"`) for release tags. Maps to
    * {@link AppSpec.releaseTagPattern}. Must be a non-empty string when present.
    *
-   * When set, production tracks the latest matching stable semver tag instead
-   * of the branch head. The tag commit must still pass the ordinary CI gate.
+   * When set, `releaseTagFormat = "date"` and an exact `releaseCiWorkflow`
+   * filename are required. Only real-calendar `vYYYYMMDD.N` tags on the main
+   * branch can ship production.
    */
   releaseTagPattern?: string;
+  releaseTagFormat?: "date";
+  releaseCiWorkflow?: string;
 
   /**
    * App-level secret env-var NAMES samohost will auto-generate per preview env
@@ -164,6 +167,8 @@ const APP_KEYS = new Set<string>([
   // accepted + persisted; the tag-gated deploy behavior is a separate,
   // not-yet-shipped feature — prod deploys on main SHA + CI-green regardless of this value.
   "releaseTagPattern",
+  "releaseTagFormat",
+  "releaseCiWorkflow",
   // PR-B/PR-C: secrets and databaseUrlEnv are schema-only in this PR.
   // Secret generation (PR-B) and DB URL rewriting (PR-C) are separate.
   "secrets",
@@ -1104,6 +1109,25 @@ export function parseSamohostToml(text: string): ParseTomlResult {
       }
     }
   }
+  let releaseTagFormat: "date" | undefined;
+  {
+    const value = raw["releaseTagFormat"];
+    if (value !== undefined) {
+      if (value !== "date") errors.push(`field releaseTagFormat must be "date"`);
+      else releaseTagFormat = "date";
+    }
+  }
+  const releaseCiWorkflow = optionalString(raw, "releaseCiWorkflow", errors);
+  if (releaseCiWorkflow !== undefined && !/^[A-Za-z0-9._-]+\.ya?ml$/.test(releaseCiWorkflow)) {
+    errors.push(`releaseCiWorkflow must be an exact workflow filename (for example "ci.yml")`);
+  }
+  if (releaseTagPattern !== undefined) {
+    if (releaseTagFormat !== "date") errors.push(`releaseTagFormat = "date" is required with releaseTagPattern`);
+    if (releaseCiWorkflow === undefined) errors.push(`releaseCiWorkflow is required with releaseTagPattern`);
+    if (kind === "static" && mainHost === undefined) {
+      errors.push(`mainHost is required for a static release-channel app`);
+    }
+  }
 
   // ---- 10. Return result -------------------------------------------------------
   if (errors.length > 0) {
@@ -1137,6 +1161,8 @@ export function parseSamohostToml(text: string): ParseTomlResult {
     ...(defaultListener !== undefined ? { defaultListener } : {}),
     ...(mainListen !== undefined ? { mainListen } : {}),
     ...(releaseTagPattern !== undefined ? { releaseTagPattern } : {}),
+    ...(releaseTagFormat !== undefined ? { releaseTagFormat } : {}),
+    ...(releaseCiWorkflow !== undefined ? { releaseCiWorkflow } : {}),
     ...(secrets !== undefined ? { secrets } : {}),
     ...(databaseUrlEnv !== undefined ? { databaseUrlEnv } : {}),
   };

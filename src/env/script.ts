@@ -2567,6 +2567,7 @@ export function buildHostPrepScript(
   sudoersLines.push(
     `${sshUser} ALL=(root) NOPASSWD: /usr/bin/systemctl reload caddy`,
     `${sshUser} ALL=(root) NOPASSWD: /usr/bin/tee /etc/caddy/sites.d/*.caddy`,
+    `${sshUser} ALL=(root) NOPASSWD: /usr/bin/mv -- /etc/caddy/sites.d/*.caddy /etc/caddy/sites.d/*.caddy`,
     `${sshUser} ALL=(root) NOPASSWD: /usr/bin/rm -f /etc/caddy/sites.d/*.caddy`,
   );
   if (!isStatic) {

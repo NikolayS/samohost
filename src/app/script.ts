@@ -65,6 +65,8 @@ export type PhaseName =
 export interface DeployTarget {
   /** Full 40-char git SHA to deploy. */
   sha: string;
+  /** Resolved production release tag (required for release-channel static apps). */
+  tag?: string;
 }
 
 /** Number of health-check attempts and the sleep between them. */
@@ -109,6 +111,19 @@ export function buildDeployScript(app: AppRecord, target: DeployTarget): string 
   };
 
   const sha = target.sha;
+  const releaseIdentity = target.tag ?? sha;
+  if (app.kind === "static" && app.releaseTagPattern !== undefined && target.tag === undefined) {
+    throw new Error("release-channel static deploy requires the resolved release tag");
+  }
+  if (app.kind === "static" && app.mainHost === undefined) {
+    throw new Error("static production deploy requires mainHost");
+  }
+  const staticMainSnippet = app.kind === "static"
+    ? `/etc/caddy/sites.d/00-main-${app.name}.caddy`
+    : undefined;
+  const staticStagedSnippet = staticMainSnippet === undefined
+    ? undefined
+    : `/etc/caddy/sites.d/.samohost-next-00-main-${app.name}.caddy`;
   const appDir = sq(app.appDir);
   const unit = sq(app.serviceUnit);
   const healthUrl = sq(app.healthUrl);
@@ -130,6 +145,7 @@ export function buildDeployScript(app: AppRecord, target: DeployTarget): string 
     `SAMOHOST_BRANCH=${branch}`,
     `SAMOHOST_UNIT=${unit}`,
     `SAMOHOST_HEALTH_URL=${healthUrl}`,
+    ...(app.kind === "static" ? [`SAMOHOST_RELEASE_TAG=${sq(releaseIdentity)}`] : []),
     "",
     'cd "$SAMOHOST_APP_DIR"',
     "",
@@ -179,6 +195,14 @@ export function buildDeployScript(app: AppRecord, target: DeployTarget): string 
     '  rm -rf "${SAMOHOST_APP_DIR}/dist.prev"',
     '  cp -r "${SAMOHOST_APP_DIR}/dist" "${SAMOHOST_APP_DIR}/dist.prev"',
     "fi",
+    ...(app.kind === "static"
+      ? [
+        'SAMOHOST_VHOST_BACKUP="$(mktemp)"',
+        'SAMOHOST_VERSION_BACKUP="$(mktemp)"',
+        `if [[ -f ${sq(staticMainSnippet!)} ]]; then cat ${sq(staticMainSnippet!)} > "$SAMOHOST_VHOST_BACKUP"; SAMOHOST_OLD_VHOST_PRESENT=1; else SAMOHOST_OLD_VHOST_PRESENT=0; fi`,
+        'if [[ -f "${SAMOHOST_APP_DIR}/version.json" ]]; then cp "${SAMOHOST_APP_DIR}/version.json" "$SAMOHOST_VERSION_BACKUP"; SAMOHOST_OLD_VERSION_PRESENT=1; else SAMOHOST_OLD_VERSION_PRESENT=0; fi',
+      ]
+      : []),
     marker("checkpoint", "ok"),
     "",
   );
@@ -193,24 +217,40 @@ export function buildDeployScript(app: AppRecord, target: DeployTarget): string 
       "# reload Caddy (static site — no systemd unit to restart).",
       "# Emits rollback:ok / rollback:fail and exits 1.",
       "rollback() {",
-      "  git reset --hard \"${PRE_DEPLOY_SHA}\" || true",
+      "  local rb_ok=1",
+      "  local rb_route_ok=1",
+      "  git reset --hard \"${PRE_DEPLOY_SHA}\" || rb_ok=0",
       '  if [[ -d "${SAMOHOST_APP_DIR}/dist.prev" ]]; then',
-      '    rm -rf "${SAMOHOST_APP_DIR}/dist"',
-      '    cp -r "${SAMOHOST_APP_DIR}/dist.prev" "${SAMOHOST_APP_DIR}/dist"',
+      '    rm -rf "${SAMOHOST_APP_DIR}/dist" || rb_ok=0',
+      '    cp -r "${SAMOHOST_APP_DIR}/dist.prev" "${SAMOHOST_APP_DIR}/dist" || rb_ok=0',
       "  fi",
+      '  if [[ "${SAMOHOST_OLD_VERSION_PRESENT:-0}" == "1" ]]; then',
+      '    if rb_version_tmp=$(mktemp "${SAMOHOST_APP_DIR}/.version.rollback.XXXXXX"); then',
+      '      if cp "$SAMOHOST_VERSION_BACKUP" "$rb_version_tmp"; then /usr/bin/mv -f "$rb_version_tmp" "${SAMOHOST_APP_DIR}/version.json" || rb_ok=0; else rb_ok=0; fi',
+      '    else rb_ok=0; fi',
+      '  else rm -f "${SAMOHOST_APP_DIR}/version.json" || rb_ok=0; fi',
+      `  sudo /usr/bin/rm -f ${sq(staticStagedSnippet!)} || rb_route_ok=0`,
+      '  if [[ "${SAMOHOST_OLD_VHOST_PRESENT:-0}" == "1" ]]; then',
+      `    if sudo /usr/bin/tee ${sq(staticStagedSnippet!)} >/dev/null < "$SAMOHOST_VHOST_BACKUP"; then sudo /usr/bin/mv -- ${sq(staticStagedSnippet!)} ${sq(staticMainSnippet!)} || rb_route_ok=0; else rb_route_ok=0; fi`,
+      `  else sudo /usr/bin/rm -f ${sq(staticMainSnippet!)} || rb_route_ok=0; fi`,
+      "  caddy validate --config /etc/caddy/Caddyfile >/dev/null || rb_route_ok=0",
       // Static rollback: reload caddy, not restart a unit that doesn't exist.
       // full-path systemctl: see header note (3).
-      "  sudo /usr/bin/systemctl reload caddy || true",
+      '  if [[ "$rb_route_ok" == "1" ]]; then sudo /usr/bin/systemctl reload caddy || rb_ok=0; else rb_ok=0; fi',
       `  sleep ${RESTART_SETTLE_SEC}`,
       "  local rb_code",
       // -k: Caddy uses tls internal (self-signed origin cert); CF Full-mode proxies it.
-      '  rb_code=$(curl -s -k -o /dev/null -w "%{http_code}" --max-time 10 "${SAMOHOST_HEALTH_URL}" || echo 000)',
-      '  if [[ "$rb_code" == "200" ]]; then',
+      ...(app.mainHost !== undefined
+        ? [`  rb_code=$(curl -s -k -H ${sq(`Host: ${app.mainHost}`)} -o /dev/null -w "%{http_code}" --max-time 10 ${app.mainListen === "cp-http80" ? "http" : "https"}://127.0.0.1/ || echo 000)`]
+        : ['  rb_code=$(curl -s -k -o /dev/null -w "%{http_code}" --max-time 10 "${SAMOHOST_HEALTH_URL}" || echo 000)']),
+      '  if [[ "$rb_ok" == "1" && "$rb_code" == "200" ]]; then',
       `    ${marker("rollback", "ok")}`,
       "  else",
       `    ${marker("rollback", "fail")}`,
       '    echo "rollback health re-check failed (HTTP $rb_code) — manual intervention required" >&2',
       "  fi",
+      `  sudo /usr/bin/rm -f ${sq(staticStagedSnippet!)} || true`,
+      '  rm -f "${SAMOHOST_VERSION_NEXT:-}" "$SAMOHOST_VHOST_BACKUP" "$SAMOHOST_VERSION_BACKUP" || true',
       "  exit 1",
       "}",
       "",
@@ -250,7 +290,7 @@ export function buildDeployScript(app: AppRecord, target: DeployTarget): string 
     `  ${marker("checkout", "ok")}`,
     "else",
     `  ${marker("checkout", "fail")}`,
-    "  exit 1",
+    app.kind === "static" ? "  rollback" : "  exit 1",
     "fi",
     "",
   );
@@ -262,6 +302,28 @@ export function buildDeployScript(app: AppRecord, target: DeployTarget): string 
     // static assets from the updated checkout. Health probe uses -k because
     // Caddy uses tls internal (self-signed origin cert) with CF Full-mode.
     // ========================================================================
+
+    const address = app.mainListen === "cp-http80" ? `http://${app.mainHost}` : app.mainHost;
+    const vhostBody = [
+      `${address} {`,
+      `\troot * ${app.appDir}`,
+      `\ttry_files {path} /index.html`,
+      `\tfile_server`,
+      `\tencode gzip`,
+      ...(app.mainListen === "cp-http80" ? [] : [`\ttls internal`]),
+      `}`,
+      ``,
+    ].join("\n");
+    push(
+      "# --- static release identity + routing checkpoint ---",
+      'if ! SAMOHOST_VERSION_NEXT=$(mktemp "${SAMOHOST_APP_DIR}/.version.next.XXXXXX"); then rollback; fi',
+      'if printf \'{"version":"%s","tag":"%s","sha":"%s","environment":"production"}\\n\' "$SAMOHOST_RELEASE_TAG" "$SAMOHOST_RELEASE_TAG" "$SAMOHOST_SHA" > "$SAMOHOST_VERSION_NEXT"; then /usr/bin/mv -f "$SAMOHOST_VERSION_NEXT" "${SAMOHOST_APP_DIR}/version.json" || rollback; else rollback; fi',
+      `sudo /usr/bin/rm -f ${sq(staticStagedSnippet!)} || rollback`,
+      `printf %s ${sq(vhostBody)} | sudo /usr/bin/tee ${sq(staticStagedSnippet!)} >/dev/null || rollback`,
+      `sudo /usr/bin/mv -- ${sq(staticStagedSnippet!)} ${sq(staticMainSnippet!)} || rollback`,
+      "caddy validate --config /etc/caddy/Caddyfile >/dev/null || rollback",
+      "",
+    );
 
     // ----- caddy-reload (static) -------------------------------------------
     // Full-path systemctl reload (not restart): see header note (3).
@@ -275,7 +337,7 @@ export function buildDeployScript(app: AppRecord, target: DeployTarget): string 
       `  ${marker("caddy-reload", "ok")}`,
       "else",
       `  ${marker("caddy-reload", "fail")}`,
-      "  exit 1",
+      "  rollback",
       "fi",
       "",
     );
@@ -288,12 +350,13 @@ export function buildDeployScript(app: AppRecord, target: DeployTarget): string 
       marker("health", "start"),
       "health_ok=0",
       `for attempt in $(seq 1 ${HEALTH_RETRIES}); do`,
-      '  code=$(curl -s -k -o /dev/null -w "%{http_code}" --max-time 10 "${SAMOHOST_HEALTH_URL}" || echo 000)',
-      '  if [[ "$code" == "200" ]]; then health_ok=1; break; fi',
+      `  body=$(curl -s -k -H ${sq(`Host: ${app.mainHost}`)} --max-time 10 ${app.mainListen === "cp-http80" ? "http" : "https"}://127.0.0.1/version.json || true)`,
+      '  if [[ "$body" == *"\\\"version\\\":\\\"${SAMOHOST_RELEASE_TAG}\\\""* && "$body" == *"\\\"tag\\\":\\\"${SAMOHOST_RELEASE_TAG}\\\""* && "$body" == *"\\\"sha\\\":\\\"${SAMOHOST_SHA}\\\""* && "$body" == *"\\\"environment\\\":\\\"production\\\""* ]]; then health_ok=1; break; fi',
       `  sleep ${HEALTH_SLEEP_SEC}`,
       "done",
       'if [[ "$health_ok" == "1" ]]; then',
       `  ${marker("health", "ok")}`,
+      '  rm -f "$SAMOHOST_VHOST_BACKUP" "$SAMOHOST_VERSION_BACKUP" || true',
       "else",
       `  ${marker("health", "fail")}`,
       '  echo "health check failed after retries — rolling back" >&2',
