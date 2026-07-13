@@ -271,7 +271,7 @@ describe("(1) SSH-count — heal cycle makes ≤ budget remote() calls per VM", 
   );
 
   test(
-    "unchanged legacy none/template PR records are rejected before batching",
+    "every legacy none/template record is rejected before PR listing or batching",
     async () => {
       for (const dbBackend of ["none", "template"] as const) {
         const branch = `legacy-${dbBackend}`;
@@ -282,20 +282,22 @@ describe("(1) SSH-count — heal cycle makes ≤ budget remote() calls per VM", 
           vhost: `field-record-${branch}.samo.cat`,
           dbBackend,
           dbName: dbBackend === "template" ? `field_record_${branch}` : undefined,
-          // `none` models an older record created before prNumber was stored;
-          // `template` exercises the explicit PR-record audit at cycle start.
+          // `none` models an unstamped manual/closed record created before
+          // prNumber was stored; `template` models a PR-stamped record.
           prNumber: dbBackend === "none" ? undefined : 42,
           lastDeployedSha: `sha-${dbBackend}`,
         }));
 
         let remoteCalls = 0;
+        let prListCalls = 0;
         const deps = (await import("../src/commands/trigger.ts")).defaultTriggerDeps({
           envStore,
-          listOpenPrs: async () => [{
-            number: dbBackend === "none" ? 41 : 42,
-            headRef: branch,
-            headSha: `sha-${dbBackend}`,
-          }],
+          // The unsafe stored record must win even when PR listing would fail;
+          // no provider call or remote mutation is allowed first.
+          listOpenPrs: async () => {
+            prListCalls++;
+            throw new Error("gh pr list: simulated provider failure");
+          },
           remote: async () => {
             remoteCalls++;
             return { code: 0, stdout: "", stderr: "" };
@@ -306,6 +308,7 @@ describe("(1) SSH-count — heal cycle makes ≤ budget remote() calls per VM", 
           heal: true,
           prPreviews: true,
         })).rejects.toThrow(/destroy\/recreate.*DBLab/);
+        expect(prListCalls).toBe(0);
         expect(remoteCalls).toBe(0);
 
         envStore.remove("vm-1111", "field-record", branch);

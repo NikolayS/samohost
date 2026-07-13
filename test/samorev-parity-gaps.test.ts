@@ -661,6 +661,10 @@ describe("(4) PREREQ_CONSISTENT: no silent wildcard-degrade when CF token absent
 
 describe("(5a) REPORTING_DERIVETARGET: deriveTarget error in PrPreviewSummary", () => {
   test("port-pool exhaustion → failed result with real error (not 'item not found')", async () => {
+    // The planted pool-fill records use dbBackend=none; make this fixture an
+    // explicit no-database app so the test reaches its allocation concern.
+    appStore.upsert(makeApp({ dbBackend: "none" }));
+
     // Exhaust the port pool by planting 100 envs (DEFAULT_POOL.size = 100).
     for (let i = 0; i < DEFAULT_POOL.size; i++) {
       envStore.upsert({
