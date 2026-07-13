@@ -13,7 +13,7 @@ import {
   buildControlPlaneCustomDomainVhostScript,
   buildControlPlaneCustomDomainVhostRemoveScript,
   envsRoot,
-  previewUserFor,
+  previewUserForEnv,
   previewHelperPathFor,
   type EnvScriptTarget,
 } from "../src/env/script.ts";
@@ -2773,16 +2773,48 @@ describe("untrusted preview Unix boundary (#149)", () => {
     previewEnvAllowlist: ["DATABASE_URL", "NODE_ENV"],
   });
 
-  test("identity is deterministic, bounded, and distinct for sibling apps", () => {
-    const a = previewUserFor(isolatedApp());
-    const b = previewUserFor(app({ name: "sibling-app" }));
-    expect(a).toBe(previewUserFor(isolatedApp()));
+  test("identity is deterministic, bounded, and distinct for sibling envs", () => {
+    const a = previewUserForEnv(isolatedApp(), "field-record-1-feat-x");
+    const b = previewUserForEnv(isolatedApp(), "field-record-1-feat-y");
+    expect(a).toBe(previewUserForEnv(isolatedApp(), "field-record-1-feat-x"));
     expect(a.length).toBeLessThanOrEqual(32);
     expect(a).not.toBe(prodUser);
     expect(a).not.toBe(b);
     expect(previewHelperPathFor(isolatedApp())).not.toBe(
       previewHelperPathFor(app({ name: "sibling-app" })),
     );
+    expect(() => previewUserForEnv(isolatedApp(), "sibling-app-feat-x")).toThrow();
+    expect(() => previewUserForEnv(isolatedApp(), "field-record-1/feat-x")).toThrow();
+  });
+
+  test("create/heal/destroy/static/stateless retain one env identity lifecycle", () => {
+    const configured = isolatedApp();
+    const env = target({ dbBackend: "none" });
+    const envUser = previewUserForEnv(configured, env.name);
+    const create = buildEnvCreateScript(configured, env);
+    const heal = buildEnvCreateScript(configured, env);
+    const destroy = buildEnvDestroyScript(configured, env);
+    const prep = buildHostPrepScript(configured, "operator");
+    const staticPrep = buildHostPrepScript(
+      { ...configured, kind: "static" },
+      "operator",
+    );
+
+    expect(create).toBe(heal);
+    expect(create).toContain(`sudo -H -u '${envUser}' /usr/bin/npm ci`);
+    expect(create).toContain("check 'env-user-v2'");
+    expect(prep).toContain("if [[ -e \"$record\" ]]; then verify_identity");
+    expect(prep).toContain("reconcile 'env-user-v2'");
+    expect(prep).toContain("old shared-user preview detected");
+    expect(destroy.indexOf("SAMOHOST_PHASE:unit-stop:ok")).toBeLessThan(
+      destroy.indexOf("SAMOHOST_PHASE:dir-remove:start"),
+    );
+    expect(destroy).toContain("clean \"$SAMOHOST_ENV_NAME\" 'env-user-v2'");
+    expect(staticPrep).toContain("UNITS=()");
+    expect(staticPrep).toContain("ENV_USER=$(ensure_identity \"$ENV_NAME\")");
+    expect(staticPrep).toContain('chown -R --no-dereference "$ENV_USER:$STATIC_READER_GROUP"');
+    expect(staticPrep).toContain('chmod -R u=rwX,g=rX,o= "$ENVS_ROOT/$ENV_NAME"');
+    expect(staticPrep).not.toContain('chmod 755 "$ENVS_ROOT/$ENV_NAME"');
   });
 
   test("host-prep preserves then root-locks the raw template and installs a root helper", () => {
@@ -2808,19 +2840,23 @@ describe("untrusted preview Unix boundary (#149)", () => {
   });
 
   test("node lifecycle and runtime use previewUser, never prod appUser/SSH user", () => {
-    const previewUser = previewUserFor(isolatedApp());
+    const previewUser = previewUserForEnv(isolatedApp(), target().name);
+    const previewPrefix = previewUser.match(/^(se-[0-9a-f]{10}-)/)?.[1];
+    expect(previewPrefix).toBeDefined();
     const create = buildEnvCreateScript(isolatedApp(), target());
     const prep = buildHostPrepScript(isolatedApp(), "operator");
     expect(create).toContain(`sudo -H -u '${previewUser}' /usr/bin/npm ci`);
     expect(create).toContain(
       `sudo -H -u '${previewUser}' /usr/bin/bash -c 'export PORT=3100; npm run build'`,
     );
-    expect(prep).toContain(`User=${previewUser}`);
-    expect(prep).toContain(`Group=${previewUser}`);
+    expect(prep).toContain("User=samohost-preview-disabled");
+    expect(prep).toContain("Group=samohost-preview-disabled");
+    expect(prep).toContain("10-samohost-preview-identity.conf");
+    expect(prep).toContain("printf '[Service]\\nUser=%s\\nGroup=%s\\n'");
     expect(prep).not.toContain(`User=${prodUser}`);
     expect(prep).not.toContain(`operator ALL=(${prodUser})`);
-    expect(prep).toContain(`operator ALL=(${previewUser}) NOPASSWD: /usr/bin/npm`);
-    expect(prep).toContain(`operator ALL=(${previewUser}) NOPASSWD: /usr/bin/bash`);
+    expect(prep).toContain(`operator ALL=(${previewPrefix}*) NOPASSWD: /usr/bin/npm`);
+    expect(prep).toContain(`operator ALL=(${previewPrefix}*) NOPASSWD: /usr/bin/bash`);
   });
 
   test("compound build expressions cannot escape back to the SSH identity", () => {
@@ -2894,10 +2930,17 @@ describe("untrusted preview Unix boundary (#149)", () => {
       const owner = spawnSync("id", ["-un"], { encoding: "utf8" }).stdout.trim();
       const group = spawnSync("id", ["-gn"], { encoding: "utf8" }).stdout.trim();
       const helper = rendered!
-        .replace(/^PREVIEW_USER=.*$/m, `PREVIEW_USER='${owner}'`)
         .replace(/^ENVS_ROOT=.*$/m, `ENVS_ROOT='${root}'`)
         .replace(/^RAW_TEMPLATE=.*$/m, `RAW_TEMPLATE='${raw}'`)
         .replaceAll("== root:root", `== ${owner}:${group}`)
+        .replace(
+          /verify_identity\(\) \{[\s\S]*?\n\}\nensure_identity\(\)/,
+          `verify_identity() { printf '%s\\n' '${owner}'; }\nensure_identity()`,
+        )
+        .replace(
+          /assert_root\(\) \{[\s\S]*?\n\}\nassert_template\(\)/,
+          "assert_root() { return 0; }\nassert_template()",
+        )
         // Ownership transfer is covered structurally in generated host-prep;
         // this non-root execution harness focuses on filtering/atomic output.
         .replace("umask 077", "umask 077\nchown() { return 0; }");
@@ -2947,6 +2990,108 @@ describe("untrusted preview Unix boundary (#149)", () => {
       expect(probe.status, probe.stderr).toBe(0);
     } finally {
       rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("executed two-preview probe: A gets EACCES for B checkout/env/secrets/process", () => {
+    if (process.platform !== "linux" ||
+      spawnSync("sudo", ["-n", "true"]).status !== 0) return;
+
+    const boundaryApp = isolatedApp();
+    boundaryApp.name = `iso-${process.pid}`;
+    const envA = `${boundaryApp.name}-a`;
+    const envB = `${boundaryApp.name}-b`;
+    const userA = previewUserForEnv(boundaryApp, envA);
+    const userB = previewUserForEnv(boundaryApp, envB);
+    const dir = mkdtempSync(join(tmpdir(), "samohost-two-preview-"));
+    const checkoutA = join(dir, "checkout-a");
+    const checkoutB = join(dir, "checkout-b");
+    const secretsA = join(dir, "secrets-a");
+    const secretsB = join(dir, "secrets-b");
+    let processB = "";
+    const sudo = (args: string[]) => spawnSync("sudo", ["-n", ...args], {
+      encoding: "utf8",
+    });
+    const expectSudo = (args: string[]) => {
+      const result = sudo(args);
+      expect(result.status, result.stderr).toBe(0);
+      return result;
+    };
+    const writeAs = (user: string, path: string, value: string) =>
+      expectSudo([
+        "-u", user, "/bin/sh", "-c",
+        "umask 077; printf '%s' \"$2\" > \"$1\"",
+        "samohost-isolation-test", path, value,
+      ]);
+
+    try {
+      expect(userA).not.toBe(userB);
+      expectSudo([
+        "/usr/sbin/useradd", "--system", "--user-group", "--no-create-home",
+        "--home-dir", join(dir, "home-a"), "--shell", "/usr/sbin/nologin", userA,
+      ]);
+      expectSudo([
+        "/usr/sbin/useradd", "--system", "--user-group", "--no-create-home",
+        "--home-dir", join(dir, "home-b"), "--shell", "/usr/sbin/nologin", userB,
+      ]);
+      expectSudo(["/usr/bin/install", "-d", "-m", "711", "-o", "root", "-g", "root", dir]);
+      for (const [owner, path] of [
+        [userA, checkoutA], [userA, secretsA],
+        [userB, checkoutB], [userB, secretsB],
+      ]) {
+        expectSudo(["/usr/bin/install", "-d", "-m", "700", "-o", owner!, "-g", owner!, path!]);
+      }
+      writeAs(userA, join(checkoutA, "checkout.txt"), "A checkout\n");
+      writeAs(userA, join(checkoutA, ".env"), "A_ENV=1\n");
+      writeAs(userA, join(secretsA, "secrets.env"), "A_SECRET=1\n");
+      writeAs(userB, join(checkoutB, "checkout.txt"), "B checkout\n");
+      writeAs(userB, join(checkoutB, ".env"), "B_ENV=1\n");
+      writeAs(userB, join(secretsB, "secrets.env"), "B_SECRET=1\n");
+
+      const started = expectSudo([
+        "-u", userB, "/bin/sh", "-c",
+        "/usr/bin/setsid /usr/bin/sleep 60 >/dev/null 2>&1 & printf '%s\\n' \"$!\"",
+      ]);
+      processB = started.stdout.trim();
+      expect(processB).toMatch(/^[0-9]+$/);
+      expectSudo(["/bin/kill", "-0", processB]);
+
+      const probeScript = [
+        "set -u",
+        "cat \"$1/checkout.txt\" >/dev/null",
+        "cat \"$1/.env\" >/dev/null",
+        "cat \"$2/secrets.env\" >/dev/null",
+        "set +e",
+        "cat \"$3/checkout.txt\" >/dev/null 2>\"$1/read.err\"; read_rc=$?",
+        "printf x >> \"$3/checkout.txt\" 2>\"$1/write.err\"; write_rc=$?",
+        "cat \"$3/.env\" >/dev/null 2>\"$1/env.err\"; env_rc=$?",
+        "cat \"$4/secrets.env\" >/dev/null 2>\"$1/secrets.err\"; secrets_rc=$?",
+        "kill -0 \"$5\" 2>\"$1/probe.err\"; probe_rc=$?",
+        "cat \"/proc/$5/environ\" >/dev/null 2>\"$1/process-read.err\"; process_read_rc=$?",
+        "kill -TERM \"$5\" 2>\"$1/signal.err\"; signal_rc=$?",
+        "set -e",
+        "test \"$read_rc\" -ne 0 && test \"$write_rc\" -ne 0",
+        "test \"$env_rc\" -ne 0 && test \"$secrets_rc\" -ne 0",
+        "test \"$probe_rc\" -ne 0 && test \"$process_read_rc\" -ne 0 && test \"$signal_rc\" -ne 0",
+        "grep -qi 'permission denied' \"$1/read.err\"",
+        "grep -qi 'permission denied' \"$1/process-read.err\"",
+        "grep -Eqi 'operation not permitted|permission denied' \"$1/signal.err\"",
+      ].join("\n");
+      const probe = sudo([
+        "-u", userA, "/bin/bash", "-c", probeScript,
+        "samohost-isolation-test", checkoutA, secretsA, checkoutB, secretsB, processB,
+      ]);
+      expect(probe.status, `${probe.stdout}\n${probe.stderr}`).toBe(0);
+      expectSudo(["/bin/kill", "-0", processB]);
+    } finally {
+      if (processB !== "") sudo(["/bin/kill", "-KILL", processB]);
+      sudo(["/usr/bin/pkill", "-KILL", "-u", userA]);
+      sudo(["/usr/bin/pkill", "-KILL", "-u", userB]);
+      sudo(["/usr/sbin/userdel", userA]);
+      sudo(["/usr/sbin/userdel", userB]);
+      sudo(["/usr/sbin/groupdel", userA]);
+      sudo(["/usr/sbin/groupdel", userB]);
+      sudo(["/bin/rm", "-rf", "--", dir]);
     }
   });
 

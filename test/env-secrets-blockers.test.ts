@@ -283,10 +283,12 @@ describe("ALSO: buildEnvDestroyScript — cleans secrets dir", () => {
     expect(s).toMatch(/samohost-secrets.*clean|rm.*-rf.*samohost\/envs\/acme-app-feat-x/);
   });
 
-  test("destroy script for legacy app (no secrets) does NOT add secrets dir cleanup", () => {
+  test("destroy cleans the identity secrets dir even without declared app secrets", () => {
     const s = buildEnvDestroyScript(app({ secrets: undefined }), target());
-    expect(s).not.toContain("/var/lib/samohost/envs");
-    expect(s).not.toContain("samohost-secrets");
+    // DBLab clone-role credentials use the same per-env secrets file, so an
+    // absent app.secrets declaration is not proof that the directory is empty.
+    expect(s).toContain("samohost-secrets clean 'acme-app-feat-x'");
+    expect(s).toContain("clean \"$SAMOHOST_ENV_NAME\" 'env-user-v2'");
   });
 });
 

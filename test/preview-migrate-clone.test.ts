@@ -28,6 +28,7 @@ import { join } from "node:path";
 import {
   buildEnvCreateScript,
   buildHostPrepScript,
+  previewUserForEnv,
   type EnvScriptTarget,
 } from "../src/env/script.ts";
 import type { AppRecord } from "../src/types.ts";
@@ -370,7 +371,9 @@ describe("GAP 1: migrate phase — schema in branch applied to clone before app 
     const migrateBlock = lines
       .slice(migrateStartLine, migrateOkLine + 1)
       .join("\n");
-    expect(migrateBlock).toContain("sudo -H -u 'smp-field-record-1-");
+    expect(migrateBlock).toContain(
+      `sudo -H -u '${previewUserForEnv(app(), target().name)}'`,
+    );
     expect(migrateBlock).not.toContain("sudo -u 'field-record'");
   });
 
