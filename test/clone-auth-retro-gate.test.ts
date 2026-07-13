@@ -33,6 +33,8 @@ import { tmpdir } from "node:os";
 import { spawnSync } from "node:child_process";
 import {
   buildEnvCreateScript,
+  buildHostPrepScript,
+  previewHelperPathFor,
   type EnvScriptTarget,
 } from "../src/env/script.ts";
 import type { AppRecord } from "../src/types.ts";
@@ -89,6 +91,13 @@ function extractCredFn(s: string): string {
   return m[1]!;
 }
 
+/** Extract the root helper's URL-role parser installed by host-prep. */
+function extractUrlRoleFn(s: string): string {
+  const m = s.match(/(url_role\(\) \{[^\n]*\})/);
+  if (m === null) throw new Error("url_role() not found in host-prep script");
+  return m[1]!;
+}
+
 // ---------------------------------------------------------------------------
 // 1a. REGRESSION: DBROLE extraction — sed pipeline must produce non-empty role
 //
@@ -102,34 +111,19 @@ function extractCredFn(s: string): string {
 // ---------------------------------------------------------------------------
 
 describe("RETRO 1a. DBROLE extraction: pipeline extracts non-empty role from both URL forms", () => {
-  /** Run the generated per-envDbVar role parser against a synthetic template. */
+  /** Run the root boundary's role parser against a synthetic template line. */
   function evalDbrole(templateUrl: string, databaseUrlEnv = "DATABASE_URL"): { value: string; status: number } {
-    const s = buildEnvCreateScript(
+    const s = buildHostPrepScript(
       app({ databaseUrlEnv, appUser: "samograph-user" }),
-      target({ dbBackend: "dblab" }),
+      "operator",
     );
-    const assignLine = extractSetPwFn(s).split("\n")
-      .map((line) => line.trim())
-      .find((line) => line.startsWith("role="));
-    if (assignLine === undefined) {
-      throw new Error("per-variable role= line not found in generated script");
-    }
-    const dir = mkdtempSync(join(tmpdir(), "samohost-dbrole-"));
-    try {
-      const templatePath = join(dir, "template.env");
-      writeFileSync(templatePath, `${databaseUrlEnv}=${templateUrl}\n`, { mode: 0o600 });
-      const prog = [
-        `SAMOHOST_ENV_TEMPLATE=${JSON.stringify(templatePath)}`,
-        `var=${JSON.stringify(databaseUrlEnv)}`,
-        `line="$(grep -E \"^${databaseUrlEnv}=\" \"$SAMOHOST_ENV_TEMPLATE\" | tail -n 1)"`,
-        assignLine,
-        `printf '%s\\n' "$role"`,
-      ].join("\n");
-      const res = spawnSync("bash", ["-c", prog], { encoding: "utf8" });
-      return { value: res.stdout.trim(), status: res.status ?? 1 };
-    } finally {
-      rmSync(dir, { recursive: true, force: true });
-    }
+    const fn = extractUrlRoleFn(s);
+    const prog = [
+      fn,
+      `url_role ${JSON.stringify(`${databaseUrlEnv}=${templateUrl}`)}`,
+    ].join("\n");
+    const res = spawnSync("bash", ["-c", prog], { encoding: "utf8" });
+    return { value: res.stdout.trim(), status: res.status ?? 1 };
   }
 
   test("URL WITH password postgresql://samo:pw@host/db → role = 'samo' (non-empty)", () => {
@@ -168,16 +162,13 @@ describe("RETRO 1a. DBROLE extraction: pipeline extracts non-empty role from bot
   });
 
   test("generated role parser uses sed -nE with an explicit print suffix", () => {
-    const s = buildEnvCreateScript(
+    const s = buildHostPrepScript(
       app({ databaseUrlEnv: "DATABASE_URL", appUser: "samograph-user" }),
-      target({ dbBackend: "dblab" }),
+      "operator",
     );
-    const assignLine = extractSetPwFn(s).split("\n")
-      .map((line) => line.trim())
-      .find((line) => line.startsWith("role="));
-    expect(assignLine).toBeDefined();
-    expect(assignLine).toContain("sed -nE");
-    expect(assignLine).toMatch(/\\1\|p/);
+    const fn = extractUrlRoleFn(s);
+    expect(fn).toContain("sed -nE");
+    expect(fn).toMatch(/\\1\|p/);
   });
 });
 
@@ -195,41 +186,44 @@ describe("RETRO 1a. DBROLE extraction: pipeline extracts non-empty role from bot
 // the no-appUser path.
 // ---------------------------------------------------------------------------
 
-describe("RETRO 1b. no-appUser path: credentialed rewrite called after hostport in envfile phase", () => {
+describe("RETRO 1b. clone credentials stay wired through the root envfile boundary", () => {
   /** App with databaseUrlEnv but WITHOUT appUser (the samograph case). */
   const noUserAppWithDbUrl = () =>
     app({ databaseUrlEnv: "DATABASE_URL" /* no appUser */ });
 
-  test("no-appUser + databaseUrlEnv → generated script contains samohost_rewire_db_credentialed", () => {
-    const s = buildEnvCreateScript(noUserAppWithDbUrl(), target({ dbBackend: "dblab" }));
-    expect(s).toContain("samohost_rewire_db_credentialed");
+  test("no-appUser + databaseUrlEnv → create delegates envfile materialisation to the app helper", () => {
+    const a = noUserAppWithDbUrl();
+    const s = buildEnvCreateScript(a, target({ dbBackend: "dblab" }));
+    expect(s).toContain(
+      `sudo -n '${previewHelperPathFor(a)}' envfile 'samograph-feat-retro' 'feat/retro' ` +
+        `'samograph-feat-retro.samo.cat' 'dblab' "$SAMOHOST_DB_PORT" 'PORT=40200'`,
+    );
   });
 
-  test("no-appUser + databaseUrlEnv → credentialed call AFTER hostport call in script order", () => {
+  test("no-appUser + databaseUrlEnv → helper envfile call remains after DB clone credential setup", () => {
     const s = buildEnvCreateScript(noUserAppWithDbUrl(), target({ dbBackend: "dblab" }));
-    const hostportIdx = s.indexOf('samohost_rewire_db_hostport "$SAMOHOST_ENV_DIR/.env"');
-    const credIdx = s.indexOf('samohost_rewire_db_credentialed "$SAMOHOST_ENV_DIR/.env"');
-    expect(hostportIdx).toBeGreaterThan(-1);
-    expect(credIdx).toBeGreaterThan(-1);
-    // Credentialed rewrite must follow hostport rewrite (hostport sets the correct
-    // host:port; credentialed then adds user:pw on top of that).
-    expect(credIdx).toBeGreaterThan(hostportIdx);
+    const dbOkIdx = s.indexOf("<<<SAMOHOST_PHASE:db:ok>>>");
+    const envfileCallIdx = s.indexOf(" envfile 'samograph-feat-retro'");
+    expect(dbOkIdx).toBeGreaterThan(-1);
+    expect(envfileCallIdx).toBeGreaterThan(dbOkIdx);
   });
 
-  test("no-appUser + databaseUrlEnv → credentialed call is in the envfile phase &&-chain", () => {
+  test("no-appUser + databaseUrlEnv → helper call is inside the envfile phase", () => {
     const s = buildEnvCreateScript(noUserAppWithDbUrl(), target({ dbBackend: "dblab" }));
-    // Both calls must appear within the same envfile-phase &&-chain.
-    const envfilePhasesIdx = s.indexOf("<<<SAMOHOST_PHASE:envfile:start>>>");
-    const credIdx = s.indexOf('samohost_rewire_db_credentialed "$SAMOHOST_ENV_DIR/.env"');
-    expect(envfilePhasesIdx).toBeGreaterThan(-1);
-    expect(credIdx).toBeGreaterThan(envfilePhasesIdx);
+    const envfileStartIdx = s.indexOf("<<<SAMOHOST_PHASE:envfile:start>>>");
+    const envfileCallIdx = s.indexOf(" envfile 'samograph-feat-retro'");
+    const envfileOkIdx = s.indexOf("<<<SAMOHOST_PHASE:envfile:ok>>>");
+    expect(envfileCallIdx).toBeGreaterThan(envfileStartIdx);
+    expect(envfileCallIdx).toBeLessThan(envfileOkIdx);
   });
 
   test("no-appUser + implicit DATABASE_URL still receives clone-only credentials", () => {
-    // databaseUrlEnv is only a compatibility alias; effective envDbVars
-    // defaults to DATABASE_URL and every mapped URL must be credentialed.
-    const s = buildEnvCreateScript(app( /* no databaseUrlEnv, no appUser */), target({ dbBackend: "dblab" }));
-    expect(s).toContain('samohost_rewire_db_credentialed "$SAMOHOST_ENV_DIR/.env"');
+    // databaseUrlEnv is only a compatibility alias; the root helper defaults
+    // envDbVars to DATABASE_URL and rewrites it from the clone-only secret.
+    const prep = buildHostPrepScript(app( /* no databaseUrlEnv, no appUser */), "operator");
+    expect(prep).toContain("DB_VARS=('DATABASE_URL')");
+    expect(prep).toContain('PW=$(grep -E "^SAMOHOST_CLONE_ROLE_PW_${ROLE}="');
+    expect(prep).toContain("@127.0.0.1:%s%s\\n");
   });
 });
 

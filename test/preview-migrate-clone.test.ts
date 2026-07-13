@@ -355,7 +355,7 @@ describe("GAP 1: migrate phase — schema in branch applied to clone before app 
     expect(migrateBlock).toMatch(/\. .*\.env/);
   });
 
-  test("script text: appUser-wrapped — sudo -u <appUser> when appUser is set", () => {
+  test("script text: migrate runs as the isolated preview user, not appUser", () => {
     const s = buildEnvCreateScript(
       app({ migrateCmd: "node migrate.js", appUser: "field-record" }),
       target(),
@@ -370,8 +370,8 @@ describe("GAP 1: migrate phase — schema in branch applied to clone before app 
     const migrateBlock = lines
       .slice(migrateStartLine, migrateOkLine + 1)
       .join("\n");
-    // The migrate command must be wrapped as the app user.
-    expect(migrateBlock).toContain("sudo -u 'field-record'");
+    expect(migrateBlock).toContain("sudo -H -u 'smp-field-record-1-");
+    expect(migrateBlock).not.toContain("sudo -u 'field-record'");
   });
 
   test("executed: migrate phase is FAIL-CLOSED — migrate:fail + exit 1 when command fails", () => {
@@ -459,11 +459,12 @@ describe("GAP 1: migrate phase — schema in branch applied to clone before app 
       const migrateBlock = lines
         .slice(startIdx, endIdx + 1)
         .join("\n")
-        .replace(/npm run migrate/, "true");
+        .replace(/npm run migrate/, "true")
+        .replace("/opt/field-record/envs/field-record-1-feat-x", dir);
 
       const prog = [
         "set -euo pipefail",
-        `SAMOHOST_ENV_DIR='${dir}'`,
+        "sudo() { if [[ \"$1\" == -H ]]; then shift; fi; if [[ \"$1\" == -u ]]; then shift 2; fi; \"$@\"; }",
         migrateBlock,
       ].join("\n");
 
@@ -615,14 +616,12 @@ describe("GAP 3: role-assumption replay — GRANT R TO L for SET ROLE capability
 });
 
 // ---------------------------------------------------------------------------
-// BLOCKER 1 (b) — db-preflight hint must not suggest --db none for apps that
-// have a migrateCmd or envDbVars. Using --db none skips DB rewiring entirely,
-// so migrateCmd would target the PROD DATABASE_URL and envDbVars URLs remain
-// at prod. The hint must point to installing dblab or using --db template.
+// BLOCKER 1 (b) — db-preflight must not suggest an isolation-bypassing
+// fallback for database-backed previews. DBLab is the only allowed backend.
 // ---------------------------------------------------------------------------
 
-describe("BLOCKER 1(b): db-preflight hint omits --db none for apps with migrateCmd or envDbVars", () => {
-  test("hint omits --db none when app declares migrateCmd", () => {
+describe("BLOCKER 1(b): db-preflight advertises no DB fallback for database apps", () => {
+  test("hint requires DBLab when app declares migrateCmd", () => {
     // The db-preflight failure hint (only emitted for dblab backend) must NOT
     // suggest 'none' as a fallback when the app declares a migrateCmd.
     // The hint currently says "(or use --db template|none)" — the `none` part
@@ -638,11 +637,12 @@ describe("BLOCKER 1(b): db-preflight hint omits --db none for apps with migrateC
       .split("\n")
       .find((l) => l.includes("dblab-install-runbook") || l.includes("Diagnose with:"));
     expect(hintLine).toBeDefined();
-    // The hint must NOT contain `none` (including `template|none`) for migrateCmd apps.
+    expect(hintLine).toContain("DBLab is required");
     expect(hintLine).not.toContain("none");
+    expect(hintLine).not.toContain("--db template");
   });
 
-  test("hint omits --db none when app declares envDbVars", () => {
+  test("hint requires DBLab when app declares envDbVars", () => {
     // envDbVars names the DB URL env vars that get rewired to the clone.
     // With --db none, no rewiring happens → those URLs still point at PROD.
     const s = buildEnvCreateScript(
@@ -653,15 +653,21 @@ describe("BLOCKER 1(b): db-preflight hint omits --db none for apps with migrateC
       .split("\n")
       .find((l) => l.includes("dblab-install-runbook") || l.includes("Diagnose with:"));
     expect(hintLine).toBeDefined();
-    // Must NOT contain `none` (including `template|none`) for envDbVars apps.
+    expect(hintLine).toContain("DBLab is required");
     expect(hintLine).not.toContain("none");
+    expect(hintLine).not.toContain("--db template");
   });
 
   test("hint may still suggest --db none for apps with no migrateCmd and no envDbVars", () => {
     // A static site or no-DB app has no migrateCmd and no envDbVars — using
     // --db none is safe for them. The hint may continue to mention it.
-    // The hint contains `template|none`; checking for `none` as a substring.
-    const noDbApp = app({ migrateCmd: undefined, envDbVars: undefined });
+    const noDbApp = app({
+      dbBackend: "none",
+      previewDbBackend: undefined,
+      migrateCmd: undefined,
+      databaseUrlEnv: undefined,
+      envDbVars: undefined,
+    });
     const s = buildEnvCreateScript(noDbApp, target({ dbBackend: "dblab" }));
     const hintLine = s
       .split("\n")
@@ -712,8 +718,8 @@ describe("BLOCKER 2: scoped emitted-count parity gate (non-vacuous + non-brickin
 // for migrateCmd "bun packages/..." is a valid exact-path NOPASSWD line.
 // ---------------------------------------------------------------------------
 
-describe("NEEDED: bun migrateCmd produces absolute-path sudoers grant", () => {
-  test("bun migrateCmd resolves to absolute path in appUser sudoers (visudo-safe)", () => {
+describe("NEEDED: compound migrateCmd stays inside previewUser shell", () => {
+  test("bun migrateCmd is covered by the isolated bash grant", () => {
     // `bun packages/shared/db/migrate.ts` is the motivating migrateCmd for
     // samograph. Without a `bun` mapping in resolveBuildBin, the sudoers line
     // becomes `NOPASSWD: bun` (relative path) — visudo -cf rejects it, the
@@ -727,15 +733,8 @@ describe("NEEDED: bun migrateCmd produces absolute-path sudoers grant", () => {
       }),
       "samo",
     );
-    // Must emit the absolute-path grant — not the bare binary name.
-    expect(s).toContain("NOPASSWD: /usr/bin/bun");
-    // Bare `bun` with no leading slash must NOT appear as a sudoers Cmnd.
-    // (The path may legitimately appear in comments or environment strings,
-    // so we check the NOPASSWD pattern specifically.)
-    const sudoersLine = s
-      .split("\n")
-      .find((l) => l.includes("NOPASSWD:") && l.includes("bun") && !l.includes("/usr/bin/bun"));
-    expect(sudoersLine).toBeUndefined();
+    expect(s).toContain("NOPASSWD: /usr/bin/bash");
+    expect(s).not.toContain("NOPASSWD: /usr/bin/bun");
   });
 });
 
@@ -789,11 +788,12 @@ describe("commit 95cbccb: no-appUser migrate subshell cds to SAMOHOST_ENV_DIR be
         }
       }
       expect(startIdx).toBeGreaterThan(-1);
-      const migrateBlock = lines.slice(startIdx, endIdx + 1).join("\n");
+      const migrateBlock = lines.slice(startIdx, endIdx + 1).join("\n")
+        .replace("/opt/field-record/envs/field-record-1-feat-x", dir);
 
       const prog = [
         "set -euo pipefail",
-        `SAMOHOST_ENV_DIR='${dir}'`,
+        "sudo() { if [[ \"$1\" == -H ]]; then shift; fi; if [[ \"$1\" == -u ]]; then shift 2; fi; \"$@\"; }",
         // Simulate buildCmd having cd'd away from SAMOHOST_ENV_DIR:
         "cd /tmp",
         migrateBlock,

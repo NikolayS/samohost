@@ -57,9 +57,9 @@ export function validatePreviewEnvIsolation(app: AppSpec): void {
     );
   }
 
-  if (app.envFile === undefined) return;
   const allow = app.previewEnvAllowlist;
   if (allow === undefined) {
+    if (app.envFile === undefined) return;
     throw new Error(
       `app '${app.name}' declares envFile but has no previewEnvAllowlist; ` +
         `refusing to copy the production environment into preview code`,

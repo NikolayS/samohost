@@ -22,6 +22,7 @@ import {
   buildEnvCreateScript,
   buildHostPrepScript,
   buildSecretsRotateScript,
+  previewUserFor,
   type EnvScriptTarget,
 } from "../src/env/script.ts";
 import { runOnboard, type OnboardDeps, type OnboardInput } from "../src/commands/onboard.ts";
@@ -118,13 +119,11 @@ describe("buildEnvCreateScript with secrets", () => {
     expect(s).toContain("init");
   });
 
-  test("secrets.env is owned by the env user (appUser passed to helper)", () => {
-    const s = buildEnvCreateScript(
-      app({ secrets: ["SESSION_SECRET"], appUser: "acme-user" }),
-      target(),
-    );
-    // The appUser must appear in the helper call (second positional arg).
-    expect(s).toContain("acme-user");
+  test("secrets.env is owned by the isolated preview user", () => {
+    const a = app({ secrets: ["SESSION_SECRET"], appUser: "acme-user" });
+    const s = buildEnvCreateScript(a, target());
+    expect(s).toContain(`samohost-secrets init 'acme-app-feat-x' '${previewUserFor(a)}'`);
+    expect(s).not.toContain("samohost-secrets init 'acme-app-feat-x' 'acme-user'");
     expect(s).toContain("samohost-secrets");
   });
 

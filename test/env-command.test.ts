@@ -320,7 +320,9 @@ describe("env commands", () => {
     );
     expect(code).toBe(0);
     expect(scripts).toHaveLength(1);
-    expect(scripts[0]).toContain("git clone");
+    expect(scripts[0]).toContain("samohost-preview-");
+    expect(scripts[0]).toContain(' clone "$SAMOHOST_ENV_NAME" "$SAMOHOST_BRANCH"');
+    expect(scripts[0]).not.toContain("git clone");
     const rec = envStore.get("vm-1111", "field-record-1", "feat/x");
     expect(rec?.name).toBe("field-record-1-feat-x");
     expect(rec?.port).toBe(3100);

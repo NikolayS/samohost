@@ -59,6 +59,7 @@ import { describe, expect, test } from "bun:test";
 import {
   buildEnvCreateScript,
   buildEnvDestroyScript,
+  buildHostPrepScript,
   type EnvScriptTarget,
 } from "../src/env/script.ts";
 import {
@@ -358,17 +359,15 @@ describe("B. envfile strip-append per listener portEnv", () => {
     const t = multiTarget();
     const script = buildEnvCreateScript(app, t);
 
-    // The script must strip-then-append WS_HUB_PORT with the allocated value (3101)
-    // Strip: grep -vE '^WS_HUB_PORT=' (removes stale prod value 8788)
-    expect(script).toContain("WS_HUB_PORT");
-    // Must include a grep-vE strip for WS_HUB_PORT
-    expect(script).toMatch(/grep\s+-v.*WS_HUB_PORT/);
-    // Must append the allocated port value
-    expect(script).toContain("WS_HUB_PORT=3101");
+    // Create passes only the allocated values to the root envfile helper.
+    expect(script).toContain("'WS_HUB_PORT=3101'");
+    expect(script).toContain("'INGEST_PORT=3102'");
 
-    // Same for INGEST_PORT
-    expect(script).toMatch(/grep\s+-v.*INGEST_PORT/);
-    expect(script).toContain("INGEST_PORT=3102");
+    // The installed helper owns the strip-then-append operation, so stale
+    // values from the root-only template cannot survive into the final file.
+    const prep = buildHostPrepScript(app, "operator");
+    expect(prep).toContain('strip_key "$VAR" "$OUT"');
+    expect(prep).toContain("printf '%s=%s\\n' \"$VAR\" \"$VALUE\"");
   });
 
   test("ms-ef-2: PORT strip-append present for web listener", () => {
@@ -376,9 +375,9 @@ describe("B. envfile strip-append per listener portEnv", () => {
     const t = multiTarget();
     const script = buildEnvCreateScript(app, t);
 
-    // The web listener (portEnv=PORT) must be handled
-    expect(script).toMatch(/grep\s+-v.*PORT=/);
-    expect(script).toContain("PORT=3100");
+    // The web listener (portEnv=PORT) must be passed to the helper.
+    expect(script).toContain("'PORT=3100'");
+    expect(buildHostPrepScript(app, "operator")).toContain('strip_key "$VAR" "$OUT"');
   });
 });
 
