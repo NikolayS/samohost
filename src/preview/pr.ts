@@ -289,6 +289,11 @@ export async function runPrPreviewPass(
   for (const env of allEnvs) {
     if (openSet.has(env.branch)) continue; // branch is open — keep
 
+    // A standing tracked-branch environment is app-owned, never PR-owned.
+    // Keep it even if a stale record still carries a prNumber from before the
+    // app opted in; the standing convergence pass will clear that stale owner.
+    if (app.standingPreview === true && env.branch === app.branch) continue;
+
     // PR-provenance guard: ONLY reap envs that were created by this pass.
     // Manually-created and demo previews (prNumber===undefined) are NEVER
     // touched by the closed-PR reaper — they are not owned by any PR.

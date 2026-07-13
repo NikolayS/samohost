@@ -281,6 +281,18 @@ export interface AppSpec {
   releaseTagPattern?: string;
 
   /**
+   * Keep the tracked {@link branch} deployed as a persistent preview env at
+   * `<name>-<branch>.samo.cat`. This is the stable client-review channel for
+   * release-tag apps; production remains independently tag-gated at
+   * {@link mainHost}. Absent/false preserves the legacy behavior exactly.
+   *
+   * Registration requires {@link releaseTagPattern}: without a separate
+   * release channel, production already follows `branch` and a standing
+   * preview would be a misleading duplicate.
+   */
+  standingPreview?: boolean;
+
+  /**
    * App-level secret env-var NAMES samohost will auto-generate per preview env
    * (PR-B). Each entry must match ^[A-Z_][A-Z0-9_]*$ (standard uppercase
    * env-var name). No duplicates. Absent = no auto-generated secrets.

@@ -27,6 +27,8 @@ serviceUnit = "{{APP_NAME}}"                        # systemd unit restarted on 
 # envDbVars      = ["DATABASE_URL"]                 # vars rewritten per preview env
 # rlsNonSuperuser = true                            # enforce non-superuser RLS gate
 # kind           = "node"                           # "node" (default) or "static"
+# releaseTagPattern = "v*"                          # separate tag-gated production channel
+# standingPreview = true                             # retain branch at <app>-<branch>.samo.cat
 
 # ---- provision (reserved for future provision --from-toml) -----------------
 # [provision]

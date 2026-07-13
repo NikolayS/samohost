@@ -47,6 +47,7 @@ import {
 import type { EnvStore } from "../state/envs.ts";
 import type { PrPreviewSummary, PrPreviewResult } from "../preview/pr.ts";
 import type { HealSummary, HealResult } from "../preview/heal.ts";
+import type { StandingPreviewResult } from "../preview/standing.ts";
 import type { EnvIdleGcDeps } from "./env-idle.ts";
 import type { AppRecord, EnvDbBackend, EnvRecord, VmRecord } from "../types.ts";
 import type { SpawnResult } from "../ssh/runner.ts";
@@ -176,6 +177,8 @@ export interface TriggerRunReport {
    * at least one live app was in scope, and the prPreview dep is wired.
    */
   prPreviews?: PrPreviewSummary[];
+  /** Persistent tracked-branch preview results for opted-in apps (#150). */
+  standingPreviews?: StandingPreviewResult[];
   /**
    * Per-app self-heal summaries (samohost #78). Present when --pr-previews was
    * active, a live app was in scope, and the heal dep is wired. Surfaces every
@@ -247,6 +250,11 @@ export interface TriggerDeps {
    * pass is silently skipped even if input.prPreviews is true.
    */
   prPreview?: (app: AppRecord, vm: VmRecord) => Promise<PrPreviewSummary>;
+  /** Fallback non-batched standing-preview implementation for tests/callers. */
+  standingPreview?: (
+    app: AppRecord,
+    vm: VmRecord,
+  ) => Promise<StandingPreviewResult>;
   /**
    * OPTIONAL: Curried self-heal function (samohost #78). When present and
    * input.prPreviews is true, called once per live candidate app BEFORE the
@@ -281,8 +289,16 @@ export interface TriggerDeps {
   batchedVmCycle?: (
     app: AppRecord,
     vm: VmRecord,
-    cycleOpts: { heal: boolean; prPreviews: boolean },
-  ) => Promise<{ heal: HealSummary; prPreview: PrPreviewSummary }>;
+    cycleOpts: {
+      heal: boolean;
+      prPreviews: boolean;
+      standingPreview: boolean;
+    },
+  ) => Promise<{
+    heal: HealSummary;
+    prPreview: PrPreviewSummary;
+    standingPreview?: StandingPreviewResult;
+  }>;
   /**
    * OPTIONAL: Curried idle-GC function (samohost #87). When present and
    * `input.idleGc` is true, called once per unique live VM in scope after the
@@ -640,7 +656,7 @@ export async function runTriggerRun(
     }
   }
 
-  // ---- Self-heal + PR-preview pass ----------------------------------------
+  // ---- Self-heal + persistent branch + PR-preview pass -------------------
   //
   // BATCHED PATH (preferred, when deps.batchedVmCycle is wired):
   //   Calls batchedVmCycle once per live candidate app. The closure runs ALL
@@ -656,12 +672,15 @@ export async function runTriggerRun(
   //   build TriggerDeps without batchedVmCycle. All shipped production wiring
   //   MUST supply batchedVmCycle.
   //
-  // Gating: `input.heal === true` OR `input.prPreviews === true`.
+  // Gating: explicit heal/PR flags OR an app-level standingPreview opt-in.
   // Per-app isolation: one app's failure must not abort the cycle.
   let healSummaries: HealSummary[] | undefined;
   let prPreviewSummaries: PrPreviewSummary[] | undefined;
+  let standingPreviewResults: StandingPreviewResult[] | undefined;
 
-  const wantHealOrPreview = input.heal === true || input.prPreviews === true;
+  const hasStandingPreview = candidates.some((app) => app.standingPreview === true);
+  const wantHealOrPreview =
+    input.heal === true || input.prPreviews === true || hasStandingPreview;
 
   if (wantHealOrPreview && deps.batchedVmCycle !== undefined) {
     // ---- BATCHED path (primary production path) ---------------------------
@@ -670,18 +689,30 @@ export async function runTriggerRun(
       const vmRecord = allVms.find((v) => v.id === app.vmId);
       if (vmRecord === undefined) continue;
       if (!LIVE_STATES.has(vmRecord.lifecycleState)) continue;
+      if (
+        input.heal !== true &&
+        input.prPreviews !== true &&
+        app.standingPreview !== true
+      ) continue;
       liveAppsForBatch.push({ app, vm: vmRecord });
     }
 
     if (liveAppsForBatch.length > 0) {
-      if (input.heal === true || input.prPreviews === true) healSummaries = [];
+      // Standing previews participate in clone healing even when --heal and
+      // --pr-previews are absent, so their DBLab clone cannot silently rot.
+      healSummaries = [];
       if (input.prPreviews === true) prPreviewSummaries = [];
+      if (hasStandingPreview) standingPreviewResults = [];
 
       for (const { app, vm: vmRecord } of liveAppsForBatch) {
         try {
           const result = await deps.batchedVmCycle(app, vmRecord, {
-            heal: input.heal === true || input.prPreviews === true,
+            heal:
+              input.heal === true ||
+              input.prPreviews === true ||
+              app.standingPreview === true,
             prPreviews: input.prPreviews === true,
+            standingPreview: app.standingPreview === true,
           });
 
           if (healSummaries !== undefined) {
@@ -697,7 +728,23 @@ export async function runTriggerRun(
           if (prPreviewSummaries !== undefined) {
             prPreviewSummaries.push(result.prPreview);
           }
+          if (
+            standingPreviewResults !== undefined &&
+            result.standingPreview !== undefined
+          ) {
+            standingPreviewResults.push(result.standingPreview);
+          }
         } catch (e) {
+          if (app.standingPreview === true) {
+            standingPreviewResults ??= [];
+            standingPreviewResults.push({
+              app: app.name,
+              vm: vmRecord.name,
+              branch: app.branch,
+              action: "error",
+              error: e instanceof Error ? e.message : String(e),
+            });
+          }
           err(
             `samohost: warning: batched preview cycle failed for app ${app.name}: ` +
               (e instanceof Error ? e.message : String(e)),
@@ -707,12 +754,20 @@ export async function runTriggerRun(
     }
   } else {
     // ---- FALLBACK path (backward-compat: separate heal + prPreview) -------
-    if ((input.heal === true || input.prPreviews === true) && deps.heal !== undefined) {
+    if (
+      (input.heal === true || input.prPreviews === true || hasStandingPreview) &&
+      deps.heal !== undefined
+    ) {
       const liveHealApps: Array<{ app: AppRecord; vm: VmRecord }> = [];
       for (const app of candidates) {
         const vmRecord = allVms.find((v) => v.id === app.vmId);
         if (vmRecord === undefined) continue;
         if (!LIVE_STATES.has(vmRecord.lifecycleState)) continue;
+        if (
+          input.heal !== true &&
+          input.prPreviews !== true &&
+          app.standingPreview !== true
+        ) continue;
         liveHealApps.push({ app, vm: vmRecord });
       }
       if (liveHealApps.length > 0) {
@@ -729,6 +784,40 @@ export async function runTriggerRun(
           }
         }
       }
+    }
+
+    if (hasStandingPreview && deps.standingPreview !== undefined) {
+      standingPreviewResults = [];
+      for (const app of candidates) {
+        if (app.standingPreview !== true) continue;
+        const vmRecord = allVms.find((v) => v.id === app.vmId);
+        if (vmRecord === undefined || !LIVE_STATES.has(vmRecord.lifecycleState)) continue;
+        try {
+          standingPreviewResults.push(await deps.standingPreview(app, vmRecord));
+        } catch (e) {
+          standingPreviewResults.push({
+            app: app.name,
+            vm: vmRecord.name,
+            branch: app.branch,
+            action: "error",
+            error: e instanceof Error ? e.message : String(e),
+          });
+        }
+      }
+    } else if (hasStandingPreview && deps.standingPreview === undefined) {
+      standingPreviewResults = candidates
+        .filter((app) => app.standingPreview === true)
+        .flatMap((app): StandingPreviewResult[] => {
+          const vmRecord = allVms.find((v) => v.id === app.vmId);
+          if (vmRecord === undefined || !LIVE_STATES.has(vmRecord.lifecycleState)) return [];
+          return [{
+            app: app.name,
+            vm: vmRecord.name,
+            branch: app.branch,
+            action: "error",
+            error: "standingPreview is enabled but trigger standing-preview dependency is absent",
+          }];
+        });
     }
 
     // PR-preview pass (opt-in: only when input.prPreviews is true and dep is wired).
@@ -799,7 +888,14 @@ export async function runTriggerRun(
     ...(gcByVm !== undefined ? { gc: gcByVm } : {}),
     ...(healSummaries !== undefined ? { heal: healSummaries } : {}),
     ...(prPreviewSummaries !== undefined ? { prPreviews: prPreviewSummaries } : {}),
+    ...(standingPreviewResults !== undefined
+      ? { standingPreviews: standingPreviewResults }
+      : {}),
   };
+
+  const standingFailed = (standingPreviewResults ?? []).filter(
+    (result) => result.action === "failed" || result.action === "error",
+  ).length;
 
   if (opts.json) {
     out(JSON.stringify(report, null, 2));
@@ -815,10 +911,20 @@ export async function runTriggerRun(
       const errStr = r.error !== undefined ? ` error: ${r.error}` : "";
       out(`  ${r.vm}/${r.app}: ${r.action}${shaStr}${reasonStr}${errStr}`);
     }
+    for (const preview of standingPreviewResults ?? []) {
+      const shaStr = preview.sha !== undefined ? ` sha=${preview.sha.slice(0, 12)}` : "";
+      const urlStr = preview.url !== undefined ? ` ${preview.url}` : "";
+      const errStr = preview.error !== undefined ? ` error: ${preview.error}` : "";
+      out(
+        `  ${preview.vm}/${preview.app} standing-preview: ` +
+          `${preview.action}${shaStr}${urlStr}${errStr}`,
+      );
+    }
   }
 
-  // Exit code: 0 if no failures; 1 if any failed or errored
-  return failed > 0 ? 1 : 0;
+  // A stale/unreachable stable review URL is a failed trigger cycle, not a
+  // warning hidden behind a green timer status.
+  return failed > 0 || standingFailed > 0 ? 1 : 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -1056,6 +1162,54 @@ export function defaultTriggerDeps(opts: TriggerDepsOpts = {}): TriggerDeps {
       const noop = (_s: string) => {};
       // Pass the shared envStore so heal and prPreview see the same records.
       return runHealPass(app, vmRecord, defaultHealDeps(envStore), noop, (s: string) => process.stderr.write(s + "\n"));
+    },
+
+    standingPreview: async (
+      app: AppRecord,
+      vmRecord: VmRecord,
+    ): Promise<StandingPreviewResult> => {
+      const { runStandingPreviewPass } = await import("../preview/standing.ts");
+      const {
+        DEFAULT_PREVIEW_DOMAIN,
+        runEnvCreate,
+        defaultEnvExecDeps: mkEnvExecDeps,
+      } = await import("./env.ts");
+      const { StateStore: StandingVmStore } = await import("../state/store.ts");
+      const { AppStore: StandingAppStore } = await import("../state/apps.ts");
+
+      return runStandingPreviewPass(app, vmRecord, {
+        envStore,
+        resolveRef: opts.resolveRef ?? appDeployDeps.resolveRef,
+        ensurePreview: async (args) => {
+          let captured = "";
+          await runEnvCreate(
+            {
+              vm: args.vm,
+              app: args.app,
+              branch: args.branch,
+              db: previewDbBackendFor(app),
+              previewDomain: DEFAULT_PREVIEW_DOMAIN,
+              lastDeployedSha: args.headSha,
+            },
+            { json: true },
+            new StandingVmStore(),
+            new StandingAppStore(),
+            envStore,
+            mkEnvExecDeps(),
+            (s: string) => { captured += s; },
+            (s: string) => process.stderr.write(s + "\n"),
+          );
+          try {
+            const report = JSON.parse(captured) as import("./env.ts").EnvCreateReport;
+            return {
+              vhost: report.vhost,
+              outcome: report.outcome === "ok" ? "ok" : "failed",
+            };
+          } catch {
+            return { vhost: "", outcome: "failed" };
+          }
+        },
+      });
     },
 
     prPreview: async (app: AppRecord, vmRecord: VmRecord): Promise<PrPreviewSummary> => {
@@ -1413,8 +1567,16 @@ export function defaultTriggerDeps(opts: TriggerDepsOpts = {}): TriggerDeps {
     batchedVmCycle: async (
       app: AppRecord,
       vmRecord: VmRecord,
-      cycleOpts: { heal: boolean; prPreviews: boolean },
-    ): Promise<{ heal: HealSummary; prPreview: PrPreviewSummary }> => {
+      cycleOpts: {
+        heal: boolean;
+        prPreviews: boolean;
+        standingPreview: boolean;
+      },
+    ): Promise<{
+      heal: HealSummary;
+      prPreview: PrPreviewSummary;
+      standingPreview?: StandingPreviewResult;
+    }> => {
       // The injectable remote for counting in tests; prod uses the real runner.
       // NOTE: we import the factory here but build the WORK remote lazily after
       // computing the item count so it gets a proportionally scaled timeout
@@ -1544,6 +1706,40 @@ export function defaultTriggerDeps(opts: TriggerDepsOpts = {}): TriggerDeps {
           // prListSucceeded stays false → reap loop is gated below.
         }
       }
+
+      // Resolve the standing tracked branch independently from production.
+      // For release-channel apps this is the source of the durable client
+      // review env; production resolution remains owned by the tag channel.
+      let standingHeadSha: string | undefined;
+      let standingResolveError: string | undefined;
+      if (cycleOpts.standingPreview) {
+        try {
+          standingHeadSha = (
+            await (opts.resolveRef ?? appDeployDeps.resolveRef)(
+              app.repo,
+              app.branch,
+            )
+          ).trim();
+          if (standingHeadSha.length === 0) {
+            throw new Error("resolved branch SHA is empty");
+          }
+        } catch (e) {
+          standingResolveError = e instanceof Error ? e.message : String(e);
+          process.stderr.write(
+            `samohost: batchedVmCycle: standing preview ref resolution failed ` +
+              `for ${app.repo}@${app.branch} — ${standingResolveError}\n`,
+          );
+        }
+      }
+
+      const standingExisting = cycleOpts.standingPreview
+        ? envStore.get(vmRecord.id, app.name, app.branch)
+        : undefined;
+      const standingNeedsDeploy =
+        standingHeadSha !== undefined &&
+        (standingExisting === undefined ||
+          standingExisting.lastDeployedSha !== standingHeadSha ||
+          standingExisting.prNumber !== undefined);
 
       // H5 CAP: apply MAX_PR_PREVIEWS_PER_CYCLE before computing needDeploy.
       // Safety cap — not a target.  Emit a warning when truncated.
@@ -1693,6 +1889,70 @@ export function defaultTriggerDeps(opts: TriggerDepsOpts = {}): TriggerDeps {
         });
       }
 
+      let standingEarlyError = standingResolveError;
+      let standingWorkItem: {
+        branch: string;
+        headSha: string;
+        script: string;
+        vhost: string;
+        isNewEnv: boolean;
+      } | undefined;
+
+      if (
+        cycleOpts.standingPreview &&
+        standingNeedsDeploy &&
+        standingHeadSha !== undefined &&
+        standingEarlyError === undefined
+      ) {
+        const existing = envStore.get(vmRecord.id, app.name, app.branch);
+        const isNewEnv = existing === undefined;
+        let target: import("../env/script.ts").EnvScriptTarget | undefined;
+
+        if (existing !== undefined) {
+          target = localTargetFromRecord(existing);
+        } else {
+          const derived = localDeriveTarget(
+            app,
+            app.branch,
+            previewDbBackendFor(app),
+            localPreviewDomain,
+            envStore.listFor(vmRecord.id),
+            localPool,
+          );
+          if ("error" in derived) {
+            standingEarlyError = derived.error;
+          } else if (phase1LivePorts.has(derived.port)) {
+            standingEarlyError =
+              `port ${derived.port} is already bound on ${vmRecord.name}; ` +
+              `standing preview will retry next cycle`;
+          } else {
+            target = derived;
+            envStore.upsert({
+              id: crypto.randomUUID(),
+              vmId: vmRecord.id,
+              appName: app.name,
+              branch: app.branch,
+              name: target.name,
+              port: target.port,
+              vhost: target.vhost,
+              dbBackend: target.dbBackend,
+              ...(target.dbName !== undefined ? { dbName: target.dbName } : {}),
+              createdAt: new Date().toISOString(),
+            });
+          }
+        }
+
+        if (standingEarlyError === undefined && target !== undefined) {
+          standingWorkItem = {
+            branch: app.branch,
+            headSha: standingHeadSha,
+            script: buildEnvCreateScript(app, target),
+            vhost: target.vhost,
+            isNewEnv,
+          };
+        }
+      }
+
       // ------------------------------------------------------------------
       // DNS ensure phase: call ensurePreviewDns for PR items that need it.
       //
@@ -1769,6 +2029,47 @@ export function defaultTriggerDeps(opts: TriggerDepsOpts = {}): TriggerDeps {
         }
       }
 
+      if (standingWorkItem !== undefined) {
+        const existing = envStore.get(
+          vmRecord.id,
+          app.name,
+          standingWorkItem.branch,
+        );
+        const needsDnsEnsure =
+          standingWorkItem.isNewEnv || existing?.lastDeployedSha === undefined;
+        if (needsDnsEnsure) {
+          try {
+            if (opts.ensurePreviewDns !== undefined) {
+              await opts.ensurePreviewDns(standingWorkItem.vhost, vmRecord.ip);
+            } else {
+              const cfToken = process.env["CLOUDFLARE_SAMOCAT"];
+              if (!cfToken) {
+                throw new Error(
+                  `CLOUDFLARE_SAMOCAT is not set — cannot ensure DNS for ` +
+                    standingWorkItem.vhost,
+                );
+              }
+              const { CloudflareDns } = await import("../dns/cloudflare.ts");
+              const { ensurePreviewDns: ensureDns } = await import("../dns/ensure.ts");
+              const zoneId = process.env["SAMOHOST_SAMOCAT_ZONE_ID"];
+              const provider = new CloudflareDns({
+                token: cfToken,
+                ...(zoneId ? { zoneId } : { zoneName: "samo.cat" }),
+              });
+              await ensureDns(provider, standingWorkItem.vhost, vmRecord.ip);
+            }
+          } catch (e) {
+            standingEarlyError =
+              `standing preview DNS ensure failed for ${standingWorkItem.vhost}: ` +
+              (e instanceof Error ? e.message : String(e));
+            process.stderr.write(
+              `samohost: batchedVmCycle: ${standingEarlyError}\n`,
+            );
+            standingWorkItem = undefined;
+          }
+        }
+      }
+
       // Remove items that failed DNS ensure from the work list so they are not
       // batched to the VM (they are already recorded in prEarlyFailures for
       // Phase-6 to surface as action="failed").
@@ -1797,10 +2098,16 @@ export function defaultTriggerDeps(opts: TriggerDepsOpts = {}): TriggerDeps {
         healResults: [],
       };
 
-      const hasWork = deadCloneItems.length > 0 || effectivePrWorkItems.length > 0;
+      const hasWork =
+        deadCloneItems.length > 0 ||
+        effectivePrWorkItems.length > 0 ||
+        standingWorkItem !== undefined;
       if (hasWork) {
         // FIX 1: scale the work-session timeout by total item count.
-        const totalItems = deadCloneItems.length + effectivePrWorkItems.length;
+        const totalItems =
+          deadCloneItems.length +
+          effectivePrWorkItems.length +
+          (standingWorkItem !== undefined ? 1 : 0);
         const scaledTimeoutMs = computeBatchTimeoutMs(totalItems);
         // When opts.remote is injected (tests), use it as-is (it's a fake).
         // In production, build a fresh runner with the scaled timeout.
@@ -1810,6 +2117,9 @@ export function defaultTriggerDeps(opts: TriggerDepsOpts = {}): TriggerDeps {
           vm: vmRecord,
           app,
           prs: effectivePrWorkItems,
+          ...(standingWorkItem !== undefined
+            ? { standing: standingWorkItem }
+            : {}),
           deadClones: deadCloneItems,
           envStore,
           remote: workRemote, // SSH CALL #2 (conditional — only when there is work)
@@ -1871,6 +2181,107 @@ export function defaultTriggerDeps(opts: TriggerDepsOpts = {}): TriggerDeps {
         deferred: healResults.filter((r) => r.action === "skipped" && r.health === "dead").length,
         results: healResults,
       };
+
+      let standingPreviewOut: StandingPreviewResult | undefined;
+      if (cycleOpts.standingPreview) {
+        const base = {
+          app: app.name,
+          vm: vmRecord.name,
+          branch: app.branch,
+        };
+
+        if (standingEarlyError !== undefined) {
+          standingPreviewOut = {
+            ...base,
+            action: standingResolveError !== undefined ? "error" : "failed",
+            ...(standingHeadSha !== undefined ? { sha: standingHeadSha } : {}),
+            error: standingEarlyError,
+          };
+        } else if (!standingNeedsDeploy && standingHeadSha !== undefined) {
+          standingPreviewOut = {
+            ...base,
+            action: "unchanged",
+            sha: standingHeadSha,
+            ...(standingExisting !== undefined
+              ? { url: `https://${standingExisting.vhost}` }
+              : {}),
+          };
+        } else if (!batchResult.ok) {
+          standingPreviewOut = {
+            ...base,
+            action: "failed",
+            ...(standingHeadSha !== undefined ? { sha: standingHeadSha } : {}),
+            error: batchResult.error ?? "batch SSH call failed",
+          };
+        } else if (
+          standingWorkItem !== undefined &&
+          batchResult.standingResult?.found === true
+        ) {
+          const rec = envStore.get(vmRecord.id, app.name, app.branch);
+          const url = `https://${standingWorkItem.vhost}`;
+          const { EXTERNAL_PROBE_RETRIES } = await import("./env.ts");
+          const sleep = opts.sleep ??
+            ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
+          const probe = opts.httpProbe ?? (async (probeUrl: string) => {
+            const { spawnSync: curlSpawn } = await import("node:child_process");
+            const { buildCurlProbeArgs, parseCurlProbeResult } = await import("./env.ts");
+            const curlArgs = buildCurlProbeArgs(probeUrl);
+            const result = curlSpawn(curlArgs[0] as string, curlArgs.slice(1), {
+              encoding: "utf8",
+              timeout: 15_000,
+            });
+            return parseCurlProbeResult(result.stdout ?? "", result.status ?? 1);
+          });
+
+          let probeOk = false;
+          let probeError = "external HTTPS probe failed";
+          for (let attempt = 0; attempt < EXTERNAL_PROBE_RETRIES; attempt++) {
+            if (attempt > 0) await sleep(5_000);
+            try {
+              const result = await probe(`${url}/`);
+              if (result.ok) {
+                probeOk = true;
+                break;
+              }
+              probeError = `external HTTPS probe returned HTTP ${result.status}`;
+            } catch (e) {
+              probeError = e instanceof Error ? e.message : String(e);
+            }
+          }
+
+          if (probeOk && rec !== undefined && standingHeadSha !== undefined) {
+            envStore.upsert({
+              ...rec,
+              lastDeployedSha: standingHeadSha,
+              // Transfer any stale PR ownership to the standing channel.
+              prNumber: undefined,
+            });
+            standingPreviewOut = {
+              ...base,
+              action: standingExisting === undefined ? "created" : "redeployed",
+              sha: standingHeadSha,
+              url,
+            };
+          } else {
+            standingPreviewOut = {
+              ...base,
+              action: "failed",
+              ...(standingHeadSha !== undefined ? { sha: standingHeadSha } : {}),
+              url,
+              error: rec === undefined
+                ? "standing preview batch succeeded without an EnvRecord"
+                : probeError,
+            };
+          }
+        } else {
+          standingPreviewOut = {
+            ...base,
+            action: "failed",
+            ...(standingHeadSha !== undefined ? { sha: standingHeadSha } : {}),
+            error: "standing preview item not found in batch output",
+          };
+        }
+      }
 
       // ------------------------------------------------------------------
       // Phase 6: Build PrPreviewSummary + post comments.
@@ -2074,6 +2485,7 @@ export function defaultTriggerDeps(opts: TriggerDepsOpts = {}): TriggerDeps {
         const allEnvsForApp = envStore.listFor(vmRecord.id, app.name);
         for (const env of allEnvsForApp) {
           if (openPrBranchSet.has(env.branch)) continue; // still open — keep
+          if (app.standingPreview === true && env.branch === app.branch) continue;
           if (env.prNumber === undefined) continue; // not PR-managed — never reap
           if (envStore.get(vmRecord.id, app.name, env.branch) === undefined) continue; // already gone
 
@@ -2121,7 +2533,13 @@ export function defaultTriggerDeps(opts: TriggerDepsOpts = {}): TriggerDeps {
         ...(prListError !== undefined ? { listError: prListError } : {}),
       };
 
-      return { heal: healSummaryOut, prPreview: prPreviewSummaryOut };
+      return {
+        heal: healSummaryOut,
+        prPreview: prPreviewSummaryOut,
+        ...(standingPreviewOut !== undefined
+          ? { standingPreview: standingPreviewOut }
+          : {}),
+      };
     },
 
     // Test-only sentinel: confirms that heal and prPreview closures use the

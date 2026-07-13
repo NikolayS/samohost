@@ -200,6 +200,12 @@ export interface BatchedVmCycleInput {
     /** The script to run for this PR (build + restart). */
     script?: string;
   }>;
+  /** Persistent tracked-branch preview needing create/redeploy this cycle. */
+  standing?: {
+    branch: string;
+    headSha: string;
+    script?: string;
+  };
   /** Dead clones that need re-creation this cycle. */
   deadClones: Array<{
     envName: string;
@@ -229,6 +235,13 @@ export interface BatchedVmCycleOutput {
     stderr: string;
     found: boolean;
   }>;
+  standingResult?: {
+    branch: string;
+    headSha: string;
+    stdout: string;
+    stderr: string;
+    found: boolean;
+  };
   healResults: Array<{
     envName: string;
     cloneId: string;
@@ -247,7 +260,7 @@ export interface BatchedVmCycleOutput {
 export async function runBatchedVmCycle(
   input: BatchedVmCycleInput,
 ): Promise<BatchedVmCycleOutput> {
-  const { vm, prs, deadClones, remote } = input;
+  const { vm, prs, standing, deadClones, remote } = input;
 
   // Build per-item BatchWorkItems for prs + dead clones.
   const items: BatchWorkItem[] = [];
@@ -256,6 +269,13 @@ export async function runBatchedVmCycle(
     const id = `pr-${pr.prNumber}-${pr.branch.replace(/[^a-z0-9]/gi, "-")}`;
     // Use provided script or a placeholder if not given (callers wire real scripts).
     const script = pr.script ?? `echo "pr-preview: branch=${pr.branch} sha=${pr.headSha}"`;
+    items.push({ id, script });
+  }
+
+  if (standing !== undefined) {
+    const id = `standing-${standing.branch.replace(/[^a-z0-9]/gi, "-")}`;
+    const script = standing.script ??
+      `echo "standing-preview: branch=${standing.branch} sha=${standing.headSha}"`;
     items.push({ id, script });
   }
 
@@ -290,6 +310,17 @@ export async function runBatchedVmCycle(
         stderr: error,
         found: false,
       })),
+      ...(standing !== undefined
+        ? {
+            standingResult: {
+              branch: standing.branch,
+              headSha: standing.headSha,
+              stdout: "",
+              stderr: error,
+              found: false,
+            },
+          }
+        : {}),
       healResults: deadClones.map((c) => ({
         envName: c.envName,
         cloneId: c.cloneId,
@@ -316,6 +347,20 @@ export async function runBatchedVmCycle(
     };
   });
 
+  const standingResult = standing === undefined
+    ? undefined
+    : (() => {
+        const id = `standing-${standing.branch.replace(/[^a-z0-9]/gi, "-")}`;
+        const r = parsedById.get(id);
+        return {
+          branch: standing.branch,
+          headSha: standing.headSha,
+          stdout: r?.stdout ?? "",
+          stderr: r?.stderr ?? raw.stderr,
+          found: r?.found ?? false,
+        };
+      })();
+
   const healResults = deadClones.map((clone) => {
     const id = `heal-${clone.cloneId}-${clone.envName.replace(/[^a-z0-9]/gi, "-")}`;
     const r = parsedById.get(id);
@@ -328,5 +373,10 @@ export async function runBatchedVmCycle(
     };
   });
 
-  return { ok: true, prResults, healResults };
+  return {
+    ok: true,
+    prResults,
+    ...(standingResult !== undefined ? { standingResult } : {}),
+    healResults,
+  };
 }

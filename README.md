@@ -177,6 +177,8 @@ serviceUnit = "field-record-1"                      # systemd unit restarted on 
 # seedCmd         = "npm run seed"
 # envFile         = "/opt/field-record-1/app.env"   # sourced read-only on deploy; never read/written by samohost
 # mainHost        = "field-record-1.samo.team"       # public production host for the main-env Caddy vhost
+# releaseTagPattern = "v*"                            # production release channel (required below)
+# standingPreview = true                              # persistent <app>-<branch>.samo.cat client-review env
 # rlsUrlVar       = "RLS_DATABASE_URL"               # env var holding the non-superuser URL for the RLS probe
 # envDbVars       = ["DATABASE_URL"]                 # vars whose DB host:port is rewritten per preview env
 # rlsNonSuperuser = true                             # require non-superuser connection (RLS gate)
@@ -193,6 +195,14 @@ serviceUnit = "field-record-1"                      # systemd unit restarted on 
 
 No secrets ever belong in the manifest — it lives in a (often public) client
 repo. Database URLs / tokens stay in the app's own `--env-file` on the host.
+
+`standingPreview = true` is an explicit opt-in for release-channel apps. It
+tracks the declared `branch` at the stable URL
+`https://<app>-<branch-label>.samo.cat`, updates when that branch SHA changes,
+and survives PR-close, TTL, and idle cleanup. The trigger still externally
+probes the URL before recording success, and a failed standing preview makes
+the trigger cycle fail. It requires `releaseTagPattern` so the stable client
+review environment cannot accidentally be the same channel as production.
 
 ## How it's tested
 

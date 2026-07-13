@@ -119,6 +119,19 @@ ExecStart=/usr/bin/bun run src/cli.ts trigger run --gc --pr-previews
 Previews still need the same CF DNS + origin-TLS setup as any `env create`
 (`docs/preview-reachability.md`).
 
+### Stable client-review preview (`standingPreview`)
+
+For an app whose production deploys come from a separate tag release channel,
+set `releaseTagPattern` and `standingPreview = true` in `.samohost.toml`. No
+trigger flag is required: every ordinary trigger cycle tracks the app's
+declared branch and converges `https://<app>-<branch-label>.samo.cat`.
+
+The stable preview is updated on a new branch SHA and is not owned by a PR, TTL,
+or idle policy. It is therefore excluded from PR-close, branch/TTL, and idle
+reapers. A failed public HTTPS probe is reported in `standingPreviews` and makes
+the trigger exit non-zero, so the dashboard/timer cannot call a stale review
+URL healthy.
+
 ### Required env vars for `--pr-previews` / `--heal`
 
 The trigger service **requires** the following variable when `--pr-previews` or

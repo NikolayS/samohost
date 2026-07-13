@@ -63,6 +63,29 @@ collisions in the env registry.
 
 Source: `docs/control-plane-setup.md`.
 
+## Persistent tracked-branch preview
+
+Release-channel apps can opt into one stable client-review environment:
+
+```toml
+branch = "main"
+releaseTagPattern = "v*"
+standingPreview = true
+```
+
+The trigger converges `main` at `https://{app}-main.samo.cat`: first cycle
+creates it, later branch SHAs redeploy it, and an unchanged SHA is a no-op. It
+shares the existing batched preview SSH session and uses the same DBLab healing
+path when the preview is DB-backed. Success is recorded only after the public
+HTTPS probe passes; create, redeploy, DNS, resolution, or probe failure makes
+the trigger cycle exit non-zero.
+
+Unlike an ephemeral PR preview, this environment is app-owned. PR-close,
+branch/TTL GC, and idle GC cannot reap it while the app remains opted in with
+the same tracked branch. `samohost env destroy` remains the explicit removal
+path. Generic apps with no `standingPreview` field retain their existing
+behavior.
+
 ## Known bugs (open as of 2026-07-07)
 
 | Issue | Summary |

@@ -1341,6 +1341,16 @@ export async function runEnvGc(
       continue;
     }
 
+    // Standing tracked-branch previews are durable review infrastructure.
+    // While the app remains registered with the same branch opted in, only an
+    // explicit `env destroy` may remove this EnvRecord. Branch-gone and TTL GC
+    // are intentionally bypassed (samohost #150).
+    if (appRec.standingPreview === true && env.branch === appRec.branch) {
+      kept++;
+      log(`  kept ${env.name} (standing preview for ${appRec.branch})`);
+      continue;
+    }
+
     // --- Branch check (OPTIONAL) ---
     let branchGone = false;
     let branchCheckFailed = false;

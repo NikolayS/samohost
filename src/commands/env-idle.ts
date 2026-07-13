@@ -155,7 +155,7 @@ export function idleSinceMs(env: EnvRecord, now: Date): number {
 export async function runEnvIdleGc(
   input: EnvIdleGcInput,
   vmStore: StateStore,
-  _appStore: AppStore,
+  appStore: AppStore,
   envStore: EnvStore,
   destroyEnv: DestroyEnvFn,
   out: (s: string) => void,
@@ -176,6 +176,14 @@ export async function runEnvIdleGc(
   let kept = 0;
 
   for (const env of envs) {
+    const app = appStore.get(env.vmId, env.appName);
+    if (app?.standingPreview === true && env.branch === app.branch) {
+      // Stable client-review environments are never idle-reaped. Their
+      // lifecycle is explicit and tied to the app registration (#150).
+      kept++;
+      continue;
+    }
+
     const idle = idleSinceMs(env, now);
 
     if (idle < input.idleThresholdMs) {

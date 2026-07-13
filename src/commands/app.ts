@@ -103,6 +103,8 @@ export interface AppRegisterInput {
    * regardless of this value.
    */
   releaseTagPattern?: string;
+  /** Keep the tracked branch as a persistent client-review preview env. */
+  standingPreview?: boolean;
 
   /**
    * App-level secret env-var NAMES to auto-generate per preview env (PR-B).
@@ -235,6 +237,14 @@ export function runAppRegister(
     }
   }
 
+  if (input.standingPreview === true && input.releaseTagPattern === undefined) {
+    err(
+      "error: standingPreview=true requires releaseTagPattern so production " +
+        "and the persistent branch preview remain separate channels",
+    );
+    return 1;
+  }
+
   const spec: AppSpec = {
     name: input.name,
     repo: input.repo,
@@ -266,6 +276,7 @@ export function runAppRegister(
     // accepted + persisted; the tag-gated deploy behavior is a separate,
     // not-yet-shipped feature — prod deploys on main SHA + CI-green regardless of this value.
     ...(input.releaseTagPattern !== undefined ? { releaseTagPattern: input.releaseTagPattern } : {}),
+    ...(input.standingPreview !== undefined ? { standingPreview: input.standingPreview } : {}),
     // PR-B/PR-C schema: accepted + persisted; secret generation and DB URL rewriting
     // are separate, not-yet-shipped features.
     ...(input.secrets !== undefined ? { secrets: input.secrets } : {}),
@@ -375,6 +386,7 @@ export function runAppRegisterFromToml(
     ...(app.defaultListener !== undefined ? { defaultListener: app.defaultListener } : {}),
     ...(app.mainListen !== undefined ? { mainListen: app.mainListen } : {}),
     ...(app.releaseTagPattern !== undefined ? { releaseTagPattern: app.releaseTagPattern } : {}),
+    ...(app.standingPreview !== undefined ? { standingPreview: app.standingPreview } : {}),
     ...(app.secrets !== undefined ? { secrets: app.secrets } : {}),
     ...(app.databaseUrlEnv !== undefined ? { databaseUrlEnv: app.databaseUrlEnv } : {}),
   };
