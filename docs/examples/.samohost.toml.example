@@ -32,6 +32,8 @@ serviceUnit = "field-record-1"                     # systemd unit restarted on d
 # envFile        = "/opt/field-record-1/app.env"  # remote env file, sourced read-only on deploy
 #                                                 #   (NEVER read or written by samohost)
 # mainHost       = "field-record-1.samo.team"     # public production host for the main-env Caddy vhost
+# releaseTagPattern = "v*"                        # separate tag-gated production release channel
+# standingPreview = true                          # persist <app>-<branch>.samo.cat; requires releaseTagPattern
 # rlsUrlVar      = "RLS_DATABASE_URL"             # env var holding the NON-superuser URL the RLS probe uses
 # envDbVars      = ["DATABASE_URL", "APP_DATABASE_URL"]  # vars whose DB host:port is rewritten per preview env
 # rlsNonSuperuser = true                          # require the app to connect as a non-superuser (RLS gate)

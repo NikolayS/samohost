@@ -91,6 +91,12 @@ export interface AppManifest {
   releaseTagPattern?: string;
 
   /**
+   * Maintain the tracked branch as the persistent `*-<branch>.samo.cat`
+   * client-review environment. Requires releaseTagPattern.
+   */
+  standingPreview?: boolean;
+
+  /**
    * App-level secret env-var NAMES samohost will auto-generate per preview env
    * (PR-B). Each entry must match ^[A-Z_][A-Z0-9_]*$. No duplicates.
    * Absent = no auto-generated secrets. Maps to {@link AppSpec.secrets}.
@@ -166,6 +172,7 @@ const APP_KEYS = new Set<string>([
   // accepted + persisted; the tag-gated deploy behavior is a separate,
   // not-yet-shipped feature — prod deploys on main SHA + CI-green regardless of this value.
   "releaseTagPattern",
+  "standingPreview",
   // PR-B/PR-C: secrets and databaseUrlEnv are schema-only in this PR.
   // Secret generation (PR-B) and DB URL rewriting (PR-C) are separate.
   "secrets",
@@ -735,6 +742,7 @@ export function parseSamohostToml(text: string): ParseTomlResult {
   const appUser = optionalString(raw, "appUser", errors);
   const envDbVars = optionalStringArray(raw, "envDbVars", errors);
   const rlsNonSuperuser = optionalBoolean(raw, "rlsNonSuperuser", errors);
+  const standingPreview = optionalBoolean(raw, "standingPreview", errors);
 
   // issue #36: optional enum field (must be "node" | "static" when present)
   let kind: "node" | "static" | undefined;
@@ -1108,6 +1116,13 @@ export function parseSamohostToml(text: string): ParseTomlResult {
     }
   }
 
+  if (standingPreview === true && releaseTagPattern === undefined) {
+    errors.push(
+      `field standingPreview=true requires releaseTagPattern — production must ` +
+        `have a separate tag-gated channel before branch can be retained as a preview`,
+    );
+  }
+
   // ---- 10. Return result -------------------------------------------------------
   if (errors.length > 0) {
     return { ok: false, errors };
@@ -1140,6 +1155,7 @@ export function parseSamohostToml(text: string): ParseTomlResult {
     ...(defaultListener !== undefined ? { defaultListener } : {}),
     ...(mainListen !== undefined ? { mainListen } : {}),
     ...(releaseTagPattern !== undefined ? { releaseTagPattern } : {}),
+    ...(standingPreview !== undefined ? { standingPreview } : {}),
     ...(secrets !== undefined ? { secrets } : {}),
     ...(databaseUrlEnv !== undefined ? { databaseUrlEnv } : {}),
   };

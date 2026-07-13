@@ -27,6 +27,13 @@ Three namespaces, three purposes:
 
 Preview URL pattern: `{app}-{branch-label}.samo.cat`
 
+The same namespace has two lifecycles:
+
+- Ephemeral PR previews are PR-owned and removed after the PR closes.
+- An explicitly configured standing preview is app-owned, normally
+  `{app}-main.samo.cat`, and follows the tracked branch until explicitly
+  destroyed or the app is reconfigured.
+
 `samo.cat` NS was moved to Cloudflare 2026-06-11 (Option 2 from
 `docs/dns-preview-authority.md`). Per-preview A records are written by
 `samohost env create` via the `CLOUDFLARE_SAMOCAT` token.
