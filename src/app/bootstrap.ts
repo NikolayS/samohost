@@ -213,6 +213,7 @@ export function buildHostBootstrapScript(
   opts: HostBootstrapOptions,
 ): string {
   const isStatic = app.kind === "static";
+  const isStaticReleaseChannel = isStatic && app.releaseTagPattern !== undefined;
 
   // Guard: dbName is required for non-static apps (node apps need a database).
   // Static apps have no database — callers MUST omit dbName for static and
@@ -620,12 +621,12 @@ export function buildHostBootstrapScript(
     "",
   );
 
-  // ---- static-only: production Caddy file_server vhost block ----------------
-  // For static apps: write a file_server Caddy site block serving the app
-  // checkout directory. Uses `tls internal` (self-signed origin cert) so that
-  // CF Full-mode proxying works without an ACME challenge — ACME cannot complete
-  // behind CF-locked :443, matching buildStaticEnvCreateScript's rationale.
-  if (isStatic && app.mainHost !== undefined) {
+  // ---- static branch-channel: production Caddy file_server vhost block ------
+  // Branch-channel static apps preserve the legacy bootstrap-owned appDir
+  // route. Release-channel static apps MUST NOT create or replace this vhost:
+  // only the tag-authorized deploy transaction may atomically activate a
+  // versioned candidate. This also makes bootstrap reruns preserve that route.
+  if (isStatic && !isStaticReleaseChannel && app.mainHost !== undefined) {
     const caddySitePath = `/etc/caddy/sites.d/00-main-${app.name}.caddy`;
     const siteAddress = app.mainListen === "cp-http80"
       ? `http://${app.mainHost}`
