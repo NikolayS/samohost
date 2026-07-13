@@ -269,6 +269,78 @@ describe("(1) SSH-count — heal cycle makes ≤ budget remote() calls per VM", 
       expect(callCount.value).toBeLessThanOrEqual(CONNECTION_BUDGET_PER_VM);
     },
   );
+
+  test(
+    "unchanged legacy none/template PR records are rejected before batching",
+    async () => {
+      for (const dbBackend of ["none", "template"] as const) {
+        const branch = `legacy-${dbBackend}`;
+        envStore.upsert(makeEnvRecord({
+          id: `env-${dbBackend}`,
+          branch,
+          name: `field-record-${branch}`,
+          vhost: `field-record-${branch}.samo.cat`,
+          dbBackend,
+          dbName: dbBackend === "template" ? `field_record_${branch}` : undefined,
+          // `none` models an older record created before prNumber was stored;
+          // `template` exercises the explicit PR-record audit at cycle start.
+          prNumber: dbBackend === "none" ? undefined : 42,
+          lastDeployedSha: `sha-${dbBackend}`,
+        }));
+
+        let remoteCalls = 0;
+        const deps = (await import("../src/commands/trigger.ts")).defaultTriggerDeps({
+          envStore,
+          listOpenPrs: async () => [{
+            number: dbBackend === "none" ? 41 : 42,
+            headRef: branch,
+            headSha: `sha-${dbBackend}`,
+          }],
+          remote: async () => {
+            remoteCalls++;
+            return { code: 0, stdout: "", stderr: "" };
+          },
+        });
+
+        await expect(deps.batchedVmCycle!(makeApp(), makeVm(), {
+          heal: true,
+          prPreviews: true,
+        })).rejects.toThrow(/destroy\/recreate.*DBLab/);
+        expect(remoteCalls).toBe(0);
+
+        envStore.remove("vm-1111", "field-record", branch);
+      }
+    },
+  );
+
+  test(
+    "legacy DBLab records cannot build heal scripts without a preview env allowlist",
+    async () => {
+      envStore.upsert(makeEnvRecord({
+        prNumber: 43,
+        dbBackend: "dblab",
+      }));
+
+      let remoteCalls = 0;
+      const deps = (await import("../src/commands/trigger.ts")).defaultTriggerDeps({
+        envStore,
+        remote: async () => {
+          remoteCalls++;
+          return { code: 0, stdout: "", stderr: "" };
+        },
+      });
+
+      await expect(deps.batchedVmCycle!(makeApp({
+        envFile: "/opt/field-record/prod.env",
+        envDbVars: ["DATABASE_URL"],
+        databaseUrlEnv: "DATABASE_URL",
+      }), makeVm(), {
+        heal: true,
+        prPreviews: false,
+      })).rejects.toThrow(/no previewEnvAllowlist/);
+      expect(remoteCalls).toBe(0);
+    },
+  );
 });
 
 // ---------------------------------------------------------------------------

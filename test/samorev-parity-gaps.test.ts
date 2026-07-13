@@ -729,6 +729,10 @@ describe("(5a) REPORTING_DERIVETARGET: deriveTarget error in PrPreviewSummary", 
 
 describe("(5b) REPORTING_PRLIST: prList failure produces listError field", () => {
   test("PrPreviewSummary has listError when listOpenPrs throws", async () => {
+    // This case exercises PR-list reporting, not DB policy. Make the fixture an
+    // explicit no-database app so its stored `none` preview is policy-safe.
+    appStore.upsert(makeApp({ dbBackend: "none" }));
+
     // Plant a PR-managed env to show the summary exists (not empty report).
     const plantedEnv = makeEnvRecord("feat/plant-pr", {
       prNumber: 600,

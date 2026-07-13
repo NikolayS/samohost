@@ -1421,6 +1421,22 @@ export function defaultTriggerDeps(opts: TriggerDepsOpts = {}): TriggerDeps {
       vmRecord: VmRecord,
       cycleOpts: { heal: boolean; prPreviews: boolean },
     ): Promise<{ heal: HealSummary; prPreview: PrPreviewSummary }> => {
+      // Fail closed before constructing a probe, heal, or existing-preview
+      // script. Legacy AppRecords can predate the preview env allowlist and
+      // would otherwise reach the batched path without calling
+      // previewDbBackendFor() (which is only needed for a brand-new target).
+      validatePreviewEnvIsolation(app);
+
+      // Audit every record already known to be PR-managed before the
+      // unchanged-SHA filter can hide it. Explicit `env destroy` intentionally
+      // does not call this guard, so operators can still remove an unsafe
+      // legacy none/template preview and recreate it with DBLab.
+      for (const stored of envStore.listFor(vmRecord.id, app.name)) {
+        if (stored.prNumber !== undefined) {
+          assertStoredPreviewBackend(app, stored.dbBackend);
+        }
+      }
+
       // The injectable remote for counting in tests; prod uses the real runner.
       // NOTE: we import the factory here but build the WORK remote lazily after
       // computing the item count so it gets a proportionally scaled timeout
@@ -1548,6 +1564,17 @@ export function defaultTriggerDeps(opts: TriggerDepsOpts = {}): TriggerDeps {
               `false-positive reap of PR-managed envs\n`,
           );
           // prListSucceeded stays false → reap loop is gated below.
+        }
+      }
+
+      // Older PR env records may not have prNumber persisted. Match every open
+      // PR by branch and audit the stored backend before filtering unchanged
+      // SHAs or applying the per-cycle cap, otherwise an already-up-to-date
+      // legacy none/template preview can bypass the DBLab-only policy forever.
+      for (const pr of openPrs) {
+        const existing = envStore.get(vmRecord.id, app.name, pr.headRef);
+        if (existing !== undefined) {
+          assertStoredPreviewBackend(app, existing.dbBackend);
         }
       }
 
