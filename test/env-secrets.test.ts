@@ -222,8 +222,9 @@ describe("buildHostPrepScript unit template with secrets", () => {
     // Both empty and absent secrets[] must produce exactly the same output as today.
     expect(withEmptySecrets).toBe(baseline);
     expect(withoutSecrets).toBe(baseline);
-    // And the baseline must NOT contain a secrets.env EnvironmentFile line.
-    expect(baseline).not.toContain("secrets.env");
+    // The helper is present for generated clone DB credentials, but the unit
+    // must not load an app-secrets EnvironmentFile when secrets[] is empty.
+    expect(baseline).not.toContain("EnvironmentFile=/var/lib/samohost/envs/%i/secrets.env");
   });
 
   test("unit template is valid bash when secrets are declared", () => {
@@ -427,6 +428,9 @@ serviceUnit = "acme-app"
 releaseTagPattern = "v*"
 secrets     = ["SESSION_SECRET", "TOKEN_SECRET"]
 databaseUrlEnv = "DATABASE_URL"
+envDbVars = ["DATABASE_URL"]
+previewEnvAllowlist = ["DATABASE_URL", "NODE_ENV"]
+previewEnvUnset = ["PRODUCTION_SIGNING_KEY"]
 defaultListener = "web"
 mainListen = "tls"
 
@@ -472,6 +476,8 @@ to = "web"
     expect(rec).toBeDefined();
     expect(rec!.secrets).toEqual(["SESSION_SECRET", "TOKEN_SECRET"]);
     expect(rec!.databaseUrlEnv).toBe("DATABASE_URL");
+    expect(rec!.previewEnvAllowlist).toEqual(["DATABASE_URL", "NODE_ENV"]);
+    expect(rec!.previewEnvUnset).toEqual(["PRODUCTION_SIGNING_KEY"]);
   });
 
   test("onboarded app RETAINS releaseTagPattern", async () => {
@@ -521,8 +527,8 @@ describe("legacy app (no secrets) behaviour", () => {
     const legacy = buildHostPrepScript(app({ secrets: undefined }), "samo");
     const emptySecrets = buildHostPrepScript(app({ secrets: [] }), "samo");
     expect(legacy).toBe(emptySecrets);
-    expect(legacy).not.toContain("secrets.env");
-    expect(legacy).not.toContain("/var/lib/samohost/envs");
+    expect(legacy).not.toContain("EnvironmentFile=/var/lib/samohost/envs/%i/secrets.env");
+    expect(legacy).toContain("/usr/local/sbin/samohost-secrets");
   });
 
   test("env-create script for legacy app is byte-identical to app with secrets: undefined vs secrets: []", () => {

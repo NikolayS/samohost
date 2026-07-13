@@ -50,7 +50,11 @@ import type { HealSummary, HealResult } from "../preview/heal.ts";
 import type { EnvIdleGcDeps } from "./env-idle.ts";
 import type { AppRecord, EnvDbBackend, EnvRecord, VmRecord } from "../types.ts";
 import type { SpawnResult } from "../ssh/runner.ts";
-import { resolvePreviewDbBackend } from "../preview/db-policy.ts";
+import {
+  assertStoredPreviewBackend,
+  resolvePreviewDbBackend,
+  validatePreviewEnvIsolation,
+} from "../preview/db-policy.ts";
 
 // ---------------------------------------------------------------------------
 // Public helpers
@@ -70,6 +74,7 @@ import { resolvePreviewDbBackend } from "../preview/db-policy.ts";
  * stated explicitly in the AppSpec.
  */
 export function previewDbBackendFor(app: AppRecord): EnvDbBackend {
+  validatePreviewEnvIsolation(app);
   return resolvePreviewDbBackend(app);
 }
 
@@ -1615,6 +1620,7 @@ export function defaultTriggerDeps(opts: TriggerDepsOpts = {}): TriggerDeps {
         const isNewEnv = existing === undefined;
 
         if (existing !== undefined) {
+          assertStoredPreviewBackend(app, existing.dbBackend);
           targetForPr = localTargetFromRecord(existing);
         } else {
           // New env: derive target using store-only allocation (natural allocation).
@@ -1652,9 +1658,15 @@ export function defaultTriggerDeps(opts: TriggerDepsOpts = {}): TriggerDeps {
           // and either the squatter will be gone, or the cycle will fail again. We
           // do NOT try a different port — that would silently let the PR land on an
           // unexpected port while the squatter is still bound on the intended one.
-          if (phase1LivePorts.has(t.port)) {
+          const allocatedListenerPorts = t.ports !== undefined
+            ? Object.values(t.ports)
+            : [t.port];
+          const squattedPort = allocatedListenerPorts.find((port) =>
+            phase1LivePorts.has(port)
+          );
+          if (squattedPort !== undefined) {
             const errMsg =
-              `port ${t.port} is already bound on ${vmRecord.name} ` +
+              `listener port ${squattedPort} is already bound on ${vmRecord.name} ` +
               `(squatted by a foreign process per Phase-1 probe); ` +
               `skipping this PR — will retry next cycle after squatter vacates`;
             process.stderr.write(`samohost: batchedVmCycle: ${errMsg}\n`);
@@ -1675,6 +1687,9 @@ export function defaultTriggerDeps(opts: TriggerDepsOpts = {}): TriggerDeps {
               branch: pr.headRef,
               name: targetForPr.name,
               port: targetForPr.port,
+              ...(targetForPr.ports !== undefined
+                ? { ports: targetForPr.ports }
+                : {}),
               vhost: targetForPr.vhost,
               dbBackend: targetForPr.dbBackend,
               ...(targetForPr.dbName !== undefined ? { dbName: targetForPr.dbName } : {}),

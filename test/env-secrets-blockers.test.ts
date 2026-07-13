@@ -235,10 +235,13 @@ describe("BLOCKER 2: buildHostPrepScript — no separator-matching glob in sudoe
     expect(s).toMatch(/\^a-z0-9.*-|ENV_NAME.*=~|regex.*env/i);
   });
 
-  test("no secrets sudoers grants remain for apps without secrets", () => {
+  test("DB-backed apps without app secrets retain only the clone-credential helper grant", () => {
     const s = buildHostPrepScript(app({ secrets: [] }), "samo");
-    expect(s).not.toContain("samohost-secrets");
-    expect(s).not.toContain("secrets.env");
+    // Every effective envDbVars URL receives a generated clone-only password,
+    // so the exact-path helper is still required even with secrets=[].
+    expect(s).toMatch(/NOPASSWD: \/usr\/local\/sbin\/samohost-secrets/);
+    // App-secret loading remains absent from the systemd unit.
+    expect(s).not.toContain("EnvironmentFile=/var/lib/samohost/envs/%i/secrets.env");
   });
 });
 

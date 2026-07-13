@@ -283,6 +283,38 @@ describe("A. deriveTarget — multi-service port allocation", () => {
     expect(second.ports?.["ingest"]).toBe(DEFAULT_POOL.base + 5);
   });
 
+  test("ms-dt-2b: another app's secondary listener reserves that port VM-wide", () => {
+    const app = multiApp();
+    const existing: EnvRecord[] = [];
+
+    // Primary ports consume 3100..3109. The final record's secondary listener
+    // owns 3110 — the incident shape that previously let samograph choose 3110
+    // as its base because only EnvRecord.port was considered.
+    for (let offset = 0; offset < 10; offset++) {
+      existing.push(envRecord({
+        id: `other-${offset}`,
+        appName: "another-app",
+        branch: `feat/other-${offset}`,
+        name: `another-app-${offset}`,
+        port: DEFAULT_POOL.base + offset,
+        ...(offset === 9
+          ? { ports: { web: DEFAULT_POOL.base + offset, "app-api": DEFAULT_POOL.base + 10 } }
+          : {}),
+      }));
+    }
+
+    const result = deriveTarget(app, "feat/x", "none", "samo.cat", existing, DEFAULT_POOL);
+    if ("error" in result) throw new Error(result.error);
+
+    expect(result.port).toBe(DEFAULT_POOL.base + 11);
+    expect(Object.values(result.ports ?? {})).not.toContain(DEFAULT_POOL.base + 10);
+    expect(result.ports).toEqual({
+      web: DEFAULT_POOL.base + 11,
+      "ws-hub": DEFAULT_POOL.base + 12,
+      ingest: DEFAULT_POOL.base + 13,
+    });
+  });
+
   test("ms-dt-3: pool exhaustion when N ports can't be satisfied", () => {
     const app = multiApp();
     // Fill all but 2 slots (pool has 100 ports; a 3-listener app needs 3, but only 2 remain)

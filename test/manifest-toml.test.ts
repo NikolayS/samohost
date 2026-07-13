@@ -459,6 +459,7 @@ describe("round-trip: --from-toml produces same AppSpec as equivalent flags", ()
         mainHost: "field-record-1.samo.team",
         rlsUrlVar: "APP_DATABASE_URL",
         envDbVars: ["DATABASE_URL", "APP_DATABASE_URL"],
+        previewEnvAllowlist: ["DATABASE_URL", "APP_DATABASE_URL", "NODE_ENV"],
         rlsNonSuperuser: true,
       },
       { json: false },
@@ -478,7 +479,7 @@ describe("round-trip: --from-toml produces same AppSpec as equivalent flags", ()
     const specFields = [
       "name", "repo", "branch", "appDir", "buildCmd", "healthUrl",
       "serviceUnit", "migrateCmd", "seedCmd", "envFile", "mainHost",
-      "rlsUrlVar", "envDbVars", "assertions",
+      "rlsUrlVar", "envDbVars", "previewEnvAllowlist", "assertions",
     ] as const;
     for (const field of specFields) {
       expect(recToml?.[field]).toEqual(recFlags?.[field]);
@@ -2126,6 +2127,20 @@ describe("parseSamohostToml — secrets[] + databaseUrlEnv parse", () => {
     expect(result.ok).toBe(false);
     if (result.ok) throw new Error("expected ok=false");
     expect(result.errors.some((e) => e.toLowerCase().includes("databaseurlenv"))).toBe(true);
+  });
+
+  test("sec-15b: databaseUrlEnv must be included in envDbVars", () => {
+    const toml = minimalForSecrets([
+      'dbBackend = "dblab"',
+      'databaseUrlEnv = "APP_DATABASE_URL"',
+      'envDbVars = ["DATABASE_URL"]',
+    ].join("\n"));
+    const result = parseSamohostToml(toml);
+    expect(result.ok).toBe(false);
+    if (result.ok) throw new Error("expected ok=false");
+    expect(result.errors.some((e) =>
+      e.includes("APP_DATABASE_URL") && e.includes("present in envDbVars"),
+    )).toBe(true);
   });
 
   // sec-16: secrets wrong type (not an array) → type error

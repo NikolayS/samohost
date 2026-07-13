@@ -18,7 +18,7 @@
  */
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
@@ -162,10 +162,67 @@ describe("1. clone-role password: script structure when databaseUrlEnv is declar
     expect(s).toContain("samohost_set_clone_role_password");
   });
 
-  test("SAMOHOST_CLONE_CRED_VAR is emitted with the databaseUrlEnv value", () => {
+  test("all envDbVars are selected for clone-only credential rewriting", () => {
     const s = buildEnvCreateScript(appWithDbUrl(), tgt());
-    // The script must know which var to rewrite with credentials.
-    expect(s).toContain("SAMOHOST_CLONE_CRED_VAR='DATABASE_URL'");
+    expect(s).toContain("SAMOHOST_ENV_DB_VARS=('DATABASE_URL')");
+    expect(s).toContain('secret_key="SAMOHOST_CLONE_ROLE_PW_${role}"');
+    expect(s).toContain('pw="${SAMOHOST_CLONE_PW_BY_ROLE[$role]:-}"');
+  });
+
+  test("two DB URLs using the same role share one credential and one ALTER ROLE", () => {
+    const dir = mkdtempSync(join(tmpdir(), "samohost-shared-role-"));
+    try {
+      const templatePath = join(dir, "template.env");
+      const countPath = join(dir, "psql-count");
+      writeFileSync(templatePath, [
+        "DATABASE_URL=postgresql://samo@db/main",
+        "APP_DATABASE_URL=postgresql://samo@db/app",
+        "",
+      ].join("\n"), { mode: 0o600 });
+      const fakeSudo = join(dir, "sudo");
+      writeFileSync(fakeSudo, "#!/bin/bash\n[[ \"$2\" == get ]] && printf 'aabb\\n'\nexit 0\n");
+      chmodSync(fakeSudo, 0o755);
+      const fakePsql = join(dir, "psql");
+      writeFileSync(fakePsql, "#!/bin/bash\ncat >/dev/null\nprintf 'call\\n' >> \"$PSQL_COUNT_FILE\"\n");
+      chmodSync(fakePsql, 0o755);
+
+      const s = buildEnvCreateScript(
+        app({
+          databaseUrlEnv: "DATABASE_URL",
+          envDbVars: ["DATABASE_URL", "APP_DATABASE_URL"],
+        }),
+        tgt(),
+      );
+      const fnMatch = s.match(/(samohost_set_clone_role_password\(\) \{[\s\S]*?\n\})/);
+      if (fnMatch === null) throw new Error("samohost_set_clone_role_password() not found");
+      const fn = fnMatch[1]!.replace(/\/usr\/bin\/psql\b/, fakePsql);
+      const prog = [
+        "set -uo pipefail",
+        `PATH=${JSON.stringify(dir)}:"$PATH"`,
+        `export PSQL_COUNT_FILE=${JSON.stringify(countPath)}`,
+        `SAMOHOST_ENV_TEMPLATE=${JSON.stringify(templatePath)}`,
+        "SAMOHOST_ENV_DB_VARS=(DATABASE_URL APP_DATABASE_URL)",
+        "declare -A SAMOHOST_CLONE_ROLE_BY_VAR=()",
+        "declare -A SAMOHOST_CLONE_PW_BY_VAR=()",
+        "declare -A SAMOHOST_CLONE_PW_BY_ROLE=()",
+        "SAMOHOST_ENV_NAME='test-env'",
+        "SAMOHOST_SECRETS_ENV_USER='testuser'",
+        "SAMOHOST_DB_PASSWORD='adminpw'",
+        "SAMOHOST_DB_PORT='5433'",
+        fn,
+        "samohost_set_clone_role_password",
+        "printf '%s|%s\\n' \"${SAMOHOST_CLONE_PW_BY_VAR[DATABASE_URL]}\" \"${SAMOHOST_CLONE_PW_BY_VAR[APP_DATABASE_URL]}\"",
+      ].join("\n");
+      const res = spawnSync("bash", ["-c", prog], { encoding: "utf8" });
+      if (res.status !== 0) {
+        throw new Error(`shared-role harness failed (${res.status}): ${res.stderr}`);
+      }
+      expect(res.status).toBe(0);
+      expect(res.stdout.trim()).toBe("aabb|aabb");
+      expect(readFileSync(countPath, "utf8").trim().split("\n")).toHaveLength(1);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 
   test("uses samohost-secrets init (reuse semantics) — not rotate — for clone role password", () => {
@@ -232,12 +289,11 @@ describe("1. clone-role password: script structure when databaseUrlEnv is declar
     expect(setPwIdx).toBeGreaterThan(syncIdx);
   });
 
-  test("no clone-role password logic when databaseUrlEnv is absent", () => {
-    // Apps without databaseUrlEnv keep the current host:port-only rewire.
+  test("default DATABASE_URL also receives clone-only credentials", () => {
     const s = buildEnvCreateScript(app(), target({ dbBackend: "dblab" }));
-    expect(s).not.toContain("samohost_set_clone_role_password");
-    expect(s).not.toContain("samohost_rewire_db_credentialed");
-    expect(s).not.toContain("SAMOHOST_CLONE_CRED_VAR");
+    expect(s).toContain("samohost_set_clone_role_password");
+    expect(s).toContain("samohost_rewire_db_credentialed");
+    expect(s).toContain("SAMOHOST_ENV_DB_VARS=('DATABASE_URL')");
   });
 
   test("no clone-role password for template backend (no clone to ALTER ROLE in)", () => {
@@ -268,7 +324,8 @@ describe("2. RESET-THEN-REWIRE: idempotency via init (reuse) semantics", () => {
     //   - URL rewrite produces the SAME DATABASE_URL → app config unchanged
     const s = buildEnvCreateScript(appWithDbUrl(), target({ dbBackend: "dblab" }));
     // Must use 'init' (reuse) for the clone role password secret.
-    expect(s).toMatch(/samohost-secrets init[^\n]*SAMOHOST_CLONE_ROLE_PW/);
+    expect(s).toContain('secret_key="SAMOHOST_CLONE_ROLE_PW_${role}"');
+    expect(s).toMatch(/samohost-secrets init[^\n]*"\$secret_key"/);
     // Must NOT use 'rotate' for the clone role password (that would change it).
     expect(s).not.toMatch(/samohost-secrets rotate[^\n]*SAMOHOST_CLONE_ROLE_PW/);
   });
@@ -313,9 +370,9 @@ describe("2. RESET-THEN-REWIRE: idempotency via init (reuse) semantics", () => {
 
       const prog = [
         "set -uo pipefail",
-        `SAMOHOST_CLONE_CRED_VAR='DATABASE_URL'`,
-        `SAMOHOST_CLONE_APP_DBROLE='samo'`,
-        `SAMOHOST_CLONE_ROLE_PW='abc123deadbeef'`,
+        `SAMOHOST_ENV_DB_VARS=('DATABASE_URL')`,
+        `declare -A SAMOHOST_CLONE_ROLE_BY_VAR=([DATABASE_URL]='samo')`,
+        `declare -A SAMOHOST_CLONE_PW_BY_VAR=([DATABASE_URL]='abc123deadbeef')`,
         `SAMOHOST_DB_PORT='45001'`,
         fn,
         `samohost_rewire_db_credentialed '${envPath}'`,
@@ -358,9 +415,9 @@ describe("2. RESET-THEN-REWIRE: idempotency via init (reuse) semantics", () => {
 
       const prog = [
         "set -uo pipefail",
-        `SAMOHOST_CLONE_CRED_VAR='DATABASE_URL'`,
-        `SAMOHOST_CLONE_APP_DBROLE='samo'`,
-        `SAMOHOST_CLONE_ROLE_PW='newpassword123'`,
+        `SAMOHOST_ENV_DB_VARS=('DATABASE_URL')`,
+        `declare -A SAMOHOST_CLONE_ROLE_BY_VAR=([DATABASE_URL]='samo')`,
+        `declare -A SAMOHOST_CLONE_PW_BY_VAR=([DATABASE_URL]='newpassword123')`,
         `SAMOHOST_DB_PORT='45001'`,
         fn,
         `samohost_rewire_db_credentialed '${envPath}'`,
@@ -376,8 +433,7 @@ describe("2. RESET-THEN-REWIRE: idempotency via init (reuse) semantics", () => {
     }
   });
 
-  test("executed: credentialed rewrite is a no-op when credential vars are unset", () => {
-    // When SAMOHOST_CLONE_CRED_VAR is empty, the function returns 0 without changing anything.
+  test("executed: credentialed rewrite fails closed when clone credentials are unset", () => {
     const dir = mkdtempSync(join(tmpdir(), "samohost-credrew-"));
     try {
       const envPath = join(dir, ".env");
@@ -394,15 +450,17 @@ describe("2. RESET-THEN-REWIRE: idempotency via init (reuse) semantics", () => {
 
       const prog = [
         "set -uo pipefail",
-        // No SAMOHOST_CLONE_CRED_VAR set → function should be a no-op
+        `SAMOHOST_ENV_DB_VARS=('DATABASE_URL')`,
+        `declare -A SAMOHOST_CLONE_ROLE_BY_VAR=()`,
+        `declare -A SAMOHOST_CLONE_PW_BY_VAR=()`,
         fn,
         `samohost_rewire_db_credentialed '${envPath}'`,
       ].join("\n");
       const res = spawnSync("bash", ["-c", prog], { encoding: "utf8" });
-      expect(res.status).toBe(0);
+      expect(res.status).not.toBe(0);
       const { readFileSync } = require("node:fs");
       const result = readFileSync(envPath, "utf8");
-      // File unchanged.
+      // File unchanged on failure.
       expect(result).toBe(original);
     } finally {
       rmSync(dir, { recursive: true, force: true });
@@ -568,7 +626,7 @@ describe("5. leak-regression: clone-role password value never in TS-controlled o
   test("env-create script uses variable references not literal passwords", () => {
     const s = buildEnvCreateScript(appWithDbUrl(), target({ dbBackend: "dblab" }));
     // Password is referenced only as a variable, never as a literal value.
-    expect(s).toContain("$SAMOHOST_CLONE_ROLE_PW");
+    expect(s).toContain("SAMOHOST_CLONE_PW_BY_VAR");
     // The variable's VALUE is never in the generated script (it's set at runtime
     // via 'sudo samohost-secrets get' on the host).
     expect(s).not.toMatch(/SAMOHOST_CLONE_ROLE_PW=[0-9a-f]{32,}/);

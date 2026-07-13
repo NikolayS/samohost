@@ -1120,7 +1120,7 @@ describe("issue #7: clone globals sync (logical retrieval drops cluster roles/gr
   test("sync runs INSIDE the db phase, after port extraction, before envfile", () => {
     const s = dblabScript();
     const dbStart = s.indexOf("<<<SAMOHOST_PHASE:db:start>>>");
-    const sync = s.indexOf("samohost_sync_clone_globals\n");
+    const sync = s.indexOf("&& samohost_sync_clone_globals");
     const envfileStart = s.indexOf("<<<SAMOHOST_PHASE:envfile:start>>>");
     expect(sync).toBeGreaterThan(dbStart);
     expect(sync).toBeLessThan(envfileStart);
