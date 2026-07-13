@@ -50,6 +50,7 @@ import type { HealSummary, HealResult } from "../preview/heal.ts";
 import type { EnvIdleGcDeps } from "./env-idle.ts";
 import type { AppRecord, EnvDbBackend, EnvRecord, VmRecord } from "../types.ts";
 import type { SpawnResult } from "../ssh/runner.ts";
+import { resolvePreviewDbBackend } from "../preview/db-policy.ts";
 
 // ---------------------------------------------------------------------------
 // Public helpers
@@ -69,7 +70,7 @@ import type { SpawnResult } from "../ssh/runner.ts";
  * stated explicitly in the AppSpec.
  */
 export function previewDbBackendFor(app: AppRecord): EnvDbBackend {
-  return app.previewDbBackend ?? (app.dbBackend === "none" ? "none" : "dblab");
+  return resolvePreviewDbBackend(app);
 }
 
 // ---------------------------------------------------------------------------

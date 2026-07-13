@@ -1373,14 +1373,13 @@ describe("previewDbBackendFor (PR-preview DB backend selection)", () => {
     expect(previewDbBackendFor(app)).toBe("dblab");
   });
 
-  test("dblab-2 — previewDbBackend: 'template': returns 'template' (explicit operator override)", () => {
-    // Operator explicitly sets the legacy template backend.
+  test("dblab-2 — database-backed app rejects explicit template backend", () => {
     const app = makeApp({ previewDbBackend: "template" });
-    expect(previewDbBackendFor(app)).toBe("template");
+    expect(() => previewDbBackendFor(app)).toThrow(/requires previewDbBackend='dblab'/);
   });
 
-  test("dblab-3 — previewDbBackend: 'none': returns 'none'", () => {
-    const app = makeApp({ previewDbBackend: "none" });
+  test("dblab-3 — explicit no-database app resolves none", () => {
+    const app = makeApp({ dbBackend: "none", previewDbBackend: "none" });
     expect(previewDbBackendFor(app)).toBe("none");
   });
 

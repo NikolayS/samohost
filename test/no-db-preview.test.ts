@@ -206,7 +206,9 @@ serviceUnit = "samohost-fixture"
   test("toml-prev-1: previewDbBackend='none' is accepted (not rejected as unknown key)", () => {
     // Current code: APP_KEYS does not include 'previewDbBackend' → {ok:false, errors:['unknown top-level key: previewDbBackend']}.
     // Fixed code: parses ok.
-    const result = parseSamohostToml(minimalToml + `\npreviewDbBackend = "none"\n`);
+    const result = parseSamohostToml(
+      minimalToml + `\ndbBackend = "none"\npreviewDbBackend = "none"\n`,
+    );
     if (!result.ok) {
       throw new Error("expected ok=true; errors: " + result.errors.join(", "));
     }
@@ -272,7 +274,7 @@ describe("runPreviewRebuild — db backend resolution", () => {
     // Current code: EnvCreateInput.db is HARDCODED to 'dblab' → captured input.db='dblab' (WRONG).
     // Fixed code: resolves via previewDbBackendFor(app) → 'none'.
     vmStore.upsert(makeVm());
-    appStore.upsert(makeApp({ previewDbBackend: "none" }));
+    appStore.upsert(makeApp({ dbBackend: "none", previewDbBackend: "none" }));
 
     const capturedInputs: EnvCreateInput[] = [];
     const deps = makeRebuildDeps(capturedInputs);

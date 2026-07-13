@@ -58,6 +58,7 @@ import type {
 } from "../types.ts";
 import { CloudflareDns, type DnsProviderPort } from "../dns/cloudflare.ts";
 import { ensurePreviewDns, removePreviewDns } from "../dns/ensure.ts";
+import { resolvePreviewDbBackend } from "../preview/db-policy.ts";
 
 /** Default preview domain for the SOLO plan (issue #117). */
 export const DEFAULT_PREVIEW_DOMAIN = "samo.cat";
@@ -664,6 +665,13 @@ export async function runEnvCreate(
 ): Promise<number> {
   const r = resolve(vmStore, appStore, input.vm, input.app, err);
   if (r === undefined) return 1;
+
+  try {
+    resolvePreviewDbBackend(r.app, input.db);
+  } catch (e) {
+    err(`error: ${e instanceof Error ? e.message : String(e)}`);
+    return 1;
+  }
 
   // Fail-loud: dblab and template backends rewrite the DATABASE_URL in the
   // clone/template env. Without databaseUrlEnv declared on the app, env-create

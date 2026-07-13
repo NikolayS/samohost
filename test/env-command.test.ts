@@ -327,7 +327,7 @@ describe("env commands", () => {
     expect(second?.name).toBe(first!.name);
   });
 
-  test("create with --template-db persists it and pins it into the script (#11)", async () => {
+  test("database-backed create rejects --db template before remote mutation", async () => {
     const scripts: string[] = [];
     const c = capture();
     const code = await runEnvCreate(
@@ -336,19 +336,10 @@ describe("env commands", () => {
       { json: false }, vmStore, appStore, envStore,
       fakeDeps(CREATE_OK, scripts), c.out, c.err,
     );
-    expect(code).toBe(0);
-    expect(scripts[0]).toContain("SAMOHOST_TEMPLATE_DB='my_tpl'");
-    const rec = envStore.get("vm-1111", "field-record-1", "feat/x");
-    expect(rec?.templateDb).toBe("my_tpl");
-    // Re-create (and destroy) reuse the PERSISTED template db, not the flag.
-    const scripts2: string[] = [];
-    await runEnvCreate(
-      { vm: "samo-we-field-record", app: "field-record-1", branch: "feat/x",
-        db: "template", previewDomain: "samo.cat" },
-      { json: false }, vmStore, appStore, envStore,
-      fakeDeps(CREATE_OK, scripts2), capture().out, capture().err,
-    );
-    expect(scripts2[0]).toContain("SAMOHOST_TEMPLATE_DB='my_tpl'");
+    expect(code).toBe(1);
+    expect(scripts).toHaveLength(0);
+    expect(c.e).toContain("requires previewDbBackend='dblab'");
+    expect(envStore.get("vm-1111", "field-record-1", "feat/x")).toBeUndefined();
   });
 
   test("second branch gets the next port; list shows both", async () => {

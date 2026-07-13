@@ -650,10 +650,7 @@ describe("runAppRegisterFromToml — dbBackend/previewDbBackend threading (#88)"
     expect(previewDbBackendFor(rec!)).toBe("none");
   });
 
-  test("reg-db-3: manifest with previewDbBackend='template' yields AppRecord.previewDbBackend='template'", () => {
-    // Also dropped: previewDbBackend is not threaded from AppManifest to AppRegisterInput.
-    // Updated (PR secrets+databaseUrlEnv): previewDbBackend='template' is explicitly
-    // DB-backed → databaseUrlEnv is now required; add it to satisfy the new rule.
+  test("reg-db-3: database-backed manifest rejects previewDbBackend='template'", () => {
     const tomlPath = writeToml(
       'previewDbBackend = "template"\ndatabaseUrlEnv = "DATABASE_URL"',
     );
@@ -666,11 +663,10 @@ describe("runAppRegisterFromToml — dbBackend/previewDbBackend threading (#88)"
       c.out,
       c.err,
     );
-    expect(code).toBe(0);
+    expect(code).toBe(1);
     const rec = appStore.get("vm-1111", "samohost-fixture");
-    expect(rec).toBeDefined();
-    expect(rec?.previewDbBackend).toBe("template");
-    expect(rec?.databaseUrlEnv).toBe("DATABASE_URL");
+    expect(rec).toBeUndefined();
+    expect(c.e).toContain("requires previewDbBackend='dblab'");
   });
 
   test("reg-db-4: manifest with both dbBackend='none' and previewDbBackend='dblab' → both persisted", () => {
@@ -2066,7 +2062,7 @@ describe("parseSamohostToml — secrets[] + databaseUrlEnv parse", () => {
   // sec-9: explicit previewDbBackend=none without databaseUrlEnv → ok
   test("sec-9: explicit previewDbBackend=none without databaseUrlEnv → ok", () => {
     // Regression guard: previewDbBackend=none means no DB clone; exempt.
-    const toml = minimalForSecrets('previewDbBackend = "none"');
+    const toml = minimalForSecrets('dbBackend = "none"\npreviewDbBackend = "none"');
     const result = parseSamohostToml(toml);
     if (!result.ok) throw new Error("expected ok=true; errors: " + result.errors.join(", "));
     expect(result.app.databaseUrlEnv).toBeUndefined();

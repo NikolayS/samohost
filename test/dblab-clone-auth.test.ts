@@ -462,18 +462,14 @@ describe("3. env-create FAILS LOUD: databaseUrlEnv required for dblab/template b
     expect(r.e).toContain("declare databaseUrlEnv");
   });
 
-  test("FAILS with exit 1 when db=template and databaseUrlEnv is absent", async () => {
+  test("FAILS closed when a database-backed app requests template", async () => {
     const r = await runCreate(app( /* no databaseUrlEnv */ ), "template");
     expect(r.code).toBe(1);
-    expect(r.e).toContain("databaseUrlEnv");
-    expect(r.e).toContain("declare databaseUrlEnv");
+    expect(r.e).toContain("requires previewDbBackend='dblab'");
   });
 
-  test("PASSES when db=none (no DB URL rewriting needed)", async () => {
-    const r = await runCreate(app( /* no databaseUrlEnv */ ), "none");
-    // Should not fail on the databaseUrlEnv check.
-    expect(r.e).not.toContain("declare databaseUrlEnv");
-    // The db=none path should proceed (remote call succeeds with CREATE_OK output).
+  test("PASSES when an explicitly no-database app uses db=none", async () => {
+    const r = await runCreate(app({ dbBackend: "none" }), "none");
     expect(r.code).toBe(0);
   });
 
@@ -484,10 +480,10 @@ describe("3. env-create FAILS LOUD: databaseUrlEnv required for dblab/template b
     expect(r.code).toBe(0);
   });
 
-  test("PASSES when db=template and databaseUrlEnv is present", async () => {
+  test("REJECTS db=template even when databaseUrlEnv is present", async () => {
     const r = await runCreate(app({ databaseUrlEnv: "DATABASE_URL" }), "template");
-    expect(r.e).not.toContain("declare databaseUrlEnv");
-    expect(r.code).toBe(0);
+    expect(r.code).toBe(1);
+    expect(r.e).toContain("requires previewDbBackend='dblab'");
   });
 
   test("error message names the app and the backend, and is actionable", () => {

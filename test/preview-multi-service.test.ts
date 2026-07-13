@@ -855,7 +855,7 @@ describe("J. EnvCreateReport.ports populated", () => {
       vmStore.upsert(vmRec);
 
       const appStore = new AppStore();
-      const appRec = multiApp();
+      const appRec = multiApp({ dbBackend: "none" });
       appStore.upsert(appRec);
 
       const envStore = new EnvStore();
@@ -909,7 +909,7 @@ describe("J. EnvCreateReport.ports populated", () => {
       vmStore.upsert(vm());
 
       const appStore = new AppStore();
-      appStore.upsert(multiApp());
+      appStore.upsert(multiApp({ dbBackend: "none" }));
 
       const envStore = new EnvStore();
       const deps = makeDeps(CREATE_OK);

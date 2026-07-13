@@ -18,6 +18,7 @@
 import { parse as parseToml } from "smol-toml";
 import type { TomlValueWithoutBigInt } from "smol-toml";
 import type { ListenerSpec, ServiceSpec, RouteSpec } from "../types.ts";
+import { resolvePreviewDbBackend } from "../preview/db-policy.ts";
 
 /** A plain TOML table returned by smol-toml's `parse()` (no bigint). */
 type TomlTableLike = Record<string, TomlValueWithoutBigInt>;
@@ -1143,6 +1144,15 @@ export function parseSamohostToml(text: string): ParseTomlResult {
     ...(secrets !== undefined ? { secrets } : {}),
     ...(databaseUrlEnv !== undefined ? { databaseUrlEnv } : {}),
   };
+
+  try {
+    resolvePreviewDbBackend(app);
+  } catch (e) {
+    return {
+      ok: false,
+      errors: [e instanceof Error ? e.message : String(e)],
+    };
+  }
 
   return {
     ok: true,

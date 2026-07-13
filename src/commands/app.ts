@@ -33,6 +33,7 @@ import {
 } from "../ssh/runner.ts";
 import type { AppRecord, AppSpec, EnvDbBackend, ServiceSpec, RouteSpec, VmRecord } from "../types.ts";
 import { parseSamohostToml, validateServicesTopology } from "../manifest/toml.ts";
+import { resolvePreviewDbBackend } from "../preview/db-policy.ts";
 
 // ---------------------------------------------------------------------------
 // Parsed inputs (produced by the CLI parser)
@@ -271,6 +272,13 @@ export function runAppRegister(
     ...(input.secrets !== undefined ? { secrets: input.secrets } : {}),
     ...(input.databaseUrlEnv !== undefined ? { databaseUrlEnv: input.databaseUrlEnv } : {}),
   };
+
+  try {
+    resolvePreviewDbBackend(spec);
+  } catch (e) {
+    err(`error: invalid preview database policy: ${e instanceof Error ? e.message : String(e)}`);
+    return 1;
+  }
 
   const existing = appStore.get(vm.id, input.name);
   const record: AppRecord = {
