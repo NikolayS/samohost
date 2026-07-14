@@ -15,7 +15,7 @@ import {
 import { AppStore } from "../src/state/apps.ts";
 import { StateStore } from "../src/state/store.ts";
 import type { SpawnResult } from "../src/ssh/runner.ts";
-import type { VmRecord } from "../src/types.ts";
+import type { AppRecord, VmRecord } from "../src/types.ts";
 import {
   buildEnvCreateScript,
   type EnvScriptTarget,
@@ -546,6 +546,121 @@ describe("app commands", () => {
     expect(rec?.deployedSha).toBeUndefined();
   });
 
+  test("re-register CAS rejects a stale snapshot without erasing deploy state", () => {
+    register();
+    class RacingStore extends AppStore {
+      private raced = false;
+
+      override get(vmId: string, name: string): AppRecord | undefined {
+        const snapshot = super.get(vmId, name);
+        if (!this.raced && snapshot !== undefined) {
+          this.raced = true;
+          super.compareAndSwap(snapshot, {
+            ...snapshot,
+            deployedSha: "concurrent-sha",
+            releaseTagCursor: "v20260714.2",
+          });
+        }
+        return snapshot;
+      }
+    }
+    const racingStore = new RacingStore(appStore.path);
+    const c = capture();
+    const code = runAppRegister(
+      {
+        vm: "samo-we-field-record",
+        name: "field-record",
+        repo: "Tanya301/field-record-1",
+        branch: "main",
+        appDir: "/opt/field-record/app",
+        buildCmd: "npm run build:new",
+        serviceUnit: "field-record",
+        healthUrl: "http://localhost:3000/api/version",
+        rlsNonSuperuser: true,
+      },
+      { json: false }, vmStore, racingStore, c.out, c.err,
+    );
+
+    expect(code).toBe(1);
+    expect(c.e).toContain("changed concurrently");
+    expect(appStore.get("vm-1111", "field-record")).toMatchObject({
+      buildCmd: "npm run build",
+      deployedSha: "concurrent-sha",
+      releaseTagCursor: "v20260714.2",
+    });
+  });
+
+  test("register create-if-absent rejects a concurrent first creator", () => {
+    class RacingStore extends AppStore {
+      private raced = false;
+
+      override get(vmId: string, name: string): AppRecord | undefined {
+        const snapshot = super.get(vmId, name);
+        if (!this.raced && snapshot === undefined) {
+          this.raced = true;
+          super.upsert({
+            id: "first-creator",
+            vmId,
+            name,
+            repo: "first/creator",
+            branch: "main",
+            appDir: "/opt/first/app",
+            buildCmd: "npm run first",
+            serviceUnit: "first",
+            healthUrl: "http://localhost:3000/health",
+          });
+        }
+        return snapshot;
+      }
+    }
+    const racingStore = new RacingStore(appStore.path);
+    const c = capture();
+    const code = runAppRegister(
+      {
+        vm: "samo-we-field-record",
+        name: "field-record",
+        repo: "second/creator",
+        branch: "main",
+        appDir: "/opt/second/app",
+        buildCmd: "npm run second",
+        serviceUnit: "second",
+        healthUrl: "http://localhost:3001/health",
+        rlsNonSuperuser: false,
+      },
+      { json: false }, vmStore, racingStore, c.out, c.err,
+    );
+
+    expect(code).toBe(1);
+    expect(c.e).toContain("changed concurrently");
+    expect(appStore.get("vm-1111", "field-record")).toMatchObject({
+      id: "first-creator",
+      repo: "first/creator",
+      buildCmd: "npm run first",
+    });
+  });
+
+  test("register reports a live AppStore lock as an ordinary command failure", () => {
+    writeFileSync(`${appStore.path}.lock.${process.pid}.live-register`, "");
+    const c = capture();
+    const code = runAppRegister(
+      {
+        vm: "samo-we-field-record",
+        name: "field-record",
+        repo: "Tanya301/field-record-1",
+        branch: "main",
+        appDir: "/opt/field-record/app",
+        buildCmd: "npm run build",
+        serviceUnit: "field-record",
+        healthUrl: "http://localhost:3000/api/version",
+        rlsNonSuperuser: false,
+      },
+      { json: false }, vmStore, appStore, c.out, c.err,
+    );
+
+    expect(code).toBe(1);
+    expect(c.e).toContain("locked by live process");
+  });
+
   test("register persists rlsUrlVar on the app record (issue #2 bug 2)", () => {
     const c = capture();
     const code = runAppRegister(
@@ -732,6 +847,30 @@ describe("app commands", () => {
       deployedSha: "concurrent-sha",
       releaseTagCursor: "v20260714.2",
     });
+  });
+
+  test("deploy reports a locked post-remote stamp without throwing", async () => {
+    register();
+    const c = capture();
+    const code = await runAppDeploy(
+      { vm: "samo-we-field-record", app: "field-record", sha: SHA, skipCiGate: false },
+      { json: true },
+      vmStore,
+      appStore,
+      deployDeps(HAPPY, {
+        remote: () => {
+          writeFileSync(`${appStore.path}.lock.${process.pid}.live-deploy`, "");
+          return Promise.resolve({ code: 0, stdout: HAPPY, stderr: "" });
+        },
+      }),
+      c.out,
+      c.err,
+    );
+
+    expect(code).toBe(1);
+    expect(c.e).toContain("remote deploy completed");
+    expect(c.e).toContain("local state was not stamped");
+    expect(appStore.get("vm-1111", "field-record")?.deployedSha).toBeUndefined();
   });
 
   test("deploy rollback path: exit 1, failedSha set, deployedSha unchanged", async () => {

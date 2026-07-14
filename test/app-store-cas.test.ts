@@ -64,33 +64,37 @@ describe("AppStore lock/CAS", () => {
     expect(saved.lastDeployAt).toBe("2026-07-14T12:00:00.000Z");
   });
 
-  test("all mutations fail closed while a live local writer owns the lock", () => {
+  test("a live unique contender prevents a second writer from entering", () => {
     dir = mkdtempSync(join(tmpdir(), "samohost-app-lock-"));
     const path = join(dir, "apps.json");
     const store = new AppStore(path);
     store.upsert(app());
-    writeFileSync(`${path}.lock`, JSON.stringify({
-      pid: process.pid,
-      token: "another-live-writer",
-    }));
+    writeFileSync(`${path}.lock.${process.pid}.another-live-writer`, "");
 
     expect(() => store.upsert({ ...app(), deployedSha: "must-not-land" }))
       .toThrow(/locked by live process/);
     expect(store.get("vm-1", "site")?.deployedSha).toBeUndefined();
   });
 
-  test("a lock abandoned by a crashed process is recovered before the atomic write", () => {
+  test("stale cleanup never deletes a replacement contender", () => {
     dir = mkdtempSync(join(tmpdir(), "samohost-app-stale-lock-"));
     const path = join(dir, "apps.json");
     const store = new AppStore(path);
-    writeFileSync(`${path}.lock`, JSON.stringify({
-      pid: 2_147_483_647,
-      token: "crashed-writer",
-    }));
+    const stale = `${path}.lock.2147483647.crashed-writer`;
+    const replacement = `${path}.lock.${process.pid}.replacement-writer`;
+    writeFileSync(stale, "");
+    writeFileSync(replacement, "");
+
+    expect(() => store.upsert(app({ deployedSha: "must-not-land" })))
+      .toThrow(/locked by live process/);
+    expect(readFileSync(replacement, "utf8")).toBe("");
+    expect(store.get("vm-1", "site")).toBeUndefined();
+
+    rmSync(replacement);
 
     store.upsert(app({ deployedSha: "safe" }));
 
     expect(store.get("vm-1", "site")?.deployedSha).toBe("safe");
-    expect(() => readFileSync(`${path}.lock`, "utf8")).toThrow();
+    expect(() => readFileSync(stale, "utf8")).toThrow();
   });
 });
