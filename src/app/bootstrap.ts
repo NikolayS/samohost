@@ -839,7 +839,7 @@ export function buildHostBootstrapScript(
   if (isStatic || opts.firewallOpts !== undefined) {
     const fwLines = buildFirewallLines(isStatic, appUser, {
       ...opts.firewallOpts,
-      allowCfHttps: isStatic,
+      allowCfHttps: opts.firewallOpts?.allowCfHttps ?? isStatic,
     });
     push(
       `# ---------------------------------------------------------------------------`,
