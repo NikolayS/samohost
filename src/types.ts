@@ -523,6 +523,8 @@ export interface VmRecord {
   /** Remote login user for SSH (SPEC-DELTA §1). For provisioned VMs this equals
    * the spec's adminUser; for adopted VMs it is supplied via --ssh-user. */
   sshUser: string;
+  /** Control-plane egress IP authorized to reach cp-http80 app listeners. */
+  controlPlaneIp?: string;
   /** Pinned host key fingerprint, out-of-band verified at adopt time
    * (SPEC-DELTA §1). Format: `SHA256:<43 base64 chars>`. All SSH pins this
    * key (`StrictHostKeyChecking=yes`, per-VM known_hosts). */

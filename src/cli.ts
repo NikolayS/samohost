@@ -298,6 +298,7 @@ app bootstrap options (PR-A1+A2 — ONE-TIME OS bootstrap + DB + env + clone;
   <vm>                       VM name or id (required)
   <app>                      app name or id (required)
   --app-user <user>          OS user created to run the app (required)
+  --control-plane-ip <ip>    source allowed to reach cp-http80 on port 80
   --db-name <name>           Database to create — required for node apps and
                              invalid for static apps. Never derived from the
                              app name; must match the actual database.
@@ -1605,6 +1606,7 @@ function parseAppBootstrap(args: string[]): ParsedAppBootstrap {
   let tlsMode: "acme" | "local" | undefined;
   let appDbRole: string | undefined;
   let seedOwnerLogin: string | undefined;
+  let controlPlaneIp: string | undefined;
 
   const { vm, app } = takeVmApp(args, (a, i) => {
     if (a === "--app-user") { appUser = takeValue(args, i, a); return i + 1; }
@@ -1631,6 +1633,10 @@ function parseAppBootstrap(args: string[]): ParsedAppBootstrap {
     // PR-A2 optional DB/env options
     if (a === "--app-db-role") { appDbRole = takeValue(args, i, a); return i + 1; }
     if (a === "--seed-owner-login") { seedOwnerLogin = takeValue(args, i, a); return i + 1; }
+    if (a === "--control-plane-ip") {
+      controlPlaneIp = takeValue(args, i, a);
+      return i + 1;
+    }
     // Legacy --print is a no-op (bootstrap always prints to stdout)
     if (a === "--print") { return i; }
     return undefined;
@@ -1656,6 +1662,7 @@ function parseAppBootstrap(args: string[]): ParsedAppBootstrap {
     ...(tlsMode !== undefined ? { tlsMode } : {}),
     ...(appDbRole !== undefined ? { appDbRole } : {}),
     ...(seedOwnerLogin !== undefined ? { seedOwnerLogin } : {}),
+    ...(controlPlaneIp !== undefined ? { controlPlaneIp } : {}),
   };
   return { kind: "app-bootstrap", input };
 }
