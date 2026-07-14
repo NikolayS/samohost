@@ -172,6 +172,16 @@ export function buildDeployScript(app: AppRecord, target: DeployTarget): string 
     "",
     ...(app.kind === "static" ? [...staticTreeGuardFnLines(), ""] : []),
     'cd "$SAMOHOST_APP_DIR"',
+    // git >=2.35 dubious-ownership fix (issue #160): the deploy runs as OS user
+    // 'samo' but the app dir is owned by a per-app OS user (e.g. 'friends-site').
+    // git aborts with "fatal: detected dubious ownership in repository" before
+    // emitting any phase marker, so parseDeployOutcome returns 'incomplete' and
+    // the releaseTagCursor never advances. Writing to samo's ~/.gitconfig here
+    // (git config --global) is self-contained, requires no external file, is
+    // idempotent across deploys, and covers every git invocation in the script
+    // (fetch, rev-parse, reset, worktree add/remove/prune) without needing to
+    // thread the flag through each call site.
+    'git config --global --add safe.directory "$SAMOHOST_APP_DIR"',
     "",
   );
 
