@@ -861,7 +861,7 @@ describe("register -> deploy/trigger two-hop routing lifecycle", () => {
     ]);
     expect(deployScript).toContain("Prior release cleanup is deferred");
     expect(deployScript).toContain("SAMOHOST_OLD_ROUTE_ADDRESS");
-    expect(deployScript).toContain("01-samohost-transition-");
+    expect(deployScript).toContain("samohost-static-route-client-site");
     expect(h.projectScripts.find((s) => phase(s) === "rollback")).toContain(
       "worktree remove --force",
     );

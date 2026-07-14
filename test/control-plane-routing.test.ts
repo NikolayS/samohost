@@ -252,7 +252,7 @@ describe("control-plane production mainHost routing", () => {
     });
     expect(spawnSync("bash", ["-n"], { input: script }).status, script).toBe(0);
     expect(script).toContain("SAMOHOST_OLD_ROUTE_ADDRESS");
-    expect(script).toContain("01-samohost-transition-");
+    expect(script).toContain("samohost-static-route-friends-of-twin-peaks");
     expect(script).toContain("Prior release cleanup is deferred");
   });
 

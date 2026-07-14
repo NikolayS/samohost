@@ -84,8 +84,10 @@ describe("static release-channel production vhost ownership", () => {
       buildHostPrepScript(release, "agent", { forceMainVhost: true }),
     ];
     for (const script of releaseScripts) {
-      expect(script).not.toContain("00-main-release-site.caddy");
       expect(script).not.toContain("root * /opt/release-site/app");
+    }
+    for (const script of releaseScripts.slice(1)) {
+      expect(script).not.toContain("00-main-release-site.caddy");
       expect(script).toContain(
         "/usr/bin/tee /etc/caddy/.samohost-next-Caddyfile",
       );
@@ -96,6 +98,10 @@ describe("static release-channel production vhost ownership", () => {
         "/usr/bin/rm -f /etc/caddy/.samohost-next-Caddyfile",
       );
     }
+    expect(releaseScripts[0]).toContain("samohost-static-route-release-site");
+    expect(releaseScripts[0]).not.toContain(
+      "agent ALL=(root) NOPASSWD: /usr/bin/tee /etc/caddy/sites.d/*.caddy",
+    );
     expect(releaseScripts[0]).toContain("SAMOHOST_CADDY_INSTALLED_NOW=0");
     expect(releaseScripts[0]).toContain("SAMOHOST_CADDY_INSTALLED_NOW=1");
 

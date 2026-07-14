@@ -194,12 +194,11 @@ describe("staticRoot schema and path security", () => {
       sha: "abc1234def5678901234567890abcdef12345678",
       tag: "v20260714.1",
     });
-    const deployStage = deploy.lastIndexOf("sudo /usr/bin/tee '/etc/caddy/sites.d/.samohost-next-00-main-astro-site.caddy'");
-    const deployActivate = deploy.indexOf("sudo /usr/bin/mv --", deployStage);
-    const deployReload = deploy.indexOf("sudo /usr/bin/systemctl reload caddy", deployActivate);
+    const deployStage = deploy.lastIndexOf("cat > '/opt/astro-site/releases/.samohost-main-next.caddy'");
+    const deployActivate = deploy.indexOf("sudo '/usr/local/sbin/samohost-static-route-astro-site'", deployStage);
     expect(deploy.lastIndexOf(guardCall.replace("CHECKOUT", "CANDIDATE"), deployStage)).toBeGreaterThan(-1);
     expect(deploy.indexOf(guardCall.replace("CHECKOUT", "CANDIDATE"), deployStage)).toBeLessThan(deployActivate);
-    expect(deploy.lastIndexOf(guardCall.replace("CHECKOUT", "CANDIDATE"), deployReload)).toBeGreaterThan(deployActivate);
+    expect(deploy.lastIndexOf(guardCall.replace("CHECKOUT", "CANDIDATE"), deployActivate)).toBeGreaterThan(deployStage);
   });
 });
 

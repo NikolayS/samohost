@@ -21,10 +21,9 @@
  *
  *  3. /opt/<app> layout: appBase, ${appBase}/uploads, appDir — owned by appUser.
  *
- *  4. Deploy sudoers /etc/sudoers.d/<name>-agent: full-path NOPASSWD grants
- *     for systemctl (daemon-reload, enable, start, stop, restart), psql as
- *     postgres, journalctl *. Validated with `visudo -cf`. Issue #99: every
- *     grant is an EXACT absolute path (Defaults use_pty assumed in effect).
+ *  4. Deploy sudoers /etc/sudoers.d/<name>-agent: node apps get exact-path
+ *     service/DB/log grants; static apps get one app-bound, zero-argument
+ *     root helper. Validated with `visudo -cf`.
  *
  *  5. MAIN systemd service unit /etc/systemd/system/<serviceUnit>.service.
  *     NOT the template @.service — that is owned by host-prep. Runs
@@ -80,6 +79,10 @@ import {
   staticTreeGuardFnLines,
 } from "./static-root.ts";
 import { assertSafeAppIdentity } from "./identity.ts";
+import {
+  buildStaticRouteHelper,
+  staticRouteHelperPath,
+} from "./static-route-helper.ts";
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -259,6 +262,9 @@ export function buildHostBootstrapScript(
   const rlsUrlVar = app.rlsUrlVar ?? "APP_DATABASE_URL";
   const staticReleaseState = staticReleaseStatePaths(app.appDir);
   const staticReleaseTagFormat = app.releaseTagFormat ?? "";
+  const staticHelperPath = isStatic && app.mainHost !== undefined
+    ? staticRouteHelperPath(app)
+    : undefined;
 
   const lines: string[] = [];
   const staticBranchVhostLines: string[] = [];
@@ -510,10 +516,11 @@ export function buildHostBootstrapScript(
   );
 
   // ---- section 6: deploy sudoers --------------------------------------------
-  // Static apps get a reduced sudoers: no unit-specific grants (the main unit
-  // does not exist), no psql grant (no DB). Only daemon-reload and journalctl
-  // are retained (daemon-reload is needed for caddy reload; journalctl for logs).
+  // Static apps have no unit or DB grants. Their only privileged operation is
+  // an app-bound, root-owned helper which validates canonical route/state and
+  // accepts no arguments before mutating Caddy.
   if (isStatic) {
+    const helper = staticHelperPath === undefined ? undefined : buildStaticRouteHelper(app);
     push(
       `# ---------------------------------------------------------------------------`,
       `# §6. Deploy sudoers ${sudoersFile} (static app — no unit grants).`,
@@ -521,24 +528,24 @@ export function buildHostBootstrapScript(
       `#     (Defaults use_pty + exact-path NOPASSWD — issue #99).`,
       `# ---------------------------------------------------------------------------`,
       "",
+      ...(helper === undefined
+        ? []
+        : [
+          `SAMOHOST_STATIC_HELPER_TMP=$(mktemp)`,
+          `cat > "$SAMOHOST_STATIC_HELPER_TMP" <<'SAMOHOST_STATIC_HELPER'`,
+          helper,
+          `SAMOHOST_STATIC_HELPER`,
+          `install -m 0755 -o root -g root "$SAMOHOST_STATIC_HELPER_TMP" ${sq(staticHelperPath!)}`,
+          `rm -f "$SAMOHOST_STATIC_HELPER_TMP"`,
+        ]),
       `cat > ${sq(sudoersFile)} <<SUDOERS`,
-      `${appUser} ALL=(root) NOPASSWD: /usr/bin/systemctl daemon-reload`,
-      `${appUser} ALL=(root) NOPASSWD: /usr/bin/systemctl reload caddy`,
-      `${appUser} ALL=(root) NOPASSWD: /usr/bin/tee /etc/caddy/sites.d/*.caddy`,
-      `${appUser} ALL=(root) NOPASSWD: /usr/bin/mv -- /etc/caddy/sites.d/*.caddy /etc/caddy/sites.d/*.caddy`,
-      `${appUser} ALL=(root) NOPASSWD: /usr/bin/rm -f /etc/caddy/sites.d/*.caddy`,
-      ...(isStaticReleaseChannel
-        ? [
-          `${appUser} ALL=(root) NOPASSWD: /usr/bin/tee /etc/caddy/.samohost-next-Caddyfile`,
-          `${appUser} ALL=(root) NOPASSWD: /usr/bin/mv -- /etc/caddy/.samohost-next-Caddyfile /etc/caddy/Caddyfile`,
-          `${appUser} ALL=(root) NOPASSWD: /usr/bin/rm -f /etc/caddy/.samohost-next-Caddyfile`,
-        ]
-        : []),
-      `${appUser} ALL=(root) NOPASSWD: /usr/bin/journalctl *`,
+      ...(staticHelperPath === undefined
+        ? [`# No production mainHost: this static app needs no privileged deploy command.`]
+        : [`${appUser} ALL=(root) NOPASSWD: ${staticHelperPath}`]),
       "SUDOERS",
       `chmod 440 ${sq(sudoersFile)}`,
       `visudo -cf ${sq(sudoersFile)}`,
-      `echo "Sudoers: ${sudoersFile} written and validated (static — no unit grants)."`,
+      `echo "Sudoers: ${sudoersFile} written and validated (static route helper only)."`,
       "",
     );
   } else {
@@ -1083,11 +1090,13 @@ export function buildHostBootstrapScript(
       `/usr/bin/systemctl is-active caddy >/dev/null 2>&1 && caddy_ok=1 || true`,
       `chk "caddy active" "$caddy_ok"`,
       "",
-      `# sudo grant count for ${appUser} (static: expect >=3: daemon-reload + reload caddy + journalctl)`,
-      `sudo_count=$(grep -c ${sq(`NOPASSWD`)} ${sq(sudoersFile)} 2>/dev/null || echo 0)`,
+      `# Hosted static apps get one app-bound helper; unhosted apps get none.`,
+      `sudo_count=$(grep -c ${sq(`NOPASSWD`)} ${sq(sudoersFile)} 2>/dev/null || true)`,
       `sudo_ok=0`,
-      `if [[ "$sudo_count" -ge 3 ]]; then sudo_ok=1; fi`,
-      `chk "sudoers grants count: $sudo_count (expect >=3)" "$sudo_ok"`,
+      ...(staticHelperPath === undefined
+        ? [`if [[ "$sudo_count" -eq 0 ]]; then sudo_ok=1; fi`]
+        : [`if [[ "$sudo_count" -eq 1 && -x ${sq(staticHelperPath)} ]]; then sudo_ok=1; fi`]),
+      `chk "expected app-bound static route helper grants" "$sudo_ok"`,
       "",
       `# app clone present`,
       `clone_ok=0`,
