@@ -18,7 +18,9 @@ import { buildHostBootstrapScript } from "../src/app/bootstrap.ts";
 import { buildDeployScript } from "../src/app/script.ts";
 import { staticReleaseStatePaths } from "../src/app/static-root.ts";
 import { buildCustomDomainVhostScript } from "../src/env/script.ts";
-import type { AppRecord } from "../src/types.ts";
+import { controlPlaneMainRouteFingerprint } from "../src/caddy/control-plane.ts";
+import { reconcileTwoHopMainRoute } from "../src/caddy/two-hop.ts";
+import type { AppRecord, VmRecord } from "../src/types.ts";
 
 /** A field-record-1-like app record (the production deploy this generalizes). */
 function fieldRecord(overrides: Partial<AppRecord> = {}): AppRecord {
@@ -428,7 +430,7 @@ describe("buildDeployScript — static path (kind='static')", () => {
     );
   });
 
-  test("executed repeated releases keep the live checkout untouched and retire only after healthy cutover", () => {
+  test("executed repeated releases keep the live checkout untouched and retire only after healthy cutover", async () => {
     const dir = mkdtempSync(join(tmpdir(), "samohost-static-release-"));
     const origin = join(dir, "origin.git");
     const seed = join(dir, "seed");
@@ -452,16 +454,20 @@ describe("buildDeployScript — static path (kind='static')", () => {
       git(["config", "user.email", "samohost@example.invalid"], seed);
 
       mkdirSync(join(seed, "dist"));
+      mkdirSync(join(seed, "public"));
       writeFileSync(join(seed, "dist", "index.html"), "old\n");
-      git(["add", "dist/index.html"], seed);
+      writeFileSync(join(seed, "public", "index.html"), "old public\n");
+      git(["add", "dist/index.html", "public/index.html"], seed);
       git(["commit", "-m", "old"], seed);
       const oldSha = git(["rev-parse", "HEAD"], seed);
 
       writeFileSync(join(seed, "dist", "index.html"), "release one\n");
+      writeFileSync(join(seed, "public", "index.html"), "release one public\n");
       git(["commit", "-am", "release one"], seed);
       const firstSha = git(["rev-parse", "HEAD"], seed);
 
       writeFileSync(join(seed, "dist", "index.html"), "release two\n");
+      writeFileSync(join(seed, "public", "index.html"), "release two public\n");
       git(["commit", "-am", "release two"], seed);
       const secondSha = git(["rev-parse", "HEAD"], seed);
 
@@ -659,10 +665,102 @@ describe("buildDeployScript — static path (kind='static')", () => {
         releaseDir: secondRoot.slice(0, -"/dist".length),
       });
       expect(spawnSync("caddy", ["validate", "--config", baseFile]).status).toBe(0);
-
       const secondIdentity = readFileSync(join(secondRoot, "version.json"), "utf8");
       const secondState = readFileSync(activePaths.activeState, "utf8");
       const secondRoute = readFileSync(activePaths.activeRoute, "utf8");
+      const secondSite = readFileSync(siteFile, "utf8");
+
+      // A manifest-only staticRoot change at the deployed SHA is a real
+      // production config change. Route-only reconciliation must point the
+      // active route/state at the new root inside the existing detached
+      // worktree before the control-plane route is accepted and stamped.
+      const staticRootDrift: AppRecord = {
+        ...releaseApp,
+        staticRoot: "public",
+        deployedSha: secondSha,
+        releaseTagCursor: "v20260713.3",
+        controlPlaneRouteFingerprint: controlPlaneMainRouteFingerprint(
+          releaseApp,
+          {
+            id: "vm-1",
+            provider: "hetzner",
+            providerId: "1",
+            name: "shared",
+            ip: "192.0.2.10",
+            sshKeyPath: "/tmp/test-key",
+            sshPort: 2223,
+            sshUser: "samo",
+            hostKeyFingerprint: `SHA256:${"A".repeat(43)}`,
+            region: "fsn1",
+            type: "cx22",
+            modules: [],
+            lifecycleState: "ready",
+            createdAt: "2026-07-13T00:00:00.000Z",
+            updatedAt: "2026-07-13T00:00:00.000Z",
+          },
+        ),
+      };
+      const targetVm: VmRecord = {
+        id: "vm-1",
+        provider: "hetzner",
+        providerId: "1",
+        name: "shared",
+        ip: "192.0.2.10",
+        sshKeyPath: "/tmp/test-key",
+        sshPort: 2223,
+        sshUser: "samo",
+        hostKeyFingerprint: `SHA256:${"A".repeat(43)}`,
+        region: "fsn1",
+        type: "cx22",
+        modules: [],
+        lifecycleState: "ready",
+        createdAt: "2026-07-13T00:00:00.000Z",
+        updatedAt: "2026-07-13T00:00:00.000Z",
+      };
+      let controlPlaneCheckedRoot = "";
+      const reconciled = await reconcileTwoHopMainRoute(staticRootDrift, targetVm, {
+        projectRoute: async (_vm, script) => {
+          const sandboxed = script
+            .replaceAll("/etc/caddy", caddyDir)
+            .replaceAll("/tmp/samohost-main-route-", `${dir}/route-txn-`);
+          const result = spawnSync("bash", ["-s"], {
+            input: sandboxed,
+            encoding: "utf8",
+            env: {
+              ...process.env,
+              PATH: `${binDir}:${process.env["PATH"] ?? ""}`,
+            },
+          });
+          return {
+            code: result.status ?? 1,
+            stdout: result.stdout,
+            stderr: result.stderr,
+          };
+        },
+        controlPlaneRoute: async () => {
+          controlPlaneCheckedRoot = activeRoot();
+          const identity = JSON.parse(
+            readFileSync(join(controlPlaneCheckedRoot, "version.json"), "utf8"),
+          ) as Record<string, string>;
+          return identity.sha === secondSha &&
+              identity.version === "v20260713.3"
+            ? { code: 0, stdout: "exact identity", stderr: "" }
+            : { code: 1, stdout: "", stderr: "wrong deployed identity" };
+        },
+      });
+      expect(reconciled.ok, reconciled.error).toBe(true);
+      expect(controlPlaneCheckedRoot).toBe(`${secondRoot.slice(0, -"/dist".length)}/public`);
+      expect(activeRoot()).toBe(controlPlaneCheckedRoot);
+      expect(JSON.parse(readFileSync(activePaths.activeState, "utf8"))).toMatchObject({
+        sha: secondSha,
+        tag: "v20260713.3",
+        releaseDir: secondRoot.slice(0, -"/dist".length),
+        staticRoot: "public",
+      });
+      writeFileSync(siteFile, secondSite);
+      writeFileSync(activePaths.activeRoute, secondRoute);
+      writeFileSync(activePaths.activeState, secondState);
+
       execute(firstSha, "v20260713.4", true);
       expect(routedRoot()).toBe(secondRoot);
       expect(activeRoot()).toBe(secondRoot);
