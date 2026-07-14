@@ -14,6 +14,7 @@ SAMOHOST_UNIT='field-record'
 SAMOHOST_HEALTH_URL='http://localhost:3000/api/version'
 
 cd "$SAMOHOST_APP_DIR"
+git config --global --add safe.directory "$SAMOHOST_APP_DIR"
 
 # --- env: source the app env file (READ-ONLY; never written, never echoed) ---
 set -a; . '/opt/field-record/staging.env'; set +a
