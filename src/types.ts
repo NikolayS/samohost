@@ -328,6 +328,13 @@ export interface AppRecord extends AppSpec {
   failedSha?: string;
   lastDeployAt?: string;
   /**
+   * SHA-256 of the last control-plane main-route specification that was
+   * successfully reconciled. Independent of deployedSha: re-registering an
+   * unchanged code SHA may still require a host rename, upstream update, or
+   * managed-route removal. Absent on records predating route management.
+   */
+  controlPlaneRouteFingerprint?: string;
+  /**
    * Highest release tag observed by the production tag channel. On first
    * activation for an already-deployed app, samohost records the current tag
    * here without deploying it; only a later, greater tag may advance prod.

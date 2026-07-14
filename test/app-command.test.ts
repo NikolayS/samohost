@@ -20,6 +20,7 @@ import {
   buildEnvCreateScript,
   type EnvScriptTarget,
 } from "../src/env/script.ts";
+import { controlPlaneMainRouteFingerprint } from "../src/caddy/control-plane.ts";
 
 function vm(o: Partial<VmRecord> = {}): VmRecord {
   return {
@@ -544,6 +545,10 @@ describe("app commands", () => {
     expect(routeScript).toContain("field-record-1.samo.team");
     expect(routeScript).toContain("178.105.246.151:80");
     expect(JSON.parse(c.o).routing).toBe("ready");
+    const saved = appStore.get("vm-1111", "field-record")!;
+    expect(saved.controlPlaneRouteFingerprint).toBe(
+      controlPlaneMainRouteFingerprint(saved, vm()),
+    );
   });
 
   test("route failure does not stamp deployedSha, so the trigger retries", async () => {
@@ -552,6 +557,7 @@ describe("app commands", () => {
       ...appStore.get("vm-1111", "field-record")!,
       mainHost: "field-record-1.samo.team",
       mainListen: "cp-http80",
+      controlPlaneRouteFingerprint: "f".repeat(64),
     });
     const c = capture();
     const code = await runAppDeploy(
@@ -572,6 +578,7 @@ describe("app commands", () => {
     const rec = appStore.get("vm-1111", "field-record");
     expect(rec?.deployedSha).toBeUndefined();
     expect(rec?.failedSha).toBeUndefined();
+    expect(rec?.controlPlaneRouteFingerprint).toBe("f".repeat(64));
   });
 
   test("deploy rollback path: exit 1, failedSha set, deployedSha unchanged", async () => {

@@ -26,6 +26,7 @@ import {
 } from "../app/release-policy.ts";
 import {
   buildControlPlaneMainRouteReconcileScript,
+  controlPlaneMainRouteFingerprint,
   needsControlPlaneMainRoute,
 } from "../caddy/control-plane.ts";
 import {
@@ -328,6 +329,12 @@ export function runAppRegister(
       : {}),
     ...(existing?.lastDeployAt !== undefined
       ? { lastDeployAt: existing.lastDeployAt }
+      : {}),
+    // This records what was successfully applied, not what is desired now.
+    // Preserve it across re-registration so the trigger can observe routing
+    // drift even when deployedSha is unchanged.
+    ...(existing?.controlPlaneRouteFingerprint !== undefined
+      ? { controlPlaneRouteFingerprint: existing.controlPlaneRouteFingerprint }
       : {}),
     ...(existing?.releaseTagPattern === input.releaseTagPattern &&
     existing?.releaseTagFormat === input.releaseTagFormat &&
@@ -870,6 +877,8 @@ export async function runAppDeploy(
   const updated: AppRecord = { ...app, lastDeployAt: stamped };
   if (outcome === "deployed" && routing !== "failed") {
     updated.deployedSha = sha;
+    updated.controlPlaneRouteFingerprint =
+      controlPlaneMainRouteFingerprint(app, vm);
     // A successful deploy supersedes any prior bad-SHA guard for this app.
     delete updated.failedSha;
   } else if (outcome === "rolled-back" || outcome === "rollback-failed") {

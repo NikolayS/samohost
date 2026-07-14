@@ -45,6 +45,11 @@ import {
 } from "./app.ts";
 import { checkCiGreen } from "../app/cigate.ts";
 import {
+  buildControlPlaneMainRouteReconcileScript,
+  controlPlaneMainRouteFingerprint,
+  needsControlPlaneMainRoute,
+} from "../caddy/control-plane.ts";
+import {
   CANONICAL_RELEASE_CI_WORKFLOW,
   isCanonicalReleaseCiWorkflow,
 } from "../app/release-policy.ts";
@@ -162,6 +167,7 @@ export interface TriggerAppResult {
     | "known-bad"
     | "skipped"
     | "would-deploy"
+    | "would-reconcile-routing"
     | "failed"
     | "error";
   sha?: string;
@@ -225,6 +231,14 @@ export interface TriggerDeps {
   isCommitOnBranch?: CommitOnBranchVerifier;
   /** CURRIED runAppDeploy — AppDeployDeps already bound inside. */
   deploy: TriggerDeploy;
+  /**
+   * Reconcile only the local control-plane Caddy route for an already-deployed
+   * app. Optional for test fixtures; routing drift fails closed when absent.
+   */
+  reconcileControlPlaneRoute?: (
+    app: AppRecord,
+    vm: VmRecord,
+  ) => Promise<SpawnResult>;
   /**
    * Injected fetch used by checkCiGreen. Prod wires globalThis.fetch; tests
    * inject a fixture that returns workflow_runs JSON without hitting the network.
@@ -345,22 +359,26 @@ export interface TriggerDeps {
  *    - Skip apps whose VM is missing or whose lifecycleState is not in
  *      {ready, adopted}.
  *    - Apply --vm / --app narrowing when provided.
- * 2. For each candidate: resolve the tracked-branch SHA via resolveRef.
- * 3. Ordered short-circuits (no CI call for these):
+ * 2. Reconcile stamped control-plane routing drift for already-deployed apps.
+ *    A successful reconcile advances the route fingerprint; a failure leaves
+ *    it unchanged and fails closed before any code/tag short-circuit.
+ * 3. For each candidate: resolve the tracked-branch SHA via resolveRef.
+ * 4. Ordered short-circuits (no CI call for these):
  *    - equal to deployedSha → action up-to-date; no CI call, no deploy.
  *    - equal to failedSha   → action known-bad; no CI call, no deploy (avoids
  *                              the pointless SSH/CI round-trip).
  *    - --dry-run            → action would-deploy; no CI call, no deploy
  *                              (offline-safe).
- * 4. Check CI via checkCiGreen(repo, sha, {fetch, env}):
+ * 5. Check CI via checkCiGreen(repo, sha, {fetch, env}):
  *    - "pending"  → action skipped, reason "ci-pending"; DO NOT call deploy.
  *    - "none"     → action skipped, reason "ci-none";    DO NOT call deploy.
  *    - "failure"  → action skipped, reason "ci-red";     DO NOT call deploy.
  *    - "success"  → proceed to call deps.deploy.
- * 5. Call deps.deploy. Non-zero exit → action failed (genuine deploy failure).
- * 6. Per-app isolation: catch any throw per-app; record action=error; continue.
- * 7. Exit 0 if all actions are {deployed, up-to-date, known-bad, skipped,
- *    would-deploy}; exit 1 if any action is {failed, error}.
+ * 6. Call deps.deploy. Non-zero exit → action failed (genuine deploy failure).
+ * 7. Per-app isolation: catch any throw per-app; record action=error; continue.
+ * 8. Exit 0 if all actions are {deployed, up-to-date, known-bad, skipped,
+ *    would-deploy, would-reconcile-routing}; exit 1 if any action is
+ *    {failed, error}.
  *
  * Bucket mapping for report counters:
  *   deployed            → report.deployed
@@ -368,6 +386,7 @@ export interface TriggerDeps {
  *   known-bad           → report.skipped
  *   skipped             → report.skipped  (includes all ci-* reasons)
  *   would-deploy        → report.skipped
+ *   would-reconcile-routing → report.skipped
  *   failed | error      → report.failed
  */
 export async function runTriggerRun(
@@ -427,6 +446,52 @@ export async function runTriggerRun(
     }
 
     try {
+      // Routing is independently versioned from deployedSha. Re-registering
+      // an app may rename/remove mainHost, change cp-http80 -> tls, or point at
+      // a VM whose IP changed without changing the deployed code commit.
+      // Reconcile that config-only drift before any same-SHA/tag short-circuit.
+      // Legacy records with neither an explicit cp-http80 route nor a stamp are
+      // treated as never managed, so unrelated existing apps are not touched.
+      let routingReconciled = false;
+      if (app.deployedSha !== undefined) {
+        const desiredRouting = controlPlaneMainRouteFingerprint(app, vmRecord);
+        const routingDrift =
+          (app.controlPlaneRouteFingerprint === undefined &&
+            needsControlPlaneMainRoute(app)) ||
+          (app.controlPlaneRouteFingerprint !== undefined &&
+            app.controlPlaneRouteFingerprint !== desiredRouting);
+
+        if (routingDrift) {
+          if (input.dryRun) {
+            results.push({
+              app: app.name,
+              vm: vmName,
+              action: "would-reconcile-routing",
+              sha: app.deployedSha,
+              reason: "routing-spec-drift",
+            });
+            continue;
+          }
+          if (deps.reconcileControlPlaneRoute === undefined) {
+            throw new Error(
+              "control-plane routing drift detected but the reconciler is absent",
+            );
+          }
+          const routeResult = await deps.reconcileControlPlaneRoute(app, vmRecord);
+          if (routeResult.code !== 0) {
+            throw new Error(
+              `control-plane main-route reconcile failed (exit ${routeResult.code}): ` +
+                routeResult.stderr,
+            );
+          }
+
+          // Stamp only AFTER the transactional script validates + reloads.
+          app.controlPlaneRouteFingerprint = desiredRouting;
+          appStore.upsert({ ...app });
+          routingReconciled = true;
+        }
+      }
+
       // Resolve the target SHA. Prod (main-env) tracks either the tracked
       // branch HEAD (default, unchanged) or — when the app opts into the
       // release-tag production channel (issue #132) — the LATEST git tag
@@ -538,6 +603,7 @@ export async function runTriggerRun(
           vm: vmName,
           action: "up-to-date",
           sha: resolvedSha,
+          ...(routingReconciled ? { reason: "routing-reconciled" } : {}),
         });
         continue;
       }
@@ -931,6 +997,7 @@ export async function runTriggerRun(
       case "known-bad":
       case "skipped":
       case "would-deploy":
+      case "would-reconcile-routing":
         skipped++;
         break;
       case "failed":
@@ -1122,6 +1189,12 @@ export function defaultTriggerDeps(opts: TriggerDepsOpts = {}): TriggerDeps {
     // Curried: AppDeployDeps already captured in closure.
     deploy: (input, opts, vmStore, appStore, out, err) =>
       runAppDeploy(input, opts, vmStore, appStore, appDeployDeps, out, err),
+
+    reconcileControlPlaneRoute: (app, vm) =>
+      appDeployDeps.controlPlaneRoute(
+        vm,
+        buildControlPlaneMainRouteReconcileScript(app, vm),
+      ),
 
     // Real network fetch; checkCiGreen reads GH_TOKEN/GITHUB_TOKEN from
     // process.env at call time (env: undefined → default).

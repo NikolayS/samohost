@@ -91,8 +91,15 @@ Registration remains offline: it records the declaration, and app bootstrap
 writes the matching `http://<mainHost>:80` vhost on the project VM. The route
 becomes public only after the first healthy production deploy. Re-registering
 the same app with a changed host/IP updates its stable managed snippet; changing
-away from `cp-http80` removes that snippet after the next healthy deploy. Apps
+away from `cp-http80` removes that snippet on the next trigger cycle or healthy deploy. Apps
 sharing one VM have independent files keyed by AppRecord id.
+
+The AppRecord separately stores a fingerprint of the last successfully applied
+control-plane routing specification. `trigger run` compares that fingerprint
+before its code-SHA/tag short-circuits, so a config-only re-registration is
+reconciled even when `deployedSha` is unchanged. Host renames replace the same
+managed file; `cp-http80 → tls` and `mainHost` removal delete it. The new
+fingerprint is persisted only after Caddy validation and reload succeed.
 
 The reconciler never edits `/etc/caddy/Caddyfile`. The control plane must
 already have the canonical `import sites.d/*.caddy` line. It stages and

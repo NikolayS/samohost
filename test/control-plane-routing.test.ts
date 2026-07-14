@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { spawnSync } from "node:child_process";
 import {
   buildControlPlaneMainRouteReconcileScript,
+  controlPlaneMainRouteFingerprint,
   controlPlaneMainRoutePath,
   needsControlPlaneMainRoute,
   renderControlPlaneMainRoute,
@@ -94,6 +95,23 @@ describe("control-plane production mainHost routing", () => {
     expect(
       controlPlaneMainRoutePath(app({ mainHost: "friends-new.samo.team" })),
     ).toBe(controlPlaneMainRoutePath(friends));
+  });
+
+  test("routing fingerprint covers host, mode, and VM IP", () => {
+    const base = controlPlaneMainRouteFingerprint(app(), vm());
+    expect(
+      controlPlaneMainRouteFingerprint(
+        app({ mainHost: "gregg-brandalise.samo.team" }),
+        vm(),
+      ),
+    ).not.toBe(base);
+    expect(
+      controlPlaneMainRouteFingerprint(app(), vm({ ip: "167.233.128.163" })),
+    ).not.toBe(base);
+    expect(
+      controlPlaneMainRouteFingerprint(app({ mainListen: "tls" }), vm()),
+    ).not.toBe(base);
+    expect(controlPlaneMainRouteFingerprint(app(), vm())).toBe(base);
   });
 
   test("fails closed on invalid host and VM IP", () => {

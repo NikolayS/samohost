@@ -48,6 +48,32 @@ export function controlPlaneMainRoutePath(app: AppRecord): string {
   return `${SITES_DIR}/05-samohost-main-${readable}-${key}.caddy`;
 }
 
+/**
+ * Fingerprint of the complete desired managed state for one AppRecord.
+ *
+ * The absent state is fingerprinted too: after a successful removal, a later
+ * trigger can distinguish "removal applied" from "route lifecycle never ran".
+ */
+export function controlPlaneMainRouteFingerprint(
+  app: AppRecord,
+  vm: VmRecord,
+): string {
+  const desired = needsControlPlaneMainRoute(app)
+    ? {
+        version: 1,
+        mode: "cp-http80",
+        path: controlPlaneMainRoutePath(app),
+        host: app.mainHost,
+        upstream: upstream(vm.ip),
+      }
+    : {
+        version: 1,
+        mode: "absent",
+        path: controlPlaneMainRoutePath(app),
+      };
+  return createHash("sha256").update(JSON.stringify(desired)).digest("hex");
+}
+
 function upstream(ip: string): string {
   const family = isIP(ip);
   if (family === 0) {
