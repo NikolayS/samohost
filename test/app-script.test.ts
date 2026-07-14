@@ -231,6 +231,35 @@ describe("buildDeployScript hard-won behaviors", () => {
     expect(script).toContain("/opt/field-record/app");
   });
 
+  // git >=2.35 dubious-ownership: the deploy runs as OS user 'samo' but the app
+  // dir is owned by a per-app OS user (e.g. 'friends-site'). git aborts with
+  // "fatal: detected dubious ownership in repository" before emitting any phase
+  // marker, so parseDeployOutcome returns 'incomplete' and the releaseTagCursor
+  // never advances. The fix: emit `git config --global --add safe.directory
+  // "$SAMOHOST_APP_DIR"` unconditionally before the first git call so that all
+  // git invocations in the script (fetch, rev-parse, reset, worktree add/remove/
+  // prune) operate without ownership checks — no external file dependency.
+  test("sets safe.directory before any git call so git >=2.35 dubious-ownership check cannot abort the deploy", () => {
+    const nodeScript = buildDeployScript(fieldRecord(), TARGET);
+
+    const safeDirectiveLine = 'git config --global --add safe.directory "$SAMOHOST_APP_DIR"';
+
+    // 1. The directive must be present.
+    expect(nodeScript).toContain(safeDirectiveLine);
+
+    // 2. It must appear BEFORE the first `git fetch origin` call.
+    const safeIdx = nodeScript.indexOf(safeDirectiveLine);
+    const fetchIdx = nodeScript.indexOf("git fetch origin");
+    expect(safeIdx).toBeGreaterThan(-1);
+    expect(fetchIdx).toBeGreaterThan(-1);
+    expect(safeIdx).toBeLessThan(fetchIdx);
+
+    // 3. It must also appear before the fetch phase marker, confirming it fires
+    //    before any phase output the parser keys on.
+    const fetchMarkerIdx = nodeScript.indexOf("<<<SAMOHOST_PHASE:fetch:start>>>");
+    expect(safeIdx).toBeLessThan(fetchMarkerIdx);
+  });
+
   // Issue #78: lockfile-less apps (no-DB fixtures, minimal greenfield) hard-fail
   // npm ci with "can only install with an existing package-lock.json", which aborts
   // the whole deploy BEFORE the .env / systemd unit / Caddy vhost are written,
