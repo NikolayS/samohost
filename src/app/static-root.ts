@@ -41,6 +41,22 @@ export function staticRootOf(app: Pick<AppSpec, "kind" | "staticRoot">): string 
   return validateStaticRoot(app.staticRoot, app.kind);
 }
 
+/** Stable, app-owned metadata paths shared by tagged deploys and domain add. */
+export function staticReleaseStatePaths(appDir: string): {
+  releasesDir: string;
+  activeState: string;
+  activeRoute: string;
+} {
+  const normalized = appDir.replace(/\/+$/, "");
+  const appBase = normalized.split("/").slice(0, -1).join("/");
+  const releasesDir = `${appBase}/releases`;
+  return {
+    releasesDir,
+    activeState: `${releasesDir}/.samohost-active-static.json`,
+    activeRoute: `${releasesDir}/.samohost-active-static.caddy`,
+  };
+}
+
 /**
  * Bash helper shared by every static Caddy activation path. It rejects both
  * symlinks used as components of staticRoot and symlinks anywhere below the
