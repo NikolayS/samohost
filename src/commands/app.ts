@@ -25,6 +25,10 @@ import {
   isCanonicalReleaseCiWorkflow,
 } from "../app/release-policy.ts";
 import {
+  buildControlPlaneMainRouteReconcileScript,
+  needsControlPlaneMainRoute,
+} from "../caddy/control-plane.ts";
+import {
   buildHostBootstrapScript,
   type HostBootstrapOptions,
 } from "../app/bootstrap.ts";
@@ -647,6 +651,8 @@ export interface AppDeployDeps {
   env?: Record<string, string | undefined>;
   /** Verify that a release commit is reachable from the configured main branch. */
   isCommitOnBranch?: CommitOnBranchVerifier;
+  /** Reconcile this app's managed mainHost route on the local control plane. */
+  controlPlaneRoute: RemoteScriptRunner;
 }
 
 export interface AppDeployReport {
@@ -655,6 +661,7 @@ export interface AppDeployReport {
   sha: string;
   ci?: CiStatus;
   outcome: DeployOutcome;
+  routing: "ready" | "removed" | "failed" | "not-run";
   exitCode: number;
 }
 
@@ -828,10 +835,40 @@ export async function runAppDeploy(
   const combined = result.stdout + "\n" + result.stderr;
   const { outcome } = parseDeployOutcome(combined);
 
+  // ---- reconcile the control-plane mainHost route ------------------------
+  // App bootstrap/host-prep writes the VM-local :80 vhost.  For the explicit
+  // cp-http80 topology a second vhost must exist on the control plane to route
+  // public TLS traffic to this VM.  Reconcile only after the app deploy is
+  // healthy so a new hostname never points at an unready release.  The same
+  // stable per-app file is removed when a re-registration changes away from
+  // cp-http80 (the removal script is a no-op when no managed file exists).
+  let routing: AppDeployReport["routing"] = "not-run";
+  if (outcome === "deployed") {
+    try {
+      const routingScript = buildControlPlaneMainRouteReconcileScript(app, vm);
+      const routeResult = await deps.controlPlaneRoute(vm, routingScript);
+      if (routeResult.code === 0) {
+        routing = needsControlPlaneMainRoute(app) ? "ready" : "removed";
+      } else {
+        routing = "failed";
+        err(
+          `error: control-plane main-route reconcile failed (exit ${routeResult.code}): ` +
+            routeResult.stderr,
+        );
+      }
+    } catch (e) {
+      routing = "failed";
+      err(
+        `error: control-plane main-route reconcile failed: ` +
+          `${e instanceof Error ? e.message : String(e)}`,
+      );
+    }
+  }
+
   // ---- update bookkeeping -------------------------------------------------
   const stamped = deps.now().toISOString();
   const updated: AppRecord = { ...app, lastDeployAt: stamped };
-  if (outcome === "deployed") {
+  if (outcome === "deployed" && routing !== "failed") {
     updated.deployedSha = sha;
     // A successful deploy supersedes any prior bad-SHA guard for this app.
     delete updated.failedSha;
@@ -842,21 +879,25 @@ export async function runAppDeploy(
   // 'incomplete' leaves deployedSha/failedSha unchanged (state unknown).
   appStore.upsert(updated);
 
-  const exitCode = outcome === "deployed" ? 0 : 1;
+  const exitCode = outcome === "deployed" && routing !== "failed" ? 0 : 1;
   const report: AppDeployReport = {
     app: app.name,
     vm: vm.name,
     sha,
     ...(ci !== undefined ? { ci } : {}),
     outcome,
+    routing,
     exitCode,
   };
 
   if (opts.json) {
     out(JSON.stringify(report, null, 2));
   } else {
-    out(`deploy ${app.name}@${sha.slice(0, 12)} on ${vm.name}: ${outcome}`);
-    if (outcome !== "deployed") {
+    out(
+      `deploy ${app.name}@${sha.slice(0, 12)} on ${vm.name}: ${outcome} ` +
+        `(routing=${routing})`,
+    );
+    if (exitCode !== 0) {
       err(`deploy did not succeed (outcome=${outcome}); see remote output above`);
     }
   }
@@ -906,6 +947,22 @@ function defaultRemoteScriptRunner(): RemoteScriptRunner {
       },
     };
     return runRemote(vm, "bash -s", piping);
+  };
+}
+
+/** Run a script locally on the control plane (never over SSH). */
+function defaultControlPlaneRouteRunner(): RemoteScriptRunner {
+  return async (_vm, script): Promise<SpawnResult> => {
+    const res = spawnSync("bash", ["-s"], {
+      encoding: "utf8",
+      input: script,
+      maxBuffer: 16 * 1024 * 1024,
+    });
+    return {
+      code: typeof res.status === "number" ? res.status : 255,
+      stdout: res.stdout ?? "",
+      stderr: res.stderr ?? (res.error ? String(res.error.message) : ""),
+    };
   };
 }
 
@@ -1182,6 +1239,7 @@ export function defaultAppDeployDeps(): AppDeployDeps {
     fetch: globalThis.fetch,
     now: () => new Date(),
     isCommitOnBranch: defaultIsCommitOnBranch(),
+    controlPlaneRoute: defaultControlPlaneRouteRunner(),
   };
 }
 

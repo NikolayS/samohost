@@ -774,6 +774,7 @@ describe("release deploy authority", () => {
       fetch: makeFakeFetch([{ status: "completed", conclusion: "success" }]).fetch,
       now: () => new Date(),
       env: { GH_TOKEN: "test" },
+      controlPlaneRoute: async () => ({ code: 0, stdout: "route ready", stderr: "" }),
       ...overrides,
     };
   }
@@ -873,8 +874,14 @@ describe("release deploy authority", () => {
   });
 
   test("verified release re-gates the exact configured workflow before SSH", async () => {
+    appStore.upsert({
+      ...appStore.get("vm-1111", "field-record")!,
+      mainHost: "field-record-1.samo.team",
+      mainListen: "cp-http80",
+    });
     const seen: string[] = [];
     let remoteCalls = 0;
+    let routeScript = "";
     const d = deps({
       fetch: (async (input: string | URL | Request) => {
         seen.push(String(input));
@@ -890,6 +897,10 @@ describe("release deploy authority", () => {
           stdout: "<<<SAMOHOST_PHASE:health:start>>>\n<<<SAMOHOST_PHASE:health:ok>>>",
           stderr: "",
         };
+      },
+      controlPlaneRoute: async (_vm, script) => {
+        routeScript = script;
+        return { code: 0, stdout: "route ready", stderr: "" };
       },
     });
     const c = capture();
@@ -907,6 +918,9 @@ describe("release deploy authority", () => {
     expect(seen).toHaveLength(1);
     expect(seen[0]).toContain("/actions/workflows/ci.yml/runs?");
     expect(seen[0]).toContain("per_page=1");
+    expect(routeScript).toContain("field-record-1.samo.team");
+    expect(routeScript).toContain("178.105.246.151:80");
+    expect(JSON.parse(c.o).routing).toBe("ready");
   });
 });
 

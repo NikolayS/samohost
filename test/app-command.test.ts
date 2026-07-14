@@ -481,6 +481,8 @@ describe("app commands", () => {
         ({ ok: true, json: async () => ({ workflow_runs: [{ conclusion: "success" }] }) }) as Response) as unknown as typeof fetch,
       now: () => new Date("2026-06-11T12:00:00.000Z"),
       env: { GH_TOKEN: "tok" },
+      controlPlaneRoute: (_vm, _script): Promise<SpawnResult> =>
+        Promise.resolve({ code: 0, stdout: "route ready", stderr: "" }),
       ...overrides,
     };
   }
@@ -513,6 +515,63 @@ describe("app commands", () => {
     expect(rec?.deployedSha).toBe(SHA);
     expect(rec?.failedSha).toBeUndefined();
     expect(rec?.lastDeployAt).toBe("2026-06-11T12:00:00.000Z");
+  });
+
+  test("healthy cp-http80 deploy reconciles the local control-plane route", async () => {
+    register();
+    appStore.upsert({
+      ...appStore.get("vm-1111", "field-record")!,
+      mainHost: "field-record-1.samo.team",
+      mainListen: "cp-http80",
+    });
+    let routeScript = "";
+    const c = capture();
+    const code = await runAppDeploy(
+      { vm: "samo-we-field-record", app: "field-record", sha: SHA, skipCiGate: false },
+      { json: true },
+      vmStore,
+      appStore,
+      deployDeps(HAPPY, {
+        controlPlaneRoute: (_vm, script) => {
+          routeScript = script;
+          return Promise.resolve({ code: 0, stdout: "route ready", stderr: "" });
+        },
+      }),
+      c.out,
+      c.err,
+    );
+    expect(code).toBe(0);
+    expect(routeScript).toContain("field-record-1.samo.team");
+    expect(routeScript).toContain("178.105.246.151:80");
+    expect(JSON.parse(c.o).routing).toBe("ready");
+  });
+
+  test("route failure does not stamp deployedSha, so the trigger retries", async () => {
+    register();
+    appStore.upsert({
+      ...appStore.get("vm-1111", "field-record")!,
+      mainHost: "field-record-1.samo.team",
+      mainListen: "cp-http80",
+    });
+    const c = capture();
+    const code = await runAppDeploy(
+      { vm: "samo-we-field-record", app: "field-record", sha: SHA, skipCiGate: false },
+      { json: true },
+      vmStore,
+      appStore,
+      deployDeps(HAPPY, {
+        controlPlaneRoute: () =>
+          Promise.resolve({ code: 1, stdout: "", stderr: "caddy validate failed" }),
+      }),
+      c.out,
+      c.err,
+    );
+    expect(code).toBe(1);
+    expect(JSON.parse(c.o).routing).toBe("failed");
+    expect(c.e).toContain("control-plane main-route reconcile failed");
+    const rec = appStore.get("vm-1111", "field-record");
+    expect(rec?.deployedSha).toBeUndefined();
+    expect(rec?.failedSha).toBeUndefined();
   });
 
   test("deploy rollback path: exit 1, failedSha set, deployedSha unchanged", async () => {
