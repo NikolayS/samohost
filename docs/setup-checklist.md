@@ -63,7 +63,10 @@ Keep these as two physically separate tokens. Never widen the existing
   and **no** keyscan. A wrong or unverified fingerprint is a hard stop. The
   fingerprint is pinned and reused for every later SSH to that VM.
 - `provision` captures and pins the host key itself from the create flow, so a
-  provisioned VM needs no fingerprint flag.
+  provisioned VM needs no fingerprint flag. It also records the control-plane
+  egress IP when detection returns a valid IPv4/IPv6 address; later
+  `cp-http80` app bootstrap uses that address for its source-restricted UFW
+  `:80` rule.
 
 ## Install samohost + where state lives
 

@@ -298,7 +298,8 @@ app bootstrap options (PR-A1+A2 — ONE-TIME OS bootstrap + DB + env + clone;
   <vm>                       VM name or id (required)
   <app>                      app name or id (required)
   --app-user <user>          OS user created to run the app (required)
-  --control-plane-ip <ip>    source allowed to reach cp-http80 on port 80
+  --control-plane-ip <ip>    IPv4/IPv6 source allowed to reach cp-http80 on
+                             port 80; defaults to the IP recorded by provision
   --db-name <name>           Database to create — required for node apps and
                              invalid for static apps. Never derived from the
                              app name; must match the actual database.
