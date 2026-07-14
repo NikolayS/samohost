@@ -2781,8 +2781,6 @@ export function buildCustomDomainVhostScript(
 
   const label = fqdn.replace(/\./g, "-");
   const snippetPath = `/etc/caddy/sites.d/10-domain-${label}.caddy`;
-  const stagedPath = `/etc/caddy/sites.d/.samohost-next-10-domain-${label}.caddy`;
-  const backupPath = `/etc/caddy/sites.d/.samohost-prev-10-domain-${label}.caddy`;
 
   // http:// prefix → Caddy serves on :80 only, no TLS redirect.  The control
   // plane proxies custom-domain traffic over plain HTTP to this VM, so a :443
@@ -2804,8 +2802,8 @@ export function buildCustomDomainVhostScript(
     "",
     ...(isStatic
       ? [
-          `STAGED=${sq(stagedPath)}`,
-          `BACKUP=${sq(backupPath)}`,
+          'STAGED=""',
+          'BACKUP=""',
           `SAMOHOST_STATIC_ROOT=${sq(staticRoot ?? "")}`,
           `SAMOHOST_CHECKOUT_REAL=$(realpath -e ${sq(app.appDir)}) || { echo "static checkout is missing" >&2; exit 1; }`,
           `if [[ -n "$SAMOHOST_STATIC_ROOT" ]]; then SAMOHOST_STATIC_CANDIDATE=${sq(`${app.appDir}/`)}"$SAMOHOST_STATIC_ROOT"; else SAMOHOST_STATIC_CANDIDATE=${sq(app.appDir)}; fi`,
@@ -2815,19 +2813,27 @@ export function buildCustomDomainVhostScript(
           "",
           ...staticTreeGuardFnLines(),
           "",
+          "samohost_cleanup_custom_domain() {",
+          '  [[ -z "$STAGED" ]] || rm -f "$STAGED"',
+          '  [[ -z "$BACKUP" ]] || rm -f "$BACKUP"',
+          "}",
+          "trap samohost_cleanup_custom_domain EXIT",
+          "",
           'samohost_assert_static_tree_safe "$SAMOHOST_CHECKOUT_REAL" "$SAMOHOST_STATIC_DIR" "$SAMOHOST_STATIC_ROOT"',
-          'sudo /usr/bin/rm -f "$STAGED"',
-          'sudo /usr/bin/rm -f "$BACKUP"',
+          'STAGED=$(mktemp)',
+          `printf 'http://${fqdn} {\\n\\troot * "%s"\\n\\tfile_server\\n}\\n' "$SAMOHOST_STATIC_DIR" > "$STAGED"`,
+          'samohost_assert_static_tree_safe "$SAMOHOST_CHECKOUT_REAL" "$SAMOHOST_STATIC_DIR" "$SAMOHOST_STATIC_ROOT"',
           "SAMOHOST_HAD_LIVE=0",
-          'if [[ -f "$SNIPPET" ]]; then sudo /usr/bin/tee "$BACKUP" >/dev/null < "$SNIPPET"; SAMOHOST_HAD_LIVE=1; fi',
-          `printf 'http://${fqdn} {\\n\\troot * "%s"\\n\\tfile_server\\n}\\n' "$SAMOHOST_STATIC_DIR" | sudo /usr/bin/tee "$STAGED" >/dev/null`,
-          'samohost_assert_static_tree_safe "$SAMOHOST_CHECKOUT_REAL" "$SAMOHOST_STATIC_DIR" "$SAMOHOST_STATIC_ROOT"',
-          'sudo /usr/bin/mv -- "$STAGED" "$SNIPPET"',
+          'if [[ -f "$SNIPPET" ]]; then BACKUP=$(mktemp); cp -- "$SNIPPET" "$BACKUP"; SAMOHOST_HAD_LIVE=1; fi',
+          'sudo /usr/bin/tee "$SNIPPET" >/dev/null < "$STAGED"',
           'if samohost_assert_static_tree_safe "$SAMOHOST_CHECKOUT_REAL" "$SAMOHOST_STATIC_DIR" "$SAMOHOST_STATIC_ROOT" && sudo /usr/bin/systemctl reload caddy; then',
-          '  sudo /usr/bin/rm -f "$BACKUP"',
+          "  :",
           "else",
-          '  if [[ "$SAMOHOST_HAD_LIVE" == "1" ]]; then sudo /usr/bin/mv -- "$BACKUP" "$SNIPPET"; else sudo /usr/bin/rm -f "$SNIPPET"; fi',
-          '  sudo /usr/bin/rm -f "$STAGED"',
+          '  if [[ "$SAMOHOST_HAD_LIVE" == "1" ]]; then',
+          '    sudo /usr/bin/tee "$SNIPPET" >/dev/null < "$BACKUP"',
+          "  else",
+          '    sudo /usr/bin/rm -f "$SNIPPET"',
+          "  fi",
           "  exit 1",
           "fi",
         ]

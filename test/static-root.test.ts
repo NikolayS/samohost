@@ -4,6 +4,7 @@ import {
   existsSync,
   mkdirSync,
   mkdtempSync,
+  readdirSync,
   readFileSync,
   rmSync,
   symlinkSync,
@@ -321,7 +322,11 @@ describe("staticRoot preview sandbox", () => {
   }
 });
 
-type CustomDomainFixture = "clean" | "root-symlink" | "nested-file-symlink";
+type CustomDomainFixture =
+  | "clean"
+  | "root-symlink"
+  | "nested-file-symlink"
+  | "reload-failure";
 
 function runCustomDomainSandbox(fixture: CustomDomainFixture): {
   status: number | null;
@@ -348,10 +353,13 @@ function runCustomDomainSandbox(fixture: CustomDomainFixture): {
     }
   }
   mkdirSync(join(caddyDir, "sites.d"), { recursive: true });
+  if (fixture === "reload-failure") {
+    writeFileSync(snippet, "legacy route\n");
+  }
   mkdirSync(binDir);
   writeFileSync(join(binDir, "sudo"), [
     "#!/usr/bin/env bash",
-    'if [[ "${1:-}" == "/usr/bin/systemctl" ]]; then exit 0; fi',
+    `if [[ "\${1:-}" == "/usr/bin/systemctl" ]]; then exit ${fixture === "reload-failure" ? "1" : "0"}; fi`,
     'exec "$@"',
     "",
   ].join("\n"));
@@ -398,4 +406,17 @@ describe("staticRoot custom-domain sandbox", () => {
       }
     });
   }
+
+  test("reload failure restores an existing custom-domain snippet byte-for-byte", () => {
+    const result = runCustomDomainSandbox("reload-failure");
+    try {
+      expect(result.status).toBe(1);
+      expect(readFileSync(result.snippet, "utf8")).toBe("legacy route\n");
+      expect(
+        readdirSync(join(result.dir, "caddy", "sites.d")),
+      ).toEqual(["10-domain-client-example.caddy"]);
+    } finally {
+      rmSync(result.dir, { recursive: true, force: true });
+    }
+  });
 });

@@ -3520,17 +3520,19 @@ describe("buildCustomDomainVhostScript", () => {
     expect(bashSyntaxOk(s)).toBe(true);
   });
 
-  test("static custom-domain activation rechecks the tree around atomic staging and reload", () => {
+  test("static custom-domain activation rechecks the tree around private staging and reload", () => {
     const s = buildCustomDomainVhostScript(staticApp(), "myapp.com");
     const guard =
       'samohost_assert_static_tree_safe "$SAMOHOST_CHECKOUT_REAL" "$SAMOHOST_STATIC_DIR" "$SAMOHOST_STATIC_ROOT"';
-    const stage = s.indexOf('sudo /usr/bin/tee "$STAGED"');
-    const activate = s.indexOf('sudo /usr/bin/mv -- "$STAGED" "$SNIPPET"');
+    const stage = s.indexOf('> "$STAGED"');
+    const activate = s.indexOf('sudo /usr/bin/tee "$SNIPPET"');
     const reload = s.indexOf("sudo /usr/bin/systemctl reload caddy", activate);
     expect(s.lastIndexOf(guard, stage)).toBeGreaterThan(-1);
     expect(s.indexOf(guard, stage)).toBeLessThan(activate);
     expect(s.lastIndexOf(guard, reload)).toBeGreaterThan(activate);
-    expect(s).toContain('sudo /usr/bin/mv -- "$BACKUP" "$SNIPPET"');
+    expect(s).toContain('sudo /usr/bin/tee "$SNIPPET" >/dev/null < "$BACKUP"');
+    expect(s).toContain("trap samohost_cleanup_custom_domain EXIT");
+    expect(s).not.toContain("sites.d/.samohost-");
   });
 
   test("node custom-domain vhost does not gain static filesystem guards", () => {
