@@ -181,11 +181,12 @@ export interface AppBootstrapInput {
   app: string;
   appUser: string;
   /**
-   * PR-A2 REQUIRED — the database name to create on the host.
-   * MUST be passed explicitly; never derived from app.name.
+   * Database name to create on the host. Required for non-static apps and
+   * invalid for static apps. When required it MUST be passed explicitly;
+   * never derive it from app.name.
    * See HostBootstrapOptions.dbName.
    */
-  dbName: string;
+  dbName?: string;
   appBase?: string;
   nodeMajor?: number;
   pgMajor?: number;
@@ -574,8 +575,9 @@ export function runAppClearFailed(
  *
  * Scope (PR-A1): runtimes (Node/PG/Caddy), app OS user, /opt layout, sudoers,
  * MAIN systemd unit, sshd AllowUsers drop-in, Caddy base config.
- * Scope (PR-A2): DB bootstrap + createdb (dbName REQUIRED, explicit),
- * base env file seeding, full token-safe repo clone, extended self-check table.
+ * Scope (PR-A2, non-static apps): DB bootstrap + createdb (dbName required
+ * and explicit), base env file seeding, full token-safe repo clone, extended
+ * self-check table. Static apps skip every DB/env bootstrap section.
  */
 export function runAppBootstrap(
   input: AppBootstrapInput,
@@ -594,10 +596,18 @@ export function runAppBootstrap(
     err(`error: app not found on vm ${vm.name}: ${input.app}`);
     return 1;
   }
+  if (app.kind === "static" && input.dbName !== undefined) {
+    err("error: --db-name is not valid for a static app; static bootstrap creates no database");
+    return 1;
+  }
+  if (app.kind !== "static" && input.dbName === undefined) {
+    err("error: a non-static app bootstrap requires --db-name <name> (explicit; never derived)");
+    return 1;
+  }
 
   const opts: HostBootstrapOptions = {
     appUser: input.appUser,
-    dbName: input.dbName,
+    ...(input.dbName !== undefined ? { dbName: input.dbName } : {}),
     ...(input.appBase !== undefined ? { appBase: input.appBase } : {}),
     ...(input.nodeMajor !== undefined ? { nodeMajor: input.nodeMajor } : {}),
     ...(input.pgMajor !== undefined ? { pgMajor: input.pgMajor } : {}),

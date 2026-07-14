@@ -1320,7 +1320,8 @@ describe("buildHostBootstrapScript — static path (kind='static')", () => {
     const end = script.indexOf("}\nCADDY_SITE", start);
     expect(start).toBeGreaterThanOrEqual(0);
     const block = script.slice(start, end);
-    expect(block).toContain("root * /opt/my-static-site/app");
+    expect(block).toContain('root * "${SAMOHOST_STATIC_DIR}"');
+    expect(script).toContain("samohost_assert_static_tree_safe");
     expect(block).toContain("try_files {path} /index.html");
     expect(block).toContain("file_server");
     expect(block).not.toContain("tls internal");

@@ -17,6 +17,7 @@ import { parseSamohostToml } from "../src/manifest/toml.ts";
 import { parseArgs } from "../src/cli.ts";
 import { buildEnvCreateScript, buildHostPrepScript } from "../src/env/script.ts";
 import { buildHostBootstrapScript } from "../src/app/bootstrap.ts";
+import { buildDeployScript } from "../src/app/script.ts";
 import type { AppRecord } from "../src/types.ts";
 
 function staticApp(overrides: Partial<AppRecord> = {}): AppRecord {
@@ -126,7 +127,7 @@ describe("staticRoot schema and path security", () => {
     expect(preview).toContain('SAMOHOST_STATIC_ROOT=\'dist\'');
     expect(preview).toContain('root * %s');
     expect(preview).toContain('"$SAMOHOST_VHOST" "$SAMOHOST_STATIC_DIR"');
-    expect(preview).toContain('> "$SAMOHOST_STATIC_DIR/config.js"');
+    expect(preview).toContain('"$SAMOHOST_STATIC_DIR/config.js"');
     expect(preview).toContain("staticRoot escapes the checkout");
 
     const hostPrep = buildHostPrepScript(app, "samo");
@@ -140,9 +141,58 @@ describe("staticRoot schema and path security", () => {
       bootstrap.indexOf("# §12. Full token-safe repo clone"),
     );
   });
+
+  test("every static activation rechecks the tree immediately around Caddy staging", () => {
+    const app = staticApp({ staticRoot: "dist", mainListen: "cp-http80" });
+    const guardCall =
+      'samohost_assert_static_tree_safe "$SAMOHOST_CHECKOUT_REAL" "$SAMOHOST_STATIC_DIR" "$SAMOHOST_STATIC_ROOT"';
+
+    const preview = buildEnvCreateScript(app, {
+      name: "astro-site-pr-1",
+      branch: "feature/one",
+      port: 3100,
+      vhost: "astro-site-pr-1.samo.cat",
+      dbBackend: "none",
+    });
+    const previewConfig = preview.indexOf("SAMOHOST_CONFIG_NEXT=$(mktemp");
+    const previewVhostWrite = preview.indexOf("&& printf '%s {", previewConfig);
+    expect(preview.lastIndexOf(guardCall, previewConfig)).toBeGreaterThan(-1);
+    expect(preview.indexOf(guardCall, previewConfig)).toBeGreaterThan(previewConfig);
+    expect(preview.indexOf(guardCall, previewConfig)).toBeLessThan(previewVhostWrite);
+
+    const hostPrep = buildHostPrepScript(app, "samo");
+    const hostPrepStage = hostPrep.indexOf("cat > /etc/caddy/sites.d/.staged-00-main-astro-site.caddy");
+    const hostPrepApply = hostPrep.indexOf("samohost_apply_main_vhost", hostPrepStage);
+    expect(hostPrep.lastIndexOf(guardCall, hostPrepStage)).toBeGreaterThan(-1);
+    expect(hostPrep.indexOf(guardCall, hostPrepStage)).toBeLessThan(hostPrepApply);
+
+    const bootstrap = buildHostBootstrapScript(app, { appUser: "astro" });
+    const bootstrapStage = bootstrap.indexOf("cat > '/etc/caddy/sites.d/00-main-astro-site.caddy'");
+    const bootstrapValidate = bootstrap.indexOf("caddy validate", bootstrapStage);
+    expect(bootstrap.lastIndexOf(guardCall, bootstrapStage)).toBeGreaterThan(-1);
+    expect(bootstrap.indexOf(guardCall, bootstrapStage)).toBeLessThan(bootstrapValidate);
+
+    const deploy = buildDeployScript({
+      ...app,
+      releaseTagPattern: "v*",
+      releaseTagFormat: "date",
+      releaseCiWorkflow: ".github/workflows/ci.yml",
+    }, {
+      sha: "abc1234def5678901234567890abcdef12345678",
+      tag: "v20260714.1",
+    });
+    const deployStage = deploy.lastIndexOf("sudo /usr/bin/tee '/etc/caddy/sites.d/.samohost-next-00-main-astro-site.caddy'");
+    const deployActivate = deploy.indexOf("sudo /usr/bin/mv --", deployStage);
+    const deployReload = deploy.indexOf("sudo /usr/bin/systemctl reload caddy", deployActivate);
+    expect(deploy.lastIndexOf(guardCall.replace("CHECKOUT", "CANDIDATE"), deployStage)).toBeGreaterThan(-1);
+    expect(deploy.indexOf(guardCall.replace("CHECKOUT", "CANDIDATE"), deployStage)).toBeLessThan(deployActivate);
+    expect(deploy.lastIndexOf(guardCall.replace("CHECKOUT", "CANDIDATE"), deployReload)).toBeGreaterThan(deployActivate);
+  });
 });
 
-function runPreviewSandbox(symlinkEscape: boolean): {
+type PreviewFixture = "clean" | "root-symlink" | "nested-file-symlink" | "nested-dir-symlink";
+
+function runPreviewSandbox(fixture: PreviewFixture): {
   status: number | null;
   stderr: string;
   dir: string;
@@ -168,16 +218,25 @@ function runPreviewSandbox(symlinkEscape: boolean): {
   git(["init", "--initial-branch=main"], seed);
   git(["config", "user.name", "Samohost Test"], seed);
   git(["config", "user.email", "samohost@example.invalid"], seed);
-  if (symlinkEscape) {
-    const outside = join(dir, "outside");
-    mkdirSync(outside);
-    writeFileSync(join(outside, "index.html"), "outside\n");
-    symlinkSync("../../../outside", join(seed, "dist"));
+  if (fixture === "root-symlink") {
+    mkdirSync(join(seed, "real-dist"));
+    writeFileSync(join(seed, "real-dist", "index.html"), "symlink target\n");
+    symlinkSync("real-dist", join(seed, "dist"));
   } else {
     mkdirSync(join(seed, "dist"));
     writeFileSync(join(seed, "dist", "index.html"), "preview dist\n");
+    if (fixture === "nested-file-symlink") {
+      mkdirSync(join(seed, "dist", "assets"));
+      symlinkSync("../index.html", join(seed, "dist", "assets", "alias.html"));
+    }
+    if (fixture === "nested-dir-symlink") {
+      mkdirSync(join(seed, "dist", "real-assets"));
+      writeFileSync(join(seed, "dist", "real-assets", "app.css"), "body {}\n");
+      mkdirSync(join(seed, "dist", "nested"));
+      symlinkSync("../real-assets", join(seed, "dist", "nested", "assets"));
+    }
   }
-  git(["add", "dist"], seed);
+  git(["add", "."], seed);
   git(["commit", "-m", "fixture"], seed);
   git(["remote", "add", "origin", origin], seed);
   git(["push", "-u", "origin", "main"], seed);
@@ -215,7 +274,7 @@ function runPreviewSandbox(symlinkEscape: boolean): {
 
 describe("staticRoot preview sandbox", () => {
   test("executed preview serves dist and writes preview identity inside dist", () => {
-    const result = runPreviewSandbox(false);
+    const result = runPreviewSandbox("clean");
     try {
       expect(result.status, result.stderr).toBe(0);
       expect(readFileSync(join(result.envDir, "dist", "index.html"), "utf8")).toBe(
@@ -233,14 +292,27 @@ describe("staticRoot preview sandbox", () => {
     }
   });
 
-  test("executed preview rejects a staticRoot symlink that escapes checkout", () => {
-    const result = runPreviewSandbox(true);
+  test("executed preview rejects a staticRoot path symlink before Caddy activation", () => {
+    const result = runPreviewSandbox("root-symlink");
     try {
       expect(result.status).toBe(1);
-      expect(result.stderr).toContain("staticRoot escapes the checkout");
+      expect(result.stderr).toContain("staticRoot path contains a symlink");
       expect(existsSync(result.snippet)).toBe(false);
     } finally {
       rmSync(result.dir, { recursive: true, force: true });
     }
   });
+
+  for (const fixture of ["nested-file-symlink", "nested-dir-symlink"] as const) {
+    test(`executed preview rejects a ${fixture} before Caddy activation`, () => {
+      const result = runPreviewSandbox(fixture);
+      try {
+        expect(result.status).toBe(1);
+        expect(result.stderr).toContain("staticRoot tree contains a symlink");
+        expect(existsSync(result.snippet)).toBe(false);
+      } finally {
+        rmSync(result.dir, { recursive: true, force: true });
+      }
+    });
+  }
 });

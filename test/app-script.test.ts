@@ -7,6 +7,7 @@ import {
   readFileSync,
   rmSync,
   statSync,
+  symlinkSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -303,7 +304,7 @@ describe("buildDeployScript — static path (kind='static')", () => {
     expect(script).toContain('SAMOHOST_RELEASES_DIR=\'/opt/my-static-site/releases\'');
     expect(script).toContain('git -C "$SAMOHOST_APP_DIR" worktree add --detach');
     expect(script).toContain("umask 022");
-    expect(script).toContain('root * "${SAMOHOST_CANDIDATE_DIR}"');
+    expect(script).toContain('root * "${SAMOHOST_STATIC_DIR}"');
     expect(script).not.toContain('git reset --hard "${SAMOHOST_SHA}"');
     expect(script).toContain(
       "sudo /usr/bin/mv -- '/etc/caddy/sites.d/.samohost-next-00-main-my-static-site.caddy' '/etc/caddy/sites.d/00-main-my-static-site.caddy'",
@@ -389,7 +390,7 @@ describe("buildDeployScript — static path (kind='static')", () => {
     }), { ...STATIC_TARGET, tag: "v20260713.1" });
     const chmod = script.indexOf('chmod 0644 "$SAMOHOST_VERSION_NEXT"');
     const rename = script.indexOf(
-      '/usr/bin/mv -f "$SAMOHOST_VERSION_NEXT" "${SAMOHOST_CANDIDATE_DIR}/version.json"',
+      '/usr/bin/mv -f "$SAMOHOST_VERSION_NEXT" "${SAMOHOST_STATIC_DIR}/version.json"',
     );
     const route = script.indexOf(
       "sudo /usr/bin/mv -- '/etc/caddy/sites.d/.samohost-next-00-main-my-static-site.caddy'",
@@ -398,9 +399,9 @@ describe("buildDeployScript — static path (kind='static')", () => {
     expect(chmod).toBeGreaterThan(-1);
     expect(rename).toBeGreaterThan(chmod);
     expect(route).toBeGreaterThan(rename);
-    expect(script).toContain('[[ -r "${SAMOHOST_CANDIDATE_DIR}/version.json" ]]');
+    expect(script).toContain('[[ -r "${SAMOHOST_STATIC_DIR}/version.json" ]]');
     expect(script).toContain(
-      '[[ "$(stat -c \'%a\' "${SAMOHOST_CANDIDATE_DIR}/version.json")" == "644" ]]',
+      '[[ "$(stat -c \'%a\' "${SAMOHOST_STATIC_DIR}/version.json")" == "644" ]]',
     );
   });
 
@@ -440,6 +441,11 @@ describe("buildDeployScript — static path (kind='static')", () => {
       writeFileSync(join(seed, "dist", "index.html"), "release two\n");
       git(["commit", "-am", "release two"], seed);
       const secondSha = git(["rev-parse", "HEAD"], seed);
+
+      symlinkSync("index.html", join(seed, "dist", "alias.html"));
+      git(["add", "dist/alias.html"], seed);
+      git(["commit", "-m", "unsafe nested symlink"], seed);
+      const badSymlinkSha = git(["rev-parse", "HEAD"], seed);
       git(["remote", "add", "origin", origin], seed);
       git(["push", "-u", "origin", "main"], seed);
 
@@ -495,6 +501,7 @@ describe("buildDeployScript — static path (kind='static')", () => {
         releaseTagFormat: "date",
         releaseCiWorkflow: ".github/workflows/ci.yml",
       });
+      let lastExecutionStderr = "";
       const execute = (sha: string, tag: string, expectFailure = false): string => {
         const script = buildDeployScript(releaseApp, { sha, tag })
           .replaceAll("/etc/caddy", caddyDir);
@@ -508,6 +515,7 @@ describe("buildDeployScript — static path (kind='static')", () => {
             FAIL_VERSION_HEALTH: expectFailure ? "1" : "0",
           },
         });
+        lastExecutionStderr = result.stderr;
         if ((!expectFailure && result.status !== 0) || (expectFailure && result.status !== 1)) {
           throw new Error(
             `unexpected static deploy exit (${result.status}):\n${result.stdout}\n${result.stderr}`,
@@ -560,6 +568,15 @@ describe("buildDeployScript — static path (kind='static')", () => {
       expect(readFileSync(join(secondRoot, "version.json"), "utf8")).toBe(secondIdentity);
       expect(git(["worktree", "list", "--porcelain"], appDir)).not.toContain(
         `${firstSha}.candidate`,
+      );
+
+      execute(badSymlinkSha, "v20260713.5", true);
+      expect(lastExecutionStderr).toContain("staticRoot tree contains a symlink");
+      expect(routedRoot()).toBe(secondRoot);
+      expect(readFileSync(join(secondRoot, "index.html"), "utf8")).toBe("release two\n");
+      expect(readFileSync(join(secondRoot, "version.json"), "utf8")).toBe(secondIdentity);
+      expect(git(["worktree", "list", "--porcelain"], appDir)).not.toContain(
+        `${badSymlinkSha}.candidate`,
       );
 
       // Every attempt fetched and staged elsewhere; the original checkout was

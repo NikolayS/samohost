@@ -40,3 +40,37 @@ export function validateStaticRoot(
 export function staticRootOf(app: Pick<AppSpec, "kind" | "staticRoot">): string | undefined {
   return validateStaticRoot(app.staticRoot, app.kind);
 }
+
+/**
+ * Bash helper shared by every static Caddy activation path. It rejects both
+ * symlinks used as components of staticRoot and symlinks anywhere below the
+ * resolved served directory. Callers run it after checkout and again as close
+ * as possible to Caddy staging/reload to narrow the unavoidable TOCTOU window.
+ */
+export function staticTreeGuardFnLines(): string[] {
+  return [
+    "samohost_assert_static_tree_safe() {",
+    '  local checkout_real="$1" static_real="$2" relative="$3"',
+    '  local current="$checkout_real" segment first_link',
+    "  local -a segments=()",
+    '  if [[ -n "$relative" ]]; then',
+    "    IFS='/' read -r -a segments <<< \"$relative\"",
+    '    for segment in "${segments[@]}"; do',
+    '      current="$current/$segment"',
+    '      if [[ -L "$current" ]]; then',
+    '        echo "staticRoot path contains a symlink; refusing Caddy activation" >&2',
+    "        return 1",
+    "      fi",
+    "    done",
+    "  fi",
+    '  if ! first_link=$(/usr/bin/find -P "$static_real" -type l -print -quit); then',
+    '    echo "cannot inspect staticRoot for symlinks; refusing Caddy activation" >&2',
+    "    return 1",
+    "  fi",
+    '  if [[ -n "$first_link" ]]; then',
+    '    echo "staticRoot tree contains a symlink; refusing Caddy activation" >&2',
+    "    return 1",
+    "  fi",
+    "}",
+  ];
+}

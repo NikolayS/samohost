@@ -9,6 +9,7 @@ import {
   runAppDeploy,
   runAppStatus,
   runAppRegisterFromToml,
+  runAppBootstrap,
   type AppDeployDeps,
 } from "../src/commands/app.ts";
 import { AppStore } from "../src/state/apps.ts";
@@ -59,6 +60,21 @@ const SHA = "abc1234def5678901234567890abcdef12345678";
 // ---------------------------------------------------------------------------
 
 describe("parseArgs app", () => {
+  test("bootstrap defers --db-name requirements until the stored app kind is known", () => {
+    const staticShape = parseArgs([
+      "app", "bootstrap", "vm", "site", "--app-user", "site",
+    ]);
+    if (staticShape.kind !== "app-bootstrap") throw new Error("expected app-bootstrap");
+    expect(staticShape.input.dbName).toBeUndefined();
+
+    const nodeShape = parseArgs([
+      "app", "bootstrap", "vm", "api", "--app-user", "api",
+      "--db-name", "api_prod",
+    ]);
+    if (nodeShape.kind !== "app-bootstrap") throw new Error("expected app-bootstrap");
+    expect(nodeShape.input.dbName).toBe("api_prod");
+  });
+
   test("register with required + optional flags", () => {
     const cmd = parseArgs([
       "app", "register", "samo-we-field-record",
@@ -196,6 +212,97 @@ describe("parseArgs app", () => {
   test("unknown subcommand throws", () => {
     expect(() => parseArgs(["app", "wat"])).toThrow(/unknown app subcommand/);
     expect(() => parseArgs(["app"])).toThrow(/requires a subcommand/);
+  });
+});
+
+describe("app bootstrap uses the stored app kind for the database contract", () => {
+  let dir: string;
+  let vmStore: StateStore;
+  let appStore: AppStore;
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), "samohost-bootstrap-kind-"));
+    vmStore = new StateStore(join(dir, "state.json"));
+    appStore = new AppStore(join(dir, "apps.json"));
+    vmStore.upsert(vm());
+    appStore.upsert({
+      id: "app-static",
+      vmId: "vm-1111",
+      name: "site",
+      kind: "static",
+      repo: "example/site",
+      branch: "main",
+      appDir: "/opt/site/app",
+      buildCmd: "npm run build",
+      healthUrl: "https://site.example.com/",
+      serviceUnit: "site",
+    });
+    appStore.upsert({
+      id: "app-node",
+      vmId: "vm-1111",
+      name: "api",
+      kind: "node",
+      repo: "example/api",
+      branch: "main",
+      appDir: "/opt/api/app",
+      buildCmd: "npm run build",
+      healthUrl: "http://localhost:3000/health",
+      serviceUnit: "api",
+    });
+  });
+
+  afterEach(() => rmSync(dir, { recursive: true, force: true }));
+
+  test("static bootstrap needs no db name and emits no database bootstrap data", () => {
+    const c = capture();
+    const code = runAppBootstrap(
+      { vm: "samo-we-field-record", app: "site", appUser: "site" },
+      vmStore,
+      appStore,
+      c.out,
+      c.err,
+    );
+    expect(code).toBe(0);
+    expect(c.e).toBe("");
+    expect(c.o).not.toContain("createdb");
+    expect(c.o).not.toContain("DATABASE_URL=");
+    expect(c.o).not.toContain("undefined");
+  });
+
+  test("static bootstrap rejects an inert --db-name", () => {
+    const c = capture();
+    const code = runAppBootstrap(
+      { vm: "samo-we-field-record", app: "site", appUser: "site", dbName: "unused" },
+      vmStore,
+      appStore,
+      c.out,
+      c.err,
+    );
+    expect(code).toBe(1);
+    expect(c.o).toBe("");
+    expect(c.e).toContain("--db-name is not valid for a static app");
+  });
+
+  test("node bootstrap still requires and uses an explicit db name", () => {
+    const missing = capture();
+    expect(runAppBootstrap(
+      { vm: "samo-we-field-record", app: "api", appUser: "api" },
+      vmStore,
+      appStore,
+      missing.out,
+      missing.err,
+    )).toBe(1);
+    expect(missing.e).toContain("requires --db-name");
+
+    const explicit = capture();
+    expect(runAppBootstrap(
+      { vm: "samo-we-field-record", app: "api", appUser: "api", dbName: "api_prod" },
+      vmStore,
+      appStore,
+      explicit.out,
+      explicit.err,
+    )).toBe(0);
+    expect(explicit.o).toContain("createdb api_prod");
   });
 });
 

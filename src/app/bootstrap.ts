@@ -45,7 +45,8 @@
  *     with `openssl rand -hex 24` (fed to psql via STDIN with dollar-quoting;
  *     NEVER in argv). Idempotent reuse from existing env file. Then idempotent
  *     `createdb <dbName>` guarded by pg_database SELECT.
- *     CRITICAL: dbName is REQUIRED and EXPLICIT — never derived from app.name.
+ *     CRITICAL for non-static apps: dbName is REQUIRED and EXPLICIT — never
+ *     derived from app.name. Static apps skip the DB and base-env sections.
  *
  *  e. Base env file seeding (600, appUser-owned): DATABASE_URL (superuser),
  *     APP_DATABASE_URL placeholder (app role + 'app_password' — rotated by
@@ -73,7 +74,7 @@
 
 import type { AppRecord } from "../types.ts";
 import { buildFirewallLines, type HostPrepFirewallOpts } from "../env/script.ts";
-import { staticRootOf } from "./static-root.ts";
+import { staticRootOf, staticTreeGuardFnLines } from "./static-root.ts";
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -82,8 +83,8 @@ import { staticRootOf } from "./static-root.ts";
 /**
  * Options for the host bootstrap script (PR-A1 OS prep + PR-A2 DB/env/clone).
  *
- * `appUser` and `dbName` are REQUIRED. All other fields are optional with
- * documented defaults.
+ * `appUser` is always required. `dbName` is required for non-static apps and
+ * invalid for static apps. All other fields are optional with documented defaults.
  */
 export interface HostBootstrapOptions {
   /**
@@ -101,9 +102,8 @@ export interface HostBootstrapOptions {
    * to samohost). The critic flagged: 'field-record-1'.replace(/-/g,'_') =
    * 'field_record_1' but the live box's DB is 'field_record'.
    *
-   * Optional for static apps (`app.kind === 'static'`): static sites have no
-   * database; passing `dbName` when absent will cause the builder to throw with
-   * a clear error for non-static apps. Static calls should simply omit this field.
+   * Invalid for static apps (`app.kind === 'static'`): static sites have no
+   * database, so static calls must omit this field.
    */
   dbName?: string;
 
@@ -227,6 +227,11 @@ export function buildHostBootstrapScript(
         `Pass dbName explicitly via HostBootstrapOptions — never derive it from app.name.`,
     );
   }
+  if (isStatic && opts.dbName !== undefined) {
+    throw new Error(
+      "buildHostBootstrapScript: dbName is not valid for static apps; static bootstrap creates no database",
+    );
+  }
 
   const appUser = opts.appUser;
   const dbName = opts.dbName; // required for non-static (guarded above); undefined for static
@@ -266,6 +271,9 @@ export function buildHostBootstrapScript(
     "#   NEVER in argv, NEVER in remote URL.",
     "set -euo pipefail",
     "",
+    ...(isStatic && !isStaticReleaseChannel && app.mainHost !== undefined
+      ? [...staticTreeGuardFnLines(), ""]
+      : []),
   );
 
   // ---- section 0: read GitHub token from FD 3 or pre-placed file ------------
@@ -678,25 +686,27 @@ export function buildHostBootstrapScript(
       `#      Idempotent: overwrite with deterministic content.`,
       `# ---------------------------------------------------------------------------`,
       "",
-      ...(staticRoot !== undefined
+      ...(isStatic
         ? [
-            `SAMOHOST_STATIC_ROOT=${sq(staticRoot)}`,
+            `SAMOHOST_STATIC_ROOT=${sq(staticRoot ?? "")}`,
             'SAMOHOST_CHECKOUT_REAL=$(realpath -e "$APP_DIR") || { echo "static checkout is missing" >&2; exit 1; }',
-            'SAMOHOST_STATIC_CANDIDATE="$APP_DIR/$SAMOHOST_STATIC_ROOT"',
+            'if [[ -n "$SAMOHOST_STATIC_ROOT" ]]; then SAMOHOST_STATIC_CANDIDATE="$APP_DIR/$SAMOHOST_STATIC_ROOT"; else SAMOHOST_STATIC_CANDIDATE="$APP_DIR"; fi',
             'SAMOHOST_STATIC_DIR=$(realpath -e "$SAMOHOST_STATIC_CANDIDATE") || { echo "staticRoot does not exist: $SAMOHOST_STATIC_ROOT" >&2; exit 1; }',
             'case "$SAMOHOST_STATIC_DIR" in "$SAMOHOST_CHECKOUT_REAL"|"$SAMOHOST_CHECKOUT_REAL"/*) ;; *) echo "staticRoot escapes the checkout: $SAMOHOST_STATIC_ROOT" >&2; exit 1 ;; esac',
             '[[ -d "$SAMOHOST_STATIC_DIR" && -f "$SAMOHOST_STATIC_DIR/index.html" ]] || { echo "staticRoot must contain index.html: $SAMOHOST_STATIC_ROOT" >&2; exit 1; }',
+            'samohost_assert_static_tree_safe "$SAMOHOST_CHECKOUT_REAL" "$SAMOHOST_STATIC_DIR" "$SAMOHOST_STATIC_ROOT"',
           ]
         : []),
-      `cat > ${sq(caddySitePath)} <<${staticRoot === undefined ? "'CADDY_SITE'" : "CADDY_SITE"}`,
+      `cat > ${sq(caddySitePath)} <<CADDY_SITE`,
       `${siteAddress} {`,
-      `  root * ${staticRoot === undefined ? app.appDir : '"${SAMOHOST_STATIC_DIR}"'}`,
+      `  root * "\${SAMOHOST_STATIC_DIR}"`,
       `  try_files {path} /index.html`,
       `  file_server`,
       `  encode gzip`,
       ...(app.mainListen === "cp-http80" ? [] : [`  tls internal`]),
       `}`,
       `CADDY_SITE`,
+      'samohost_assert_static_tree_safe "$SAMOHOST_CHECKOUT_REAL" "$SAMOHOST_STATIC_DIR" "$SAMOHOST_STATIC_ROOT"',
       `caddy validate --config /etc/caddy/Caddyfile`,
       `/usr/bin/systemctl reload caddy || /usr/bin/systemctl restart caddy`,
       `echo "Caddy: static file_server vhost ${app.mainHost} -> ${staticRoot === undefined ? app.appDir : "$SAMOHOST_STATIC_DIR"} written."`,

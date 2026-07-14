@@ -27,7 +27,7 @@
 
 import type { AppRecord, EnvDbBackend, EnvRecord } from "../types.ts";
 import { servicesOf } from "../app/services.ts";
-import { staticRootOf } from "../app/static-root.ts";
+import { staticRootOf, staticTreeGuardFnLines } from "../app/static-root.ts";
 import { planFromEnv, renderVhost } from "../caddy/render.ts";
 
 /** Same marker prefix as deploy scripts — one parser convention everywhere. */
@@ -937,7 +937,7 @@ function buildStaticEnvCreateScript(
   t: EnvScriptTarget,
 ): string {
   const staticRoot = staticRootOf(app);
-  const servedDir = staticRoot === undefined ? "$SAMOHOST_ENV_DIR" : "$SAMOHOST_STATIC_DIR";
+  const servedDir = "$SAMOHOST_STATIC_DIR";
   const root = envsRoot(app);
   const lines: string[] = [
     "#!/usr/bin/env bash",
@@ -957,6 +957,8 @@ function buildStaticEnvCreateScript(
     `SAMOHOST_APP_DIR=${sq(app.appDir)}`,
     `SAMOHOST_STATIC_ROOT=${sq(staticRoot ?? "")}`,
     `SAMOHOST_CADDY_SNIPPET=${sq(`/etc/caddy/sites.d/${t.name}.caddy`)}`,
+    "",
+    ...staticTreeGuardFnLines(),
     "",
   ];
 
@@ -982,6 +984,7 @@ function buildStaticEnvCreateScript(
     'SAMOHOST_STATIC_DIR=$(realpath -e "$SAMOHOST_STATIC_CANDIDATE") || { echo "staticRoot does not exist: $SAMOHOST_STATIC_ROOT" >&2; exit 1; }',
     'case "$SAMOHOST_STATIC_DIR" in "$SAMOHOST_CHECKOUT_REAL"|"$SAMOHOST_CHECKOUT_REAL"/*) ;; *) echo "staticRoot escapes the checkout: $SAMOHOST_STATIC_ROOT" >&2; exit 1 ;; esac',
     '[[ -d "$SAMOHOST_STATIC_DIR" && -f "$SAMOHOST_STATIC_DIR/index.html" ]] || { echo "staticRoot must be a directory containing index.html: $SAMOHOST_STATIC_ROOT" >&2; exit 1; }',
+    'samohost_assert_static_tree_safe "$SAMOHOST_CHECKOUT_REAL" "$SAMOHOST_STATIC_DIR" "$SAMOHOST_STATIC_ROOT" || exit 1',
     'cd "$SAMOHOST_ENV_DIR"',
     "",
   );
@@ -1000,7 +1003,8 @@ function buildStaticEnvCreateScript(
   // in the branch value (e.g. demo/red-bg) is safe inside a JS string literal.
   lines.push(
     "# --- config.js: overwrite with preview marker so the SPA banner fires ---",
-    `printf 'window.__GC1_CONFIG__ = { version: "", preview: true, branch: "%s" };\\n' "$SAMOHOST_BRANCH" > "${servedDir}/config.js"`,
+    `SAMOHOST_CONFIG_NEXT=$(mktemp "${servedDir}/.config.next.XXXXXX")`,
+    `if printf 'window.__GC1_CONFIG__ = { version: "", preview: true, branch: "%s" };\\n' "$SAMOHOST_BRANCH" > "$SAMOHOST_CONFIG_NEXT" && chmod 0644 "$SAMOHOST_CONFIG_NEXT" && /usr/bin/mv -f "$SAMOHOST_CONFIG_NEXT" "${servedDir}/config.js"; then :; else rm -f "$SAMOHOST_CONFIG_NEXT"; exit 1; fi`,
     "",
   );
 
@@ -1017,7 +1021,8 @@ function buildStaticEnvCreateScript(
       "vhost",
       "Caddy file_server vhost snippet + reload (sites.d include applied in host-prep)",
       [
-        "if printf '%s {\\n\\ttls internal\\n\\troot * %s\\n\\theader /config.js Cache-Control \"no-cache, no-store, must-revalidate\"\\n\\ttry_files {path} /index.html\\n\\tfile_server\\n\\tencode gzip\\n}\\n' \\",
+        'if samohost_assert_static_tree_safe "$SAMOHOST_CHECKOUT_REAL" "$SAMOHOST_STATIC_DIR" "$SAMOHOST_STATIC_ROOT" \\',
+        "   && printf '%s {\\n\\ttls internal\\n\\troot * %s\\n\\theader /config.js Cache-Control \"no-cache, no-store, must-revalidate\"\\n\\ttry_files {path} /index.html\\n\\tfile_server\\n\\tencode gzip\\n}\\n' \\",
         `     "$SAMOHOST_VHOST" "${servedDir}" \\`,
         '   | sudo /usr/bin/tee "$SAMOHOST_CADDY_SNIPPET" >/dev/null \\',
         "   && sudo /usr/bin/systemctl reload caddy; ",
@@ -2410,7 +2415,7 @@ export function buildHostPrepScript(
     const mainSiteBody = isStatic
       ? [
           `${mainSiteAddress} {`,
-          `\troot * ${staticRoot === undefined ? app.appDir : '"${SAMOHOST_STATIC_DIR}"'}`,
+          `\troot * "\${SAMOHOST_STATIC_DIR}"`,
           `\ttry_files {path} /index.html`,
           `\tfile_server`,
           `\tencode gzip`,
@@ -2430,19 +2435,23 @@ export function buildHostPrepScript(
       `#    apply.  The guard refuses if the live file exists and differs — unless`,
       `#    force=true was baked in via --force-main-vhost at host-prep time.`,
       `#    The 00- prefix sorts the live file first in sites.d.`,
-      ...(isStatic && staticRoot !== undefined
+      ...(isStatic
         ? [
-            `SAMOHOST_STATIC_ROOT=${sq(staticRoot)}`,
+            `SAMOHOST_STATIC_ROOT=${sq(staticRoot ?? "")}`,
             `SAMOHOST_CHECKOUT_REAL=$(realpath -e ${sq(app.appDir)}) || { echo "static checkout is missing" >&2; exit 1; }`,
             `if [[ -n "$SAMOHOST_STATIC_ROOT" ]]; then SAMOHOST_STATIC_CANDIDATE=${sq(`${app.appDir}/`)}"$SAMOHOST_STATIC_ROOT"; else SAMOHOST_STATIC_CANDIDATE=${sq(app.appDir)}; fi`,
             'SAMOHOST_STATIC_DIR=$(realpath -e "$SAMOHOST_STATIC_CANDIDATE") || { echo "staticRoot does not exist: $SAMOHOST_STATIC_ROOT" >&2; exit 1; }',
             'case "$SAMOHOST_STATIC_DIR" in "$SAMOHOST_CHECKOUT_REAL"|"$SAMOHOST_CHECKOUT_REAL"/*) ;; *) echo "staticRoot escapes the checkout: $SAMOHOST_STATIC_ROOT" >&2; exit 1 ;; esac',
             '[[ -d "$SAMOHOST_STATIC_DIR" && -f "$SAMOHOST_STATIC_DIR/index.html" ]] || { echo "staticRoot must contain index.html: $SAMOHOST_STATIC_ROOT" >&2; exit 1; }',
+            'samohost_assert_static_tree_safe "$SAMOHOST_CHECKOUT_REAL" "$SAMOHOST_STATIC_DIR" "$SAMOHOST_STATIC_ROOT"',
           ]
         : []),
-      `cat > ${stagedPath} <<${isStatic && staticRoot !== undefined ? "CADDY" : "'CADDY'"}`,
+      `cat > ${stagedPath} <<${isStatic ? "CADDY" : "'CADDY'"}`,
       ...mainSiteBody,
       "CADDY",
+      ...(isStatic
+        ? ['samohost_assert_static_tree_safe "$SAMOHOST_CHECKOUT_REAL" "$SAMOHOST_STATIC_DIR" "$SAMOHOST_STATIC_ROOT"']
+        : []),
       `samohost_apply_main_vhost \\`,
       `  ${stagedPath} \\`,
       `  ${livePath} \\`,
@@ -2690,6 +2699,7 @@ export function buildHostPrepScript(
     "# Review before applying. Nothing here is executed by samohost itself.",
     "set -euo pipefail",
     "",
+    ...(isStatic && managesMainVhost ? [...staticTreeGuardFnLines(), ""] : []),
     // Guard function definition (only when mainHost is set); placed early so
     // it is in scope before the Caddy step that calls it.
     ...guardFnLines,

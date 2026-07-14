@@ -2016,7 +2016,8 @@ describe("static host-prep path (kind='static')", () => {
       appDir: "/opt/gc1/app",
     }), "samo");
     expect(s).toContain("http://game-changers.samo.team {");
-    expect(s).toContain("root * /opt/gc1/app");
+    expect(s).toContain('root * "${SAMOHOST_STATIC_DIR}"');
+    expect(s).toContain("samohost_assert_static_tree_safe");
     expect(s).toContain("try_files {path} /index.html");
     expect(s).toContain("file_server");
     expect(s).not.toContain("reverse_proxy localhost:80");
@@ -2236,22 +2237,16 @@ describe("preview-flag: static env create writes config.js with preview:true", (
     expect(s).toContain("preview: true");
   });
 
-  test("static create script writes config.js into $SAMOHOST_ENV_DIR", () => {
+  test("static create script writes config.js into the canonical static directory", () => {
     const s = buildEnvCreateScript(staticApp(), target());
-    expect(s).toContain('$SAMOHOST_ENV_DIR/config.js');
+    expect(s).toContain('"$SAMOHOST_STATIC_DIR/config.js"');
   });
 
-  test("static create script OVERWRITES config.js with > (not >>)", () => {
+  test("static create script atomically replaces config.js instead of appending", () => {
     const s = buildEnvCreateScript(staticApp(), target());
-    // Must use > (overwrite) not >> (append): the repo ships a default
-    // config.js with preview:false that must be replaced.
-    expect(s).toContain('> "$SAMOHOST_ENV_DIR/config.js"');
-    // Verify it's not an append.
-    const configJsLine = s
-      .split("\n")
-      .find((l) => l.includes("config.js"));
-    expect(configJsLine).toBeDefined();
-    expect(configJsLine).not.toMatch(/>>/);
+    expect(s).toContain('SAMOHOST_CONFIG_NEXT=$(mktemp "$SAMOHOST_STATIC_DIR/.config.next.XXXXXX")');
+    expect(s).toContain('/usr/bin/mv -f "$SAMOHOST_CONFIG_NEXT" "$SAMOHOST_STATIC_DIR/config.js"');
+    expect(s).not.toContain('>> "$SAMOHOST_STATIC_DIR/config.js"');
   });
 
   test("static create script embeds the branch from $SAMOHOST_BRANCH in config.js", () => {
@@ -2289,11 +2284,20 @@ describe("preview-flag: static env create writes config.js with preview:true", (
     // Verify the printf form that will be generated works at runtime.
     const dir = mkdtempSync(join(tmpdir(), "samohost-preview-flag-static-"));
     try {
+      const generated = buildEnvCreateScript(
+        staticApp(),
+        target({ branch: "demo/red-bg" }),
+      ).split("\n");
+      const configLines = generated.filter((line) =>
+        line.includes("SAMOHOST_CONFIG_NEXT=$(mktemp") ||
+        line.startsWith("if printf 'window.__GC1_CONFIG__"),
+      );
+      expect(configLines).toHaveLength(2);
       const prog = [
         "set -euo pipefail",
-        `SAMOHOST_ENV_DIR='${dir}'`,
+        `SAMOHOST_STATIC_DIR='${dir}'`,
         `SAMOHOST_BRANCH='demo/red-bg'`,
-        `printf 'window.__GC1_CONFIG__ = { version: "", preview: true, branch: "%s" };\\n' "$SAMOHOST_BRANCH" > "$SAMOHOST_ENV_DIR/config.js"`,
+        ...configLines,
       ].join("\n");
       const r = spawnSync("bash", ["-c", prog], { encoding: "utf8" });
       expect(r.status).toBe(0);

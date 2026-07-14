@@ -43,7 +43,7 @@
  */
 
 import type { AppRecord } from "../types.ts";
-import { staticRootOf } from "./static-root.ts";
+import { staticRootOf, staticTreeGuardFnLines } from "./static-root.ts";
 
 /** Marker prefix the parser keys on. */
 export const PHASE_PREFIX = "<<<SAMOHOST_PHASE:";
@@ -132,9 +132,7 @@ export function buildDeployScript(app: AppRecord, target: DeployTarget): string 
   const staticStagedCaddyfile = "/etc/caddy/.samohost-next-Caddyfile";
   const appBase = app.appDir.replace(/\/+$/, "").split("/").slice(0, -1).join("/");
   const staticReleasesDir = `${appBase}/releases`;
-  const staticServedDir = staticRoot === undefined
-    ? "${SAMOHOST_CANDIDATE_DIR}"
-    : "${SAMOHOST_STATIC_DIR}";
+  const staticServedDir = "${SAMOHOST_STATIC_DIR}";
   const appDir = sq(app.appDir);
   const unit = sq(app.serviceUnit);
   const healthUrl = sq(app.healthUrl);
@@ -163,6 +161,7 @@ export function buildDeployScript(app: AppRecord, target: DeployTarget): string 
         ]
       : []),
     "",
+    ...(app.kind === "static" ? [...staticTreeGuardFnLines(), ""] : []),
     'cd "$SAMOHOST_APP_DIR"',
     "",
   );
@@ -339,6 +338,7 @@ export function buildDeployScript(app: AppRecord, target: DeployTarget): string 
       '  if ! SAMOHOST_STATIC_DIR=$(realpath -e "$SAMOHOST_STATIC_CANDIDATE"); then echo "staticRoot does not exist: $SAMOHOST_STATIC_ROOT" >&2; rollback; fi',
       '  case "$SAMOHOST_STATIC_DIR" in "$SAMOHOST_CANDIDATE_REAL"|"$SAMOHOST_CANDIDATE_REAL"/*) ;; *) echo "staticRoot escapes the candidate checkout: $SAMOHOST_STATIC_ROOT" >&2; rollback ;; esac',
       '  if [[ ! -d "$SAMOHOST_STATIC_DIR" || ! -f "$SAMOHOST_STATIC_DIR/index.html" ]]; then echo "staticRoot must be a directory containing index.html: $SAMOHOST_STATIC_ROOT" >&2; rollback; fi',
+      '  samohost_assert_static_tree_safe "$SAMOHOST_CANDIDATE_REAL" "$SAMOHOST_STATIC_DIR" "$SAMOHOST_STATIC_ROOT" || rollback',
       `  ${marker("checkout", "ok")}`,
       "else",
       `  ${marker("checkout", "fail")}`,
@@ -476,6 +476,7 @@ export function buildDeployScript(app: AppRecord, target: DeployTarget): string 
           "fi",
         ]
         : []),
+      'samohost_assert_static_tree_safe "$SAMOHOST_CANDIDATE_REAL" "$SAMOHOST_STATIC_DIR" "$SAMOHOST_STATIC_ROOT" || rollback',
       `sudo /usr/bin/rm -f ${sq(staticStagedSnippet!)} || rollback`,
       `sudo /usr/bin/tee ${sq(staticStagedSnippet!)} >/dev/null <<CADDY || rollback`,
       `${address} {`,
@@ -487,6 +488,7 @@ export function buildDeployScript(app: AppRecord, target: DeployTarget): string 
       ...(app.mainListen === "cp-http80" ? [] : [`\ttls internal`]),
       `}`,
       `CADDY`,
+      'samohost_assert_static_tree_safe "$SAMOHOST_CANDIDATE_REAL" "$SAMOHOST_STATIC_DIR" "$SAMOHOST_STATIC_ROOT" || rollback',
       `sudo /usr/bin/mv -- ${sq(staticStagedSnippet!)} ${sq(staticMainSnippet!)} || rollback`,
       ...(isStaticReleaseChannel
         ? [
@@ -504,7 +506,7 @@ export function buildDeployScript(app: AppRecord, target: DeployTarget): string 
       "# Static site: no Node.js unit to restart; Caddy serves the checkout directly.",
       "# Full-path systemctl: see header note (3) — bare sudo systemctl fails on hardened host.",
       marker("caddy-reload", "start"),
-      "if sudo /usr/bin/systemctl reload caddy; then",
+      'if samohost_assert_static_tree_safe "$SAMOHOST_CANDIDATE_REAL" "$SAMOHOST_STATIC_DIR" "$SAMOHOST_STATIC_ROOT" && sudo /usr/bin/systemctl reload caddy; then',
       `  sleep ${RESTART_SETTLE_SEC}`,
       `  ${marker("caddy-reload", "ok")}`,
       "else",

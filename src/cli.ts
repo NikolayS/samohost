@@ -297,10 +297,9 @@ app bootstrap options (PR-A1+A2 — ONE-TIME OS bootstrap + DB + env + clone;
   <vm>                       VM name or id (required)
   <app>                      app name or id (required)
   --app-user <user>          OS user created to run the app (required)
-  --db-name <name>           Database to create — REQUIRED, EXPLICIT.
-                             Never derived from app name (e.g. field_record,
-                             NOT field-record or field_record_1). Must match
-                             the actual database on the host.
+  --db-name <name>           Database to create — required for node apps and
+                             invalid for static apps. Never derived from the
+                             app name; must match the actual database.
   --app-base <path>          base directory (default: /opt/<app-name>)
   --node-major <N>           Node.js major via NodeSource (default: 22)
   --pg-major <N>             PostgreSQL major via PGDG (default: 18)
@@ -1608,7 +1607,7 @@ function parseAppBootstrap(args: string[]): ParsedAppBootstrap {
 
   const { vm, app } = takeVmApp(args, (a, i) => {
     if (a === "--app-user") { appUser = takeValue(args, i, a); return i + 1; }
-    // PR-A2 REQUIRED: DB name is always explicit — never derived from app.name.
+    // Kind-aware requirement is enforced after the AppRecord lookup.
     if (a === "--db-name") { dbName = takeValue(args, i, a); return i + 1; }
     if (a === "--app-base") { appBase = takeValue(args, i, a); return i + 1; }
     if (a === "--node-major") {
@@ -1639,13 +1638,12 @@ function parseAppBootstrap(args: string[]): ParsedAppBootstrap {
   if (vm === undefined) throw new UsageError("app bootstrap requires <vm> <app>");
   if (app === undefined) throw new UsageError("app bootstrap requires <vm> <app>");
   if (appUser === undefined) throw new UsageError("app bootstrap requires --app-user <user>");
-  if (dbName === undefined) throw new UsageError("app bootstrap requires --db-name <name> (REQUIRED: must be explicit; not derived from app name)");
 
   const input: AppBootstrapInput = {
     vm,
     app,
     appUser,
-    dbName,
+    ...(dbName !== undefined ? { dbName } : {}),
     ...(appBase !== undefined ? { appBase } : {}),
     ...(nodeMajor !== undefined ? { nodeMajor } : {}),
     ...(pgMajor !== undefined ? { pgMajor } : {}),
