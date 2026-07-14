@@ -30,7 +30,7 @@ import {
   buildHostBootstrapScript,
   type HostBootstrapOptions,
 } from "../app/bootstrap.ts";
-import { AppStore } from "../state/apps.ts";
+import { AppStore, AppStoreConflictError } from "../state/apps.ts";
 import { StateStore } from "../state/store.ts";
 import {
   defaultKnownHostsDir,
@@ -872,7 +872,15 @@ export async function runAppDeploy(
     // deployedSha is intentionally NOT advanced on failure.
   }
   // 'incomplete' leaves deployedSha/failedSha unchanged (state unknown).
-  appStore.upsert(updated);
+  try {
+    appStore.compareAndSwap(app, updated);
+  } catch (e) {
+    if (e instanceof AppStoreConflictError) {
+      err(`error: ${e.message}`);
+      return 1;
+    }
+    throw e;
+  }
 
   const exitCode = outcome === "deployed" ? 0 : 1;
   const report: AppDeployReport = {
