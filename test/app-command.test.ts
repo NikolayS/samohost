@@ -703,6 +703,37 @@ describe("app commands", () => {
     expect(rec?.lastDeployAt).toBe("2026-06-11T12:00:00.000Z");
   });
 
+  test("deploy state stamp rejects a concurrent SHA/tag change", async () => {
+    register();
+    const c = capture();
+    const code = await runAppDeploy(
+      { vm: "samo-we-field-record", app: "field-record", sha: SHA, skipCiGate: false },
+      { json: true },
+      vmStore,
+      appStore,
+      deployDeps(HAPPY, {
+        remote: () => {
+          const current = appStore.get("vm-1111", "field-record")!;
+          appStore.upsert({
+            ...current,
+            deployedSha: "concurrent-sha",
+            releaseTagCursor: "v20260714.2",
+          });
+          return Promise.resolve({ code: 0, stdout: HAPPY, stderr: "" });
+        },
+      }),
+      c.out,
+      c.err,
+    );
+
+    expect(code).toBe(1);
+    expect(c.e).toContain("changed concurrently");
+    expect(appStore.get("vm-1111", "field-record")).toMatchObject({
+      deployedSha: "concurrent-sha",
+      releaseTagCursor: "v20260714.2",
+    });
+  });
+
   test("deploy rollback path: exit 1, failedSha set, deployedSha unchanged", async () => {
     register();
     // seed a prior good deploy so we can assert deployedSha is NOT advanced.
