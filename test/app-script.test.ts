@@ -16,9 +16,12 @@ import { join } from "node:path";
 import { spawnSync } from "node:child_process";
 import { buildHostBootstrapScript } from "../src/app/bootstrap.ts";
 import { buildDeployScript } from "../src/app/script.ts";
+import { buildStaticRouteHelper } from "../src/app/static-route-helper.ts";
 import { staticReleaseStatePaths } from "../src/app/static-root.ts";
 import { buildCustomDomainVhostScript } from "../src/env/script.ts";
-import type { AppRecord } from "../src/types.ts";
+import { controlPlaneMainRouteFingerprint } from "../src/caddy/control-plane.ts";
+import { reconcileTwoHopMainRoute } from "../src/caddy/two-hop.ts";
+import type { AppRecord, VmRecord } from "../src/types.ts";
 
 /** A field-record-1-like app record (the production deploy this generalizes). */
 function fieldRecord(overrides: Partial<AppRecord> = {}): AppRecord {
@@ -304,14 +307,14 @@ describe("buildDeployScript — static path (kind='static')", () => {
     );
     expect(script).toContain(".version.next.");
     expect(script).toContain('/usr/bin/mv -f "$SAMOHOST_VERSION_NEXT"');
-    expect(script).toContain(".samohost-next-00-main-my-static-site.caddy");
+    expect(script).toContain(".samohost-main-next.caddy");
     expect(script).toContain('SAMOHOST_RELEASES_DIR=\'/opt/my-static-site/releases\'');
     expect(script).toContain('git -C "$SAMOHOST_APP_DIR" worktree add --detach');
     expect(script).toContain("umask 022");
     expect(script).toContain('root * "${SAMOHOST_STATIC_DIR}"');
     expect(script).not.toContain('git reset --hard "${SAMOHOST_SHA}"');
     expect(script).toContain(
-      "sudo /usr/bin/mv -- '/etc/caddy/sites.d/.samohost-next-00-main-my-static-site.caddy' '/etc/caddy/sites.d/00-main-my-static-site.caddy'",
+      "sudo '/usr/local/sbin/samohost-static-route-my-static-site'",
     );
     expect(script).toContain(
       "SAMOHOST_ACTIVE_STATE='/opt/my-static-site/releases/.samohost-active-static.json'",
@@ -319,19 +322,19 @@ describe("buildDeployScript — static path (kind='static')", () => {
     expect(script).toContain(
       "SAMOHOST_ACTIVE_ROUTE='/opt/my-static-site/releases/.samohost-active-static.caddy'",
     );
-    const activeRoute = script.indexOf(
-      '/usr/bin/mv -f "$SAMOHOST_ACTIVE_ROUTE_NEXT" "$SAMOHOST_ACTIVE_ROUTE"',
+    const stagedRoute = script.indexOf(".samohost-active-route.next");
+    const stagedState = script.indexOf(".samohost-active-state.next", stagedRoute);
+    const reconcile = script.indexOf(
+      "sudo '/usr/local/sbin/samohost-static-route-my-static-site'",
+      stagedState,
     );
-    const reload = script.indexOf("sudo /usr/bin/systemctl reload caddy", activeRoute);
-    const activeState = script.indexOf(
-      '/usr/bin/mv -f "$SAMOHOST_ACTIVE_STATE_NEXT" "$SAMOHOST_ACTIVE_STATE"',
-      reload,
-    );
-    const healthOk = script.indexOf("<<<SAMOHOST_PHASE:health:ok>>>", activeState);
-    expect(activeRoute).toBeGreaterThan(-1);
-    expect(reload).toBeGreaterThan(activeRoute);
-    expect(activeState).toBeGreaterThan(reload);
-    expect(healthOk).toBeGreaterThan(activeState);
+    const healthOk = script.indexOf("<<<SAMOHOST_PHASE:health:ok>>>", reconcile);
+    const commit = script.indexOf("printf 'commit", healthOk);
+    expect(stagedRoute).toBeGreaterThan(-1);
+    expect(stagedState).toBeGreaterThan(stagedRoute);
+    expect(reconcile).toBeGreaterThan(stagedState);
+    expect(healthOk).toBeGreaterThan(reconcile);
+    expect(commit).toBeGreaterThan(healthOk);
   });
 
   test("release static health uses intended Host identity and rollback restores untouched prior route", () => {
@@ -354,8 +357,8 @@ describe("buildDeployScript — static path (kind='static')", () => {
     expect(rollback).not.toContain("SAMOHOST_VERSION_BACKUP");
     expect(rollback).toContain("SAMOHOST_VHOST_BACKUP");
     expect(rollback).toContain('worktree remove --force "$SAMOHOST_CANDIDATE_DIR"');
-    expect(rollback).toContain("caddy validate");
-    expect(rollback).toContain("reload caddy");
+    expect(rollback).toContain("printf 'rollback");
+    expect(rollback).toContain("samohost-static-route-my-static-site");
   });
 
   test("static deploy script is valid bash", () => {
@@ -388,7 +391,7 @@ describe("buildDeployScript — static path (kind='static')", () => {
     // The exact form should be `sudo /usr/bin/systemctl reload caddy`
     // (full-path sudo, consistent with header note 3 in app/script.ts).
     const script = buildDeployScript(staticApp(), STATIC_TARGET);
-    expect(script).toContain("reload caddy");
+    expect(script).toContain("samohost-static-route-my-static-site");
     // The caddy-reload phase marker must be present.
     expect(script).toContain("<<<SAMOHOST_PHASE:caddy-reload:start>>>");
   });
@@ -401,7 +404,7 @@ describe("buildDeployScript — static path (kind='static')", () => {
     expect(rollbackBody).not.toContain("git reset --hard");
     expect(rollbackBody).toContain("SAMOHOST_VHOST_BACKUP");
     expect(rollbackBody).toContain('worktree remove --force "$SAMOHOST_CANDIDATE_DIR"');
-    expect(rollbackBody).toContain("reload caddy");
+    expect(rollbackBody).toContain("samohost-static-route-my-static-site");
     expect(rollbackBody).not.toMatch(/systemctl\s+restart/);
   });
 
@@ -416,7 +419,7 @@ describe("buildDeployScript — static path (kind='static')", () => {
       '/usr/bin/mv -f "$SAMOHOST_VERSION_NEXT" "${SAMOHOST_STATIC_DIR}/version.json"',
     );
     const route = script.indexOf(
-      "sudo /usr/bin/mv -- '/etc/caddy/sites.d/.samohost-next-00-main-my-static-site.caddy'",
+      "sudo '/usr/local/sbin/samohost-static-route-my-static-site'",
       rename,
     );
     expect(chmod).toBeGreaterThan(-1);
@@ -428,7 +431,7 @@ describe("buildDeployScript — static path (kind='static')", () => {
     );
   });
 
-  test("executed repeated releases keep the live checkout untouched and retire only after healthy cutover", () => {
+  test("executed repeated releases keep the live checkout untouched and retire only after healthy cutover", async () => {
     const dir = mkdtempSync(join(tmpdir(), "samohost-static-release-"));
     const origin = join(dir, "origin.git");
     const seed = join(dir, "seed");
@@ -452,16 +455,20 @@ describe("buildDeployScript — static path (kind='static')", () => {
       git(["config", "user.email", "samohost@example.invalid"], seed);
 
       mkdirSync(join(seed, "dist"));
+      mkdirSync(join(seed, "public"));
       writeFileSync(join(seed, "dist", "index.html"), "old\n");
-      git(["add", "dist/index.html"], seed);
+      writeFileSync(join(seed, "public", "index.html"), "old public\n");
+      git(["add", "dist/index.html", "public/index.html"], seed);
       git(["commit", "-m", "old"], seed);
       const oldSha = git(["rev-parse", "HEAD"], seed);
 
       writeFileSync(join(seed, "dist", "index.html"), "release one\n");
+      writeFileSync(join(seed, "public", "index.html"), "release one public\n");
       git(["commit", "-am", "release one"], seed);
       const firstSha = git(["rev-parse", "HEAD"], seed);
 
       writeFileSync(join(seed, "dist", "index.html"), "release two\n");
+      writeFileSync(join(seed, "public", "index.html"), "release two public\n");
       git(["commit", "-am", "release two"], seed);
       const secondSha = git(["rev-parse", "HEAD"], seed);
 
@@ -493,9 +500,15 @@ describe("buildDeployScript — static path (kind='static')", () => {
       const baseFile = join(caddyDir, "Caddyfile");
       writeFileSync(baseFile, legacyBase);
       const siteFile = join(caddyDir, "sites.d", "00-main-my-static-site.caddy");
+      const siblingSiteFile = join(caddyDir, "sites.d", "00-main-sibling-static.caddy");
+      const siblingSite = "http://sibling.example.com {\n\troot * \"/opt/sibling/releases/healthy/dist\"\n\tfile_server\n}\n";
+      writeFileSync(siblingSiteFile, siblingSite);
+      const curlLog = join(dir, "curl.log");
+      writeFileSync(curlLog, "");
 
       writeFileSync(join(binDir, "sudo"), [
         "#!/usr/bin/env bash",
+        'if [[ "${1:-}" == /usr/local/sbin/samohost-static-route-* ]]; then exec "$STATIC_ROUTE_HELPER"; fi',
         'if [[ "${1:-}" == "/usr/bin/systemctl" ]]; then exit 0; fi',
         'exec "$@"',
         "",
@@ -504,6 +517,7 @@ describe("buildDeployScript — static path (kind='static')", () => {
       writeFileSync(join(binDir, "sleep"), "#!/usr/bin/env bash\nexit 0\n");
       writeFileSync(join(binDir, "curl"), [
         "#!/usr/bin/env bash",
+        'printf "%s\\n" "$*" >> "$CURL_LOG"',
         'if [[ "$*" == *"version.json"* ]]; then',
         '  root=$(sed -n \'s/^[[:space:]]*root \\* "\\(.*\\)"$/\\1/p\' "$CADDY_SITE" | head -n 1)',
         '  if [[ "${FAIL_VERSION_HEALTH:-0}" == "1" ]]; then printf \'invalid\\n\'; else cat "$root/version.json"; fi',
@@ -524,11 +538,33 @@ describe("buildDeployScript — static path (kind='static')", () => {
         releaseTagFormat: "date",
         releaseCiWorkflow: ".github/workflows/ci.yml",
       });
+      const helperFile = join(binDir, "static-route-helper");
+      writeFileSync(
+        helperFile,
+        buildStaticRouteHelper(releaseApp)
+          .replaceAll("/etc/caddy", caddyDir)
+          .replaceAll("/var/lib/samohost", join(dir, "var-lib"))
+          .replaceAll("/usr/bin/systemctl", join(binDir, "systemctl"))
+          .replaceAll("install -d -m 0700 -o root -g root", "install -d -m 0700"),
+      );
+      writeFileSync(join(binDir, "systemctl"), "#!/usr/bin/env bash\nexit 0\n");
+      chmodSync(helperFile, 0o755);
+      chmodSync(join(binDir, "systemctl"), 0o755);
       const activePaths = staticReleaseStatePaths(appDir);
       const domainFile = join(caddyDir, "sites.d", "10-domain-client-example.caddy");
       let lastExecutionStderr = "";
-      const execute = (sha: string, tag: string, expectFailure = false): string => {
-        const script = buildDeployScript(releaseApp, { sha, tag })
+      const execute = (
+        sha: string,
+        tag: string,
+        expectFailure = false,
+        targetApp: AppRecord = releaseApp,
+        deferStaticCleanup = false,
+      ): string => {
+        const script = buildDeployScript(targetApp, {
+          sha,
+          tag,
+          ...(deferStaticCleanup ? { deferStaticCleanup: true } : {}),
+        })
           .replaceAll("/etc/caddy", caddyDir);
         const result = spawnSync("bash", ["-s"], {
           input: script,
@@ -537,7 +573,9 @@ describe("buildDeployScript — static path (kind='static')", () => {
             ...process.env,
             PATH: `${binDir}:${process.env["PATH"] ?? ""}`,
             CADDY_SITE: siteFile,
+            CURL_LOG: curlLog,
             FAIL_VERSION_HEALTH: expectFailure ? "1" : "0",
+            STATIC_ROUTE_HELPER: helperFile,
           },
         });
         lastExecutionStderr = result.stderr;
@@ -623,6 +661,98 @@ describe("buildDeployScript — static path (kind='static')", () => {
         firstScript.indexOf('worktree remove --force "$SAMOHOST_PREVIOUS_RELEASE_DIR"'),
       );
 
+      // The only sudo target is a zero-argument, app-bound helper. Even an app
+      // user that can replace every app-owned staging file cannot claim a
+      // sibling hostname or escape its own releases directory.
+      const invokeHelper = (...args: string[]) => spawnSync(helperFile, args, {
+        encoding: "utf8",
+        env: {
+          ...process.env,
+          PATH: `${binDir}:${process.env["PATH"] ?? ""}`,
+        },
+      });
+      expect(invokeHelper("sibling-static").status).toBe(64);
+      const protectedBase = readFileSync(baseFile, "utf8");
+      const protectedMain = readFileSync(siteFile, "utf8");
+      const routeAction = join(activePaths.releasesDir, ".samohost-route-action");
+      const stagedMain = join(activePaths.releasesDir, ".samohost-main-next.caddy");
+      const stagedState = join(activePaths.releasesDir, ".samohost-active-state.next");
+      const stagedRoute = join(activePaths.releasesDir, ".samohost-active-route.next");
+      writeFileSync(stagedState, readFileSync(activePaths.activeState));
+      writeFileSync(stagedRoute, readFileSync(activePaths.activeRoute));
+      writeFileSync(stagedMain, siblingSite);
+      writeFileSync(routeAction, "apply\n");
+      const siblingClaim = invokeHelper();
+      expect(siblingClaim.status).not.toBe(0);
+      expect(siblingClaim.stderr).toContain("staged main route is not canonical");
+      expect(readFileSync(baseFile, "utf8")).toBe(protectedBase);
+      expect(readFileSync(siteFile, "utf8")).toBe(protectedMain);
+      expect(readFileSync(siblingSiteFile, "utf8")).toBe(siblingSite);
+
+      const protectedState = readFileSync(activePaths.activeState, "utf8");
+      const escapedState = JSON.parse(protectedState) as Record<string, unknown>;
+      escapedState.releaseDir = appDir;
+      writeFileSync(stagedState, JSON.stringify(escapedState));
+      writeFileSync(stagedRoute, readFileSync(activePaths.activeRoute));
+      writeFileSync(stagedMain, protectedMain);
+      writeFileSync(routeAction, "apply\n");
+      const pathEscape = invokeHelper();
+      expect(pathEscape.status).not.toBe(0);
+      expect(pathEscape.stderr).toContain("release escaped app releases");
+      expect(readFileSync(baseFile, "utf8")).toBe(protectedBase);
+      expect(readFileSync(siteFile, "utf8")).toBe(protectedMain);
+      expect(readFileSync(siblingSiteFile, "utf8")).toBe(siblingSite);
+
+      // Simulate a process dying after the privileged apply returned but
+      // before health/commit. Active identity stays on the old release, and
+      // the same rollback action used at the next deploy checkpoint restores
+      // the route transaction before normal deployment resumes below.
+      const crashCandidate = join(activePaths.releasesDir, `${secondSha}.crash`);
+      git(["worktree", "add", "--detach", crashCandidate, secondSha], appDir);
+      const crashRoot = join(crashCandidate, "dist");
+      writeFileSync(join(crashRoot, "version.json"), JSON.stringify({
+        version: "v20260713.99",
+        tag: "v20260713.99",
+        sha: secondSha,
+        environment: "production",
+      }));
+      writeFileSync(stagedState, JSON.stringify({
+        schema: 1,
+        appName: releaseApp.name,
+        sha: secondSha,
+        tag: "v20260713.99",
+        releaseDir: crashCandidate,
+        staticRoot: "dist",
+        releaseTagFormat: "date",
+      }));
+      writeFileSync(
+        stagedRoute,
+        `root * "${crashRoot}"\ntry_files {path} /index.html\nfile_server\nencode gzip\n`,
+      );
+      writeFileSync(stagedMain, [
+        "http://my-static-site.example.com {",
+        `\t# samohost-worktree "${crashCandidate}"`,
+        `\troot * "${crashRoot}"`,
+        "\ttry_files {path} /index.html",
+        "\tfile_server",
+        "\tencode gzip",
+        "}",
+        "",
+      ].join("\n"));
+      writeFileSync(routeAction, "apply\n");
+      const interruptedApply = invokeHelper();
+      expect(interruptedApply.status, interruptedApply.stderr).toBe(0);
+      expect(routedRoot()).toBe(crashRoot);
+      expect(readFileSync(activePaths.activeState, "utf8")).toBe(protectedState);
+      expect(readFileSync(siblingSiteFile, "utf8")).toBe(siblingSite);
+      writeFileSync(routeAction, "rollback\n");
+      const recovered = invokeHelper();
+      expect(recovered.status, recovered.stderr).toBe(0);
+      expect(readFileSync(siteFile, "utf8")).toBe(protectedMain);
+      expect(readFileSync(activePaths.activeState, "utf8")).toBe(protectedState);
+      expect(readFileSync(siblingSiteFile, "utf8")).toBe(siblingSite);
+      git(["worktree", "remove", "--force", crashCandidate], appDir);
+
       const domainScript = executeDomain();
       const firstDomain = readFileSync(domainFile, "utf8");
       expect(firstDomain).toContain(`import "${activePaths.activeRoute}"`);
@@ -645,10 +775,102 @@ describe("buildDeployScript — static path (kind='static')", () => {
         releaseDir: secondRoot.slice(0, -"/dist".length),
       });
       expect(spawnSync("caddy", ["validate", "--config", baseFile]).status).toBe(0);
-
       const secondIdentity = readFileSync(join(secondRoot, "version.json"), "utf8");
       const secondState = readFileSync(activePaths.activeState, "utf8");
       const secondRoute = readFileSync(activePaths.activeRoute, "utf8");
+      const secondSite = readFileSync(siteFile, "utf8");
+
+      // A manifest-only staticRoot change at the deployed SHA is a real
+      // production config change. Route-only reconciliation must point the
+      // active route/state at the new root inside the existing detached
+      // worktree before the control-plane route is accepted and stamped.
+      const staticRootDrift: AppRecord = {
+        ...releaseApp,
+        staticRoot: "public",
+        deployedSha: secondSha,
+        releaseTagCursor: "v20260713.3",
+        controlPlaneRouteFingerprint: controlPlaneMainRouteFingerprint(
+          releaseApp,
+          {
+            id: "vm-1",
+            provider: "hetzner",
+            providerId: "1",
+            name: "shared",
+            ip: "192.0.2.10",
+            sshKeyPath: "/tmp/test-key",
+            sshPort: 2223,
+            sshUser: "samo",
+            hostKeyFingerprint: `SHA256:${"A".repeat(43)}`,
+            region: "fsn1",
+            type: "cx22",
+            modules: [],
+            lifecycleState: "ready",
+            createdAt: "2026-07-13T00:00:00.000Z",
+            updatedAt: "2026-07-13T00:00:00.000Z",
+          },
+        ),
+      };
+      const targetVm: VmRecord = {
+        id: "vm-1",
+        provider: "hetzner",
+        providerId: "1",
+        name: "shared",
+        ip: "192.0.2.10",
+        sshKeyPath: "/tmp/test-key",
+        sshPort: 2223,
+        sshUser: "samo",
+        hostKeyFingerprint: `SHA256:${"A".repeat(43)}`,
+        region: "fsn1",
+        type: "cx22",
+        modules: [],
+        lifecycleState: "ready",
+        createdAt: "2026-07-13T00:00:00.000Z",
+        updatedAt: "2026-07-13T00:00:00.000Z",
+      };
+      let controlPlaneCheckedRoot = "";
+      const reconciled = await reconcileTwoHopMainRoute(staticRootDrift, targetVm, {
+        projectRoute: async (_vm, script) => {
+          const sandboxed = script
+            .replaceAll("/etc/caddy", caddyDir)
+            .replaceAll("/tmp/samohost-main-route-", `${dir}/route-txn-`);
+          const result = spawnSync("bash", ["-s"], {
+            input: sandboxed,
+            encoding: "utf8",
+            env: {
+              ...process.env,
+              PATH: `${binDir}:${process.env["PATH"] ?? ""}`,
+            },
+          });
+          return {
+            code: result.status ?? 1,
+            stdout: result.stdout,
+            stderr: result.stderr,
+          };
+        },
+        controlPlaneRoute: async () => {
+          controlPlaneCheckedRoot = activeRoot();
+          const identity = JSON.parse(
+            readFileSync(join(controlPlaneCheckedRoot, "version.json"), "utf8"),
+          ) as Record<string, string>;
+          return identity.sha === secondSha &&
+              identity.version === "v20260713.3"
+            ? { code: 0, stdout: "exact identity", stderr: "" }
+            : { code: 1, stdout: "", stderr: "wrong deployed identity" };
+        },
+      });
+      expect(reconciled.ok, reconciled.error).toBe(true);
+      expect(controlPlaneCheckedRoot).toBe(`${secondRoot.slice(0, -"/dist".length)}/public`);
+      expect(activeRoot()).toBe(controlPlaneCheckedRoot);
+      expect(JSON.parse(readFileSync(activePaths.activeState, "utf8"))).toMatchObject({
+        sha: secondSha,
+        tag: "v20260713.3",
+        releaseDir: secondRoot.slice(0, -"/dist".length),
+        staticRoot: "public",
+      });
+      writeFileSync(siteFile, secondSite);
+      writeFileSync(activePaths.activeRoute, secondRoute);
+      writeFileSync(activePaths.activeState, secondState);
+
       execute(firstSha, "v20260713.4", true);
       expect(routedRoot()).toBe(secondRoot);
       expect(activeRoot()).toBe(secondRoot);
@@ -661,7 +883,38 @@ describe("buildDeployScript — static path (kind='static')", () => {
         `${firstSha}.candidate`,
       );
 
-      execute(badSymlinkSha, "v20260713.5", true);
+      // A manifest route change must restore and probe the snapshotted old
+      // cp-http80 host, not the desired new TLS host. Only after that proof may
+      // the failed candidate be removed and active state remain old.
+      writeFileSync(curlLog, "");
+      const driftedApp: AppRecord = {
+        ...releaseApp,
+        mainHost: "renamed-static.example.com",
+        mainListen: "tls",
+      };
+      const driftScript = execute(
+        firstSha,
+        "v20260713.5",
+        true,
+        driftedApp,
+        true,
+      );
+      const curlCalls = readFileSync(curlLog, "utf8").trim().split("\n");
+      expect(curlCalls.at(-1)).toContain("Host: my-static-site.example.com");
+      expect(curlCalls.at(-1)).toContain("http://127.0.0.1/");
+      expect(curlCalls.at(-1)).not.toContain("renamed-static.example.com");
+      expect(driftScript).toContain('SAMOHOST_OLD_ROUTE_SCHEME=""');
+      expect(driftScript).toContain('SAMOHOST_OLD_ROUTE_ADDRESS=""');
+      expect(driftScript.indexOf('"$SAMOHOST_OLD_ROUTE_SCHEME://127.0.0.1/"'))
+        .toBeLessThan(driftScript.indexOf('worktree remove --force "$SAMOHOST_CANDIDATE_DIR"'));
+      expect(routedRoot()).toBe(secondRoot);
+      expect(readFileSync(activePaths.activeState, "utf8")).toBe(secondState);
+      expect(readFileSync(activePaths.activeRoute, "utf8")).toBe(secondRoute);
+      expect(git(["worktree", "list", "--porcelain"], appDir)).not.toContain(
+        `${firstSha}.candidate`,
+      );
+
+      execute(badSymlinkSha, "v20260713.6", true);
       expect(lastExecutionStderr).toContain("staticRoot tree contains a symlink");
       expect(routedRoot()).toBe(secondRoot);
       expect(activeRoot()).toBe(secondRoot);
@@ -680,6 +933,7 @@ describe("buildDeployScript — static path (kind='static')", () => {
       expect(readFileSync(join(appDir, "dist", "index.html"), "utf8")).toBe(originalContent);
       expect(readdirSync(join(caddyDir, "sites.d")).sort()).toEqual([
         "00-main-my-static-site.caddy",
+        "00-main-sibling-static.caddy",
         "10-domain-client-example.caddy",
       ]);
       expect(readdirSync(activePaths.releasesDir).some((entry) =>
@@ -747,6 +1001,7 @@ describe("buildDeployScript — static path (kind='static')", () => {
       ].join("\n"));
       writeFileSync(join(binDir, "sudo"), [
         "#!/usr/bin/env bash",
+        'if [[ "${1:-}" == /usr/local/sbin/samohost-static-route-* ]]; then exec "$STATIC_ROUTE_HELPER"; fi',
         'if [[ "${1:-}" == "/usr/bin/systemctl" ]]; then exit 0; fi',
         'exec "$@"',
         "",
@@ -773,6 +1028,16 @@ describe("buildDeployScript — static path (kind='static')", () => {
         staticRoot: "dist",
         mainListen: "cp-http80",
       });
+      const helperFile = join(binDir, "static-route-helper");
+      writeFileSync(
+        helperFile,
+        buildStaticRouteHelper(branchApp)
+          .replaceAll("/etc/caddy", caddyDir)
+          .replaceAll("/var/lib/samohost", join(dir, "var-lib"))
+          .replaceAll("/usr/bin/systemctl", join(binDir, "systemctl"))
+          .replaceAll("install -d -m 0700 -o root -g root", "install -d -m 0700"),
+      );
+      chmodSync(helperFile, 0o755);
       const activePaths = staticReleaseStatePaths(appDir);
       const domainFile = join(caddyDir, "sites.d", "10-domain-client-example.caddy");
       const execute = (sha: string, expectFailure = false): void => {
@@ -784,6 +1049,7 @@ describe("buildDeployScript — static path (kind='static')", () => {
             PATH: `${binDir}:${process.env["PATH"] ?? ""}`,
             CADDY_SITE: siteFile,
             FAIL_VERSION_HEALTH: expectFailure ? "1" : "0",
+            STATIC_ROUTE_HELPER: helperFile,
           },
         });
         if ((!expectFailure && result.status !== 0) || (expectFailure && result.status !== 1)) {

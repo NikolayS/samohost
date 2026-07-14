@@ -73,6 +73,8 @@ function deployDeps(): AppDeployDeps {
       ({ ok: true, json: async () => ({ workflow_runs: [{ conclusion: "success" }] }) }) as Response) as unknown as typeof fetch,
     now: () => new Date("2026-06-11T12:00:00.000Z"),
     env: { GH_TOKEN: "tok" },
+    controlPlaneRoute: () =>
+      Promise.resolve({ code: 0, stdout: "route ready", stderr: "" }),
   };
 }
 

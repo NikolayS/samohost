@@ -20,6 +20,7 @@ import {
   buildEnvCreateScript,
   type EnvScriptTarget,
 } from "../src/env/script.ts";
+import { controlPlaneMainRouteFingerprint } from "../src/caddy/control-plane.ts";
 
 function vm(o: Partial<VmRecord> = {}): VmRecord {
   return {
@@ -73,6 +74,16 @@ describe("parseArgs app", () => {
     ]);
     if (nodeShape.kind !== "app-bootstrap") throw new Error("expected app-bootstrap");
     expect(nodeShape.input.dbName).toBe("api_prod");
+  });
+
+  test("bootstrap parses the control-plane source IP used for cp-http80 firewall access", () => {
+    const parsed = parseArgs([
+      "app", "bootstrap", "vm", "site", "--app-user", "site",
+      "--control-plane-ip", "91.99.233.145",
+    ]);
+    if (parsed.kind !== "app-bootstrap") throw new Error("expected app-bootstrap");
+    expect((parsed.input as typeof parsed.input & { controlPlaneIp?: string }).controlPlaneIp)
+      .toBe("91.99.233.145");
   });
 
   test("register with required + optional flags", () => {
@@ -283,6 +294,184 @@ describe("app bootstrap uses the stored app kind for the database contract", () 
     expect(c.e).toContain("--db-name is not valid for a static app");
   });
 
+  test("cp-http80 bootstrap fails closed without a control-plane IP", () => {
+    const existing = appStore.get("vm-1111", "site")!;
+    appStore.upsert({
+      ...existing,
+      mainHost: "site.example.com",
+      mainListen: "cp-http80",
+    });
+    const c = capture();
+    const code = runAppBootstrap(
+      { vm: "samo-we-field-record", app: "site", appUser: "site" },
+      vmStore,
+      appStore,
+      c.out,
+      c.err,
+    );
+    expect(code).toBe(1);
+    expect(c.o).toBe("");
+    expect(c.e).toContain("--control-plane-ip");
+  });
+
+  test("cp-http80 bootstrap emits only the requested source-restricted :80 rule", () => {
+    const existing = appStore.get("vm-1111", "site")!;
+    appStore.upsert({
+      ...existing,
+      mainHost: "site.example.com",
+      mainListen: "cp-http80",
+    });
+    const c = capture();
+    const input = {
+      vm: "samo-we-field-record",
+      app: "site",
+      appUser: "site",
+      controlPlaneIp: "91.99.233.145",
+    } as Parameters<typeof runAppBootstrap>[0] & { controlPlaneIp: string };
+    const code = runAppBootstrap(input, vmStore, appStore, c.out, c.err);
+    expect(code).toBe(0);
+    expect(c.e).toBe("");
+    expect(c.o).toContain("proto tcp from '91.99.233.145' to any port 80");
+    expect(c.o).not.toMatch(/ufw allow (?:80|80\/tcp)/);
+  });
+
+  test("cp-http80 bootstrap rejects a non-IP control-plane source", () => {
+    const existing = appStore.get("vm-1111", "site")!;
+    appStore.upsert({
+      ...existing,
+      mainHost: "site.example.com",
+      mainListen: "cp-http80",
+    });
+    const c = capture();
+    const input = {
+      vm: "samo-we-field-record",
+      app: "site",
+      appUser: "site",
+      controlPlaneIp: "0.0.0.0/0",
+    } as Parameters<typeof runAppBootstrap>[0] & { controlPlaneIp: string };
+    expect(runAppBootstrap(input, vmStore, appStore, c.out, c.err)).toBe(1);
+    expect(c.o).toBe("");
+    expect(c.e).toContain("valid IP");
+  });
+
+  test("cp-http80 bootstrap reuses the source IP persisted during provision", () => {
+    const existing = appStore.get("vm-1111", "site")!;
+    appStore.upsert({
+      ...existing,
+      mainHost: "site.example.com",
+      mainListen: "cp-http80",
+    });
+    vmStore.upsert(vm({
+      controlPlaneIp: "91.99.233.145",
+    } as Partial<VmRecord> & { controlPlaneIp: string }));
+    const c = capture();
+    expect(runAppBootstrap(
+      { vm: "samo-we-field-record", app: "site", appUser: "site" },
+      vmStore,
+      appStore,
+      c.out,
+      c.err,
+    )).toBe(0);
+    expect(c.e).toBe("");
+    expect(c.o).toContain("proto tcp from '91.99.233.145' to any port 80");
+  });
+
+  test("persisted control-plane IP does not open :80 for a static TLS app", () => {
+    vmStore.upsert(vm({
+      controlPlaneIp: "91.99.233.145",
+    } as Partial<VmRecord> & { controlPlaneIp: string }));
+    const existing = appStore.get("vm-1111", "site")!;
+    appStore.upsert({
+      ...existing,
+      mainHost: "site.example.com",
+      mainListen: "tls",
+    });
+    const c = capture();
+    expect(runAppBootstrap(
+      { vm: "samo-we-field-record", app: "site", appUser: "site" },
+      vmStore,
+      appStore,
+      c.out,
+      c.err,
+    )).toBe(0);
+    expect(c.o).not.toContain("to any port 80");
+  });
+
+  test("node cp-http80 bootstrap emits its source-restricted :80 rule", () => {
+    const existing = appStore.get("vm-1111", "api")!;
+    appStore.upsert({
+      ...existing,
+      mainHost: "api.example.com",
+      mainListen: "cp-http80",
+    });
+    const c = capture();
+    const input = {
+      vm: "samo-we-field-record",
+      app: "api",
+      appUser: "api",
+      dbName: "api_prod",
+      controlPlaneIp: "91.99.233.145",
+    };
+    expect(runAppBootstrap(input, vmStore, appStore, c.out, c.err)).toBe(0);
+    expect(c.o).toContain("proto tcp from '91.99.233.145' to any port 80");
+  });
+
+  test("cp-http80 bootstrap accepts an IPv6 source but rejects an IPv6 CIDR", () => {
+    const existing = appStore.get("vm-1111", "site")!;
+    appStore.upsert({
+      ...existing,
+      mainHost: "site.example.com",
+      mainListen: "cp-http80",
+    });
+    const good = capture();
+    expect(runAppBootstrap({
+      vm: "samo-we-field-record",
+      app: "site",
+      appUser: "site",
+      controlPlaneIp: "2001:db8::1",
+    }, vmStore, appStore, good.out, good.err)).toBe(0);
+    expect(good.o).toContain("proto tcp from '2001:db8::1' to any port 80");
+
+    const bad = capture();
+    expect(runAppBootstrap({
+      vm: "samo-we-field-record",
+      app: "site",
+      appUser: "site",
+      controlPlaneIp: "2001:db8::/64",
+    }, vmStore, appStore, bad.out, bad.err)).toBe(1);
+    expect(bad.e).toContain("valid IPv4 or IPv6");
+  });
+
+  test("non-cp topology ignores stale persisted source and rejects an explicit inert source", () => {
+    vmStore.upsert(vm({
+      controlPlaneIp: "stale-not-an-ip",
+    } as Partial<VmRecord> & { controlPlaneIp: string }));
+    const existing = appStore.get("vm-1111", "site")!;
+    appStore.upsert({
+      ...existing,
+      mainHost: "site.example.com",
+      mainListen: "tls",
+    });
+    const stored = capture();
+    expect(runAppBootstrap(
+      { vm: "samo-we-field-record", app: "site", appUser: "site" },
+      vmStore,
+      appStore,
+      stored.out,
+      stored.err,
+    )).toBe(0);
+    expect(stored.o).not.toContain("to any port 80");
+
+    const explicit = capture();
+    expect(runAppBootstrap({
+      vm: "samo-we-field-record",
+      app: "site",
+      appUser: "site",
+      controlPlaneIp: "91.99.233.145",
+    }, vmStore, appStore, explicit.out, explicit.err)).toBe(1);
+    expect(explicit.e).toContain("only valid for cp-http80");
+  });
+
   test("node bootstrap still requires and uses an explicit db name", () => {
     const missing = capture();
     expect(runAppBootstrap(
@@ -481,6 +670,10 @@ describe("app commands", () => {
         ({ ok: true, json: async () => ({ workflow_runs: [{ conclusion: "success" }] }) }) as Response) as unknown as typeof fetch,
       now: () => new Date("2026-06-11T12:00:00.000Z"),
       env: { GH_TOKEN: "tok" },
+      controlPlaneRoute: (_vm, _script): Promise<SpawnResult> =>
+        Promise.resolve({ code: 0, stdout: "route ready", stderr: "" }),
+      projectRoute: (_vm, _script): Promise<SpawnResult> =>
+        Promise.resolve({ code: 0, stdout: "project route ready", stderr: "" }),
       ...overrides,
     };
   }
@@ -513,6 +706,97 @@ describe("app commands", () => {
     expect(rec?.deployedSha).toBe(SHA);
     expect(rec?.failedSha).toBeUndefined();
     expect(rec?.lastDeployAt).toBe("2026-06-11T12:00:00.000Z");
+  });
+
+  test("healthy cp-http80 deploy reconciles the local control-plane route", async () => {
+    register();
+    appStore.upsert({
+      ...appStore.get("vm-1111", "field-record")!,
+      mainHost: "field-record-1.samo.team",
+      mainListen: "cp-http80",
+    });
+    let routeScript = "";
+    const c = capture();
+    const code = await runAppDeploy(
+      { vm: "samo-we-field-record", app: "field-record", sha: SHA, skipCiGate: false },
+      { json: true },
+      vmStore,
+      appStore,
+      deployDeps(HAPPY, {
+        controlPlaneRoute: (_vm, script) => {
+          routeScript = script;
+          return Promise.resolve({ code: 0, stdout: "route ready", stderr: "" });
+        },
+      }),
+      c.out,
+      c.err,
+    );
+    expect(code).toBe(0);
+    expect(routeScript).toContain("field-record-1.samo.team");
+    expect(routeScript).toContain("178.105.246.151:80");
+    expect(JSON.parse(c.o).routing).toBe("ready");
+    const saved = appStore.get("vm-1111", "field-record")!;
+    expect(saved.controlPlaneRouteFingerprint).toBe(
+      controlPlaneMainRouteFingerprint(saved, vm()),
+    );
+  });
+
+  test("deploy carries the registered app identity without changing VM sshUser", async () => {
+    register();
+    const app = appStore.get("vm-1111", "field-record")!;
+    appStore.upsert({ ...app, appUser: "field-record" });
+    let runAsUser: unknown;
+    let seenVmUser = "";
+    const c = capture();
+    const code = await runAppDeploy(
+      { vm: "samo-we-field-record", app: "field-record", sha: SHA, skipCiGate: false },
+      { json: true },
+      vmStore,
+      appStore,
+      deployDeps(HAPPY, {
+        remote: async (targetVm, _script, ...args: unknown[]) => {
+          seenVmUser = targetVm.sshUser;
+          runAsUser = (args[0] as { runAsUser?: string } | undefined)?.runAsUser;
+          return { code: 0, stdout: HAPPY, stderr: "" };
+        },
+      }),
+      c.out,
+      c.err,
+    );
+    expect(code).toBe(0);
+    expect(runAsUser).toBe("field-record");
+    expect(seenVmUser).toBe("agent");
+    expect(vmStore.list()[0]!.sshUser).toBe("agent");
+  });
+
+  test("route failure does not stamp deployedSha, so the trigger retries", async () => {
+    register();
+    appStore.upsert({
+      ...appStore.get("vm-1111", "field-record")!,
+      mainHost: "field-record-1.samo.team",
+      mainListen: "cp-http80",
+      controlPlaneRouteFingerprint: "f".repeat(64),
+    });
+    const c = capture();
+    const code = await runAppDeploy(
+      { vm: "samo-we-field-record", app: "field-record", sha: SHA, skipCiGate: false },
+      { json: true },
+      vmStore,
+      appStore,
+      deployDeps(HAPPY, {
+        controlPlaneRoute: () =>
+          Promise.resolve({ code: 1, stdout: "", stderr: "caddy validate failed" }),
+      }),
+      c.out,
+      c.err,
+    );
+    expect(code).toBe(1);
+    expect(JSON.parse(c.o).routing).toBe("failed");
+    expect(c.e).toContain("control-plane route reconcile failed");
+    const rec = appStore.get("vm-1111", "field-record");
+    expect(rec?.deployedSha).toBeUndefined();
+    expect(rec?.failedSha).toBeUndefined();
+    expect(rec?.controlPlaneRouteFingerprint).toBe("f".repeat(64));
   });
 
   test("deploy rollback path: exit 1, failedSha set, deployedSha unchanged", async () => {

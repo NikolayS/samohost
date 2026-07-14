@@ -16,6 +16,7 @@
 
 import { readFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
+import { isIP } from "node:net";
 import { checkCiGreen, type CiStatus } from "../app/cigate.ts";
 import { parseDeployOutcome, type DeployOutcome } from "../app/parse.ts";
 import { buildDeployScript } from "../app/script.ts";
@@ -24,6 +25,21 @@ import {
   CANONICAL_RELEASE_CI_WORKFLOW,
   isCanonicalReleaseCiWorkflow,
 } from "../app/release-policy.ts";
+import {
+  assertSafeAppId,
+  assertSafeAppName,
+} from "../app/identity.ts";
+import {
+  controlPlaneMainRouteFingerprint,
+  needsControlPlaneMainRoute,
+} from "../caddy/control-plane.ts";
+import {
+  beginTwoHopMainRoute,
+  completeTwoHopMainRoute,
+  hasMainRouteDrift,
+  rollbackTwoHopMainRoute,
+  type TwoHopRouteDeps,
+} from "../caddy/two-hop.ts";
 import {
   buildHostBootstrapScript,
   type HostBootstrapOptions,
@@ -196,6 +212,8 @@ export interface AppBootstrapInput {
   appDbRole?: string;
   /** PR-A2 optional — value written into SEED_OWNER_LOGIN. Default "owner". */
   seedOwnerLogin?: string;
+  /** Source allowed to reach a cp-http80 listener; persisted on provisioned VMs. */
+  controlPlaneIp?: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -218,6 +236,12 @@ export function runAppRegister(
   out: (s: string) => void,
   err: (s: string) => void,
 ): number {
+  try {
+    assertSafeAppName(input.name);
+  } catch (e) {
+    err(`error: ${e instanceof Error ? e.message : String(e)}`);
+    return 1;
+  }
   const vm = findVm(vmStore, input.vm);
   if (vm === undefined) {
     err(`error: VM not found in state: ${input.vm}`);
@@ -311,6 +335,14 @@ export function runAppRegister(
   };
 
   const existing = appStore.get(vm.id, input.name);
+  if (existing !== undefined) {
+    try {
+      assertSafeAppId(existing.id);
+    } catch (e) {
+      err(`error: ${e instanceof Error ? e.message : String(e)}`);
+      return 1;
+    }
+  }
   const record: AppRecord = {
     ...spec,
     id: existing?.id ?? crypto.randomUUID(),
@@ -324,6 +356,12 @@ export function runAppRegister(
       : {}),
     ...(existing?.lastDeployAt !== undefined
       ? { lastDeployAt: existing.lastDeployAt }
+      : {}),
+    // This records what was successfully applied, not what is desired now.
+    // Preserve it across re-registration so the trigger can observe routing
+    // drift even when deployedSha is unchanged.
+    ...(existing?.controlPlaneRouteFingerprint !== undefined
+      ? { controlPlaneRouteFingerprint: existing.controlPlaneRouteFingerprint }
       : {}),
     ...(existing?.releaseTagPattern === input.releaseTagPattern &&
     existing?.releaseTagFormat === input.releaseTagFormat &&
@@ -604,6 +642,24 @@ export function runAppBootstrap(
     err("error: a non-static app bootstrap requires --db-name <name> (explicit; never derived)");
     return 1;
   }
+  if (input.controlPlaneIp !== undefined && app.mainListen !== "cp-http80") {
+    err("error: --control-plane-ip is only valid for cp-http80 apps");
+    return 1;
+  }
+  const controlPlaneIp = app.mainListen === "cp-http80"
+    ? input.controlPlaneIp ?? vm.controlPlaneIp
+    : input.controlPlaneIp;
+  if (app.mainListen === "cp-http80" && controlPlaneIp === undefined) {
+    err(
+      "error: cp-http80 bootstrap requires --control-plane-ip <ip> " +
+        "(or a control-plane IP recorded during provision)",
+    );
+    return 1;
+  }
+  if (controlPlaneIp !== undefined && isIP(controlPlaneIp) === 0) {
+    err("error: --control-plane-ip must be a valid IPv4 or IPv6 address");
+    return 1;
+  }
 
   const opts: HostBootstrapOptions = {
     appUser: input.appUser,
@@ -615,6 +671,9 @@ export function runAppBootstrap(
     ...(input.tlsMode !== undefined ? { tlsMode: input.tlsMode } : {}),
     ...(input.appDbRole !== undefined ? { appDbRole: input.appDbRole } : {}),
     ...(input.seedOwnerLogin !== undefined ? { seedOwnerLogin: input.seedOwnerLogin } : {}),
+    ...(app.mainListen === "cp-http80" && controlPlaneIp !== undefined
+      ? { firewallOpts: { controlPlaneIp } }
+      : {}),
   };
 
   out(buildHostBootstrapScript(app, opts));
@@ -629,6 +688,7 @@ export function runAppBootstrap(
 export type RemoteScriptRunner = (
   vm: VmRecord,
   script: string,
+  identity?: { runAsUser: string },
 ) => Promise<SpawnResult>;
 
 /** Injectable git-ref resolver (`gh api` in prod). Returns a full SHA. */
@@ -647,6 +707,10 @@ export interface AppDeployDeps {
   env?: Record<string, string | undefined>;
   /** Verify that a release commit is reachable from the configured main branch. */
   isCommitOnBranch?: CommitOnBranchVerifier;
+  /** Reconcile this app's managed mainHost route on the local control plane. */
+  controlPlaneRoute: RemoteScriptRunner;
+  /** Run the transactional project-VM route scripts over pinned SSH. */
+  projectRoute?: RemoteScriptRunner;
 }
 
 export interface AppDeployReport {
@@ -655,6 +719,7 @@ export interface AppDeployReport {
   sha: string;
   ci?: CiStatus;
   outcome: DeployOutcome;
+  routing: "ready" | "removed" | "failed" | "not-run";
   exitCode: number;
 }
 
@@ -812,15 +877,66 @@ export async function runAppDeploy(
     }
   }
 
-  // ---- build + push the script over ONE connection -----------------------
-  const script = buildDeployScript(app, {
-    sha,
-    ...(input.releaseTag !== undefined ? { tag: input.releaseTag } : {}),
-  });
+  // Snapshot project routing before a deploy can change it. CI and all other
+  // preflight failures happen above, so they never touch either routing hop.
+  let routeTransactionNeeded: boolean;
+  let script: string;
+  try {
+    const routingDrift = hasMainRouteDrift(app, vm);
+    // A CP-fronted deploy must prove the complete CP -> project path even when
+    // its Caddy specification is byte-identical. The release behind that route
+    // changed, so config drift alone is not a sufficient transaction trigger.
+    routeTransactionNeeded = routingDrift || needsControlPlaneMainRoute(app);
+    script = buildDeployScript(app, {
+      sha,
+      ...(input.releaseTag !== undefined ? { tag: input.releaseTag } : {}),
+      ...(routeTransactionNeeded ? { deferStaticCleanup: true } : {}),
+    });
+  } catch (e) {
+    err(`error: cannot build deploy transaction: ${e instanceof Error ? e.message : String(e)}`);
+    return 1;
+  }
+  let routeDeps: TwoHopRouteDeps | undefined;
+  if (routeTransactionNeeded) {
+    if (deps.projectRoute === undefined) {
+      err("error: route transaction required but the project-route runner is unavailable");
+      return 1;
+    }
+    routeDeps = {
+      projectRoute: deps.projectRoute,
+      controlPlaneRoute: deps.controlPlaneRoute,
+    };
+    try {
+      const begun = await beginTwoHopMainRoute(app, vm, routeDeps);
+      if (begun.code !== 0) {
+        err(
+          `error: project main-route transaction begin failed (exit ${begun.code}): ` +
+            (begun.stderr || begun.stdout),
+        );
+        return 1;
+      }
+    } catch (e) {
+      err(
+        `error: project main-route transaction begin failed: ` +
+          `${e instanceof Error ? e.message : String(e)}`,
+      );
+      return 1;
+    }
+  }
+
+  // ---- push the deploy script --------------------------------------------
   let result: SpawnResult;
   try {
-    result = await deps.remote(vm, script);
+    result = await deps.remote(
+      vm,
+      script,
+      ...(app.appUser !== undefined ? [{ runAsUser: app.appUser }] : []),
+    );
   } catch (e) {
+    if (routeDeps !== undefined) {
+      const rollbackError = await rollbackTwoHopMainRoute(app, vm, routeDeps);
+      if (rollbackError !== undefined) err(`error: ${rollbackError}`);
+    }
     err(`error: remote deploy connection failed: ${e instanceof Error ? e.message : String(e)}`);
     return 1;
   }
@@ -828,11 +944,32 @@ export async function runAppDeploy(
   const combined = result.stdout + "\n" + result.stderr;
   const { outcome } = parseDeployOutcome(combined);
 
+  // ---- complete project-VM -> control-plane route transaction ------------
+  let routing: AppDeployReport["routing"] = "not-run";
+  if (routeDeps !== undefined) {
+    if (outcome === "deployed") {
+      const routeResult = await completeTwoHopMainRoute(app, vm, routeDeps, {
+        sha,
+        expectedIdentity: input.releaseTag ?? sha,
+      });
+      routing = routeResult.routing;
+      if (!routeResult.ok) err(`error: ${routeResult.error ?? "two-hop route reconcile failed"}`);
+      if (routeResult.warning !== undefined) err(`warning: ${routeResult.warning}`);
+    } else {
+      const rollbackError = await rollbackTwoHopMainRoute(app, vm, routeDeps);
+      if (rollbackError !== undefined) {
+        err(`error: ${rollbackError}`);
+      }
+    }
+  }
+
   // ---- update bookkeeping -------------------------------------------------
   const stamped = deps.now().toISOString();
   const updated: AppRecord = { ...app, lastDeployAt: stamped };
-  if (outcome === "deployed") {
+  if (outcome === "deployed" && routing !== "failed") {
     updated.deployedSha = sha;
+    updated.controlPlaneRouteFingerprint =
+      controlPlaneMainRouteFingerprint(app, vm);
     // A successful deploy supersedes any prior bad-SHA guard for this app.
     delete updated.failedSha;
   } else if (outcome === "rolled-back" || outcome === "rollback-failed") {
@@ -842,21 +979,25 @@ export async function runAppDeploy(
   // 'incomplete' leaves deployedSha/failedSha unchanged (state unknown).
   appStore.upsert(updated);
 
-  const exitCode = outcome === "deployed" ? 0 : 1;
+  const exitCode = outcome === "deployed" && routing !== "failed" ? 0 : 1;
   const report: AppDeployReport = {
     app: app.name,
     vm: vm.name,
     sha,
     ...(ci !== undefined ? { ci } : {}),
     outcome,
+    routing,
     exitCode,
   };
 
   if (opts.json) {
     out(JSON.stringify(report, null, 2));
   } else {
-    out(`deploy ${app.name}@${sha.slice(0, 12)} on ${vm.name}: ${outcome}`);
-    if (outcome !== "deployed") {
+    out(
+      `deploy ${app.name}@${sha.slice(0, 12)} on ${vm.name}: ${outcome} ` +
+        `(routing=${routing})`,
+    );
+    if (exitCode !== 0) {
       err(`deploy did not succeed (outcome=${outcome}); see remote output above`);
     }
   }
@@ -888,7 +1029,7 @@ function defaultRemoteScriptRunner(): RemoteScriptRunner {
       });
     },
   };
-  return (vm, script) => {
+  return (vm, script, identity) => {
     // Pipe the script to the runner via a stdin-injecting spawn wrapper.
     const piping: RunDeps = {
       ...deps,
@@ -905,7 +1046,30 @@ function defaultRemoteScriptRunner(): RemoteScriptRunner {
         });
       },
     };
-    return runRemote(vm, "bash -s", piping);
+    let command = "bash -s";
+    if (identity !== undefined) {
+      if (!/^[a-z_][a-z0-9_-]{0,31}$/.test(identity.runAsUser)) {
+        return Promise.reject(new Error("invalid appUser for remote deploy identity"));
+      }
+      command = `sudo -u ${identity.runAsUser} -- /usr/bin/bash -s`;
+    }
+    return runRemote(vm, command, piping);
+  };
+}
+
+/** Run a script locally on the control plane (never over SSH). */
+function defaultControlPlaneRouteRunner(): RemoteScriptRunner {
+  return async (_vm, script): Promise<SpawnResult> => {
+    const res = spawnSync("bash", ["-s"], {
+      encoding: "utf8",
+      input: script,
+      maxBuffer: 16 * 1024 * 1024,
+    });
+    return {
+      code: typeof res.status === "number" ? res.status : 255,
+      stdout: res.stdout ?? "",
+      stderr: res.stderr ?? (res.error ? String(res.error.message) : ""),
+    };
   };
 }
 
@@ -1176,12 +1340,15 @@ export function defaultIsCommitOnBranch(): CommitOnBranchVerifier {
 
 /** Default production deploy deps. */
 export function defaultAppDeployDeps(): AppDeployDeps {
+  const remote = defaultRemoteScriptRunner();
   return {
-    remote: defaultRemoteScriptRunner(),
+    remote,
     resolveRef: defaultRefResolver(),
     fetch: globalThis.fetch,
     now: () => new Date(),
     isCommitOnBranch: defaultIsCommitOnBranch(),
+    controlPlaneRoute: defaultControlPlaneRouteRunner(),
+    projectRoute: remote,
   };
 }
 

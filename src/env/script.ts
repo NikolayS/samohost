@@ -32,6 +32,7 @@ import {
   staticRootOf,
   staticTreeGuardFnLines,
 } from "../app/static-root.ts";
+import { assertSafeAppIdentity } from "../app/identity.ts";
 import { planFromEnv, renderVhost } from "../caddy/render.ts";
 
 /** Same marker prefix as deploy scripts — one parser convention everywhere. */
@@ -2328,6 +2329,7 @@ export function buildHostPrepScript(
   sshUser: string,
   firewallOpts?: HostPrepFirewallOpts,
 ): string {
+  assertSafeAppIdentity(app);
   const staticRoot = staticRootOf(app);
   const isStatic = app.kind === "static";
   const isStaticReleaseChannel = isStatic && app.releaseTagPattern !== undefined;

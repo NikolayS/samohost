@@ -328,6 +328,13 @@ export interface AppRecord extends AppSpec {
   failedSha?: string;
   lastDeployAt?: string;
   /**
+   * SHA-256 of the last control-plane main-route specification that was
+   * successfully reconciled. Independent of deployedSha: re-registering an
+   * unchanged code SHA may still require a host rename, upstream update, or
+   * managed-route removal. Absent on records predating route management.
+   */
+  controlPlaneRouteFingerprint?: string;
+  /**
    * Highest release tag observed by the production tag channel. On first
    * activation for an already-deployed app, samohost records the current tag
    * here without deploying it; only a later, greater tag may advance prod.
@@ -523,6 +530,8 @@ export interface VmRecord {
   /** Remote login user for SSH (SPEC-DELTA §1). For provisioned VMs this equals
    * the spec's adminUser; for adopted VMs it is supplied via --ssh-user. */
   sshUser: string;
+  /** Control-plane egress IP authorized to reach cp-http80 app listeners. */
+  controlPlaneIp?: string;
   /** Pinned host key fingerprint, out-of-band verified at adopt time
    * (SPEC-DELTA §1). Format: `SHA256:<43 base64 chars>`. All SSH pins this
    * key (`StrictHostKeyChecking=yes`, per-VM known_hosts). */

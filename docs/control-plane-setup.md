@@ -15,6 +15,7 @@ doc says what lives where, the systemd units, and the one-time ordering.
 |---|---|---|
 | Provision / adopt / status / ssh / logs | operator host or control plane (ad-hoc) | `samohost` CLI invoked by a human/bot |
 | App deploy (main → prod) | control plane, on a timer | `samohost trigger run` |
+| `*.samo.team` production route | control plane Caddy | reconciled after each healthy `cp-http80` app deploy |
 | Preview GC (branch-gone / orphan) | control plane, same timer (opt-in) | `samohost trigger run --gc` |
 | The deployed app + preview envs | each project VM | systemd units written by `app bootstrap` / `env create` host-prep |
 | Edge preview banner | Cloudflare (no VM) | `wrangler deploy` of the Worker — see `docs/edge-preview-banner.md` |
@@ -174,6 +175,8 @@ auto-execute them. Run each on the VM as root, in order, after the VM is
    (NodeSource) + PostgreSQL (PGDG) at the pinned majors, creates the database
    (`--db-name` is **required and explicit** — never derived from the app name),
    writes the systemd main unit + env file template + Caddy main-host vhost.
+   For `mainListen = "cp-http80"`, this is the project-VM half only; the
+   control-plane half is activated automatically after the healthy deploy.
    Review the script, then run it as root on the VM.
 
 2. **`env plan <vm> <app> --host-prep`**
@@ -193,3 +196,8 @@ provision|adopt VM ─▶ status --audit ─▶ (root on VM) app bootstrap ─�
         ─▶ enable samohost-trigger.timer (unattended deploy + opt-in GC)
         ─▶ wrangler deploy (edge banner)
 ```
+
+`app register` is intentionally offline and only persists the route
+declaration. `app deploy` runs from the control plane; after the remote health
+gate succeeds it atomically reconciles `mainHost → app VM:80`, validates and
+reloads Caddy, and only then stamps the release deployed.

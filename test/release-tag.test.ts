@@ -43,6 +43,7 @@ import {
   type TriggerDeps,
   type TriggerRunReport,
 } from "../src/commands/trigger.ts";
+import { controlPlaneMainRouteFingerprint } from "../src/caddy/control-plane.ts";
 import { AppStore } from "../src/state/apps.ts";
 import { StateStore } from "../src/state/store.ts";
 import type { AppRecord, VmRecord } from "../src/types.ts";
@@ -609,8 +610,7 @@ describe("trigger run — release-tag production channel", () => {
 
   test("§8 #6 latest tag already deployed → up-to-date, no deploy", async () => {
     vmStore.upsert(makeVm());
-    appStore.upsert(
-      makeApp({
+    const alreadyDeployed = makeApp({
         deployedSha: SHA_TAG, // already on the latest tag's commit
         mainHost: "field-record-1.samo.team",
         releaseTagPattern: "v*",
@@ -618,8 +618,14 @@ describe("trigger run — release-tag production channel", () => {
         releaseCiWorkflow: ".github/workflows/ci.yml",
         releaseTagCursor: "v20260713.1",
         releaseTagChannelInitialized: true,
-      }),
-    );
+      });
+    appStore.upsert({
+      ...alreadyDeployed,
+      controlPlaneRouteFingerprint: controlPlaneMainRouteFingerprint(
+        alreadyDeployed,
+        makeVm(),
+      ),
+    });
 
     let deployCalls = 0;
     const { fetch: fakeFetch, callCount } = makeFakeFetch([]);
@@ -774,6 +780,8 @@ describe("release deploy authority", () => {
       fetch: makeFakeFetch([{ status: "completed", conclusion: "success" }]).fetch,
       now: () => new Date(),
       env: { GH_TOKEN: "test" },
+      controlPlaneRoute: async () => ({ code: 0, stdout: "route ready", stderr: "" }),
+      projectRoute: async () => ({ code: 0, stdout: "project route ready", stderr: "" }),
       ...overrides,
     };
   }
@@ -873,8 +881,14 @@ describe("release deploy authority", () => {
   });
 
   test("verified release re-gates the exact configured workflow before SSH", async () => {
+    appStore.upsert({
+      ...appStore.get("vm-1111", "field-record")!,
+      mainHost: "field-record-1.samo.team",
+      mainListen: "cp-http80",
+    });
     const seen: string[] = [];
     let remoteCalls = 0;
+    let routeScript = "";
     const d = deps({
       fetch: (async (input: string | URL | Request) => {
         seen.push(String(input));
@@ -890,6 +904,10 @@ describe("release deploy authority", () => {
           stdout: "<<<SAMOHOST_PHASE:health:start>>>\n<<<SAMOHOST_PHASE:health:ok>>>",
           stderr: "",
         };
+      },
+      controlPlaneRoute: async (_vm, script) => {
+        routeScript = script;
+        return { code: 0, stdout: "route ready", stderr: "" };
       },
     });
     const c = capture();
@@ -907,6 +925,9 @@ describe("release deploy authority", () => {
     expect(seen).toHaveLength(1);
     expect(seen[0]).toContain("/actions/workflows/ci.yml/runs?");
     expect(seen[0]).toContain("per_page=1");
+    expect(routeScript).toContain("field-record-1.samo.team");
+    expect(routeScript).toContain("178.105.246.151:80");
+    expect(JSON.parse(c.o).routing).toBe("ready");
   });
 });
 

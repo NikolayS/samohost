@@ -71,12 +71,66 @@ request to the corresponding project VM. No CF DNS API token is needed for
 this routing; Cloudflare handles the wildcard DNS record to the control plane
 IP.
 
+### Managed production routes
+
+For an app with both `mainHost` and `mainListen = "cp-http80"`, a successful
+`samohost app deploy` (including release-tag deploys through `trigger run`)
+reconciles a control-plane snippet under `/etc/caddy/sites.d/`:
+
+```
+<mainHost> {
+    tls internal
+    reverse_proxy <app-vm-ip>:80 {
+        header_up Host <mainHost>
+        header_up X-Real-IP {remote_host}
+    }
+}
+```
+
+Registration remains offline: it records the declaration, and app bootstrap
+writes the initial project-VM vhost. A production routing change is then a
+two-hop transaction: samohost snapshots the old project-VM snippet, applies
+and locally health-checks the desired project topology in a transition snippet
+while the old host remains live, and only then changes the control-plane
+snippet. Before either hop commits, the control plane probes its own
+`127.0.0.1:443` listener with the production hostname as both TLS SNI and Host,
+thereby exercising the configured upstream without relying on public DNS. A
+static release must return the exact expected tag and commit identity from
+`/version.json`. If the control-plane update or end-to-end probe fails, its
+snippet is restored, then the project transition is removed and the
+project VM is restored and health-checked through its old host. Re-registering with a changed
+host/IP updates the stable managed files; changing away from `cp-http80`
+updates/removes the project topology before removing the control-plane route.
+Apps sharing one VM retain independent transaction files and route snippets.
+
+The AppRecord separately stores a fingerprint of the last successfully applied
+project-plus-control-plane routing specification. After resolving the target
+SHA, `trigger run` reconciles config-only drift when that SHA is already
+deployed. A new SHA/tag must pass CI and its healthy deploy before either route
+can advance. Host renames replace the same managed files; `cp-http80 → tls`
+and `mainHost` removal remove the control-plane hop only after the project hop
+is ready. The fingerprint, deployed SHA, and release cursor advance only after
+both Caddy transactions succeed.
+
+The reconciler never edits `/etc/caddy/Caddyfile`. The control plane must
+already have the canonical `import sites.d/*.caddy` line. It stages and
+atomically renames the snippet, validates the complete Caddy config, then
+reloads. A validation or reload failure restores and reloads the previous
+snippet; an unreachable upstream, non-200 response, or wrong release identity
+does the same. The project-VM transaction then restores its snapshot. The deploy is
+not stamped successful, so the trigger retries.
+If the same hostname is still declared in a legacy hand-authored file, the
+reconciler fails closed instead of creating an ambiguous duplicate or claiming
+to manage a route it cannot update.
+
+Run production deploys from the control plane. The timer user needs only the
+local sudo operations used by the transaction: install/copy/move/remove files
+under `/etc/caddy/sites.d/`, `caddy validate --config /etc/caddy/Caddyfile`, and
+`systemctl reload caddy`. Do not grant Caddyfile write access and do not add
+main-host blocks by hand.
+
 Source: `samo.team/SPEC.md` (line 522 diagram), memory `project_samo_mvp_no_cloudflare_token.md`.
 
-## samohost vhost template caveat
-
-Issue #121 (open 2026-07-06): the current `host-prep` vhost template generates
-a single-upstream `:443` only. This is unusable for multi-service apps and
-clobbers hand-authored `00-main-<app>.caddy` snippets. If your app needs
-multiple upstreams (e.g. app on :3000 + API on :4000), write the Caddyfile
-snippet manually and do not use the vhost template until #121 is resolved.
+The project-VM vhost and the control-plane route are deliberately separate:
+multi-service path routing stays on the project VM, while the control plane
+has exactly one upstream (`<app-vm-ip>:80`) per public host.

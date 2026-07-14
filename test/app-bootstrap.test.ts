@@ -1359,6 +1359,18 @@ describe("buildHostBootstrapScript — static path (kind='static')", () => {
     expect(script).toContain("from '10.0.0.1'");
   });
 
+  test("static cp-fronted bootstrap can disable direct Cloudflare :443 ingress", () => {
+    const script = buildHostBootstrapScript(
+      staticRecord({ mainListen: "cp-http80" }),
+      staticOpts({
+        firewallOpts: { controlPlaneIp: "10.0.0.1", allowCfHttps: false },
+      }),
+    );
+    expect(script).toContain("proto tcp from '10.0.0.1' to any port 80");
+    expect(script).not.toContain("https://www.cloudflare.com/ips-v4");
+    expect(script).not.toContain("https://www.cloudflare.com/ips-v6");
+  });
+
   test("static bootstrap self-check omits node/postgres/unit/db rows", () => {
     // FAILS today: §13 self-check always emits all rows including
     // node_ok, pg_ok, unit_ok, db_ok.
@@ -1388,6 +1400,35 @@ describe("buildHostBootstrapScript — static path (kind='static')", () => {
     expect(sudoBlock).not.toContain("systemctl stop my-static-site");
     expect(sudoBlock).not.toContain("systemctl restart my-static-site");
     expect(sudoBlock).not.toContain("systemctl enable my-static-site");
+  });
+
+  test("static app user has one app-bound helper grant and no direct Caddy or log privilege", () => {
+    const script = buildHostBootstrapScript(staticRecord(), staticOpts());
+    const sudoStart = script.indexOf("cat > '/etc/sudoers.d/");
+    const sudoEnd = script.indexOf("\nSUDOERS\n", sudoStart) + 8;
+    const sudoBlock = script.slice(sudoStart, sudoEnd);
+    expect(sudoBlock).toContain(
+      "agent ALL=(root) NOPASSWD: /usr/local/sbin/samohost-static-route-my-static-site",
+    );
+    expect(sudoBlock).not.toContain("/usr/bin/tee ");
+    expect(sudoBlock).not.toContain("/usr/bin/mv ");
+    expect(sudoBlock).not.toContain("/usr/bin/rm ");
+    expect(sudoBlock).not.toContain("systemctl");
+    expect(sudoBlock).not.toContain("journalctl");
+    expect(sudoBlock).not.toContain("/etc/caddy/Caddyfile");
+    expect(sudoBlock).not.toContain("sites.d/*");
+  });
+
+  test("static route helper is root-owned, argument-free, and app-bound", () => {
+    const script = buildHostBootstrapScript(staticRecord(), staticOpts());
+    const helper = "/usr/local/sbin/samohost-static-route-my-static-site";
+    expect(script).toContain(`install -m 0755 -o root -g root`);
+    expect(script).toContain(helper);
+    expect(script).toContain('[[ "$#" == "0" ]]');
+    expect(script).toContain("my-static-site.example.com");
+    expect(script).toContain("/opt/my-static-site/releases");
+    expect(script).toContain("/etc/caddy/sites.d/00-main-my-static-site.caddy");
+    expect(script).not.toContain(`${helper} "$@"`);
   });
 
   test("static bootstrap does NOT throw when dbName is absent (static apps have no database)", () => {

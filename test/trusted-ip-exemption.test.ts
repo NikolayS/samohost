@@ -40,6 +40,7 @@ import {
   type ProvisionDeps,
 } from "../src/commands/provision.ts";
 import type { SpawnFn } from "../src/ssh/runner.ts";
+import type { VmRecord } from "../src/types.ts";
 
 // ─────────────────────────────────────────────────────────────
 // Shared fixture data (mirrors provision.test.ts)
@@ -201,6 +202,8 @@ describe("provision — auto-inject control-plane egress IP as trusted", () => {
     );
     const limitIdx = userData.indexOf("ufw limit 2223/tcp");
     expect(allowIdx).toBeLessThan(limitIdx);
+    expect((env.store.list()[0] as VmRecord & { controlPlaneIp?: string }).controlPlaneIp)
+      .toBe(EGRESS_IP);
   });
 
   test("when detectEgressIp returns null the provision still succeeds (graceful no-op)", async () => {
