@@ -13,6 +13,7 @@ import {
   buildProjectMainRouteCommitScript,
   buildProjectMainRoutePrepareScript,
   buildProjectMainRouteRollbackScript,
+  buildStaticRootReconcileScript,
 } from "./project-main.ts";
 
 export type RouteScriptRunner = (
@@ -34,12 +35,32 @@ export interface TwoHopRouteResult {
 
 function appliedProbeExpectation(
   app: AppRecord,
+  trusted?: ControlPlaneProbeExpectation,
 ): ControlPlaneProbeExpectation | undefined {
-  if (app.kind !== "static" || app.deployedSha === undefined) return undefined;
+  if (app.kind !== "static") return undefined;
+  if (app.deployedSha === undefined) {
+    throw new Error("static same-SHA route reconcile has no deployedSha identity");
+  }
+  if (trusted !== undefined) {
+    if (trusted.sha !== app.deployedSha || trusted.expectedIdentity.length === 0) {
+      throw new Error("trusted static route identity does not match deployedSha");
+    }
+    if (
+      app.releaseTagPattern === undefined &&
+      trusted.expectedIdentity !== app.deployedSha
+    ) {
+      throw new Error("branch static route identity must equal deployedSha");
+    }
+    return trusted;
+  }
   const expectedIdentity = app.releaseTagPattern === undefined
     ? app.deployedSha
     : app.releaseTagCursor;
-  if (expectedIdentity === undefined) return undefined;
+  if (expectedIdentity === undefined) {
+    throw new Error(
+      "release static route identity is uninitialized; refusing status-only reconciliation",
+    );
+  }
   return {
     sha: app.deployedSha,
     expectedIdentity,
@@ -194,7 +215,18 @@ export async function reconcileTwoHopMainRoute(
   app: AppRecord,
   vm: VmRecord,
   deps: TwoHopRouteDeps,
+  trustedExpectation?: ControlPlaneProbeExpectation,
 ): Promise<TwoHopRouteResult> {
+  let probeExpectation: ControlPlaneProbeExpectation | undefined;
+  try {
+    probeExpectation = appliedProbeExpectation(app, trustedExpectation);
+  } catch (e) {
+    return {
+      ok: false,
+      routing: "failed",
+      error: e instanceof Error ? e.message : String(e),
+    };
+  }
   let begun: SpawnResult;
   try {
     begun = await beginTwoHopMainRoute(app, vm, deps);
@@ -208,5 +240,44 @@ export async function reconcileTwoHopMainRoute(
   if (begun.code !== 0) {
     return { ok: false, routing: "failed", error: failure("project-route begin", begun) };
   }
-  return completeTwoHopMainRoute(app, vm, deps, appliedProbeExpectation(app));
+  if (app.kind === "static") {
+    try {
+      const staticRoot = await deps.projectRoute(
+        vm,
+        buildStaticRootReconcileScript(
+          app,
+          controlPlaneMainRouteFingerprint(app, vm),
+          probeExpectation!,
+        ),
+      );
+      if (staticRoot.code !== 0) {
+        const rollback = await rollbackProject(
+          app,
+          vm,
+          controlPlaneMainRouteFingerprint(app, vm),
+          deps,
+        );
+        return {
+          ok: false,
+          routing: "failed",
+          error: failure("static-root reconcile", staticRoot) +
+            (rollback === undefined ? "" : `; ${rollback}`),
+        };
+      }
+    } catch (e) {
+      const rollback = await rollbackProject(
+        app,
+        vm,
+        controlPlaneMainRouteFingerprint(app, vm),
+        deps,
+      );
+      return {
+        ok: false,
+        routing: "failed",
+        error: `static-root reconcile threw: ${e instanceof Error ? e.message : String(e)}` +
+          (rollback === undefined ? "" : `; ${rollback}`),
+      };
+    }
+  }
+  return completeTwoHopMainRoute(app, vm, deps, probeExpectation);
 }

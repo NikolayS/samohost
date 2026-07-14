@@ -46,6 +46,7 @@ import {
 import { checkCiGreen } from "../app/cigate.ts";
 import {
   controlPlaneMainRouteFingerprint,
+  type ControlPlaneProbeExpectation,
 } from "../caddy/control-plane.ts";
 import {
   hasMainRouteDrift,
@@ -238,6 +239,7 @@ export interface TriggerDeps {
   reconcileMainRoute?: (
     app: AppRecord,
     vm: VmRecord,
+    exactIdentity?: ControlPlaneProbeExpectation,
   ) => Promise<TwoHopRouteResult>;
   /**
    * Injected fetch used by checkCiGreen. Prod wires globalThis.fetch; tests
@@ -567,7 +569,15 @@ export async function runTriggerRun(
             "two-hop routing drift detected but the reconciler is absent",
           );
         }
-        const routeResult = await deps.reconcileMainRoute(app, vmRecord);
+        const exactIdentity: ControlPlaneProbeExpectation | undefined =
+          app.kind === "static"
+            ? { sha: resolvedSha, expectedIdentity: resolvedTag ?? resolvedSha }
+            : undefined;
+        const routeResult = await deps.reconcileMainRoute(
+          app,
+          vmRecord,
+          exactIdentity,
+        );
         if (!routeResult.ok) {
           throw new Error(
             routeResult.error ?? "two-hop main-route reconcile failed",
@@ -1185,7 +1195,7 @@ export function defaultTriggerDeps(opts: TriggerDepsOpts = {}): TriggerDeps {
     deploy: (input, opts, vmStore, appStore, out, err) =>
       runAppDeploy(input, opts, vmStore, appStore, appDeployDeps, out, err),
 
-    reconcileMainRoute: (app, vm) => {
+    reconcileMainRoute: (app, vm, exactIdentity) => {
       if (appDeployDeps.projectRoute === undefined) {
         return Promise.resolve({
           ok: false,
@@ -1196,7 +1206,7 @@ export function defaultTriggerDeps(opts: TriggerDepsOpts = {}): TriggerDeps {
       return reconcileTwoHopMainRoute(app, vm, {
         projectRoute: appDeployDeps.projectRoute,
         controlPlaneRoute: appDeployDeps.controlPlaneRoute,
-      });
+      }, exactIdentity);
     },
 
     // Real network fetch; checkCiGreen reads GH_TOKEN/GITHUB_TOKEN from

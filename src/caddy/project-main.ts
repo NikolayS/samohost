@@ -2,7 +2,11 @@
 
 import { createHash } from "node:crypto";
 import { assertSafeAppIdentity } from "../app/identity.ts";
-import { staticReleaseStatePaths, staticRootOf } from "../app/static-root.ts";
+import {
+  staticReleaseStatePaths,
+  staticRootOf,
+  staticTreeGuardFnLines,
+} from "../app/static-root.ts";
 import type { AppRecord } from "../types.ts";
 import { planFromApp, renderVhost } from "./render.ts";
 
@@ -81,6 +85,7 @@ function common(app: AppRecord, desiredFingerprint: string): string[] {
       : [
         `ACTIVE_ROUTE=${sq(active.activeRoute)}`,
         `ACTIVE_STATE=${sq(active.activeState)}`,
+        `RELEASES=${sq(active.releasesDir)}`,
         'ACTIVE_ROUTE_BACKUP="$TXN/active-route.caddy"',
         'ACTIVE_STATE_BACKUP="$TXN/active-state.json"',
         'ACTIVE_ROUTE_PRESENCE="$TXN/active-route-presence"',
@@ -224,8 +229,140 @@ function restoreBaseLines(app: AppRecord): string[] {
       : []),
     '  if [[ "$(cat "$ACTIVE_ROUTE_PRESENCE")" == "present" ]]; then install -m 0644 "$ACTIVE_ROUTE_BACKUP" "${ACTIVE_ROUTE}.next" && /usr/bin/mv -f "${ACTIVE_ROUTE}.next" "$ACTIVE_ROUTE"; else rm -f "$ACTIVE_ROUTE" "${ACTIVE_ROUTE}.next"; fi',
     '  if [[ "$(cat "$ACTIVE_STATE_PRESENCE")" == "present" ]]; then install -m 0644 "$ACTIVE_STATE_BACKUP" "${ACTIVE_STATE}.next" && /usr/bin/mv -f "${ACTIVE_STATE}.next" "$ACTIVE_STATE"; else rm -f "$ACTIVE_STATE" "${ACTIVE_STATE}.next"; fi',
+    '  if [[ -f "$TXN/static-root-version-path" ]]; then',
+    '    static_version_path=$(cat "$TXN/static-root-version-path")',
+    '    case "$static_version_path" in "$RELEASES/"*) ;; *) echo "error: static root rollback version path escaped releases" >&2; return 1 ;; esac',
+    '    case "$(cat "$TXN/static-root-version-presence")" in',
+    '      present) install -m 0644 "$TXN/static-root-version.json" "${static_version_path}.next" && /usr/bin/mv -f "${static_version_path}.next" "$static_version_path" ;;',
+    '      absent) rm -f "$static_version_path" "${static_version_path}.next" ;;',
+    '      *) echo "error: invalid static root version snapshot state" >&2; return 1 ;;',
+    '    esac',
+    '  fi',
     "}",
   ];
+}
+
+/**
+ * Re-point an already-deployed static release at a new staticRoot without
+ * creating a second worktree. The surrounding project transaction owns
+ * rollback of the route/state files and the newly published version identity.
+ */
+export function buildStaticRootReconcileScript(
+  app: AppRecord,
+  desiredFingerprint: string,
+  expectation: { sha: string; expectedIdentity: string },
+): string {
+  assertSafeAppIdentity(app);
+  if (app.kind !== "static") throw new Error("static root reconcile requires a static app");
+  if (app.deployedSha === undefined || expectation.sha !== app.deployedSha) {
+    throw new Error("static root reconcile identity does not match deployedSha");
+  }
+  if (expectation.expectedIdentity.length === 0) {
+    throw new Error("static root reconcile requires an exact deployed identity");
+  }
+  const desiredStaticRoot = staticRootOf(app) ?? "";
+  return [
+    "#!/usr/bin/env bash",
+    "# samohost same-SHA static-root transaction",
+    ...common(app, desiredFingerprint),
+    ...staticTreeGuardFnLines(),
+    `APP_NAME=${sq(app.name)}`,
+    `APP_DIR=${sq(app.appDir)}`,
+    `DEPLOYED_SHA=${sq(expectation.sha)}`,
+    `EXPECTED_IDENTITY=${sq(expectation.expectedIdentity)}`,
+    `DESIRED_STATIC_ROOT=${sq(desiredStaticRoot)}`,
+    '[[ -f "$ACTIVE_ROUTE" && -f "$ACTIVE_STATE" ]] || { echo "error: active static deployment state/route is missing" >&2; exit 1; }',
+    'mapfile -t STATIC_META < <(python3 - "$ACTIVE_STATE" "$ACTIVE_ROUTE" "$APP_NAME" "$DEPLOYED_SHA" "$EXPECTED_IDENTITY" <<\'PY\'',
+    "import json",
+    "import os",
+    "import re",
+    "import sys",
+    "",
+    "state_path, route_path, app_name, expected_sha, expected_identity = sys.argv[1:]",
+    "try:",
+    "    with open(state_path, encoding='utf-8') as source: state = json.load(source)",
+    "except (OSError, UnicodeError, json.JSONDecodeError):",
+    "    raise SystemExit('active static deployment state is invalid')",
+    "if not isinstance(state, dict) or state.get('schema') != 1 or state.get('appName') != app_name:",
+    "    raise SystemExit('active static deployment state does not match this app')",
+    "if state.get('sha') != expected_sha or state.get('tag') != expected_identity:",
+    "    raise SystemExit('active static deployment identity mismatch')",
+    "release_dir = state.get('releaseDir')",
+    "static_root = state.get('staticRoot')",
+    "if not isinstance(release_dir, str) or not release_dir.startswith('/') or '\\n' in release_dir:",
+    "    raise SystemExit('active static releaseDir is invalid')",
+    "if not isinstance(static_root, str) or '\\n' in static_root:",
+    "    raise SystemExit('active staticRoot is invalid')",
+    "current_root = os.path.join(release_dir, static_root) if static_root else release_dir",
+    "text = open(route_path, encoding='utf-8').read()",
+    "roots = [a or b for a, b in re.findall(r'^\\s*root\\s+\\*\\s+(?:\"([^\"]+)\"|(\\S+))\\s*$', text, re.MULTILINE)]",
+    "if roots != [current_root]: raise SystemExit('active static route does not match recorded release')",
+    "try:",
+    "    with open(os.path.join(current_root, 'version.json'), encoding='utf-8') as source: identity = json.load(source)",
+    "except (OSError, UnicodeError, json.JSONDecodeError):",
+    "    raise SystemExit('active static version identity is invalid')",
+    "if identity != {'version': expected_identity, 'tag': expected_identity, 'sha': expected_sha, 'environment': 'production'}:",
+    "    raise SystemExit('active static version identity mismatch')",
+    "print(release_dir)",
+    "print(static_root)",
+    "print(current_root)",
+    "print(state.get('releaseTagFormat') or '')",
+    "PY",
+    ")",
+    '[[ "${#STATIC_META[@]}" == "4" ]] || { echo "error: cannot read active static deployment metadata" >&2; exit 1; }',
+    'WORKTREE=${STATIC_META[0]}',
+    'OLD_STATIC_ROOT=${STATIC_META[1]}',
+    'OLD_STATIC_DIR=${STATIC_META[2]}',
+    'RELEASE_TAG_FORMAT=${STATIC_META[3]}',
+    'WORKTREE_REAL=$(realpath -e "$WORKTREE") || { echo "error: recorded static worktree is missing" >&2; exit 1; }',
+    '[[ "$WORKTREE_REAL" == "$WORKTREE" ]] || { echo "error: recorded static worktree is not canonical" >&2; exit 1; }',
+    'case "$WORKTREE_REAL" in "$RELEASES/"*) ;; *) echo "error: recorded static worktree escaped managed releases" >&2; exit 1 ;; esac',
+    '[[ "$(git -C "$WORKTREE_REAL" rev-parse HEAD)" == "$DEPLOYED_SHA" ]] || { echo "error: recorded static worktree SHA mismatch" >&2; exit 1; }',
+    'if git -C "$WORKTREE_REAL" symbolic-ref -q HEAD >/dev/null 2>&1; then echo "error: recorded static worktree is not detached" >&2; exit 1; fi',
+    'if [[ -n "$DESIRED_STATIC_ROOT" ]]; then STATIC_CANDIDATE="$WORKTREE_REAL/$DESIRED_STATIC_ROOT"; else STATIC_CANDIDATE="$WORKTREE_REAL"; fi',
+    'STATIC_DIR=$(realpath -e "$STATIC_CANDIDATE") || { echo "error: desired staticRoot does not exist: $DESIRED_STATIC_ROOT" >&2; exit 1; }',
+    'case "$STATIC_DIR" in "$WORKTREE_REAL"|"$WORKTREE_REAL/"*) ;; *) echo "error: desired staticRoot escapes the recorded worktree" >&2; exit 1 ;; esac',
+    '[[ -d "$STATIC_DIR" && -f "$STATIC_DIR/index.html" ]] || { echo "error: desired staticRoot must contain index.html" >&2; exit 1; }',
+    'samohost_assert_static_tree_safe "$WORKTREE_REAL" "$STATIC_DIR" "$DESIRED_STATIC_ROOT"',
+    'if [[ "$OLD_STATIC_ROOT" == "$DESIRED_STATIC_ROOT" ]]; then echo "static root already active and identity exact"; exit 0; fi',
+    'if [[ -f "$TXN/static-root-changed" ]]; then',
+    '  [[ "$(cat "$TXN/static-root-root")" == "$STATIC_DIR" && "$(cat "$TXN/static-root-worktree")" == "$WORKTREE_REAL" ]] || { echo "error: resumed static root transaction mismatch" >&2; exit 1; }',
+    '  echo "static root transaction already applied"; exit 0',
+    'fi',
+    'VERSION_PATH="$STATIC_DIR/version.json"',
+    'printf "%s\n" "$VERSION_PATH" > "$TXN/static-root-version-path"',
+    'if [[ -f "$VERSION_PATH" ]]; then cat -- "$VERSION_PATH" > "$TXN/static-root-version.json"; printf "present\n" > "$TXN/static-root-version-presence"; else printf "absent\n" > "$TXN/static-root-version-presence"; fi',
+    'VERSION_NEXT=$(mktemp "$STATIC_DIR/.version.next.XXXXXX")',
+    'python3 - "$VERSION_NEXT" "$DEPLOYED_SHA" "$EXPECTED_IDENTITY" <<\'PY\'',
+    "import json, os, sys",
+    "path, sha, identity = sys.argv[1:]",
+    "with open(path, 'w', encoding='utf-8') as output:",
+    "    json.dump({'version': identity, 'tag': identity, 'sha': sha, 'environment': 'production'}, output, separators=(',', ':'))",
+    "    output.write('\\n')",
+    "os.chmod(path, 0o644)",
+    "PY",
+    'ROUTE_NEXT=$(mktemp "$RELEASES/.active-route.next.XXXXXX")',
+    'printf \'root * "%s"\\ntry_files {path} /index.html\\nfile_server\\nencode gzip\\n\' "$STATIC_DIR" > "$ROUTE_NEXT"',
+    'chmod 0644 "$ROUTE_NEXT"',
+    'STATE_NEXT=$(mktemp "$RELEASES/.active-state.next.XXXXXX")',
+    'python3 - "$STATE_NEXT" "$APP_NAME" "$DEPLOYED_SHA" "$EXPECTED_IDENTITY" "$WORKTREE_REAL" "$DESIRED_STATIC_ROOT" "$RELEASE_TAG_FORMAT" <<\'PY\'',
+    "import json, os, sys",
+    "path, app_name, sha, tag, release_dir, static_root, tag_format = sys.argv[1:]",
+    "payload = {'schema': 1, 'appName': app_name, 'sha': sha, 'tag': tag, 'releaseDir': release_dir, 'staticRoot': static_root, 'releaseTagFormat': tag_format or None}",
+    "with open(path, 'w', encoding='utf-8') as output:",
+    "    json.dump(payload, output, sort_keys=True, separators=(',', ':'))",
+    "    output.write('\\n')",
+    "os.chmod(path, 0o644)",
+    "PY",
+    'samohost_assert_static_tree_safe "$WORKTREE_REAL" "$STATIC_DIR" "$DESIRED_STATIC_ROOT"',
+    '/usr/bin/mv -f "$VERSION_NEXT" "$VERSION_PATH"',
+    '/usr/bin/mv -f "$ROUTE_NEXT" "$ACTIVE_ROUTE"',
+    '/usr/bin/mv -f "$STATE_NEXT" "$ACTIVE_STATE"',
+    'printf "%s\n" "$STATIC_DIR" > "$TXN/static-root-root"',
+    'printf "%s\n" "$WORKTREE_REAL" > "$TXN/static-root-worktree"',
+    ': > "$TXN/static-root-changed"',
+    'echo "static root transaction applied"',
+  ].join("\n");
 }
 
 function previousRouteHealthLines(app: AppRecord): string[] {
@@ -300,25 +437,28 @@ export function buildProjectMainRoutePrepareScript(
       ? app.appDir
       : `${app.appDir.replace(/\/+$/, "")}/${staticRoot}`;
     lines.push(
-      `python3 - "$TRANSITION" "$LIVE" "$BACKUP" "$DESIRED" ${sq(app.mainHost)} ${sq(app.mainListen ?? "cp-http80")} ${sq(fallbackRoot)} ${sq(app.appDir)} ${sq(base)} ${sq(staticRoot)} <<'PY'`,
+      `python3 - "$TRANSITION" "$LIVE" "$BACKUP" "$DESIRED" ${sq(app.mainHost)} ${sq(app.mainListen ?? "cp-http80")} ${sq(fallbackRoot)} ${sq(app.appDir)} ${sq(base)} ${sq(staticRoot)} "$TXN/static-root-root" "$TXN/static-root-worktree" <<'PY'`,
       "import json",
       "import os",
       "import re",
       "import sys",
       "",
-      "transition, live, backup, desired, host, listen, fallback_root, fallback_worktree, app_base, static_root = sys.argv[1:]",
+      "transition, live, backup, desired, host, listen, fallback_root, fallback_worktree, app_base, static_root, root_marker, worktree_marker = sys.argv[1:]",
       "root_re = re.compile(r'^\\s*root\\s+\\*\\s+(?:\"([^\"]+)\"|(\\S+))\\s*$', re.MULTILINE)",
       "worktree_re = re.compile(r'^\\s*#\\s*samohost-worktree\\s+\"([^\"]+)\"\\s*$', re.MULTILINE)",
-      "root = None",
-      "worktree = None",
-      "for source in (transition, live, backup):",
-      "    if os.path.isfile(source):",
-      "        text = open(source, encoding='utf-8').read()",
-      "        root_match = root_re.search(text)",
-      "        worktree_match = worktree_re.search(text)",
-      "        if root_match and root is None: root = root_match.group(1) or root_match.group(2)",
-      "        if worktree_match and worktree is None: worktree = worktree_match.group(1)",
-      "        if root is not None and worktree is not None: break",
+      "if os.path.isfile(root_marker) != os.path.isfile(worktree_marker):",
+      "    raise SystemExit('incomplete static root transaction marker')",
+      "root = open(root_marker, encoding='utf-8').read().strip() if os.path.isfile(root_marker) else None",
+      "worktree = open(worktree_marker, encoding='utf-8').read().strip() if os.path.isfile(worktree_marker) else None",
+      "if root is None:",
+      "    for source in (transition, live, backup):",
+      "        if os.path.isfile(source):",
+      "            text = open(source, encoding='utf-8').read()",
+      "            root_match = root_re.search(text)",
+      "            worktree_match = worktree_re.search(text)",
+      "            if root_match and root is None: root = root_match.group(1) or root_match.group(2)",
+      "            if worktree_match and worktree is None: worktree = worktree_match.group(1)",
+      "            if root is not None and worktree is not None: break",
       "if root is None:",
       "    root = fallback_root",
       "if worktree is None:",
