@@ -5,7 +5,11 @@ import { join } from "node:path";
 import { buildHostBootstrapScript } from "../src/app/bootstrap.ts";
 import { parseArgs } from "../src/cli.ts";
 import { runAppRegister } from "../src/commands/app.ts";
-import { buildEnvCreateScript, buildHostPrepScript } from "../src/env/script.ts";
+import {
+  buildEnvCreateScript,
+  buildHostPrepScript,
+  buildSecretsRotateScript,
+} from "../src/env/script.ts";
 import { parseSamohostToml } from "../src/manifest/toml.ts";
 import { AppStore } from "../src/state/apps.ts";
 import { StateStore } from "../src/state/store.ts";
@@ -96,6 +100,15 @@ describe("strict Linux appUser validation", () => {
         })
       ).not.toThrow();
       expect(() => buildHostPrepScript(app({ appUser }), "samo")).not.toThrow();
+      expect(() =>
+        buildSecretsRotateScript(app({ appUser }), {
+          name: "friends-site-main",
+          branch: "main",
+          port: 3100,
+          vhost: "friends-site-main.samo.cat",
+          dbBackend: "none",
+        })
+      ).not.toThrow();
       expect(parseSamohostToml(manifest(appUser)).ok).toBe(true);
     }
   });
@@ -191,6 +204,15 @@ describe("strict Linux appUser validation", () => {
       expect(() => buildHostPrepScript(app({ appUser }), "samo")).toThrow(
         /appUser|Linux user/i,
       );
+      expect(() =>
+        buildSecretsRotateScript(app({ appUser }), {
+          name: "friends-site-main",
+          branch: "main",
+          port: 3100,
+          vhost: "friends-site-main.samo.cat",
+          dbBackend: "none",
+        })
+      ).toThrow(/appUser|Linux user/i);
     }
   });
 });

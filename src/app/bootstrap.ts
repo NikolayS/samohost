@@ -79,6 +79,10 @@ import {
   staticRootOf,
   staticTreeGuardFnLines,
 } from "./static-root.ts";
+import {
+  assertLinuxAppUser,
+  assertOptionalLinuxAppUser,
+} from "./linux-user.ts";
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -217,6 +221,8 @@ export function buildHostBootstrapScript(
   app: AppRecord,
   opts: HostBootstrapOptions,
 ): string {
+  assertLinuxAppUser(opts.appUser);
+  assertOptionalLinuxAppUser(app.appUser);
   const staticRoot = staticRootOf(app);
   const isStatic = app.kind === "static";
   const isStaticReleaseChannel = isStatic && app.releaseTagPattern !== undefined;

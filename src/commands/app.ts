@@ -20,6 +20,7 @@ import { checkCiGreen, type CiStatus } from "../app/cigate.ts";
 import { parseDeployOutcome, type DeployOutcome } from "../app/parse.ts";
 import { buildDeployScript } from "../app/script.ts";
 import { validateStaticRoot } from "../app/static-root.ts";
+import { linuxAppUserError } from "../app/linux-user.ts";
 import {
   CANONICAL_RELEASE_CI_WORKFLOW,
   isCanonicalReleaseCiWorkflow,
@@ -218,6 +219,13 @@ export function runAppRegister(
   out: (s: string) => void,
   err: (s: string) => void,
 ): number {
+  if (input.appUser !== undefined) {
+    const appUserError = linuxAppUserError(input.appUser);
+    if (appUserError !== undefined) {
+      err(`error: invalid appUser: ${appUserError}`);
+      return 1;
+    }
+  }
   const vm = findVm(vmStore, input.vm);
   if (vm === undefined) {
     err(`error: VM not found in state: ${input.vm}`);

@@ -19,6 +19,7 @@ import { parse as parseToml } from "smol-toml";
 import type { TomlValueWithoutBigInt } from "smol-toml";
 import type { ListenerSpec, ServiceSpec, RouteSpec } from "../types.ts";
 import { validateStaticRoot } from "../app/static-root.ts";
+import { linuxAppUserError } from "../app/linux-user.ts";
 import {
   CANONICAL_RELEASE_CI_WORKFLOW,
   isCanonicalReleaseCiWorkflow,
@@ -747,6 +748,11 @@ export function parseSamohostToml(text: string): ParseTomlResult {
   const envDbVars = optionalStringArray(raw, "envDbVars", errors);
   const rlsNonSuperuser = optionalBoolean(raw, "rlsNonSuperuser", errors);
   const staticRoot = optionalString(raw, "staticRoot", errors);
+
+  if (appUser !== undefined) {
+    const appUserError = linuxAppUserError(appUser);
+    if (appUserError !== undefined) errors.push(appUserError);
+  }
 
   // issue #36: optional enum field (must be "node" | "static" when present)
   let kind: "node" | "static" | undefined;
