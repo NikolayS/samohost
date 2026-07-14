@@ -1882,7 +1882,7 @@ describe("static env-create path (kind='static')", () => {
   test("static create script contains file_server and try_files", () => {
     const s = buildEnvCreateScript(app({ kind: "static" }), target({ dbBackend: "none" }));
     expect(s).toContain("file_server");
-    expect(s).toContain("try_files {path} /index.html");
+    expect(s).toContain("try_files {path} {path}/ =404");
   });
 
   test("static create script does NOT contain npm ci, npm start, or reverse_proxy localhost:", () => {
@@ -2018,7 +2018,7 @@ describe("static host-prep path (kind='static')", () => {
     expect(s).toContain("http://game-changers.samo.team {");
     expect(s).toContain('root * "${SAMOHOST_STATIC_DIR}"');
     expect(s).toContain("samohost_assert_static_tree_safe");
-    expect(s).toContain("try_files {path} /index.html");
+    expect(s).toContain("try_files {path} {path}/ =404");
     expect(s).toContain("file_server");
     expect(s).not.toContain("reverse_proxy localhost:80");
     expect(bashSyntaxOk(s)).toBe(true);
@@ -2365,7 +2365,7 @@ describe("static vhost: /config.js served with no-cache Cache-Control header", (
     expect(s).toContain("tls internal");
     expect(s).toContain("root *");
     expect(s).toContain("file_server");
-    expect(s).toContain("try_files {path} /index.html");
+    expect(s).toContain("try_files {path} {path}/ =404");
   });
 
   test("static create bash syntax is still valid after adding the no-cache header (bash -n)", () => {

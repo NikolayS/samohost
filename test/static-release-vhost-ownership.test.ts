@@ -215,7 +215,7 @@ describe("static release-channel production vhost ownership", () => {
       const versionedRoute = [
         "http://release-site.example.com {",
         "\troot * \"/opt/release-site/releases/abc123.candidate.safe\"",
-        "\ttry_files {path} /index.html",
+        "\ttry_files {path} {path}/ =404",
         "\tfile_server",
         "\tencode gzip",
         "}",

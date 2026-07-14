@@ -399,7 +399,7 @@ function runCustomDomainSandbox(
   }) + "\n");
   writeFileSync(
     activePaths.activeRoute,
-    `root * "${staticDir}"\ntry_files {path} /index.html\nfile_server\nencode gzip\n`,
+    `root * "${staticDir}"\ntry_files {path} {path}/ =404\nfile_server\nencode gzip\n`,
   );
   mkdirSync(join(caddyDir, "sites.d"), { recursive: true });
   if (fixture === "reload-failure") {
