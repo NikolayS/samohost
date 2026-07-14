@@ -1027,7 +1027,7 @@ function buildStaticEnvCreateScript(
       "Caddy file_server vhost snippet + reload (sites.d include applied in host-prep)",
       [
         'if samohost_assert_static_tree_safe "$SAMOHOST_CHECKOUT_REAL" "$SAMOHOST_STATIC_DIR" "$SAMOHOST_STATIC_ROOT" \\',
-        "   && printf '%s {\\n\\ttls internal\\n\\troot * %s\\n\\theader /config.js Cache-Control \"no-cache, no-store, must-revalidate\"\\n\\ttry_files {path} /index.html\\n\\tfile_server\\n\\tencode gzip\\n}\\n' \\",
+        "   && printf '%s {\\n\\ttls internal\\n\\troot * %s\\n\\theader /config.js Cache-Control \"no-cache, no-store, must-revalidate\"\\n\\ttry_files {path} {path}/ =404\\n\\tfile_server\\n\\tencode gzip\\n}\\n' \\",
         `     "$SAMOHOST_VHOST" "${servedDir}" \\`,
         '   | sudo /usr/bin/tee "$SAMOHOST_CADDY_SNIPPET" >/dev/null \\',
         "   && sudo /usr/bin/systemctl reload caddy; ",
@@ -2424,7 +2424,7 @@ export function buildHostPrepScript(
       ? [
           `${mainSiteAddress} {`,
           `\troot * "\${SAMOHOST_STATIC_DIR}"`,
-          `\ttry_files {path} /index.html`,
+          `\ttry_files {path} {path}/ =404`,
           `\tfile_server`,
           `\tencode gzip`,
           ...(app.mainListen === "cp-http80" ? [] : [`\ttls internal`]),
@@ -2893,7 +2893,7 @@ export function buildCustomDomainVhostScript(
                 "    raise SystemExit('active static release identity does not match state')",
                 "PY",
                 'EXPECTED_ROUTE=$(mktemp)',
-                'printf \'root * "%s"\\ntry_files {path} /index.html\\nfile_server\\nencode gzip\\n\' "$SAMOHOST_STATIC_DIR" > "$EXPECTED_ROUTE"',
+                'printf \'root * "%s"\\ntry_files {path} {path}/ =404\\nfile_server\\nencode gzip\\n\' "$SAMOHOST_STATIC_DIR" > "$EXPECTED_ROUTE"',
                 'cmp -s "$EXPECTED_ROUTE" "$SAMOHOST_ACTIVE_ROUTE" || { echo "active static route does not match structured release state" >&2; exit 1; }',
                 'SAMOHOST_ACTIVE_FINGERPRINT=$(sha256sum "$SAMOHOST_ACTIVE_STATE" "$SAMOHOST_ACTIVE_ROUTE" | sha256sum | awk \'{print $1}\')',
           "samohost_assert_custom_domain_source() {",
