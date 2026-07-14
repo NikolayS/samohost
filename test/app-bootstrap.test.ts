@@ -1390,6 +1390,35 @@ describe("buildHostBootstrapScript — static path (kind='static')", () => {
     expect(sudoBlock).not.toContain("systemctl enable my-static-site");
   });
 
+  test("static app user has one app-bound helper grant and no direct Caddy or log privilege", () => {
+    const script = buildHostBootstrapScript(staticRecord(), staticOpts());
+    const sudoStart = script.indexOf("cat > '/etc/sudoers.d/");
+    const sudoEnd = script.indexOf("\nSUDOERS\n", sudoStart) + 8;
+    const sudoBlock = script.slice(sudoStart, sudoEnd);
+    expect(sudoBlock).toContain(
+      "agent ALL=(root) NOPASSWD: /usr/local/sbin/samohost-static-route-my-static-site",
+    );
+    expect(sudoBlock).not.toContain("/usr/bin/tee ");
+    expect(sudoBlock).not.toContain("/usr/bin/mv ");
+    expect(sudoBlock).not.toContain("/usr/bin/rm ");
+    expect(sudoBlock).not.toContain("systemctl");
+    expect(sudoBlock).not.toContain("journalctl");
+    expect(sudoBlock).not.toContain("/etc/caddy/Caddyfile");
+    expect(sudoBlock).not.toContain("sites.d/*");
+  });
+
+  test("static route helper is root-owned, argument-free, and app-bound", () => {
+    const script = buildHostBootstrapScript(staticRecord(), staticOpts());
+    const helper = "/usr/local/sbin/samohost-static-route-my-static-site";
+    expect(script).toContain(`install -m 0755 -o root -g root`);
+    expect(script).toContain(helper);
+    expect(script).toContain('[[ "$#" == "0" ]]');
+    expect(script).toContain("my-static-site.example.com");
+    expect(script).toContain("/opt/my-static-site/releases");
+    expect(script).toContain("/etc/caddy/sites.d/00-main-my-static-site.caddy");
+    expect(script).not.toContain(`${helper} "$@"`);
+  });
+
   test("static bootstrap does NOT throw when dbName is absent (static apps have no database)", () => {
     // After the fix: calling with no dbName on a static app must succeed.
     // FAILS today: function runs (no throw), but the script contains 'undefined'

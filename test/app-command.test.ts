@@ -645,6 +645,34 @@ describe("app commands", () => {
     );
   });
 
+  test("deploy carries the registered app identity without changing VM sshUser", async () => {
+    register();
+    const app = appStore.get("vm-1111", "field-record")!;
+    appStore.upsert({ ...app, appUser: "field-record" });
+    let runAsUser: unknown;
+    let seenVmUser = "";
+    const c = capture();
+    const code = await runAppDeploy(
+      { vm: "samo-we-field-record", app: "field-record", sha: SHA, skipCiGate: false },
+      { json: true },
+      vmStore,
+      appStore,
+      deployDeps(HAPPY, {
+        remote: async (targetVm, _script, ...args: unknown[]) => {
+          seenVmUser = targetVm.sshUser;
+          runAsUser = (args[0] as { runAsUser?: string } | undefined)?.runAsUser;
+          return { code: 0, stdout: HAPPY, stderr: "" };
+        },
+      }),
+      c.out,
+      c.err,
+    );
+    expect(code).toBe(0);
+    expect(runAsUser).toBe("field-record");
+    expect(seenVmUser).toBe("agent");
+    expect(vmStore.list()[0]!.sshUser).toBe("agent");
+  });
+
   test("route failure does not stamp deployedSha, so the trigger retries", async () => {
     register();
     appStore.upsert({
