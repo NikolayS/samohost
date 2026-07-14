@@ -14,6 +14,7 @@
 import { readFileSync } from "node:fs";
 import type { Provider, ProvisionSpec } from "./types.ts";
 import { validateStaticRoot } from "./app/static-root.ts";
+import { linuxAppUserError } from "./app/linux-user.ts";
 import { runPreview } from "./commands/preview.ts";
 import {
   runAdopt,
@@ -1638,6 +1639,10 @@ function parseAppBootstrap(args: string[]): ParsedAppBootstrap {
   if (vm === undefined) throw new UsageError("app bootstrap requires <vm> <app>");
   if (app === undefined) throw new UsageError("app bootstrap requires <vm> <app>");
   if (appUser === undefined) throw new UsageError("app bootstrap requires --app-user <user>");
+  const appUserError = linuxAppUserError(appUser);
+  if (appUserError !== undefined) {
+    throw new UsageError(`invalid --app-user: ${appUserError}`);
+  }
 
   const input: AppBootstrapInput = {
     vm,

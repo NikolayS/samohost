@@ -27,6 +27,7 @@
 
 import type { AppRecord, EnvDbBackend, EnvRecord } from "../types.ts";
 import { servicesOf } from "../app/services.ts";
+import { assertOptionalLinuxAppUser } from "../app/linux-user.ts";
 import {
   staticReleaseStatePaths,
   staticRootOf,
@@ -1237,6 +1238,7 @@ export function buildEnvCreateScript(
   app: AppRecord,
   t: EnvScriptTarget,
 ): string {
+  assertOptionalLinuxAppUser(app.appUser);
   staticRootOf(app);
   // issue #36: branch on kind for static sites.
   if (app.kind === "static") {
@@ -2098,6 +2100,7 @@ export function buildSecretsRotateScript(
   app: AppRecord,
   t: EnvScriptTarget,
 ): string {
+  assertOptionalLinuxAppUser(app.appUser);
   const envUser = app.appUser ?? "root";
   const secrets = app.secrets ?? [];
   const { services } = servicesOf(app);
@@ -2328,6 +2331,7 @@ export function buildHostPrepScript(
   sshUser: string,
   firewallOpts?: HostPrepFirewallOpts,
 ): string {
+  assertOptionalLinuxAppUser(app.appUser);
   const staticRoot = staticRootOf(app);
   const isStatic = app.kind === "static";
   const isStaticReleaseChannel = isStatic && app.releaseTagPattern !== undefined;

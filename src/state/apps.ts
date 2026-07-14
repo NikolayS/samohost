@@ -13,6 +13,10 @@
 import { homedir } from "node:os";
 import { join } from "node:path";
 import type { AppRecord } from "../types.ts";
+import {
+  assertOptionalLinuxAppUser,
+  linuxAppUserError,
+} from "../app/linux-user.ts";
 import { docPaths, readDoc, writeDoc, type DocPaths } from "./atomic.ts";
 
 interface AppsFile {
@@ -59,6 +63,7 @@ export class AppStore {
    * record is appended. Returns the stored record.
    */
   upsert(record: AppRecord): AppRecord {
+    assertOptionalLinuxAppUser(record.appUser);
     const state = this.read();
     const idx = state.apps.findIndex(
       (a) => a.vmId === record.vmId && a.name === record.name,
@@ -100,7 +105,12 @@ function validateAppsFile(obj: unknown): AppsFile | undefined {
     obj !== null &&
     typeof obj === "object" &&
     "apps" in obj &&
-    Array.isArray((obj as { apps: unknown }).apps)
+    Array.isArray((obj as { apps: unknown }).apps) &&
+    (obj as { apps: unknown[] }).apps.every((app) => {
+      if (app === null || typeof app !== "object") return false;
+      const appUser = (app as { appUser?: unknown }).appUser;
+      return appUser === undefined || linuxAppUserError(appUser) === undefined;
+    })
   ) {
     return obj as AppsFile;
   }
