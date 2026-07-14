@@ -20,6 +20,13 @@ import { assertSafeAppIdentity } from "../app/identity.ts";
 const CADDYFILE = "/etc/caddy/Caddyfile";
 const SITES_DIR = "/etc/caddy/sites.d";
 
+export interface ControlPlaneProbeExpectation {
+  /** Exact deployed commit identity served by static /version.json. */
+  sha: string;
+  /** Exact release identity for version+tag when the release tag is known. */
+  tag?: string;
+}
+
 function sq(value: string): string {
   return `'${value.replace(/'/g, `'"'"'`)}'`;
 }
@@ -31,6 +38,77 @@ function validHost(host: string): boolean {
     new RegExp(`^${label}(?:\\.${label})*\\.[a-z]{2,63}$`).test(host) &&
     host === host.toLowerCase()
   );
+}
+
+function probePath(app: AppRecord): string {
+  if (app.kind === "static") return "/version.json";
+  try {
+    const parsed = new URL(app.healthUrl);
+    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+      throw new Error("unsupported protocol");
+    }
+    return `${parsed.pathname}${parsed.search}` || "/";
+  } catch {
+    throw new Error("invalid app healthUrl for control-plane end-to-end probe");
+  }
+}
+
+function controlPlaneProbeLines(
+  app: AppRecord,
+  expectation?: ControlPlaneProbeExpectation,
+): string[] {
+  const host = app.mainHost!;
+  const path = probePath(app);
+  if (expectation !== undefined && !/^[0-9a-f]{40}$/.test(expectation.sha)) {
+    throw new Error("invalid expected SHA for control-plane end-to-end probe");
+  }
+  const lines = [
+    "# Prove the complete CP TLS -> configured upstream -> project route before commit.",
+    "# --resolve keeps DNS local while preserving the production Host header and TLS SNI.",
+    "# Caddy's internal CA is intentionally accepted with --insecure, matching origin probes.",
+    'PROBE_BODY=$(/usr/bin/mktemp "/tmp/samohost-main-route-probe.XXXXXX")',
+    "PROBE_OK=0",
+    'PROBE_STATUS="transport-error"',
+    "for attempt in $(seq 1 5); do",
+    '  : > "$PROBE_BODY"',
+    `  if PROBE_STATUS=$(/usr/bin/curl --silent --show-error --insecure --noproxy '*' --proto '=https' --resolve ${sq(`${host}:443:127.0.0.1`)} --output "$PROBE_BODY" --write-out '%{http_code}' --connect-timeout 5 --max-time 10 --max-filesize 1048576 ${sq(`https://${host}${path}`)}); then`,
+  ];
+  if (app.kind === "static" && expectation !== undefined) {
+    lines.push(
+      '    if [[ "$PROBE_STATUS" == "200" ]] && /usr/bin/python3 - "$PROBE_BODY" ' +
+        `${sq(expectation.sha)} ${sq(expectation.tag ?? "")} <<'PY'`,
+      "import json",
+      "import sys",
+      "",
+      "path, expected_sha, expected_tag = sys.argv[1:]",
+      "try:",
+      "    with open(path, encoding='utf-8') as source:",
+      "        body = json.load(source)",
+      "except (OSError, UnicodeError, json.JSONDecodeError):",
+      "    raise SystemExit(1)",
+      "if not isinstance(body, dict): raise SystemExit(1)",
+      "if body.get('sha') != expected_sha or body.get('environment') != 'production': raise SystemExit(1)",
+      "if expected_tag and (body.get('version') != expected_tag or body.get('tag') != expected_tag): raise SystemExit(1)",
+      "PY",
+      "    then",
+      "      PROBE_OK=1; break",
+      "    fi",
+    );
+  } else {
+    lines.push(
+      '    if [[ "$PROBE_STATUS" == "200" ]]; then PROBE_OK=1; break; fi',
+    );
+  }
+  lines.push(
+    "  else",
+    '    PROBE_STATUS="transport-error"',
+    "  fi",
+    "  sleep 1",
+    "done",
+    '[[ "$PROBE_OK" == "1" ]] || { echo "error: control-plane end-to-end route probe failed (last status: $PROBE_STATUS)" >&2; exit 1; }',
+    'echo "control-plane end-to-end route probe passed"',
+  );
+  return lines;
 }
 
 /** True only for the explicit control-plane-fronted production topology. */
@@ -147,10 +225,11 @@ function transactionPreamble(path: string): string[] {
     `SNIPPET=${sq(path)}`,
     'BACKUP="${SNIPPET}.rollback.$$"',
     "HAD_OLD=0",
+    "MUTATED=0",
     "COMMITTED=0",
     "rollback() {",
     '  rc="$?"',
-    '  if [ "$COMMITTED" -eq 0 ]; then',
+    '  if [ "$COMMITTED" -eq 0 ] && [ "$MUTATED" -eq 1 ]; then',
     '    if [ "$HAD_OLD" -eq 1 ] && [ -e "$BACKUP" ]; then',
     '      sudo /usr/bin/mv -f "$BACKUP" "$SNIPPET"',
     "    else",
@@ -163,6 +242,7 @@ function transactionPreamble(path: string): string[] {
     "    fi",
     "  fi",
     '  [ -n "${DESIRED:-}" ] && /usr/bin/rm -f "$DESIRED"',
+    '  [ -n "${PROBE_BODY:-}" ] && /usr/bin/rm -f "$PROBE_BODY"',
     '  if [ -e "$BACKUP" ] || [ -e "${SNIPPET}.new" ]; then',
     '    sudo /usr/bin/rm -f "$BACKUP" "${SNIPPET}.new"',
     "  fi",
@@ -184,6 +264,7 @@ function transactionPreamble(path: string): string[] {
 export function buildControlPlaneMainRouteReconcileScript(
   app: AppRecord,
   vm: VmRecord,
+  probeExpectation?: ControlPlaneProbeExpectation,
 ): string {
   const path = controlPlaneMainRoutePath(app);
   const lines = [
@@ -202,6 +283,7 @@ export function buildControlPlaneMainRouteReconcileScript(
       "grep -qF 'import sites.d/*.caddy' \"$CADDYFILE\" || { echo \"error: Caddyfile does not import sites.d/*.caddy\" >&2; exit 1; }",
       'sudo /usr/bin/cp -p "$SNIPPET" "$BACKUP"',
       "HAD_OLD=1",
+      "MUTATED=1",
       'sudo /usr/bin/rm -f "$SNIPPET"',
       'sudo /usr/bin/caddy validate --config "$CADDYFILE"',
       "sudo /usr/bin/systemctl reload caddy",
@@ -227,15 +309,16 @@ export function buildControlPlaneMainRouteReconcileScript(
     "fi",
     "",
     'if [ -e "$SNIPPET" ] && /usr/bin/cmp -s "$DESIRED" "$SNIPPET"; then',
-    '  echo "control-plane main route unchanged"',
-    "  COMMITTED=1",
-    "  exit 0",
+    '  echo "control-plane main route unchanged; probing through it"',
+    "else",
+    '  if [ -e "$SNIPPET" ]; then sudo /usr/bin/cp -p "$SNIPPET" "$BACKUP"; HAD_OLD=1; fi',
+    "  MUTATED=1",
+    '  sudo /usr/bin/install -m 0644 -o root -g root "$DESIRED" "${SNIPPET}.new"',
+    '  sudo /usr/bin/mv -f "${SNIPPET}.new" "$SNIPPET"',
+    '  sudo /usr/bin/caddy validate --config "$CADDYFILE"',
+    "  sudo /usr/bin/systemctl reload caddy",
     "fi",
-    'if [ -e "$SNIPPET" ]; then sudo /usr/bin/cp -p "$SNIPPET" "$BACKUP"; HAD_OLD=1; fi',
-    'sudo /usr/bin/install -m 0644 -o root -g root "$DESIRED" "${SNIPPET}.new"',
-    'sudo /usr/bin/mv -f "${SNIPPET}.new" "$SNIPPET"',
-    'sudo /usr/bin/caddy validate --config "$CADDYFILE"',
-    "sudo /usr/bin/systemctl reload caddy",
+    ...controlPlaneProbeLines(app, probeExpectation),
     "COMMITTED=1",
     `echo ${sq(`control-plane main route ready: ${host} -> ${upstream(vm.ip)}`)}`,
   ].join("\n");

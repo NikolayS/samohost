@@ -1,14 +1,27 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import {
+  chmodSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { spawnSync } from "node:child_process";
 import {
   runAppDeploy,
   runAppRegister,
   type AppDeployDeps,
   type AppRegisterInput,
 } from "../src/commands/app.ts";
-import { controlPlaneMainRouteFingerprint } from "../src/caddy/control-plane.ts";
+import {
+  controlPlaneMainRouteFingerprint,
+  controlPlaneMainRoutePath,
+  renderControlPlaneMainRoute,
+} from "../src/caddy/control-plane.ts";
+import { projectMainRoutePath } from "../src/caddy/project-main.ts";
 import { reconcileTwoHopMainRoute } from "../src/caddy/two-hop.ts";
 import {
   runTriggerRun,
@@ -24,6 +37,8 @@ const SHA = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const NEW_SHA = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 const OLD_HOST = "old-client.samo.team";
 const NEW_HOST = "new-client.samo.team";
+
+type CpProbeMode = "success" | "unreachable" | "bad-gateway" | "wrong-identity";
 
 function vm(): VmRecord {
   return {
@@ -138,6 +153,164 @@ describe("register -> deploy/trigger two-hop routing lifecycle", () => {
     return { events, projectScripts, controlScripts, projectRoute, controlPlaneRoute };
   }
 
+  function executedControlPlaneHarness(
+    oldApp: AppRecord,
+    probeMode: CpProbeMode,
+    identity: { sha: string; tag: string } = { sha: SHA, tag: SHA },
+  ) {
+    const base = routingHarness();
+    const sandbox = join(dir, `cp-${probeMode}`);
+    const caddyDir = join(sandbox, "caddy");
+    const sitesDir = join(caddyDir, "sites.d");
+    const binDir = join(sandbox, "bin");
+    const reloadLog = join(sandbox, "reload.log");
+    const projectReloadLog = join(sandbox, "project-reload.log");
+    const curlLog = join(sandbox, "curl.log");
+    const projectCaddyDir = join(sandbox, "project-caddy");
+    const projectSitesDir = join(projectCaddyDir, "sites.d");
+    mkdirSync(sitesDir, { recursive: true });
+    mkdirSync(projectSitesDir, { recursive: true });
+    mkdirSync(binDir, { recursive: true });
+    writeFileSync(reloadLog, "");
+    writeFileSync(projectReloadLog, "");
+    writeFileSync(curlLog, "");
+    writeFileSync(join(caddyDir, "Caddyfile"), "import sites.d/*.caddy\n");
+    writeFileSync(join(projectCaddyDir, "Caddyfile"), "import sites.d/*.caddy\n");
+    const snippet = controlPlaneMainRoutePath(oldApp).replace("/etc/caddy", caddyDir);
+    const oldRoute = renderControlPlaneMainRoute(oldApp, vm()) + "\n";
+    writeFileSync(snippet, oldRoute);
+    const projectSnippet = projectMainRoutePath(oldApp).replace(
+      "/etc/caddy",
+      projectCaddyDir,
+    );
+    const projectAddress = oldApp.mainListen === "tls"
+      ? oldApp.mainHost!
+      : `http://${oldApp.mainHost!}:80`;
+    const projectOldRoute = oldApp.kind === "static"
+      ? [
+        `${projectAddress} {`,
+        `\troot * "${oldApp.appDir}"`,
+        "\ttry_files {path} /index.html",
+        "\tfile_server",
+        "}",
+        "",
+      ].join("\n")
+      : [
+        `${projectAddress} {`,
+        "\treverse_proxy localhost:3000",
+        "}",
+        "",
+      ].join("\n");
+    writeFileSync(projectSnippet, projectOldRoute);
+    writeFileSync(join(binDir, "caddy"), "#!/usr/bin/env bash\nexit 0\n");
+    writeFileSync(join(binDir, "sleep"), "#!/usr/bin/env bash\nexit 0\n");
+    writeFileSync(join(binDir, "systemctl"), [
+      "#!/usr/bin/env bash",
+      'if [[ "${SAMOHOST_TEST_HOP:-cp}" == "project" ]]; then',
+      '  printf "%s\\n" "$*" >> "$PROJECT_RELOAD_LOG"',
+      "else",
+      '  printf "%s\\n" "$*" >> "$CP_RELOAD_LOG"',
+      "fi",
+      "exit 0",
+      "",
+    ].join("\n"));
+    writeFileSync(join(binDir, "curl"), [
+      "#!/usr/bin/env bash",
+      'printf "%s\\n" "$*" >> "$CP_CURL_LOG"',
+      'output=""',
+      'while [[ "$#" -gt 0 ]]; do',
+      '  if [[ "$1" == "--output" ]]; then output="$2"; shift 2; else shift; fi',
+      "done",
+      'if [[ -z "$output" ]]; then printf "200"; exit 0; fi',
+      'case "$CP_PROBE_MODE" in',
+      "  unreachable) exit 7 ;;",
+      "  bad-gateway) printf 'upstream unavailable' > \"$output\"; printf '502' ;;",
+      "  wrong-identity) printf '%s' '{\"version\":\"old\",\"tag\":\"old\",\"sha\":\"0000000000000000000000000000000000000000\",\"environment\":\"production\"}' > \"$output\"; printf '200' ;;",
+      "  success) printf '{\"version\":\"%s\",\"tag\":\"%s\",\"sha\":\"%s\",\"environment\":\"production\"}' \"$CP_EXPECTED_TAG\" \"$CP_EXPECTED_TAG\" \"$CP_EXPECTED_SHA\" > \"$output\"; printf '200' ;;",
+      "  *) exit 65 ;;",
+      "esac",
+      "",
+    ].join("\n"));
+    for (const command of ["caddy", "curl", "sleep", "systemctl"]) {
+      chmodSync(join(binDir, command), 0o755);
+    }
+
+    const projectRoute = async (
+      _vm: VmRecord,
+      script: string,
+    ): Promise<SpawnResult> => {
+      const p = phase(script);
+      base.events.push(`project:${p}`);
+      base.projectScripts.push(script);
+      const sandboxed = script
+        .replaceAll("/etc/caddy", projectCaddyDir)
+        .replaceAll("/tmp/samohost-main-route-", `${sandbox}/project-txn-`)
+        .replaceAll("sudo /usr/bin/", "")
+        .replaceAll("/usr/bin/curl", "curl");
+      const result = spawnSync("bash", ["-s"], {
+        input: sandboxed,
+        encoding: "utf8",
+        env: {
+          ...process.env,
+          PATH: `${binDir}:${process.env["PATH"] ?? ""}`,
+          SAMOHOST_TEST_HOP: "project",
+          CP_RELOAD_LOG: reloadLog,
+          PROJECT_RELOAD_LOG: projectReloadLog,
+          CP_CURL_LOG: curlLog,
+        },
+      });
+      return {
+        code: result.status ?? 1,
+        stdout: result.stdout,
+        stderr: result.stderr,
+      };
+    };
+
+    const controlPlaneRoute = async (
+      _vm: VmRecord,
+      script: string,
+    ): Promise<SpawnResult> => {
+      base.events.push("control-plane");
+      base.controlScripts.push(script);
+      const sandboxed = script
+        .replaceAll("/etc/caddy", caddyDir)
+        .replaceAll("sudo /usr/bin/", "")
+        .replaceAll(" -o root -g root", "")
+        .replaceAll("/usr/bin/curl", "curl");
+      const result = spawnSync("bash", ["-s"], {
+        input: sandboxed,
+        encoding: "utf8",
+        env: {
+          ...process.env,
+          PATH: `${binDir}:${process.env["PATH"] ?? ""}`,
+          CP_PROBE_MODE: probeMode,
+          CP_EXPECTED_SHA: identity.sha,
+          CP_EXPECTED_TAG: identity.tag,
+          CP_RELOAD_LOG: reloadLog,
+          PROJECT_RELOAD_LOG: projectReloadLog,
+          CP_CURL_LOG: curlLog,
+        },
+      });
+      return {
+        code: result.status ?? 1,
+        stdout: result.stdout,
+        stderr: result.stderr,
+      };
+    };
+    return {
+      ...base,
+      projectRoute,
+      controlPlaneRoute,
+      snippet,
+      oldRoute,
+      reloadLog,
+      curlLog,
+      projectSnippet,
+      projectOldRoute,
+      projectReloadLog,
+    };
+  }
+
   async function trigger(
     harness: ReturnType<typeof routingHarness>,
     overrides: Partial<TriggerDeps> = {},
@@ -172,6 +345,65 @@ describe("register -> deploy/trigger two-hop routing lifecycle", () => {
     );
     expect(deployCalls).toBe(0);
     return { code, report: JSON.parse(c.o), err: c.e };
+  }
+
+  async function deployStaticReleaseThroughExecutedProbe(probeMode: CpProbeMode) {
+    const releaseSpec = input({
+      kind: "static",
+      buildCmd: "npm run build",
+      healthUrl: "http://127.0.0.1/version.json",
+      releaseTagPattern: "v*",
+      releaseTagFormat: "date",
+      releaseCiWorkflow: ".github/workflows/ci.yml",
+    });
+    const seeded = seedAppliedRoute(releaseSpec);
+    const renameHost = probeMode === "wrong-identity";
+    if (renameHost) register({ ...releaseSpec, mainHost: NEW_HOST });
+    const tag = "v20260714.1";
+    const harness = executedControlPlaneHarness(
+      seeded.app,
+      probeMode,
+      { sha: NEW_SHA, tag },
+    );
+    const deps: AppDeployDeps = {
+      remote: async () => {
+        harness.events.push("deploy");
+        return ok("<<<SAMOHOST_PHASE:health:start>>>\n<<<SAMOHOST_PHASE:health:ok>>>");
+      },
+      resolveRef: async () => NEW_SHA,
+      isCommitOnBranch: async () => true,
+      fetch: (async () => ({
+        ok: true,
+        json: async () => ({ workflow_runs: [{ status: "completed", conclusion: "success" }] }),
+      }) as Response) as unknown as typeof fetch,
+      now: () => new Date("2026-07-14T01:00:00.000Z"),
+      env: { GH_TOKEN: "test" },
+      projectRoute: harness.projectRoute,
+      controlPlaneRoute: harness.controlPlaneRoute,
+    };
+    const c = capture();
+    const code = await runAppDeploy(
+      {
+        vm: vm().name,
+        app: "client-site",
+        sha: NEW_SHA,
+        releaseTag: tag,
+        skipCiGate: false,
+      },
+      { json: true },
+      vmStore,
+      appStore,
+      deps,
+      c.out,
+      c.err,
+    );
+    return {
+      code,
+      err: c.e,
+      harness,
+      saved: appStore.get(vm().id, "client-site")!,
+      seeded,
+    };
   }
 
   test("same-SHA host rename prepares project VM, then CP, then commits/stamps", async () => {
@@ -247,6 +479,87 @@ describe("register -> deploy/trigger two-hop routing lifecycle", () => {
     expect(
       appStore.get(vm().id, "client-site")?.controlPlaneRouteFingerprint,
     ).toBe(seeded.fingerprint);
+  });
+
+  for (const [label, probeMode, expectedStatus] of [
+    ["unreachable project VM", "unreachable", "transport-error"],
+    ["upstream 502", "bad-gateway", "502"],
+  ] as const) {
+    test(`executed CP probe: ${label} rolls back both hops and leaves state old`, async () => {
+      const seeded = seedAppliedRoute();
+      register(input({ mainHost: NEW_HOST }));
+      const h = executedControlPlaneHarness(seeded.app, probeMode);
+      const result = await trigger(h);
+
+      expect(result.code).toBe(1);
+      expect(result.report.results[0]?.error).toContain(
+        `last status: ${expectedStatus}`,
+      );
+      expect(h.events).toEqual([
+        "project:begin",
+        "project:prepare",
+        "control-plane",
+        "project:rollback",
+      ]);
+      expect(readFileSync(h.snippet, "utf8")).toBe(h.oldRoute);
+      expect(readFileSync(h.projectSnippet, "utf8")).toBe(h.projectOldRoute);
+      expect(readFileSync(h.reloadLog, "utf8").trim().split("\n")).toHaveLength(2);
+      expect(readFileSync(h.projectReloadLog, "utf8").trim().split("\n")).toHaveLength(3);
+      const curlArgs = readFileSync(h.curlLog, "utf8");
+      expect(curlArgs).toContain(`--resolve ${NEW_HOST}:443:127.0.0.1`);
+      expect(curlArgs).toContain(`https://${NEW_HOST}/health`);
+      expect(curlArgs).toContain("--insecure");
+      expect(curlArgs).toContain("--noproxy *");
+      expect(
+        appStore.get(vm().id, "client-site")?.controlPlaneRouteFingerprint,
+      ).toBe(seeded.fingerprint);
+    });
+  }
+
+  test("executed CP probe: wrong static identity rolls back CP and project release", async () => {
+    const result = await deployStaticReleaseThroughExecutedProbe("wrong-identity");
+    expect(result.code).toBe(1);
+    expect(result.err).toContain("last status: 200");
+    expect(result.harness.events).toEqual([
+      "project:begin",
+      "deploy",
+      "project:prepare",
+      "control-plane",
+      "project:rollback",
+    ]);
+    expect(readFileSync(result.harness.snippet, "utf8")).toBe(result.harness.oldRoute);
+    expect(readFileSync(result.harness.projectSnippet, "utf8")).toBe(
+      result.harness.projectOldRoute,
+    );
+    expect(readFileSync(result.harness.reloadLog, "utf8").trim().split("\n")).toHaveLength(2);
+    expect(readFileSync(result.harness.projectReloadLog, "utf8").trim().split("\n"))
+      .toHaveLength(3);
+    expect(result.saved.deployedSha).toBe(SHA);
+    expect(result.saved.controlPlaneRouteFingerprint).toBe(result.seeded.fingerprint);
+  });
+
+  test("executed CP probe: exact static tag/SHA identity commits both hops then stamps", async () => {
+    const result = await deployStaticReleaseThroughExecutedProbe("success");
+    expect(result.code, result.err).toBe(0);
+    expect(result.harness.events).toEqual([
+      "project:begin",
+      "deploy",
+      "project:prepare",
+      "control-plane",
+      "project:commit",
+    ]);
+    const live = readFileSync(result.harness.snippet, "utf8");
+    expect(live).toBe(result.harness.oldRoute);
+    expect(readFileSync(result.harness.reloadLog, "utf8")).toBe("");
+    const curlArgs = readFileSync(result.harness.curlLog, "utf8");
+    expect(curlArgs).toContain(`--resolve ${OLD_HOST}:443:127.0.0.1`);
+    expect(curlArgs).toContain(`https://${OLD_HOST}/version.json`);
+    expect(readFileSync(result.harness.projectReloadLog, "utf8").trim().split("\n"))
+      .toHaveLength(2);
+    expect(result.saved.deployedSha).toBe(NEW_SHA);
+    expect(result.saved.controlPlaneRouteFingerprint).toBe(
+      controlPlaneMainRouteFingerprint(result.saved, vm()),
+    );
   });
 
   test("project commit failure leaves routing state unstamped for a resumable retry", async () => {

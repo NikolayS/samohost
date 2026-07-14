@@ -6,6 +6,7 @@ import {
   buildControlPlaneMainRouteReconcileScript,
   controlPlaneMainRouteFingerprint,
   needsControlPlaneMainRoute,
+  type ControlPlaneProbeExpectation,
 } from "./control-plane.ts";
 import {
   buildProjectMainRouteBeginScript,
@@ -29,6 +30,19 @@ export interface TwoHopRouteResult {
   routing: "ready" | "removed" | "failed";
   error?: string;
   warning?: string;
+}
+
+function appliedProbeExpectation(
+  app: AppRecord,
+): ControlPlaneProbeExpectation | undefined {
+  if (app.kind !== "static" || app.deployedSha === undefined) return undefined;
+  const tag = app.releaseTagPattern === undefined
+    ? app.deployedSha
+    : app.releaseTagCursor;
+  return {
+    sha: app.deployedSha,
+    ...(tag !== undefined ? { tag } : {}),
+  };
 }
 
 export function hasMainRouteDrift(app: AppRecord, vm: VmRecord): boolean {
@@ -97,6 +111,7 @@ export async function completeTwoHopMainRoute(
   app: AppRecord,
   vm: VmRecord,
   deps: TwoHopRouteDeps,
+  probeExpectation?: ControlPlaneProbeExpectation,
 ): Promise<TwoHopRouteResult> {
   const desired = controlPlaneMainRouteFingerprint(app, vm);
   let prepared: SpawnResult;
@@ -128,7 +143,7 @@ export async function completeTwoHopMainRoute(
   try {
     controlPlane = await deps.controlPlaneRoute(
       vm,
-      buildControlPlaneMainRouteReconcileScript(app, vm),
+      buildControlPlaneMainRouteReconcileScript(app, vm, probeExpectation),
     );
   } catch (e) {
     const rollback = await rollbackProject(app, vm, desired, deps);
@@ -192,5 +207,5 @@ export async function reconcileTwoHopMainRoute(
   if (begun.code !== 0) {
     return { ok: false, routing: "failed", error: failure("project-route begin", begun) };
   }
-  return completeTwoHopMainRoute(app, vm, deps);
+  return completeTwoHopMainRoute(app, vm, deps, appliedProbeExpectation(app));
 }

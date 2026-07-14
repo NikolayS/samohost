@@ -140,10 +140,40 @@ describe("control-plane production mainHost routing", () => {
     expect(script).toContain('mv -f "$BACKUP" "$SNIPPET"');
     expect(script).toContain("COMMITTED=0");
     expect(script).toContain("trap rollback EXIT HUP INT TERM");
+    expect(script).toContain(
+      "--resolve 'friends-of-twin-peaks.samo.team:443:127.0.0.1'",
+    );
+    expect(script).toContain(
+      "https://friends-of-twin-peaks.samo.team/version.json",
+    );
+    expect(script).toContain("--insecure --noproxy '*' --proto '=https'");
+    expect(script.indexOf("systemctl reload caddy")).toBeLessThan(
+      script.indexOf("control-plane end-to-end route probe passed"),
+    );
+    expect(script.indexOf("control-plane end-to-end route probe passed")).toBeLessThan(
+      script.indexOf("COMMITTED=1", script.indexOf("control-plane end-to-end route probe passed")),
+    );
     expect(script).toContain("already exists outside samohost");
     expect(script).not.toContain("tee -a");
     expect(script).not.toContain(">> /etc/caddy/Caddyfile");
     expect(spawnSync("bash", ["-n"], { input: script }).status).toBe(0);
+  });
+
+  test("static release probe requires exact production tag and SHA identity", () => {
+    const release = app({
+      releaseTagPattern: "v*",
+      releaseTagFormat: "date",
+      releaseCiWorkflow: ".github/workflows/ci.yml",
+    });
+    const script = buildControlPlaneMainRouteReconcileScript(release, vm(), {
+      sha: "b".repeat(40),
+      tag: "v20260714.1",
+    });
+    expect(script).toContain("body.get('sha') != expected_sha");
+    expect(script).toContain("body.get('environment') != 'production'");
+    expect(script).toContain("body.get('version') != expected_tag");
+    expect(script).toContain("'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb' 'v20260714.1'");
+    expect(spawnSync("bash", ["-n"], { input: script }).status, script).toBe(0);
   });
 
   test("tls/unhosted reconciliation removes only the stable managed file", () => {

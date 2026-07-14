@@ -30,6 +30,7 @@ import {
 } from "../app/identity.ts";
 import {
   controlPlaneMainRouteFingerprint,
+  needsControlPlaneMainRoute,
 } from "../caddy/control-plane.ts";
 import {
   beginTwoHopMainRoute,
@@ -853,23 +854,27 @@ export async function runAppDeploy(
 
   // Snapshot project routing before a deploy can change it. CI and all other
   // preflight failures happen above, so they never touch either routing hop.
-  let routingDrift: boolean;
+  let routeTransactionNeeded: boolean;
   let script: string;
   try {
-    routingDrift = hasMainRouteDrift(app, vm);
+    const routingDrift = hasMainRouteDrift(app, vm);
+    // A CP-fronted deploy must prove the complete CP -> project path even when
+    // its Caddy specification is byte-identical. The release behind that route
+    // changed, so config drift alone is not a sufficient transaction trigger.
+    routeTransactionNeeded = routingDrift || needsControlPlaneMainRoute(app);
     script = buildDeployScript(app, {
       sha,
       ...(input.releaseTag !== undefined ? { tag: input.releaseTag } : {}),
-      ...(routingDrift ? { deferStaticCleanup: true } : {}),
+      ...(routeTransactionNeeded ? { deferStaticCleanup: true } : {}),
     });
   } catch (e) {
     err(`error: cannot build deploy transaction: ${e instanceof Error ? e.message : String(e)}`);
     return 1;
   }
   let routeDeps: TwoHopRouteDeps | undefined;
-  if (routingDrift) {
+  if (routeTransactionNeeded) {
     if (deps.projectRoute === undefined) {
-      err("error: routing drift detected but the project-route runner is unavailable");
+      err("error: route transaction required but the project-route runner is unavailable");
       return 1;
     }
     routeDeps = {
@@ -914,7 +919,10 @@ export async function runAppDeploy(
   let routing: AppDeployReport["routing"] = "not-run";
   if (routeDeps !== undefined) {
     if (outcome === "deployed") {
-      const routeResult = await completeTwoHopMainRoute(app, vm, routeDeps);
+      const routeResult = await completeTwoHopMainRoute(app, vm, routeDeps, {
+        sha,
+        ...(input.releaseTag !== undefined ? { tag: input.releaseTag } : {}),
+      });
       routing = routeResult.routing;
       if (!routeResult.ok) err(`error: ${routeResult.error ?? "two-hop route reconcile failed"}`);
       if (routeResult.warning !== undefined) err(`warning: ${routeResult.warning}`);

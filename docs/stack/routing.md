@@ -92,7 +92,12 @@ writes the initial project-VM vhost. A production routing change is then a
 two-hop transaction: samohost snapshots the old project-VM snippet, applies
 and locally health-checks the desired project topology in a transition snippet
 while the old host remains live, and only then changes the control-plane
-snippet. If the control-plane step fails, the transition is removed and the
+snippet. Before either hop commits, the control plane probes its own
+`127.0.0.1:443` listener with the production hostname as both TLS SNI and Host,
+thereby exercising the configured upstream without relying on public DNS. A
+static release must return the exact expected tag and commit identity from
+`/version.json`. If the control-plane update or end-to-end probe fails, its
+snippet is restored, then the project transition is removed and the
 project VM is restored and health-checked through its old host. Re-registering with a changed
 host/IP updates the stable managed files; changing away from `cp-http80`
 updates/removes the project topology before removing the control-plane route.
@@ -111,7 +116,8 @@ The reconciler never edits `/etc/caddy/Caddyfile`. The control plane must
 already have the canonical `import sites.d/*.caddy` line. It stages and
 atomically renames the snippet, validates the complete Caddy config, then
 reloads. A validation or reload failure restores and reloads the previous
-snippet; the project-VM transaction then restores its snapshot. The deploy is
+snippet; an unreachable upstream, non-200 response, or wrong release identity
+does the same. The project-VM transaction then restores its snapshot. The deploy is
 not stamped successful, so the trigger retries.
 If the same hostname is still declared in a legacy hand-authored file, the
 reconciler fails closed instead of creating an ambiguous duplicate or claiming
