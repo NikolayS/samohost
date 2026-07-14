@@ -13,7 +13,10 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
-import { validateStaticRoot } from "../src/app/static-root.ts";
+import {
+  staticReleaseStatePaths,
+  validateStaticRoot,
+} from "../src/app/static-root.ts";
 import { parseSamohostToml } from "../src/manifest/toml.ts";
 import { parseArgs } from "../src/cli.ts";
 import {
@@ -328,30 +331,71 @@ type CustomDomainFixture =
   | "nested-file-symlink"
   | "reload-failure";
 
-function runCustomDomainSandbox(fixture: CustomDomainFixture): {
+function runCustomDomainSandbox(
+  fixture: CustomDomainFixture,
+  identity?: { tag: string; releaseTagFormat: string },
+): {
   status: number | null;
   stderr: string;
   dir: string;
   appDir: string;
   snippet: string;
+  activeRoute: string;
 } {
   const dir = mkdtempSync(join(tmpdir(), "samohost-static-root-domain-"));
   const appDir = join(dir, "site", "app");
+  const releaseDir = join(dir, "site", "releases", "active-candidate");
   const caddyDir = join(dir, "caddy");
   const binDir = join(dir, "bin");
   const snippet = join(caddyDir, "sites.d", "10-domain-client-example.caddy");
   mkdirSync(appDir, { recursive: true });
+  mkdirSync(releaseDir, { recursive: true });
   if (fixture === "root-symlink") {
-    mkdirSync(join(appDir, "real-dist"));
-    writeFileSync(join(appDir, "real-dist", "index.html"), "safe\n");
-    symlinkSync("real-dist", join(appDir, "dist"));
+    mkdirSync(join(releaseDir, "real-dist"));
+    writeFileSync(join(releaseDir, "real-dist", "index.html"), "safe\n");
+    symlinkSync("real-dist", join(releaseDir, "dist"));
   } else {
-    mkdirSync(join(appDir, "dist"));
-    writeFileSync(join(appDir, "dist", "index.html"), "safe\n");
+    mkdirSync(join(releaseDir, "dist"));
+    writeFileSync(join(releaseDir, "dist", "index.html"), "safe\n");
     if (fixture === "nested-file-symlink") {
-      symlinkSync("/etc/passwd", join(appDir, "dist", "leak.txt"));
+      symlinkSync("/etc/passwd", join(releaseDir, "dist", "leak.txt"));
     }
   }
+  const git = (args: string[]): string => {
+    const result = spawnSync("git", args, { cwd: releaseDir, encoding: "utf8" });
+    if (result.status !== 0) throw new Error(result.stderr);
+    return result.stdout.trim();
+  };
+  git(["init", "--initial-branch=main"]);
+  git(["config", "user.name", "Samohost Test"]);
+  git(["config", "user.email", "samohost@example.invalid"]);
+  git(["add", "."]);
+  git(["commit", "-m", "active candidate"]);
+  const sha = git(["rev-parse", "HEAD"]);
+  const tag = identity?.tag ?? sha;
+  const staticDir = fixture === "root-symlink"
+    ? join(releaseDir, "real-dist")
+    : join(releaseDir, "dist");
+  writeFileSync(join(staticDir, "version.json"), JSON.stringify({
+    version: tag,
+    tag,
+    sha,
+    environment: "production",
+  }) + "\n");
+  const activePaths = staticReleaseStatePaths(appDir);
+  writeFileSync(activePaths.activeState, JSON.stringify({
+    schema: 1,
+    appName: "astro-site",
+    sha,
+    tag,
+    releaseDir,
+    staticRoot: "dist",
+    releaseTagFormat: identity?.releaseTagFormat ?? null,
+  }) + "\n");
+  writeFileSync(
+    activePaths.activeRoute,
+    `root * "${staticDir}"\ntry_files {path} /index.html\nfile_server\nencode gzip\n`,
+  );
   mkdirSync(join(caddyDir, "sites.d"), { recursive: true });
   if (fixture === "reload-failure") {
     writeFileSync(snippet, "legacy route\n");
@@ -365,16 +409,35 @@ function runCustomDomainSandbox(fixture: CustomDomainFixture): {
   ].join("\n"));
   chmodSync(join(binDir, "sudo"), 0o755);
 
-  const script = buildCustomDomainVhostScript(
-    staticApp({ appDir, staticRoot: "dist" }),
-    "client.example",
-  ).replaceAll("/etc/caddy", caddyDir);
+  const app = staticApp({
+    appDir,
+    staticRoot: "dist",
+    ...(identity === undefined
+      ? {}
+      : {
+          releaseTagPattern: "v*",
+          releaseCiWorkflow: ".github/workflows/ci.yml",
+        }),
+  });
+  if (identity !== undefined) {
+    (app as unknown as { releaseTagFormat: string }).releaseTagFormat =
+      identity.releaseTagFormat;
+  }
+  const script = buildCustomDomainVhostScript(app, "client.example")
+    .replaceAll("/etc/caddy", caddyDir);
   const result = spawnSync("bash", ["-s"], {
     input: script,
     encoding: "utf8",
     env: { ...process.env, PATH: `${binDir}:${process.env["PATH"] ?? ""}` },
   });
-  return { status: result.status, stderr: result.stderr, dir, appDir, snippet };
+  return {
+    status: result.status,
+    stderr: result.stderr,
+    dir,
+    appDir,
+    snippet,
+    activeRoute: activePaths.activeRoute,
+  };
 }
 
 describe("staticRoot custom-domain sandbox", () => {
@@ -383,8 +446,11 @@ describe("staticRoot custom-domain sandbox", () => {
     try {
       expect(result.status, result.stderr).toBe(0);
       const vhost = readFileSync(result.snippet, "utf8");
-      expect(vhost).toContain(`root * "${join(result.appDir, "dist")}"`);
-      expect(vhost).not.toContain(`root * "${result.appDir}"`);
+      expect(vhost).toContain(`import "${result.activeRoute}"`);
+      expect(readFileSync(result.activeRoute, "utf8")).toContain(
+        `root * "${join(result.dir, "site", "releases", "active-candidate", "dist")}"`,
+      );
+      expect(vhost).not.toContain(result.appDir);
     } finally {
       rmSync(result.dir, { recursive: true, force: true });
     }
@@ -415,6 +481,21 @@ describe("staticRoot custom-domain sandbox", () => {
       expect(
         readdirSync(join(result.dir, "caddy", "sites.d")),
       ).toEqual(["10-domain-client-example.caddy"]);
+    } finally {
+      rmSync(result.dir, { recursive: true, force: true });
+    }
+  });
+
+  test("accepts a semver tag when the configured release-tag policy is non-date", () => {
+    const result = runCustomDomainSandbox("clean", {
+      tag: "v1.2.3",
+      releaseTagFormat: "semver",
+    });
+    try {
+      expect(result.status, result.stderr).toBe(0);
+      expect(readFileSync(result.snippet, "utf8")).toContain(
+        `import "${result.activeRoute}"`,
+      );
     } finally {
       rmSync(result.dir, { recursive: true, force: true });
     }

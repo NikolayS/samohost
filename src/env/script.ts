@@ -2756,8 +2756,8 @@ export function buildHostPrepScript(
  *
  * Serving posture — HTTP only (`http://` scheme prefix):
  *   - node apps: `http://<fqdn> { reverse_proxy localhost:<port> }`
- *   - static apps: resolve the configured staticRoot, reject symlinks in its
- *     path/tree, then `http://<fqdn> { root * <staticDir>; file_server }`
+ *   - static apps: validate the last health-proven detached deployment and
+ *     import its stable managed route; never derive from the bootstrap appDir
  *
  * The `http://` prefix (instead of bare `<fqdn> { tls internal }`) is critical:
  * the control-plane proxies custom-domain traffic to this app VM on **port 80**
@@ -2790,7 +2790,7 @@ export function buildCustomDomainVhostScript(
   // plane proxies custom-domain traffic over plain HTTP to this VM, so a :443
   // redirect here would break the routing chain.
   const isStatic = app.kind === "static";
-  const isStaticReleaseChannel = isStatic && app.releaseTagPattern !== undefined;
+  const staticReleaseTagFormat = app.releaseTagFormat ?? "";
   const staticRoot = staticRootOf(app);
   const releaseState = staticReleaseStatePaths(app.appDir);
   const vhostBody = isStatic
@@ -2813,13 +2813,10 @@ export function buildCustomDomainVhostScript(
           'ACTIVE_VALUES=""',
           'EXPECTED_ROUTE=""',
           `SAMOHOST_STATIC_ROOT=${sq(staticRoot ?? "")}`,
-          ...(isStaticReleaseChannel
-            ? [
-                `SAMOHOST_RELEASES_DIR=${sq(releaseState.releasesDir)}`,
-                `SAMOHOST_ACTIVE_STATE=${sq(releaseState.activeState)}`,
-                `SAMOHOST_ACTIVE_ROUTE=${sq(releaseState.activeRoute)}`,
-              ]
-            : []),
+          `SAMOHOST_RELEASE_TAG_FORMAT=${sq(staticReleaseTagFormat)}`,
+          `SAMOHOST_RELEASES_DIR=${sq(releaseState.releasesDir)}`,
+          `SAMOHOST_ACTIVE_STATE=${sq(releaseState.activeState)}`,
+          `SAMOHOST_ACTIVE_ROUTE=${sq(releaseState.activeRoute)}`,
           "",
           ...staticTreeGuardFnLines(),
           "",
@@ -2831,30 +2828,33 @@ export function buildCustomDomainVhostScript(
           "}",
           "trap samohost_cleanup_custom_domain EXIT",
           "",
-          ...(isStaticReleaseChannel
-            ? [
-                '[[ -r "$SAMOHOST_ACTIVE_STATE" && -r "$SAMOHOST_ACTIVE_ROUTE" ]] || { echo "no authorized healthy static release is active; refusing custom-domain activation" >&2; exit 1; }',
+
+                '[[ -r "$SAMOHOST_ACTIVE_STATE" && -r "$SAMOHOST_ACTIVE_ROUTE" ]] || { echo "no authorized healthy static deployment is active; refusing custom-domain activation" >&2; exit 1; }',
                 'ACTIVE_VALUES=$(mktemp)',
-                `if ! python3 - "$SAMOHOST_ACTIVE_STATE" ${sq(app.name)} "$SAMOHOST_STATIC_ROOT" > "$ACTIVE_VALUES" <<'PY'`,
+                `if ! python3 - "$SAMOHOST_ACTIVE_STATE" ${sq(app.name)} "$SAMOHOST_STATIC_ROOT" "$SAMOHOST_RELEASE_TAG_FORMAT" > "$ACTIVE_VALUES" <<'PY'`,
                 "import datetime",
                 "import json",
                 "import re",
                 "import sys",
                 "",
-                "path, expected_app, expected_root = sys.argv[1:]",
+                "path, expected_app, expected_root, expected_format_raw = sys.argv[1:]",
+                "expected_format = expected_format_raw or None",
                 "with open(path, encoding='utf-8') as source:",
                 "    state = json.load(source)",
-                "if state.get('schema') != 1 or state.get('appName') != expected_app or state.get('staticRoot') != expected_root:",
+                "if state.get('schema') != 1 or state.get('appName') != expected_app or state.get('staticRoot') != expected_root or state.get('releaseTagFormat') != expected_format:",
                 "    raise SystemExit('active static release state does not match this app')",
                 "sha = state.get('sha')",
                 "tag = state.get('tag')",
                 "release_dir = state.get('releaseDir')",
                 "if not isinstance(sha, str) or re.fullmatch(r'[0-9a-f]{7,40}', sha) is None:",
                 "    raise SystemExit('active static release state has an invalid sha')",
-                "match = re.fullmatch(r'v([0-9]{8})[.]([1-9][0-9]*)', tag) if isinstance(tag, str) else None",
-                "if match is None:",
+                "if not isinstance(tag, str) or not tag or len(tag) > 255 or any(ord(ch) < 32 for ch in tag):",
                 "    raise SystemExit('active static release state has an invalid tag')",
-                "datetime.datetime.strptime(match.group(1), '%Y%m%d')",
+                "if expected_format == 'date':",
+                "    match = re.fullmatch(r'v([0-9]{8})[.]([1-9][0-9]*)', tag)",
+                "    if match is None:",
+                "        raise SystemExit('active static release state has an invalid dated tag')",
+                "    datetime.datetime.strptime(match.group(1), '%Y%m%d')",
                 "if not isinstance(release_dir, str) or not release_dir.startswith('/') or any(ord(ch) < 32 for ch in release_dir):",
                 "    raise SystemExit('active static release state has an invalid releaseDir')",
                 "for value in (release_dir, sha, tag):",
@@ -2892,30 +2892,16 @@ export function buildCustomDomainVhostScript(
                 'printf \'root * "%s"\\ntry_files {path} /index.html\\nfile_server\\nencode gzip\\n\' "$SAMOHOST_STATIC_DIR" > "$EXPECTED_ROUTE"',
                 'cmp -s "$EXPECTED_ROUTE" "$SAMOHOST_ACTIVE_ROUTE" || { echo "active static route does not match structured release state" >&2; exit 1; }',
                 'SAMOHOST_ACTIVE_FINGERPRINT=$(sha256sum "$SAMOHOST_ACTIVE_STATE" "$SAMOHOST_ACTIVE_ROUTE" | sha256sum | awk \'{print $1}\')',
-              ]
-            : [
-                `SAMOHOST_CHECKOUT_REAL=$(realpath -e ${sq(app.appDir)}) || { echo "static checkout is missing" >&2; exit 1; }`,
-                `if [[ -n "$SAMOHOST_STATIC_ROOT" ]]; then SAMOHOST_STATIC_CANDIDATE=${sq(`${app.appDir}/`)}"$SAMOHOST_STATIC_ROOT"; else SAMOHOST_STATIC_CANDIDATE=${sq(app.appDir)}; fi`,
-                'SAMOHOST_STATIC_DIR=$(realpath -e "$SAMOHOST_STATIC_CANDIDATE") || { echo "staticRoot does not exist: $SAMOHOST_STATIC_ROOT" >&2; exit 1; }',
-                'case "$SAMOHOST_STATIC_DIR" in "$SAMOHOST_CHECKOUT_REAL"|"$SAMOHOST_CHECKOUT_REAL"/*) ;; *) echo "staticRoot escapes the checkout: $SAMOHOST_STATIC_ROOT" >&2; exit 1 ;; esac',
-                '[[ -d "$SAMOHOST_STATIC_DIR" && -f "$SAMOHOST_STATIC_DIR/index.html" ]] || { echo "staticRoot must contain index.html: $SAMOHOST_STATIC_ROOT" >&2; exit 1; }',
-              ]),
           "samohost_assert_custom_domain_source() {",
           '  samohost_assert_static_tree_safe "$SAMOHOST_CHECKOUT_REAL" "$SAMOHOST_STATIC_DIR" "$SAMOHOST_STATIC_ROOT" || return 1',
-          ...(isStaticReleaseChannel
-            ? [
-                '  local current_fingerprint',
-                '  current_fingerprint=$(sha256sum "$SAMOHOST_ACTIVE_STATE" "$SAMOHOST_ACTIVE_ROUTE" | sha256sum | awk \'{print $1}\') || return 1',
-                '  [[ "$current_fingerprint" == "$SAMOHOST_ACTIVE_FINGERPRINT" ]] || { echo "active static release changed during custom-domain activation; retry" >&2; return 1; }',
-              ]
-            : []),
+          '  local current_fingerprint',
+          '  current_fingerprint=$(sha256sum "$SAMOHOST_ACTIVE_STATE" "$SAMOHOST_ACTIVE_ROUTE" | sha256sum | awk \'{print $1}\') || return 1',
+          '  [[ "$current_fingerprint" == "$SAMOHOST_ACTIVE_FINGERPRINT" ]] || { echo "active static release changed during custom-domain activation; retry" >&2; return 1; }',
           "}",
           "",
           'samohost_assert_custom_domain_source || exit 1',
           'STAGED=$(mktemp)',
-          ...(isStaticReleaseChannel
-            ? [`printf 'http://${fqdn} {\\n\\timport "%s"\\n}\\n' "$SAMOHOST_ACTIVE_ROUTE" > "$STAGED"`]
-            : [`printf 'http://${fqdn} {\\n\\troot * "%s"\\n\\tfile_server\\n}\\n' "$SAMOHOST_STATIC_DIR" > "$STAGED"`]),
+          `printf 'http://${fqdn} {\\n\\timport "%s"\\n}\\n' "$SAMOHOST_ACTIVE_ROUTE" > "$STAGED"`,
           'samohost_assert_custom_domain_source || exit 1',
           "SAMOHOST_HAD_LIVE=0",
           'if [[ -f "$SNIPPET" ]]; then BACKUP=$(mktemp); cp -- "$SNIPPET" "$BACKUP"; SAMOHOST_HAD_LIVE=1; fi',

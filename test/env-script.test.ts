@@ -3508,15 +3508,20 @@ describe("buildCustomDomainVhostScript", () => {
     expect(bashSyntaxOk(s)).toBe(true);
   });
 
-  test("static app vhost uses http:// scheme and file_server (not tls internal)", () => {
+  test("static app vhost imports only the structured active-deployment route", () => {
     const s = buildCustomDomainVhostScript(staticApp(), "myapp.com");
     expect(s).toContain("http://myapp.com");
     expect(s).not.toContain("tls internal");
     expect(s).toContain("file_server");
     expect(s).toContain("SAMOHOST_STATIC_ROOT='dist'");
+    expect(s).toContain(
+      "SAMOHOST_ACTIVE_STATE='/opt/field-record/releases/.samohost-active-static.json'",
+    );
     expect(s).toContain('root * "%s"');
     expect(s).toContain('"$SAMOHOST_STATIC_DIR"');
-    expect(s).not.toContain("root * /opt/field-record/app");
+    expect(s).toContain('import "%s"');
+    expect(s).not.toContain("/opt/field-record/app");
+    expect(s).toContain("no authorized healthy static deployment is active");
     expect(s).toContain("samohost_assert_static_tree_safe");
     expect(bashSyntaxOk(s)).toBe(true);
   });
@@ -3544,7 +3549,9 @@ describe("buildCustomDomainVhostScript", () => {
       releaseTagFormat: "date",
       releaseCiWorkflow: ".github/workflows/ci.yml",
     }), "myapp.com");
-    expect(s).toContain("no authorized healthy static release is active");
+    expect(s).toContain("no authorized healthy static deployment is active");
+    expect(s).toContain("SAMOHOST_RELEASE_TAG_FORMAT='date'");
+    expect(s).toContain("if expected_format == 'date':");
     expect(s).toContain(
       "SAMOHOST_ACTIVE_STATE='/opt/field-record/releases/.samohost-active-static.json'",
     );
