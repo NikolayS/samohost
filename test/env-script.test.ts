@@ -3493,6 +3493,7 @@ describe("buildCustomDomainVhostScript", () => {
   const staticApp = (): AppRecord => ({
     ...nodeApp(),
     kind: "static",
+    staticRoot: "dist",
     healthUrl: "http://localhost:80/",
   });
 
@@ -3511,7 +3512,31 @@ describe("buildCustomDomainVhostScript", () => {
     expect(s).toContain("http://myapp.com");
     expect(s).not.toContain("tls internal");
     expect(s).toContain("file_server");
+    expect(s).toContain("SAMOHOST_STATIC_ROOT='dist'");
+    expect(s).toContain('root * "%s"');
+    expect(s).toContain('"$SAMOHOST_STATIC_DIR"');
+    expect(s).not.toContain("root * /opt/field-record/app");
+    expect(s).toContain("samohost_assert_static_tree_safe");
     expect(bashSyntaxOk(s)).toBe(true);
+  });
+
+  test("static custom-domain activation rechecks the tree around atomic staging and reload", () => {
+    const s = buildCustomDomainVhostScript(staticApp(), "myapp.com");
+    const guard =
+      'samohost_assert_static_tree_safe "$SAMOHOST_CHECKOUT_REAL" "$SAMOHOST_STATIC_DIR" "$SAMOHOST_STATIC_ROOT"';
+    const stage = s.indexOf('sudo /usr/bin/tee "$STAGED"');
+    const activate = s.indexOf('sudo /usr/bin/mv -- "$STAGED" "$SNIPPET"');
+    const reload = s.indexOf("sudo /usr/bin/systemctl reload caddy", activate);
+    expect(s.lastIndexOf(guard, stage)).toBeGreaterThan(-1);
+    expect(s.indexOf(guard, stage)).toBeLessThan(activate);
+    expect(s.lastIndexOf(guard, reload)).toBeGreaterThan(activate);
+    expect(s).toContain('sudo /usr/bin/mv -- "$BACKUP" "$SNIPPET"');
+  });
+
+  test("node custom-domain vhost does not gain static filesystem guards", () => {
+    const s = buildCustomDomainVhostScript(nodeApp(), "myapp.com");
+    expect(s).not.toContain("SAMOHOST_STATIC_ROOT");
+    expect(s).not.toContain("samohost_assert_static_tree_safe");
   });
 
   test("snippet path is sites.d/10-domain-<label>.caddy (dots replaced with dashes)", () => {

@@ -2752,7 +2752,8 @@ export function buildHostPrepScript(
  *
  * Serving posture — HTTP only (`http://` scheme prefix):
  *   - node apps: `http://<fqdn> { reverse_proxy localhost:<port> }`
- *   - static apps: `http://<fqdn> { root * <appDir>; file_server }`
+ *   - static apps: resolve the configured staticRoot, reject symlinks in its
+ *     path/tree, then `http://<fqdn> { root * <staticDir>; file_server }`
  *
  * The `http://` prefix (instead of bare `<fqdn> { tls internal }`) is critical:
  * the control-plane proxies custom-domain traffic to this app VM on **port 80**
@@ -2780,17 +2781,17 @@ export function buildCustomDomainVhostScript(
 
   const label = fqdn.replace(/\./g, "-");
   const snippetPath = `/etc/caddy/sites.d/10-domain-${label}.caddy`;
+  const stagedPath = `/etc/caddy/sites.d/.samohost-next-10-domain-${label}.caddy`;
+  const backupPath = `/etc/caddy/sites.d/.samohost-prev-10-domain-${label}.caddy`;
 
   // http:// prefix → Caddy serves on :80 only, no TLS redirect.  The control
   // plane proxies custom-domain traffic over plain HTTP to this VM, so a :443
   // redirect here would break the routing chain.
-  let vhostBody: string;
-  if (app.kind === "static") {
-    vhostBody = `http://${fqdn} {\n\troot * ${app.appDir}\n\tfile_server\n}`;
-  } else {
-    const port = mainEnvPort(app);
-    vhostBody = `http://${fqdn} {\n\treverse_proxy localhost:${port}\n}`;
-  }
+  const isStatic = app.kind === "static";
+  const staticRoot = staticRootOf(app);
+  const vhostBody = isStatic
+    ? undefined
+    : `http://${fqdn} {\n\treverse_proxy localhost:${mainEnvPort(app)}\n}`;
 
   return [
     "#!/usr/bin/env bash",
@@ -2801,11 +2802,42 @@ export function buildCustomDomainVhostScript(
     "",
     `SNIPPET=${sq(snippetPath)}`,
     "",
-    "# Write the Caddy snippet (overwrite — idempotent; same content each time).",
-    `printf '%s\\n' ${sq(vhostBody)} | sudo /usr/bin/tee "$SNIPPET" >/dev/null`,
-    "",
-    "# Reload Caddy (reload fails on bad config; no separate validate step needed).",
-    `sudo /usr/bin/systemctl reload caddy`,
+    ...(isStatic
+      ? [
+          `STAGED=${sq(stagedPath)}`,
+          `BACKUP=${sq(backupPath)}`,
+          `SAMOHOST_STATIC_ROOT=${sq(staticRoot ?? "")}`,
+          `SAMOHOST_CHECKOUT_REAL=$(realpath -e ${sq(app.appDir)}) || { echo "static checkout is missing" >&2; exit 1; }`,
+          `if [[ -n "$SAMOHOST_STATIC_ROOT" ]]; then SAMOHOST_STATIC_CANDIDATE=${sq(`${app.appDir}/`)}"$SAMOHOST_STATIC_ROOT"; else SAMOHOST_STATIC_CANDIDATE=${sq(app.appDir)}; fi`,
+          'SAMOHOST_STATIC_DIR=$(realpath -e "$SAMOHOST_STATIC_CANDIDATE") || { echo "staticRoot does not exist: $SAMOHOST_STATIC_ROOT" >&2; exit 1; }',
+          'case "$SAMOHOST_STATIC_DIR" in "$SAMOHOST_CHECKOUT_REAL"|"$SAMOHOST_CHECKOUT_REAL"/*) ;; *) echo "staticRoot escapes the checkout: $SAMOHOST_STATIC_ROOT" >&2; exit 1 ;; esac',
+          '[[ -d "$SAMOHOST_STATIC_DIR" && -f "$SAMOHOST_STATIC_DIR/index.html" ]] || { echo "staticRoot must contain index.html: $SAMOHOST_STATIC_ROOT" >&2; exit 1; }',
+          "",
+          ...staticTreeGuardFnLines(),
+          "",
+          'samohost_assert_static_tree_safe "$SAMOHOST_CHECKOUT_REAL" "$SAMOHOST_STATIC_DIR" "$SAMOHOST_STATIC_ROOT"',
+          'sudo /usr/bin/rm -f "$STAGED"',
+          'sudo /usr/bin/rm -f "$BACKUP"',
+          "SAMOHOST_HAD_LIVE=0",
+          'if [[ -f "$SNIPPET" ]]; then sudo /usr/bin/tee "$BACKUP" >/dev/null < "$SNIPPET"; SAMOHOST_HAD_LIVE=1; fi',
+          `printf 'http://${fqdn} {\\n\\troot * "%s"\\n\\tfile_server\\n}\\n' "$SAMOHOST_STATIC_DIR" | sudo /usr/bin/tee "$STAGED" >/dev/null`,
+          'samohost_assert_static_tree_safe "$SAMOHOST_CHECKOUT_REAL" "$SAMOHOST_STATIC_DIR" "$SAMOHOST_STATIC_ROOT"',
+          'sudo /usr/bin/mv -- "$STAGED" "$SNIPPET"',
+          'if samohost_assert_static_tree_safe "$SAMOHOST_CHECKOUT_REAL" "$SAMOHOST_STATIC_DIR" "$SAMOHOST_STATIC_ROOT" && sudo /usr/bin/systemctl reload caddy; then',
+          '  sudo /usr/bin/rm -f "$BACKUP"',
+          "else",
+          '  if [[ "$SAMOHOST_HAD_LIVE" == "1" ]]; then sudo /usr/bin/mv -- "$BACKUP" "$SNIPPET"; else sudo /usr/bin/rm -f "$SNIPPET"; fi',
+          '  sudo /usr/bin/rm -f "$STAGED"',
+          "  exit 1",
+          "fi",
+        ]
+      : [
+          "# Write the Caddy snippet (overwrite — idempotent; same content each time).",
+          `printf '%s\\n' ${sq(vhostBody!)} | sudo /usr/bin/tee "$SNIPPET" >/dev/null`,
+          "",
+          "# Reload Caddy (reload fails on bad config; no separate validate step needed).",
+          `sudo /usr/bin/systemctl reload caddy`,
+        ]),
     "",
     `echo "custom-domain vhost ready: ${fqdn}"`,
   ].join("\n");

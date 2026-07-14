@@ -15,7 +15,11 @@ import { spawnSync } from "node:child_process";
 import { validateStaticRoot } from "../src/app/static-root.ts";
 import { parseSamohostToml } from "../src/manifest/toml.ts";
 import { parseArgs } from "../src/cli.ts";
-import { buildEnvCreateScript, buildHostPrepScript } from "../src/env/script.ts";
+import {
+  buildCustomDomainVhostScript,
+  buildEnvCreateScript,
+  buildHostPrepScript,
+} from "../src/env/script.ts";
 import { buildHostBootstrapScript } from "../src/app/bootstrap.ts";
 import { buildDeployScript } from "../src/app/script.ts";
 import type { AppRecord } from "../src/types.ts";
@@ -309,6 +313,85 @@ describe("staticRoot preview sandbox", () => {
       try {
         expect(result.status).toBe(1);
         expect(result.stderr).toContain("staticRoot tree contains a symlink");
+        expect(existsSync(result.snippet)).toBe(false);
+      } finally {
+        rmSync(result.dir, { recursive: true, force: true });
+      }
+    });
+  }
+});
+
+type CustomDomainFixture = "clean" | "root-symlink" | "nested-file-symlink";
+
+function runCustomDomainSandbox(fixture: CustomDomainFixture): {
+  status: number | null;
+  stderr: string;
+  dir: string;
+  appDir: string;
+  snippet: string;
+} {
+  const dir = mkdtempSync(join(tmpdir(), "samohost-static-root-domain-"));
+  const appDir = join(dir, "site", "app");
+  const caddyDir = join(dir, "caddy");
+  const binDir = join(dir, "bin");
+  const snippet = join(caddyDir, "sites.d", "10-domain-client-example.caddy");
+  mkdirSync(appDir, { recursive: true });
+  if (fixture === "root-symlink") {
+    mkdirSync(join(appDir, "real-dist"));
+    writeFileSync(join(appDir, "real-dist", "index.html"), "safe\n");
+    symlinkSync("real-dist", join(appDir, "dist"));
+  } else {
+    mkdirSync(join(appDir, "dist"));
+    writeFileSync(join(appDir, "dist", "index.html"), "safe\n");
+    if (fixture === "nested-file-symlink") {
+      symlinkSync("/etc/passwd", join(appDir, "dist", "leak.txt"));
+    }
+  }
+  mkdirSync(join(caddyDir, "sites.d"), { recursive: true });
+  mkdirSync(binDir);
+  writeFileSync(join(binDir, "sudo"), [
+    "#!/usr/bin/env bash",
+    'if [[ "${1:-}" == "/usr/bin/systemctl" ]]; then exit 0; fi',
+    'exec "$@"',
+    "",
+  ].join("\n"));
+  chmodSync(join(binDir, "sudo"), 0o755);
+
+  const script = buildCustomDomainVhostScript(
+    staticApp({ appDir, staticRoot: "dist" }),
+    "client.example",
+  ).replaceAll("/etc/caddy", caddyDir);
+  const result = spawnSync("bash", ["-s"], {
+    input: script,
+    encoding: "utf8",
+    env: { ...process.env, PATH: `${binDir}:${process.env["PATH"] ?? ""}` },
+  });
+  return { status: result.status, stderr: result.stderr, dir, appDir, snippet };
+}
+
+describe("staticRoot custom-domain sandbox", () => {
+  test("serves only the canonical staticRoot on a custom domain", () => {
+    const result = runCustomDomainSandbox("clean");
+    try {
+      expect(result.status, result.stderr).toBe(0);
+      const vhost = readFileSync(result.snippet, "utf8");
+      expect(vhost).toContain(`root * "${join(result.appDir, "dist")}"`);
+      expect(vhost).not.toContain(`root * "${result.appDir}"`);
+    } finally {
+      rmSync(result.dir, { recursive: true, force: true });
+    }
+  });
+
+  for (const fixture of ["root-symlink", "nested-file-symlink"] as const) {
+    test(`rejects a ${fixture} before writing or activating the custom-domain vhost`, () => {
+      const result = runCustomDomainSandbox(fixture);
+      try {
+        expect(result.status).toBe(1);
+        expect(result.stderr).toContain(
+          fixture === "root-symlink"
+            ? "staticRoot path contains a symlink"
+            : "staticRoot tree contains a symlink",
+        );
         expect(existsSync(result.snippet)).toBe(false);
       } finally {
         rmSync(result.dir, { recursive: true, force: true });
