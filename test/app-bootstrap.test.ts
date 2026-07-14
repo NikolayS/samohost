@@ -1359,6 +1359,18 @@ describe("buildHostBootstrapScript — static path (kind='static')", () => {
     expect(script).toContain("from '10.0.0.1'");
   });
 
+  test("static cp-fronted bootstrap can disable direct Cloudflare :443 ingress", () => {
+    const script = buildHostBootstrapScript(
+      staticRecord({ mainListen: "cp-http80" }),
+      staticOpts({
+        firewallOpts: { controlPlaneIp: "10.0.0.1", allowCfHttps: false },
+      }),
+    );
+    expect(script).toContain("proto tcp from '10.0.0.1' to any port 80");
+    expect(script).not.toContain("https://www.cloudflare.com/ips-v4");
+    expect(script).not.toContain("https://www.cloudflare.com/ips-v6");
+  });
+
   test("static bootstrap self-check omits node/postgres/unit/db rows", () => {
     // FAILS today: §13 self-check always emits all rows including
     // node_ok, pg_ok, unit_ok, db_ok.

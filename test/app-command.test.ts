@@ -75,6 +75,16 @@ describe("parseArgs app", () => {
     expect(nodeShape.input.dbName).toBe("api_prod");
   });
 
+  test("bootstrap parses the control-plane source IP used for cp-http80 firewall access", () => {
+    const parsed = parseArgs([
+      "app", "bootstrap", "vm", "site", "--app-user", "site",
+      "--control-plane-ip", "91.99.233.145",
+    ]);
+    if (parsed.kind !== "app-bootstrap") throw new Error("expected app-bootstrap");
+    expect((parsed.input as typeof parsed.input & { controlPlaneIp?: string }).controlPlaneIp)
+      .toBe("91.99.233.145");
+  });
+
   test("register with required + optional flags", () => {
     const cmd = parseArgs([
       "app", "register", "samo-we-field-record",
@@ -281,6 +291,184 @@ describe("app bootstrap uses the stored app kind for the database contract", () 
     expect(code).toBe(1);
     expect(c.o).toBe("");
     expect(c.e).toContain("--db-name is not valid for a static app");
+  });
+
+  test("cp-http80 bootstrap fails closed without a control-plane IP", () => {
+    const existing = appStore.get("vm-1111", "site")!;
+    appStore.upsert({
+      ...existing,
+      mainHost: "site.example.com",
+      mainListen: "cp-http80",
+    });
+    const c = capture();
+    const code = runAppBootstrap(
+      { vm: "samo-we-field-record", app: "site", appUser: "site" },
+      vmStore,
+      appStore,
+      c.out,
+      c.err,
+    );
+    expect(code).toBe(1);
+    expect(c.o).toBe("");
+    expect(c.e).toContain("--control-plane-ip");
+  });
+
+  test("cp-http80 bootstrap emits only the requested source-restricted :80 rule", () => {
+    const existing = appStore.get("vm-1111", "site")!;
+    appStore.upsert({
+      ...existing,
+      mainHost: "site.example.com",
+      mainListen: "cp-http80",
+    });
+    const c = capture();
+    const input = {
+      vm: "samo-we-field-record",
+      app: "site",
+      appUser: "site",
+      controlPlaneIp: "91.99.233.145",
+    } as Parameters<typeof runAppBootstrap>[0] & { controlPlaneIp: string };
+    const code = runAppBootstrap(input, vmStore, appStore, c.out, c.err);
+    expect(code).toBe(0);
+    expect(c.e).toBe("");
+    expect(c.o).toContain("proto tcp from '91.99.233.145' to any port 80");
+    expect(c.o).not.toMatch(/ufw allow (?:80|80\/tcp)/);
+  });
+
+  test("cp-http80 bootstrap rejects a non-IP control-plane source", () => {
+    const existing = appStore.get("vm-1111", "site")!;
+    appStore.upsert({
+      ...existing,
+      mainHost: "site.example.com",
+      mainListen: "cp-http80",
+    });
+    const c = capture();
+    const input = {
+      vm: "samo-we-field-record",
+      app: "site",
+      appUser: "site",
+      controlPlaneIp: "0.0.0.0/0",
+    } as Parameters<typeof runAppBootstrap>[0] & { controlPlaneIp: string };
+    expect(runAppBootstrap(input, vmStore, appStore, c.out, c.err)).toBe(1);
+    expect(c.o).toBe("");
+    expect(c.e).toContain("valid IP");
+  });
+
+  test("cp-http80 bootstrap reuses the source IP persisted during provision", () => {
+    const existing = appStore.get("vm-1111", "site")!;
+    appStore.upsert({
+      ...existing,
+      mainHost: "site.example.com",
+      mainListen: "cp-http80",
+    });
+    vmStore.upsert(vm({
+      controlPlaneIp: "91.99.233.145",
+    } as Partial<VmRecord> & { controlPlaneIp: string }));
+    const c = capture();
+    expect(runAppBootstrap(
+      { vm: "samo-we-field-record", app: "site", appUser: "site" },
+      vmStore,
+      appStore,
+      c.out,
+      c.err,
+    )).toBe(0);
+    expect(c.e).toBe("");
+    expect(c.o).toContain("proto tcp from '91.99.233.145' to any port 80");
+  });
+
+  test("persisted control-plane IP does not open :80 for a static TLS app", () => {
+    vmStore.upsert(vm({
+      controlPlaneIp: "91.99.233.145",
+    } as Partial<VmRecord> & { controlPlaneIp: string }));
+    const existing = appStore.get("vm-1111", "site")!;
+    appStore.upsert({
+      ...existing,
+      mainHost: "site.example.com",
+      mainListen: "tls",
+    });
+    const c = capture();
+    expect(runAppBootstrap(
+      { vm: "samo-we-field-record", app: "site", appUser: "site" },
+      vmStore,
+      appStore,
+      c.out,
+      c.err,
+    )).toBe(0);
+    expect(c.o).not.toContain("to any port 80");
+  });
+
+  test("node cp-http80 bootstrap emits its source-restricted :80 rule", () => {
+    const existing = appStore.get("vm-1111", "api")!;
+    appStore.upsert({
+      ...existing,
+      mainHost: "api.example.com",
+      mainListen: "cp-http80",
+    });
+    const c = capture();
+    const input = {
+      vm: "samo-we-field-record",
+      app: "api",
+      appUser: "api",
+      dbName: "api_prod",
+      controlPlaneIp: "91.99.233.145",
+    };
+    expect(runAppBootstrap(input, vmStore, appStore, c.out, c.err)).toBe(0);
+    expect(c.o).toContain("proto tcp from '91.99.233.145' to any port 80");
+  });
+
+  test("cp-http80 bootstrap accepts an IPv6 source but rejects an IPv6 CIDR", () => {
+    const existing = appStore.get("vm-1111", "site")!;
+    appStore.upsert({
+      ...existing,
+      mainHost: "site.example.com",
+      mainListen: "cp-http80",
+    });
+    const good = capture();
+    expect(runAppBootstrap({
+      vm: "samo-we-field-record",
+      app: "site",
+      appUser: "site",
+      controlPlaneIp: "2001:db8::1",
+    }, vmStore, appStore, good.out, good.err)).toBe(0);
+    expect(good.o).toContain("proto tcp from '2001:db8::1' to any port 80");
+
+    const bad = capture();
+    expect(runAppBootstrap({
+      vm: "samo-we-field-record",
+      app: "site",
+      appUser: "site",
+      controlPlaneIp: "2001:db8::/64",
+    }, vmStore, appStore, bad.out, bad.err)).toBe(1);
+    expect(bad.e).toContain("valid IPv4 or IPv6");
+  });
+
+  test("non-cp topology ignores stale persisted source and rejects an explicit inert source", () => {
+    vmStore.upsert(vm({
+      controlPlaneIp: "stale-not-an-ip",
+    } as Partial<VmRecord> & { controlPlaneIp: string }));
+    const existing = appStore.get("vm-1111", "site")!;
+    appStore.upsert({
+      ...existing,
+      mainHost: "site.example.com",
+      mainListen: "tls",
+    });
+    const stored = capture();
+    expect(runAppBootstrap(
+      { vm: "samo-we-field-record", app: "site", appUser: "site" },
+      vmStore,
+      appStore,
+      stored.out,
+      stored.err,
+    )).toBe(0);
+    expect(stored.o).not.toContain("to any port 80");
+
+    const explicit = capture();
+    expect(runAppBootstrap({
+      vm: "samo-we-field-record",
+      app: "site",
+      appUser: "site",
+      controlPlaneIp: "91.99.233.145",
+    }, vmStore, appStore, explicit.out, explicit.err)).toBe(1);
+    expect(explicit.e).toContain("only valid for cp-http80");
   });
 
   test("node bootstrap still requires and uses an explicit db name", () => {

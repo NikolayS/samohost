@@ -16,6 +16,7 @@
 
 import { readFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
+import { isIP } from "node:net";
 import { checkCiGreen, type CiStatus } from "../app/cigate.ts";
 import { parseDeployOutcome, type DeployOutcome } from "../app/parse.ts";
 import { buildDeployScript } from "../app/script.ts";
@@ -197,6 +198,8 @@ export interface AppBootstrapInput {
   appDbRole?: string;
   /** PR-A2 optional — value written into SEED_OWNER_LOGIN. Default "owner". */
   seedOwnerLogin?: string;
+  /** Source allowed to reach a cp-http80 listener; persisted on provisioned VMs. */
+  controlPlaneIp?: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -612,6 +615,24 @@ export function runAppBootstrap(
     err("error: a non-static app bootstrap requires --db-name <name> (explicit; never derived)");
     return 1;
   }
+  if (input.controlPlaneIp !== undefined && app.mainListen !== "cp-http80") {
+    err("error: --control-plane-ip is only valid for cp-http80 apps");
+    return 1;
+  }
+  const controlPlaneIp = app.mainListen === "cp-http80"
+    ? input.controlPlaneIp ?? vm.controlPlaneIp
+    : input.controlPlaneIp;
+  if (app.mainListen === "cp-http80" && controlPlaneIp === undefined) {
+    err(
+      "error: cp-http80 bootstrap requires --control-plane-ip <ip> " +
+        "(or a control-plane IP recorded during provision)",
+    );
+    return 1;
+  }
+  if (controlPlaneIp !== undefined && isIP(controlPlaneIp) === 0) {
+    err("error: --control-plane-ip must be a valid IPv4 or IPv6 address");
+    return 1;
+  }
 
   const opts: HostBootstrapOptions = {
     appUser: input.appUser,
@@ -623,6 +644,9 @@ export function runAppBootstrap(
     ...(input.tlsMode !== undefined ? { tlsMode: input.tlsMode } : {}),
     ...(input.appDbRole !== undefined ? { appDbRole: input.appDbRole } : {}),
     ...(input.seedOwnerLogin !== undefined ? { seedOwnerLogin: input.seedOwnerLogin } : {}),
+    ...(app.mainListen === "cp-http80" && controlPlaneIp !== undefined
+      ? { firewallOpts: { controlPlaneIp } }
+      : {}),
   };
 
   out(buildHostBootstrapScript(app, opts));

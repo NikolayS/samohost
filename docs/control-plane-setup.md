@@ -174,6 +174,11 @@ auto-execute them. Run each on the VM as root, in order, after the VM is
    (NodeSource) + PostgreSQL (PGDG) at the pinned majors, creates the database
    (`--db-name` is **required and explicit** — never derived from the app name),
    writes the systemd main unit + env file template + Caddy main-host vhost.
+   For an app whose `mainListen` is `cp-http80`, bootstrap also emits a UFW
+   `:80` rule restricted to the control plane's single IPv4/IPv6 address. A VM
+   created by `samohost provision` reuses its recorded control-plane egress IP;
+   adopted VMs must pass `--control-plane-ip <ip>`. Other topologies reject that
+   flag and do not inherit a stale persisted source.
    Review the script, then run it as root on the VM.
 
 2. **`env plan <vm> <app> --host-prep`**

@@ -116,15 +116,13 @@ export interface HostBootstrapOptions {
   dbName?: string;
 
   /**
-   * Firewall options for the generated firewall rules section (static apps only).
+   * Source-restricted firewall options for the generated bootstrap script.
    *
-   * When set, the bootstrap script includes source-restricted ufw rules:
-   *  - `:443` open ONLY to Cloudflare IP ranges (fetched at runtime; default true)
-   *  - `:80` open ONLY to the single `controlPlaneIp` (when provided)
-   *
-   * For non-static apps the firewall section is omitted (the host-prep script
-   * owns the firewall for node apps). For static apps a basic CF-direct firewall
-   * is always emitted; this option lets callers opt-in to the control-plane :80 rule.
+   * Static apps always receive a firewall section and default to direct
+   * Cloudflare `:443` ingress. Passing `allowCfHttps: false` preserves an
+   * explicitly control-plane-only topology. Node apps receive this section only
+   * when options are supplied; `runAppBootstrap` does that for `cp-http80` and
+   * emits only the single-source `:80` rule.
    */
   firewallOpts?: HostPrepFirewallOpts;
 
@@ -834,17 +832,20 @@ export function buildHostBootstrapScript(
     );
   }
 
-  // ---- static-only: firewall rules ------------------------------------------
-  // For static apps, emit source-restricted ufw rules. The app is served
-  // directly by Caddy on :443 (CF Full-mode origin): only Cloudflare edge IPs
-  // may reach :443. Optionally, :80 is opened only to the control-plane IP.
+  // ---- source-restricted firewall rules ------------------------------------
+  // Static apps default to direct CF ingress on :443. Any cp-http80 app (static
+  // or node) may additionally open :80 only to the recorded control-plane IP.
+  // Explicit allowCfHttps=false is preserved for control-plane-only static apps.
   // This mirrors buildFirewallLines from env/script.ts — reused here so the
   // same CF-range-fetch logic is not duplicated.
-  if (isStatic) {
-    const fwLines = buildFirewallLines(true, appUser, opts.firewallOpts);
+  if (isStatic || opts.firewallOpts !== undefined) {
+    const fwLines = buildFirewallLines(isStatic, appUser, {
+      ...opts.firewallOpts,
+      allowCfHttps: opts.firewallOpts?.allowCfHttps ?? isStatic,
+    });
     push(
       `# ---------------------------------------------------------------------------`,
-      `# §9c. Firewall (static app — source-restricted; world-open ufw allow NEVER emitted).`,
+      `# §9c. Firewall (source-restricted; world-open ufw allow NEVER emitted).`,
       `#      Mirrors buildFirewallLines (env/script.ts). CF ranges fetched at run time.`,
       `# ---------------------------------------------------------------------------`,
       "",
