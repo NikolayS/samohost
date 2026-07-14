@@ -325,14 +325,24 @@ describe("register -> deploy/trigger two-hop routing lifecycle", () => {
     const deps: TriggerDeps = {
       resolveRef: async () => SHA,
       deploy: async () => { deployCalls++; return 0; },
-      reconcileMainRoute: (app, targetVm) => reconcileTwoHopMainRoute(
-        app,
-        targetVm,
-        {
-          projectRoute: harness.projectRoute,
-          controlPlaneRoute: harness.controlPlaneRoute,
-        },
-      ),
+      reconcileMainRoute: (app, targetVm, ...args: unknown[]) =>
+        (reconcileTwoHopMainRoute as unknown as (
+          app: AppRecord,
+          vm: VmRecord,
+          deps: {
+            projectRoute: typeof harness.projectRoute;
+            controlPlaneRoute: typeof harness.controlPlaneRoute;
+          },
+          expectation?: unknown,
+        ) => ReturnType<typeof reconcileTwoHopMainRoute>)(
+          app,
+          targetVm,
+          {
+            projectRoute: harness.projectRoute,
+            controlPlaneRoute: harness.controlPlaneRoute,
+          },
+          args[0],
+        ),
       fetch: (async () => {
         throw new Error("same-SHA routing-only drift must not call CI");
       }) as unknown as typeof fetch,
@@ -442,6 +452,64 @@ describe("register -> deploy/trigger two-hop routing lifecycle", () => {
     expect(saved.controlPlaneRouteFingerprint).toBe(
       controlPlaneMainRouteFingerprint(saved, vm()),
     );
+  });
+
+  test("release same-SHA migration passes the resolved tag as exact route identity", async () => {
+    const tag = "v20260714.1";
+    const releaseSpec = input({
+      kind: "static",
+      buildCmd: "npm run build",
+      healthUrl: "http://127.0.0.1/version.json",
+      releaseTagPattern: "v*",
+      releaseTagFormat: "date",
+      releaseCiWorkflow: ".github/workflows/ci.yml",
+    });
+    seedAppliedRoute(releaseSpec);
+    register({ ...releaseSpec, mainHost: NEW_HOST });
+    let received: unknown;
+    const result = await trigger(routingHarness(), {
+      resolveLatestTag: async () => ({ tag, sha: SHA }),
+      isCommitOnBranch: async () => true,
+      reconcileMainRoute: async (_app, _vm, ...args: unknown[]) => {
+        received = args[0];
+        return JSON.stringify(received) === JSON.stringify({
+            sha: SHA,
+            expectedIdentity: tag,
+          })
+          ? { ok: true, routing: "ready" }
+          : { ok: false, routing: "failed", error: "missing exact release identity" };
+      },
+    });
+
+    expect(result.code).toBe(0);
+    expect(received).toEqual({ sha: SHA, expectedIdentity: tag });
+    expect(appStore.get(vm().id, "client-site")).toMatchObject({
+      releaseTagCursor: tag,
+      releaseTagChannelInitialized: true,
+    });
+  });
+
+  test("release same-SHA reconcile without a trusted tag fails before route mutation", async () => {
+    const releaseApp: AppRecord = {
+      ...seedAppliedRoute(input({
+        kind: "static",
+        buildCmd: "npm run build",
+        healthUrl: "http://127.0.0.1/version.json",
+        releaseTagPattern: "v*",
+        releaseTagFormat: "date",
+        releaseCiWorkflow: ".github/workflows/ci.yml",
+      })).app,
+      releaseTagCursor: undefined,
+    };
+    let calls = 0;
+    const result = await reconcileTwoHopMainRoute(releaseApp, vm(), {
+      projectRoute: async () => { calls++; return ok(); },
+      controlPlaneRoute: async () => { calls++; return ok(); },
+    });
+
+    expect(result.ok).toBe(false);
+    expect(result.error).toContain("identity");
+    expect(calls).toBe(0);
   });
 
   for (const [label, overrides, projectNeedle] of [
