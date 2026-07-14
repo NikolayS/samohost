@@ -615,7 +615,13 @@ export function runAppBootstrap(
     err("error: a non-static app bootstrap requires --db-name <name> (explicit; never derived)");
     return 1;
   }
-  const controlPlaneIp = input.controlPlaneIp ?? vm.controlPlaneIp;
+  if (input.controlPlaneIp !== undefined && app.mainListen !== "cp-http80") {
+    err("error: --control-plane-ip is only valid for cp-http80 apps");
+    return 1;
+  }
+  const controlPlaneIp = app.mainListen === "cp-http80"
+    ? input.controlPlaneIp ?? vm.controlPlaneIp
+    : input.controlPlaneIp;
   if (app.mainListen === "cp-http80" && controlPlaneIp === undefined) {
     err(
       "error: cp-http80 bootstrap requires --control-plane-ip <ip> " +
@@ -638,7 +644,7 @@ export function runAppBootstrap(
     ...(input.tlsMode !== undefined ? { tlsMode: input.tlsMode } : {}),
     ...(input.appDbRole !== undefined ? { appDbRole: input.appDbRole } : {}),
     ...(input.seedOwnerLogin !== undefined ? { seedOwnerLogin: input.seedOwnerLogin } : {}),
-    ...(controlPlaneIp !== undefined
+    ...(app.mainListen === "cp-http80" && controlPlaneIp !== undefined
       ? { firewallOpts: { controlPlaneIp } }
       : {}),
   };
