@@ -213,6 +213,7 @@ export function buildHostBootstrapScript(
   opts: HostBootstrapOptions,
 ): string {
   const isStatic = app.kind === "static";
+  const isStaticReleaseChannel = isStatic && app.releaseTagPattern !== undefined;
 
   // Guard: dbName is required for non-static apps (node apps need a database).
   // Static apps have no database — callers MUST omit dbName for static and
@@ -427,6 +428,7 @@ export function buildHostBootstrapScript(
     `# §3. Caddy via official apt repo (idempotent).`,
     `# ---------------------------------------------------------------------------`,
     "",
+    ...(isStaticReleaseChannel ? [`SAMOHOST_CADDY_INSTALLED_NOW=0`] : []),
     `if command -v caddy >/dev/null 2>&1; then`,
     `  echo "Caddy already present — skipping apt install."`,
     "else",
@@ -436,6 +438,7 @@ export function buildHostBootstrapScript(
     `    | tee /etc/apt/sources.list.d/caddy-stable.list`,
     `  apt-get update -qq`,
     `  apt-get install -y caddy`,
+    ...(isStaticReleaseChannel ? [`  SAMOHOST_CADDY_INSTALLED_NOW=1`] : []),
     "fi",
     "",
   );
@@ -502,6 +505,16 @@ export function buildHostBootstrapScript(
       `cat > ${sq(sudoersFile)} <<SUDOERS`,
       `${appUser} ALL=(root) NOPASSWD: /usr/bin/systemctl daemon-reload`,
       `${appUser} ALL=(root) NOPASSWD: /usr/bin/systemctl reload caddy`,
+      `${appUser} ALL=(root) NOPASSWD: /usr/bin/tee /etc/caddy/sites.d/*.caddy`,
+      `${appUser} ALL=(root) NOPASSWD: /usr/bin/mv -- /etc/caddy/sites.d/*.caddy /etc/caddy/sites.d/*.caddy`,
+      `${appUser} ALL=(root) NOPASSWD: /usr/bin/rm -f /etc/caddy/sites.d/*.caddy`,
+      ...(isStaticReleaseChannel
+        ? [
+          `${appUser} ALL=(root) NOPASSWD: /usr/bin/tee /etc/caddy/.samohost-next-Caddyfile`,
+          `${appUser} ALL=(root) NOPASSWD: /usr/bin/mv -- /etc/caddy/.samohost-next-Caddyfile /etc/caddy/Caddyfile`,
+          `${appUser} ALL=(root) NOPASSWD: /usr/bin/rm -f /etc/caddy/.samohost-next-Caddyfile`,
+        ]
+        : []),
       `${appUser} ALL=(root) NOPASSWD: /usr/bin/journalctl *`,
       "SUDOERS",
       `chmod 440 ${sq(sudoersFile)}`,
@@ -602,28 +615,58 @@ export function buildHostBootstrapScript(
     "",
     `mkdir -p /etc/caddy/sites.d`,
     "",
-    `# Write a minimal-but-valid Caddyfile. Idempotent: overwrite with the`,
-    `# deterministic content — no append-drift.`,
-    `cat > /etc/caddy/Caddyfile <<'CADDYFILE'`,
-    ...caddyfileHeader,
-    "",
-    "import sites.d/*.caddy",
-    "CADDYFILE",
-    "",
+  );
+  if (isStaticReleaseChannel) {
+    push(
+      `# A release-channel static app may already be serving a legacy route`,
+      `# directly from this base file. Preserve it byte-for-byte and add only`,
+      `# the required import. The first healthy tagged deploy owns retirement.`,
+      `if [[ "\${SAMOHOST_CADDY_INSTALLED_NOW:-0}" == "1" || ! -f /etc/caddy/Caddyfile ]]; then`,
+      `  # A just-installed package Caddyfile is vendor sample content, not a`,
+      `  # legacy production route. Start fresh hosts from the canonical base.`,
+      `  cat > /etc/caddy/Caddyfile <<'CADDYFILE'`,
+      ...caddyfileHeader,
+      "",
+      "import sites.d/*.caddy",
+      "CADDYFILE",
+      `elif grep -Eq '^[[:space:]]*import[[:space:]]+(/etc/caddy/)?sites\\.d/\\*\\.caddy([[:space:]]*(#.*)?)?$' /etc/caddy/Caddyfile; then`,
+      `  echo "Caddy: existing sites.d import preserved."`,
+      `else`,
+      `  printf '\nimport sites.d/*.caddy\n' >> /etc/caddy/Caddyfile`,
+      `  echo "Caddy: sites.d import appended without replacing legacy routes."`,
+      `fi`,
+      "",
+    );
+  } else {
+    push(
+      `# Write a minimal-but-valid Caddyfile. Idempotent: overwrite with the`,
+      `# deterministic content — no append-drift.`,
+      `cat > /etc/caddy/Caddyfile <<'CADDYFILE'`,
+      ...caddyfileHeader,
+      "",
+      "import sites.d/*.caddy",
+      "CADDYFILE",
+      "",
+    );
+  }
+  push(
     `caddy validate --config /etc/caddy/Caddyfile`,
     `/usr/bin/systemctl enable caddy`,
     `/usr/bin/systemctl reload caddy || /usr/bin/systemctl restart caddy`,
-    `echo "Caddy: Caddyfile written (tls=${tlsMode}), validated, reloaded."`,
+    `echo "Caddy: Caddyfile ${isStaticReleaseChannel ? "ready" : "written"} (tls=${tlsMode}), validated, reloaded."`,
     "",
   );
 
-  // ---- static-only: production Caddy file_server vhost block ----------------
-  // For static apps: write a file_server Caddy site block serving the app
-  // checkout directory. Uses `tls internal` (self-signed origin cert) so that
-  // CF Full-mode proxying works without an ACME challenge — ACME cannot complete
-  // behind CF-locked :443, matching buildStaticEnvCreateScript's rationale.
-  if (isStatic && app.mainHost !== undefined) {
+  // ---- static branch-channel: production Caddy file_server vhost block ------
+  // Branch-channel static apps preserve the legacy bootstrap-owned appDir
+  // route. Release-channel static apps MUST NOT create or replace this vhost:
+  // only the tag-authorized deploy transaction may atomically activate a
+  // versioned candidate. This also makes bootstrap reruns preserve that route.
+  if (isStatic && !isStaticReleaseChannel && app.mainHost !== undefined) {
     const caddySitePath = `/etc/caddy/sites.d/00-main-${app.name}.caddy`;
+    const siteAddress = app.mainListen === "cp-http80"
+      ? `http://${app.mainHost}`
+      : app.mainHost;
     push(
       `# ---------------------------------------------------------------------------`,
       `# §9b. Production Caddy file_server vhost for ${sq(app.mainHost)}.`,
@@ -633,10 +676,12 @@ export function buildHostBootstrapScript(
       `# ---------------------------------------------------------------------------`,
       "",
       `cat > ${sq(caddySitePath)} <<'CADDY_SITE'`,
-      `${app.mainHost} {`,
+      `${siteAddress} {`,
       `  root * ${app.appDir}`,
+      `  try_files {path} /index.html`,
       `  file_server`,
-      `  tls internal`,
+      `  encode gzip`,
+      ...(app.mainListen === "cp-http80" ? [] : [`  tls internal`]),
       `}`,
       `CADDY_SITE`,
       `caddy validate --config /etc/caddy/Caddyfile`,

@@ -18,6 +18,10 @@
 import { parse as parseToml } from "smol-toml";
 import type { TomlValueWithoutBigInt } from "smol-toml";
 import type { ListenerSpec, ServiceSpec, RouteSpec } from "../types.ts";
+import {
+  CANONICAL_RELEASE_CI_WORKFLOW,
+  isCanonicalReleaseCiWorkflow,
+} from "../app/release-policy.ts";
 
 /** A plain TOML table returned by smol-toml's `parse()` (no bigint). */
 type TomlTableLike = Record<string, TomlValueWithoutBigInt>;
@@ -70,7 +74,6 @@ export interface AppManifest {
    * Maps to {@link AppSpec.previewDbBackend}.
    */
   previewDbBackend?: "dblab" | "template" | "none";
-
   // ---- Multi-service spec model (additive; absent = legacy single-service) --
   /** Declared services. Maps to {@link AppSpec.services}. */
   services?: ServiceSpec[];
@@ -84,11 +87,13 @@ export interface AppManifest {
    * Optional glob pattern (e.g. `"v*"`) for release tags. Maps to
    * {@link AppSpec.releaseTagPattern}. Must be a non-empty string when present.
    *
-   * IMPORTANT — accepted + persisted; the tag-gated deploy behavior is a
-   * separate, not-yet-shipped feature — prod deploys on main SHA + CI-green
-   * regardless of this value.
+   * When set, `releaseTagFormat = "date"` and the canonical trusted
+   * `releaseCiWorkflow = ".github/workflows/ci.yml"` are required. Only
+   * real-calendar `vYYYYMMDD.N` tags on the main branch can ship production.
    */
   releaseTagPattern?: string;
+  releaseTagFormat?: "date";
+  releaseCiWorkflow?: string;
 
   /**
    * App-level secret env-var NAMES samohost will auto-generate per preview env
@@ -166,6 +171,8 @@ const APP_KEYS = new Set<string>([
   // accepted + persisted; the tag-gated deploy behavior is a separate,
   // not-yet-shipped feature — prod deploys on main SHA + CI-green regardless of this value.
   "releaseTagPattern",
+  "releaseTagFormat",
+  "releaseCiWorkflow",
   // PR-B/PR-C: secrets and databaseUrlEnv are schema-only in this PR.
   // Secret generation (PR-B) and DB URL rewriting (PR-C) are separate.
   "secrets",
@@ -1088,8 +1095,7 @@ export function parseSamohostToml(text: string): ParseTomlResult {
   }
 
   // ---- 9b. Validate releaseTagPattern (optional string, must be non-empty) ----
-  // accepted + persisted; the tag-gated deploy behavior is a separate,
-  // not-yet-shipped feature — prod deploys on main SHA + CI-green regardless of this value.
+  // Production tracks the latest matching stable semver tag when configured.
   let releaseTagPattern: string | undefined;
   {
     const rawRtp = raw["releaseTagPattern"];
@@ -1105,6 +1111,32 @@ export function parseSamohostToml(text: string): ParseTomlResult {
       } else {
         releaseTagPattern = rawRtp;
       }
+    }
+  }
+  let releaseTagFormat: "date" | undefined;
+  {
+    const value = raw["releaseTagFormat"];
+    if (value !== undefined) {
+      if (value !== "date") errors.push(`field releaseTagFormat must be "date"`);
+      else releaseTagFormat = "date";
+    }
+  }
+  const releaseCiWorkflow = optionalString(raw, "releaseCiWorkflow", errors);
+  if (releaseCiWorkflow !== undefined && !isCanonicalReleaseCiWorkflow(releaseCiWorkflow)) {
+    errors.push(
+      `releaseCiWorkflow must be the canonical trusted workflow path ` +
+      `"${CANONICAL_RELEASE_CI_WORKFLOW}"`,
+    );
+  }
+  if (releaseTagPattern !== undefined) {
+    if (releaseTagFormat !== "date") errors.push(`releaseTagFormat = "date" is required with releaseTagPattern`);
+    if (releaseCiWorkflow === undefined) {
+      errors.push(
+        `releaseCiWorkflow = "${CANONICAL_RELEASE_CI_WORKFLOW}" is required with releaseTagPattern`,
+      );
+    }
+    if (kind === "static" && mainHost === undefined) {
+      errors.push(`mainHost is required for a static release-channel app`);
     }
   }
 
@@ -1140,6 +1172,8 @@ export function parseSamohostToml(text: string): ParseTomlResult {
     ...(defaultListener !== undefined ? { defaultListener } : {}),
     ...(mainListen !== undefined ? { mainListen } : {}),
     ...(releaseTagPattern !== undefined ? { releaseTagPattern } : {}),
+    ...(releaseTagFormat !== undefined ? { releaseTagFormat } : {}),
+    ...(releaseCiWorkflow !== undefined ? { releaseCiWorkflow } : {}),
     ...(secrets !== undefined ? { secrets } : {}),
     ...(databaseUrlEnv !== undefined ? { databaseUrlEnv } : {}),
   };

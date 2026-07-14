@@ -13,6 +13,10 @@
  * GITHUB_TOKEN). It is never stored on any record and never logged. `fetch` is
  * injected so the decision logic is unit-tested fully offline.
  */
+import {
+  CANONICAL_RELEASE_CI_WORKFLOW,
+  CANONICAL_RELEASE_CI_WORKFLOW_ID,
+} from "./release-policy.ts";
 
 export type CiStatus = "success" | "pending" | "failure" | "none";
 
@@ -53,6 +57,7 @@ export async function checkCiGreen(
   repo: string,
   sha: string,
   deps: CiGateDeps,
+  workflow?: string,
 ): Promise<CiStatus> {
   const env = deps.env ?? process.env;
   const token = tokenFrom(env);
@@ -63,9 +68,15 @@ export async function checkCiGreen(
   };
   if (token) headers["Authorization"] = `Bearer ${token}`;
 
+  const workflowId = workflow === CANONICAL_RELEASE_CI_WORKFLOW
+    ? CANONICAL_RELEASE_CI_WORKFLOW_ID
+    : workflow;
+  const runsPath = workflowId === undefined
+    ? "actions/runs"
+    : `actions/workflows/${encodeURIComponent(workflowId)}/runs`;
   const url =
-    `https://api.github.com/repos/${repo}/actions/runs` +
-    `?head_sha=${encodeURIComponent(sha)}&per_page=20`;
+    `https://api.github.com/repos/${repo}/${runsPath}` +
+    `?head_sha=${encodeURIComponent(sha)}&per_page=${workflow === undefined ? 20 : 1}`;
 
   let body: RunsResponse;
   try {
@@ -77,7 +88,9 @@ export async function checkCiGreen(
   }
 
   const runs = Array.isArray(body.workflow_runs) ? body.workflow_runs : [];
-  return decide(runs);
+  // A release app names one trusted workflow. GitHub returns newest first; the
+  // newest run for the exact SHA is authoritative after a rerun.
+  return decide(workflow === undefined ? runs : runs.slice(0, 1));
 }
 
 /** Reduce the run list to a single status (deploy.sh decision table). */
@@ -92,7 +105,7 @@ function decide(runs: WorkflowRun[]): CiStatus {
     const status = (run.status ?? "").toLowerCase();
 
     // Any failed/cancelled run is decisive: refuse.
-    if (conclusion === "failure" || conclusion === "cancelled") {
+    if (conclusion !== "" && conclusion !== "success") {
       return "failure";
     }
     if (conclusion === "success") anySuccess = true;

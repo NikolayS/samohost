@@ -1,9 +1,12 @@
 import { describe, expect, test } from "bun:test";
 import {
+  chmodSync,
   existsSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  rmSync,
+  statSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -270,6 +273,67 @@ function staticApp(overrides: Partial<AppRecord> = {}): AppRecord {
 const STATIC_TARGET = { sha: "abc1234def5678901234567890abcdef12345678" };
 
 describe("buildDeployScript — static path (kind='static')", () => {
+  test("release static deploy requires a dated tag and owned main host", () => {
+    const releaseApp = staticApp({
+      releaseTagPattern: "v*",
+      releaseTagFormat: "date",
+      releaseCiWorkflow: ".github/workflows/ci.yml",
+    });
+    expect(() => buildDeployScript(releaseApp, STATIC_TARGET)).toThrow(
+      "requires the resolved release tag",
+    );
+    expect(() => buildDeployScript(
+      staticApp({ mainHost: undefined }),
+      STATIC_TARGET,
+    )).toThrow("requires mainHost");
+  });
+
+  test("release static activation stages a versioned checkout and atomically routes to it", () => {
+    const script = buildDeployScript(staticApp({
+      releaseTagPattern: "v*",
+      releaseTagFormat: "date",
+      releaseCiWorkflow: ".github/workflows/ci.yml",
+    }), { ...STATIC_TARGET, tag: "v20260713.1" });
+    expect(script).toContain(
+      '{"version":"%s","tag":"%s","sha":"%s","environment":"production"}',
+    );
+    expect(script).toContain(".version.next.");
+    expect(script).toContain('/usr/bin/mv -f "$SAMOHOST_VERSION_NEXT"');
+    expect(script).toContain(".samohost-next-00-main-my-static-site.caddy");
+    expect(script).toContain('SAMOHOST_RELEASES_DIR=\'/opt/my-static-site/releases\'');
+    expect(script).toContain('git -C "$SAMOHOST_APP_DIR" worktree add --detach');
+    expect(script).toContain("umask 022");
+    expect(script).toContain('root * "${SAMOHOST_CANDIDATE_DIR}"');
+    expect(script).not.toContain('git reset --hard "${SAMOHOST_SHA}"');
+    expect(script).toContain(
+      "sudo /usr/bin/mv -- '/etc/caddy/sites.d/.samohost-next-00-main-my-static-site.caddy' '/etc/caddy/sites.d/00-main-my-static-site.caddy'",
+    );
+  });
+
+  test("release static health uses intended Host identity and rollback restores untouched prior route", () => {
+    const script = buildDeployScript(staticApp({
+      releaseTagPattern: "v*",
+      releaseTagFormat: "date",
+      releaseCiWorkflow: ".github/workflows/ci.yml",
+    }), { ...STATIC_TARGET, tag: "v20260713.1" });
+    expect(script).toContain("-H 'Host: my-static-site.example.com'");
+    expect(script).toContain("/version.json");
+    expect(script).toContain('"environment":"production"');
+    const checkpoint = script.indexOf("SAMOHOST_VHOST_BACKUP");
+    const checkout = script.indexOf("<<<SAMOHOST_PHASE:checkout:start>>>");
+    expect(checkpoint).toBeGreaterThan(-1);
+    expect(checkpoint).toBeLessThan(checkout);
+    const rollbackStart = script.indexOf("rollback() {");
+    const rollbackEnd = script.indexOf("\n}", rollbackStart);
+    const rollback = script.slice(rollbackStart, rollbackEnd);
+    expect(rollback).not.toContain("git reset --hard");
+    expect(rollback).not.toContain("SAMOHOST_VERSION_BACKUP");
+    expect(rollback).toContain("SAMOHOST_VHOST_BACKUP");
+    expect(rollback).toContain('worktree remove --force "$SAMOHOST_CANDIDATE_DIR"');
+    expect(rollback).toContain("caddy validate");
+    expect(rollback).toContain("reload caddy");
+  });
+
   test("static deploy script is valid bash", () => {
     // The generated script must be syntactically valid bash (bash -n).
     // This passes today (the output is syntactically valid even though semantically wrong).
@@ -305,17 +369,205 @@ describe("buildDeployScript — static path (kind='static')", () => {
     expect(script).toContain("<<<SAMOHOST_PHASE:caddy-reload:start>>>");
   });
 
-  test("static rollback uses git reset + caddy reload, NOT systemctl restart", () => {
-    // FAILS today: rollback() at src/app/script.ts:198 always calls systemctl restart.
+  test("static rollback switches the vhost back and removes only the failed candidate", () => {
     const script = buildDeployScript(staticApp(), STATIC_TARGET);
-    expect(script).toContain('git reset --hard "${PRE_DEPLOY_SHA}"');
-    // Rollback must reload caddy, not restart a non-existent unit.
     const rollbackStart = script.indexOf("rollback() {");
     const rollbackEnd = script.indexOf("\n}", rollbackStart);
     const rollbackBody = script.slice(rollbackStart, rollbackEnd);
+    expect(rollbackBody).not.toContain("git reset --hard");
+    expect(rollbackBody).toContain("SAMOHOST_VHOST_BACKUP");
+    expect(rollbackBody).toContain('worktree remove --force "$SAMOHOST_CANDIDATE_DIR"');
     expect(rollbackBody).toContain("reload caddy");
     expect(rollbackBody).not.toMatch(/systemctl\s+restart/);
   });
+
+  test("public version identity is atomically published as readable mode 0644", () => {
+    const script = buildDeployScript(staticApp({
+      releaseTagPattern: "v*",
+      releaseTagFormat: "date",
+      releaseCiWorkflow: ".github/workflows/ci.yml",
+    }), { ...STATIC_TARGET, tag: "v20260713.1" });
+    const chmod = script.indexOf('chmod 0644 "$SAMOHOST_VERSION_NEXT"');
+    const rename = script.indexOf(
+      '/usr/bin/mv -f "$SAMOHOST_VERSION_NEXT" "${SAMOHOST_CANDIDATE_DIR}/version.json"',
+    );
+    const route = script.indexOf(
+      "sudo /usr/bin/mv -- '/etc/caddy/sites.d/.samohost-next-00-main-my-static-site.caddy'",
+      rename,
+    );
+    expect(chmod).toBeGreaterThan(-1);
+    expect(rename).toBeGreaterThan(chmod);
+    expect(route).toBeGreaterThan(rename);
+    expect(script).toContain('[[ -r "${SAMOHOST_CANDIDATE_DIR}/version.json" ]]');
+    expect(script).toContain(
+      '[[ "$(stat -c \'%a\' "${SAMOHOST_CANDIDATE_DIR}/version.json")" == "644" ]]',
+    );
+  });
+
+  test("executed repeated releases keep the live checkout untouched and retire only after healthy cutover", () => {
+    const dir = mkdtempSync(join(tmpdir(), "samohost-static-release-"));
+    const origin = join(dir, "origin.git");
+    const seed = join(dir, "seed");
+    const appDir = join(dir, "site", "app");
+    const caddyDir = join(dir, "caddy");
+    const binDir = join(dir, "bin");
+
+    const git = (args: string[], cwd = dir): string => {
+      const result = spawnSync("git", args, { cwd, encoding: "utf8" });
+      if (result.status !== 0) {
+        throw new Error(`git ${args.join(" ")} failed: ${result.stderr}`);
+      }
+      return result.stdout.trim();
+    };
+
+    try {
+      mkdirSync(seed, { recursive: true });
+      git(["init", "--bare", origin]);
+      git(["init", "--initial-branch=main"], seed);
+      git(["config", "user.name", "Samohost Test"], seed);
+      git(["config", "user.email", "samohost@example.invalid"], seed);
+
+      writeFileSync(join(seed, "index.html"), "old\n");
+      git(["add", "index.html"], seed);
+      git(["commit", "-m", "old"], seed);
+      const oldSha = git(["rev-parse", "HEAD"], seed);
+
+      writeFileSync(join(seed, "index.html"), "release one\n");
+      git(["commit", "-am", "release one"], seed);
+      const firstSha = git(["rev-parse", "HEAD"], seed);
+
+      writeFileSync(join(seed, "index.html"), "release two\n");
+      git(["commit", "-am", "release two"], seed);
+      const secondSha = git(["rev-parse", "HEAD"], seed);
+      git(["remote", "add", "origin", origin], seed);
+      git(["push", "-u", "origin", "main"], seed);
+
+      mkdirSync(join(dir, "site"), { recursive: true });
+      git(["clone", origin, appDir]);
+      git(["checkout", "--detach", oldSha], appDir);
+      const originalHead = git(["rev-parse", "HEAD"], appDir);
+      const originalContent = readFileSync(join(appDir, "index.html"), "utf8");
+
+      mkdirSync(join(caddyDir, "sites.d"), { recursive: true });
+      mkdirSync(binDir, { recursive: true });
+      const legacyBase = [
+        ":80 {",
+        `\troot * "${appDir}"`,
+        "\ttry_files {path} /index.html",
+        "\tfile_server",
+        "}",
+        "",
+        "import sites.d/*.caddy",
+        "",
+      ].join("\n");
+      const baseFile = join(caddyDir, "Caddyfile");
+      writeFileSync(baseFile, legacyBase);
+      const siteFile = join(caddyDir, "sites.d", "00-main-my-static-site.caddy");
+
+      writeFileSync(join(binDir, "sudo"), [
+        "#!/usr/bin/env bash",
+        'if [[ "${1:-}" == "/usr/bin/systemctl" ]]; then exit 0; fi',
+        'exec "$@"',
+        "",
+      ].join("\n"));
+      writeFileSync(join(binDir, "caddy"), "#!/usr/bin/env bash\nexit 0\n");
+      writeFileSync(join(binDir, "sleep"), "#!/usr/bin/env bash\nexit 0\n");
+      writeFileSync(join(binDir, "curl"), [
+        "#!/usr/bin/env bash",
+        'if [[ "$*" == *"version.json"* ]]; then',
+        '  root=$(sed -n \'s/^[[:space:]]*root \\* "\\(.*\\)"$/\\1/p\' "$CADDY_SITE" | head -n 1)',
+        '  if [[ "${FAIL_VERSION_HEALTH:-0}" == "1" ]]; then printf \'invalid\\n\'; else cat "$root/version.json"; fi',
+        "else",
+        "  printf '200'",
+        "fi",
+        "",
+      ].join("\n"));
+      for (const command of ["sudo", "caddy", "sleep", "curl"]) {
+        chmodSync(join(binDir, command), 0o755);
+      }
+
+      const releaseApp = staticApp({
+        appDir,
+        mainListen: "cp-http80",
+        releaseTagPattern: "v*",
+        releaseTagFormat: "date",
+        releaseCiWorkflow: ".github/workflows/ci.yml",
+      });
+      const execute = (sha: string, tag: string, expectFailure = false): string => {
+        const script = buildDeployScript(releaseApp, { sha, tag })
+          .replaceAll("/etc/caddy", caddyDir);
+        const result = spawnSync("bash", ["-s"], {
+          input: script,
+          encoding: "utf8",
+          env: {
+            ...process.env,
+            PATH: `${binDir}:${process.env["PATH"] ?? ""}`,
+            CADDY_SITE: siteFile,
+            FAIL_VERSION_HEALTH: expectFailure ? "1" : "0",
+          },
+        });
+        if ((!expectFailure && result.status !== 0) || (expectFailure && result.status !== 1)) {
+          throw new Error(
+            `unexpected static deploy exit (${result.status}):\n${result.stdout}\n${result.stderr}`,
+          );
+        }
+        return script;
+      };
+      const routedRoot = (): string => {
+        const match = readFileSync(siteFile, "utf8").match(/root \* "([^"]+)"/);
+        if (!match?.[1]) throw new Error("routed root missing from test vhost");
+        return match[1];
+      };
+
+      // A failed first activation must restore the GC-style base-file route
+      // byte-for-byte and remove the unproven sites.d route.
+      execute(firstSha, "v20260713.1", true);
+      expect(readFileSync(baseFile, "utf8")).toBe(legacyBase);
+      expect(existsSync(siteFile)).toBe(false);
+
+      const firstScript = execute(firstSha, "v20260713.2");
+      const firstRoot = routedRoot();
+      expect(firstRoot).not.toBe(appDir);
+      const migratedBase = readFileSync(baseFile, "utf8");
+      expect(migratedBase).not.toContain(`root * "${appDir}"`);
+      expect(migratedBase.match(/^\s*import\s+sites\.d\/\*\.caddy\s*$/gm)).toHaveLength(1);
+      expect(spawnSync("caddy", ["validate", "--config", baseFile]).status).toBe(0);
+      expect(readFileSync(join(firstRoot, "index.html"), "utf8")).toBe("release one\n");
+      expect(JSON.parse(readFileSync(join(firstRoot, "version.json"), "utf8"))).toEqual({
+        version: "v20260713.2",
+        tag: "v20260713.2",
+        sha: firstSha,
+        environment: "production",
+      });
+      expect(statSync(join(firstRoot, "version.json")).mode & 0o777).toBe(0o644);
+      expect(firstScript.indexOf("SAMOHOST_PHASE:health:ok")).toBeLessThan(
+        firstScript.indexOf('worktree remove --force "$SAMOHOST_PREVIOUS_RELEASE_DIR"'),
+      );
+
+      execute(secondSha, "v20260713.3");
+      const secondRoot = routedRoot();
+      expect(secondRoot).not.toBe(firstRoot);
+      expect(readFileSync(join(secondRoot, "index.html"), "utf8")).toBe("release two\n");
+      expect(statSync(join(secondRoot, "version.json")).mode & 0o777).toBe(0o644);
+      expect(existsSync(firstRoot)).toBe(false);
+
+      const secondIdentity = readFileSync(join(secondRoot, "version.json"), "utf8");
+      execute(firstSha, "v20260713.4", true);
+      expect(routedRoot()).toBe(secondRoot);
+      expect(readFileSync(join(secondRoot, "index.html"), "utf8")).toBe("release two\n");
+      expect(readFileSync(join(secondRoot, "version.json"), "utf8")).toBe(secondIdentity);
+      expect(git(["worktree", "list", "--porcelain"], appDir)).not.toContain(
+        `${firstSha}.candidate`,
+      );
+
+      // Every attempt fetched and staged elsewhere; the original checkout was
+      // never reset or rewritten before any candidate health check.
+      expect(git(["rev-parse", "HEAD"], appDir)).toBe(originalHead);
+      expect(readFileSync(join(appDir, "index.html"), "utf8")).toBe(originalContent);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }, 15_000);
 
   test("static deploy does NOT emit install/build/migrate/assert-rls/seed phase markers", () => {
     // FAILS today: install, build markers are emitted unconditionally.

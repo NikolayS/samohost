@@ -33,11 +33,21 @@ import { AppStore } from "../state/apps.ts";
 import { StateStore } from "../state/store.ts";
 import {
   runAppDeploy,
+  compareReleaseTags,
   defaultAppDeployDeps,
+  defaultIsCommitOnBranch,
+  defaultResolveLatestTag,
+  isDateReleaseTag,
   type AppDeployInput,
   type RefResolver,
+  type LatestTagResolver,
+  type CommitOnBranchVerifier,
 } from "./app.ts";
 import { checkCiGreen } from "../app/cigate.ts";
+import {
+  CANONICAL_RELEASE_CI_WORKFLOW,
+  isCanonicalReleaseCiWorkflow,
+} from "../app/release-policy.ts";
 import type { DeployOutcome } from "../app/parse.ts";
 import {
   runEnvGc,
@@ -203,6 +213,16 @@ export type TriggerDeploy = (
 export interface TriggerDeps {
   /** Resolve repo + branch → full SHA (the same RefResolver type as in app.ts). */
   resolveRef: RefResolver;
+  /**
+   * OPTIONAL: resolve repo + release-tag glob → latest matching tag's commit
+   * sha (issue #132 / SPEC-DELTA §8). Used ONLY for apps with
+   * `releaseTagPattern` set; when that app has a pattern but this dep is
+   * absent, the branch-HEAD path is taken unchanged. OPTIONAL so all existing
+   * `{resolveRef, deploy, fetch, now}` test fixtures continue to compile.
+   */
+  resolveLatestTag?: LatestTagResolver;
+  /** Verify the release commit is reachable from the configured main branch. */
+  isCommitOnBranch?: CommitOnBranchVerifier;
   /** CURRIED runAppDeploy — AppDeployDeps already bound inside. */
   deploy: TriggerDeploy;
   /**
@@ -407,11 +427,112 @@ export async function runTriggerRun(
     }
 
     try {
-      // Resolve the current SHA for the tracked branch
-      const resolvedSha = await deps.resolveRef(app.repo, app.branch);
+      // Resolve the target SHA. Prod (main-env) tracks either the tracked
+      // branch HEAD (default, unchanged) or — when the app opts into the
+      // release-tag production channel (issue #132) — the LATEST git tag
+      // matching app.releaseTagPattern. Everything downstream (up-to-date,
+      // known-bad, CI gate, deploy) is ref-agnostic and reused verbatim.
+      let resolvedSha: string;
+      let resolvedTag: string | undefined;
+      if (app.releaseTagPattern !== undefined) {
+        if (app.releaseTagFormat !== "date" || !isCanonicalReleaseCiWorkflow(app.releaseCiWorkflow)) {
+          throw new Error(
+            "release channel requires releaseTagFormat='date' and " +
+            `releaseCiWorkflow='${CANONICAL_RELEASE_CI_WORKFLOW}'`,
+          );
+        }
+        if (deps.resolveLatestTag === undefined) {
+          throw new Error("releaseTagPattern is set but the release tag resolver is absent");
+        }
+        const latest = await deps.resolveLatestTag(
+          app.repo,
+          app.releaseTagPattern,
+          app.releaseTagFormat,
+        );
+        if (latest === null) {
+          // "Tag ≠ ship": no matching tag → prod stays put. NEVER fall back to
+          // the branch HEAD (that is the preview channel, PR2).
+          // Mark an existing production app as initialized so that the first
+          // tag cut AFTER this point is a release event, not mistaken for a
+          // historical tag that needs baselining.
+          if (
+            !input.dryRun &&
+            app.deployedSha !== undefined &&
+            app.releaseTagChannelInitialized !== true
+          ) {
+            appStore.upsert({ ...app, releaseTagChannelInitialized: true });
+          }
+          results.push({
+            app: app.name,
+            vm: vmName,
+            action: "skipped",
+            reason: "no-matching-tag",
+          });
+          continue;
+        }
+        resolvedTag = latest.tag;
+        resolvedSha = latest.sha;
+        if (deps.isCommitOnBranch === undefined) {
+          throw new Error("release tag resolver is configured but main-ancestry verifier is absent");
+        }
+        if (!(await deps.isCommitOnBranch(app.repo, resolvedSha, app.branch))) {
+          results.push({
+            app: app.name,
+            vm: vmName,
+            action: "skipped",
+            sha: resolvedSha,
+            reason: "release-sha-not-on-main",
+          });
+          continue;
+        }
+      } else {
+        resolvedSha = await deps.resolveRef(app.repo, app.branch);
+      }
+
+      // Safe activation for apps that already have production state. Merely
+      // shipping support for releaseTagPattern must never roll a newer prod
+      // checkout back to the latest historical tag. The first live cycle
+      // records that tag as the cursor without deploying it. Later cycles may
+      // deploy only a strictly newer tag. A brand-new app (no deployedSha)
+      // still deploys its latest matching tag normally.
+      if (
+        resolvedTag !== undefined &&
+        app.deployedSha !== undefined &&
+        app.releaseTagChannelInitialized !== true &&
+        app.deployedSha !== resolvedSha
+      ) {
+        if (!input.dryRun) {
+          appStore.upsert({
+            ...app,
+            releaseTagCursor: resolvedTag,
+            releaseTagChannelInitialized: true,
+          });
+        }
+        results.push({
+          app: app.name,
+          vm: vmName,
+          action: "skipped",
+          sha: resolvedSha,
+          reason: input.dryRun
+            ? "release-tag-baseline-required"
+            : "release-tag-baselined",
+        });
+        continue;
+      }
 
       // up-to-date check
       if (app.deployedSha !== undefined && resolvedSha === app.deployedSha) {
+        if (
+          !input.dryRun &&
+          resolvedTag !== undefined &&
+          app.releaseTagChannelInitialized !== true
+        ) {
+          appStore.upsert({
+            ...app,
+            releaseTagCursor: resolvedTag,
+            releaseTagChannelInitialized: true,
+          });
+        }
         results.push({
           app: app.name,
           vm: vmName,
@@ -419,6 +540,26 @@ export async function runTriggerRun(
           sha: resolvedSha,
         });
         continue;
+      }
+
+      // A cursor is monotonic: deleting/repointing tags must not turn an older
+      // tag into a production rollback. Invalid cursor data also fails closed.
+      if (resolvedTag !== undefined && app.releaseTagCursor !== undefined) {
+        const order = app.releaseTagFormat === "date" && !isDateReleaseTag(app.releaseTagCursor)
+          ? null
+          : compareReleaseTags(resolvedTag, app.releaseTagCursor);
+        if (order === null || order <= 0) {
+          results.push({
+            app: app.name,
+            vm: vmName,
+            action: "skipped",
+            sha: resolvedSha,
+            reason: order === null
+              ? "release-tag-cursor-invalid"
+              : "no-new-release-tag",
+          });
+          continue;
+        }
       }
 
       // known-bad early skip (avoids pointless SSH/CI round-trip)
@@ -450,7 +591,7 @@ export async function runTriggerRun(
       const ciStatus = await checkCiGreen(app.repo, resolvedSha, {
         fetch: deps.fetch,
         env: deps.env,
-      });
+      }, resolvedTag !== undefined ? app.releaseCiWorkflow : undefined);
 
       if (ciStatus === "pending") {
         results.push({
@@ -494,6 +635,7 @@ export async function runTriggerRun(
         app: app.name,
         sha: resolvedSha,
         skipCiGate: false,
+        ...(resolvedTag !== undefined ? { releaseTag: resolvedTag } : {}),
       };
 
       const deployExit = await deps.deploy(
@@ -506,6 +648,14 @@ export async function runTriggerRun(
       );
 
       if (deployExit === 0) {
+        if (resolvedTag !== undefined) {
+          const deployed = appStore.get(app.vmId, app.name) ?? app;
+          appStore.upsert({
+            ...deployed,
+            releaseTagCursor: resolvedTag,
+            releaseTagChannelInitialized: true,
+          });
+        }
         results.push({
           app: app.name,
           vm: vmName,
@@ -894,6 +1044,7 @@ export interface TriggerDepsOpts {
    * Production: absent (undefined) → uses defaultAppDeployDeps().resolveRef.
    */
   resolveRef?: RefResolver;
+  isCommitOnBranch?: CommitOnBranchVerifier;
   /**
    * Injectable PR-listing function (for integration tests — avoids requiring
    * a live `gh` binary). When provided, batchedVmCycle uses it instead of
@@ -963,6 +1114,10 @@ export function defaultTriggerDeps(opts: TriggerDepsOpts = {}): TriggerDeps {
     // Reuse the same resolver the deploy path uses (no new resolver code).
     // Tests may inject a fast mock via opts.resolveRef to avoid real GitHub API calls.
     resolveRef: opts.resolveRef ?? appDeployDeps.resolveRef,
+
+    // Release-tag production channel (issue #132): latest matching tag → sha.
+    resolveLatestTag: defaultResolveLatestTag(),
+    isCommitOnBranch: opts.isCommitOnBranch ?? defaultIsCommitOnBranch(),
 
     // Curried: AppDeployDeps already captured in closure.
     deploy: (input, opts, vmStore, appStore, out, err) =>

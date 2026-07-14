@@ -1311,6 +1311,21 @@ describe("buildHostBootstrapScript — static path (kind='static')", () => {
     expect(script).toContain("tls internal");
   });
 
+  test("static bootstrap honors cp-http80 without emitting tls internal", () => {
+    const script = buildHostBootstrapScript(
+      staticRecord({ mainListen: "cp-http80" }),
+      staticOpts(),
+    );
+    const start = script.indexOf("http://my-static-site.example.com {");
+    const end = script.indexOf("}\nCADDY_SITE", start);
+    expect(start).toBeGreaterThanOrEqual(0);
+    const block = script.slice(start, end);
+    expect(block).toContain("root * /opt/my-static-site/app");
+    expect(block).toContain("try_files {path} /index.html");
+    expect(block).toContain("file_server");
+    expect(block).not.toContain("tls internal");
+  });
+
   test("static bootstrap firewall: source-restricts :443 to CF IP ranges, NEVER world-open", () => {
     // FAILS today: buildHostBootstrapScript has no firewall section at all.
     const script = buildHostBootstrapScript(staticRecord(), staticOpts());

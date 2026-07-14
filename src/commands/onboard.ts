@@ -451,6 +451,8 @@ Refs: NikolayS/samohost#127
     ...(app.appUser           !== undefined ? { appUser:           app.appUser }           : {}),
     // ---- fields that were previously dropped (samorev #140) ----
     ...(app.releaseTagPattern !== undefined ? { releaseTagPattern: app.releaseTagPattern } : {}),
+    ...(app.releaseTagFormat  !== undefined ? { releaseTagFormat:  app.releaseTagFormat }  : {}),
+    ...(app.releaseCiWorkflow !== undefined ? { releaseCiWorkflow: app.releaseCiWorkflow } : {}),
     ...(app.services          !== undefined ? { services:          app.services }          : {}),
     ...(app.routes            !== undefined ? { routes:            app.routes }            : {}),
     ...(app.defaultListener   !== undefined ? { defaultListener:   app.defaultListener }   : {}),

@@ -1820,7 +1820,11 @@ describe("parseSamohostToml — releaseTagPattern (parse-only, inert)", () => {
 
   // rtp-1: present + valid glob → parses ok, value lands in AppManifest
   test('rtp-1: releaseTagPattern = "v*" parses ok and value is present', () => {
-    const result = parseSamohostToml(minimal('releaseTagPattern = "v*"'));
+    const result = parseSamohostToml(minimal([
+      'releaseTagPattern = "v*"',
+      'releaseTagFormat = "date"',
+      'releaseCiWorkflow = ".github/workflows/ci.yml"',
+    ].join("\n")));
     if (!result.ok) throw new Error("expected ok=true; errors: " + result.errors.join(", "));
     expect(result.app.releaseTagPattern).toBe("v*");
   });
@@ -1850,9 +1854,13 @@ describe("parseSamohostToml — releaseTagPattern (parse-only, inert)", () => {
 
   // rtp-5: various valid glob patterns are accepted
   test('rtp-5: releaseTagPattern = "release-*" (more complex glob) parses ok', () => {
-    const result = parseSamohostToml(minimal('releaseTagPattern = "release-*"'));
+    const result = parseSamohostToml(minimal([
+      'releaseTagPattern = "v2026*"',
+      'releaseTagFormat = "date"',
+      'releaseCiWorkflow = ".github/workflows/ci.yml"',
+    ].join("\n")));
     if (!result.ok) throw new Error("expected ok=true; errors: " + result.errors.join(", "));
-    expect(result.app.releaseTagPattern).toBe("release-*");
+    expect(result.app.releaseTagPattern).toBe("v2026*");
   });
 });
 
@@ -1903,7 +1911,11 @@ describe("runAppRegisterFromToml — releaseTagPattern threaded to AppRecord", (
 
   // rtp-6: releaseTagPattern in toml → lands on AppRecord
   test('rtp-6: releaseTagPattern "v*" in toml → AppRecord.releaseTagPattern = "v*"', () => {
-    const tomlPath = writeToml('releaseTagPattern = "v*"');
+    const tomlPath = writeToml([
+      'releaseTagPattern = "v*"',
+      'releaseTagFormat = "date"',
+      'releaseCiWorkflow = ".github/workflows/ci.yml"',
+    ].join("\n"));
     const c = capture();
     const code = runAppRegisterFromToml(
       { vm: "samo-we-field-record", tomlPath },

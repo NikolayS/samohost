@@ -2305,6 +2305,8 @@ export function buildHostPrepScript(
   firewallOpts?: HostPrepFirewallOpts,
 ): string {
   const isStatic = app.kind === "static";
+  const isStaticReleaseChannel = isStatic && app.releaseTagPattern !== undefined;
+  const managesMainVhost = app.mainHost !== undefined && !isStaticReleaseChannel;
   const root = envsRoot(app);
   // Issue #97: the preview unit and the envs root must be owned by the app
   // user when appUser is registered. Fall back to sshUser for back-compat with
@@ -2323,15 +2325,18 @@ export function buildHostPrepScript(
   // differing live file unless --force-main-vhost was set for this invocation.
   const guardFnLines: string[] = [];
   const mainVhostLines: string[] = [];
-  if (app.mainHost !== undefined) {
-    if (!isValidMainHost(app.mainHost)) {
-      throw new Error(
-        `invalid mainHost ${JSON.stringify(app.mainHost)} for app ` +
-          `'${app.name}' — expected a dotted lowercase DNS name like ` +
-          `"app.example.com" (embedded in a root-run script; ` +
-          `failing closed)`,
-      );
-    }
+  if (app.mainHost !== undefined && !isValidMainHost(app.mainHost)) {
+    throw new Error(
+      `invalid mainHost ${JSON.stringify(app.mainHost)} for app ` +
+        `'${app.name}' — expected a dotted lowercase DNS name like ` +
+        `"app.example.com" (embedded in a root-run script; ` +
+        `failing closed)`,
+    );
+  }
+  if (managesMainVhost) {
+    // Narrowed by managesMainVhost, but keep a local constant so TypeScript and
+    // the generated prose both reflect that this branch owns a concrete host.
+    const mainHost = app.mainHost!;
     const port = mainEnvPort(app);
     const livePath = `/etc/caddy/sites.d/00-main-${app.name}.caddy`;
     const stagedPath = `/etc/caddy/sites.d/.staged-00-main-${app.name}.caddy`;
@@ -2383,6 +2388,25 @@ export function buildHostPrepScript(
       "",
     );
 
+    const mainSiteAddress = isStatic && app.mainListen === "cp-http80"
+      ? `http://${mainHost}`
+      : mainHost;
+    const mainSiteBody = isStatic
+      ? [
+          `${mainSiteAddress} {`,
+          `\troot * ${app.appDir}`,
+          `\ttry_files {path} /index.html`,
+          `\tfile_server`,
+          `\tencode gzip`,
+          ...(app.mainListen === "cp-http80" ? [] : [`\ttls internal`]),
+          `}`,
+        ]
+      : [
+          `${mainHost} {`,
+          `\treverse_proxy localhost:${port}`,
+          `}`,
+        ];
+
     mainVhostLines.push(
       "",
       `#    Landmine guard: render the intended single-service vhost to a staged`,
@@ -2391,9 +2415,7 @@ export function buildHostPrepScript(
       `#    force=true was baked in via --force-main-vhost at host-prep time.`,
       `#    The 00- prefix sorts the live file first in sites.d.`,
       `cat > ${stagedPath} <<'CADDY'`,
-      `${app.mainHost} {`,
-      `\treverse_proxy localhost:${port}`,
-      `}`,
+      ...mainSiteBody,
       "CADDY",
       `samohost_apply_main_vhost \\`,
       `  ${stagedPath} \\`,
@@ -2550,7 +2572,15 @@ export function buildHostPrepScript(
   sudoersLines.push(
     `${sshUser} ALL=(root) NOPASSWD: /usr/bin/systemctl reload caddy`,
     `${sshUser} ALL=(root) NOPASSWD: /usr/bin/tee /etc/caddy/sites.d/*.caddy`,
+    `${sshUser} ALL=(root) NOPASSWD: /usr/bin/mv -- /etc/caddy/sites.d/*.caddy /etc/caddy/sites.d/*.caddy`,
     `${sshUser} ALL=(root) NOPASSWD: /usr/bin/rm -f /etc/caddy/sites.d/*.caddy`,
+    ...(isStaticReleaseChannel
+      ? [
+        `${sshUser} ALL=(root) NOPASSWD: /usr/bin/tee /etc/caddy/.samohost-next-Caddyfile`,
+        `${sshUser} ALL=(root) NOPASSWD: /usr/bin/mv -- /etc/caddy/.samohost-next-Caddyfile /etc/caddy/Caddyfile`,
+        `${sshUser} ALL=(root) NOPASSWD: /usr/bin/rm -f /etc/caddy/.samohost-next-Caddyfile`,
+      ]
+      : []),
   );
   if (!isStatic) {
     sudoersLines.push(
@@ -2638,16 +2668,18 @@ export function buildHostPrepScript(
     // it is in scope before the Caddy step that calls it.
     ...guardFnLines,
     ...nodeOnlyLines,
-    `# ${isStatic ? "1" : "3"}. Caddy: include per-env vhost snippets + the durable MAIN-env vhost`,
-    `#    (field-record-1#117 ITEM C, 7th drift class).`,
+    `# ${isStatic ? "1" : "3"}. Caddy: include per-env vhost snippets${isStaticReleaseChannel ? "; production activates only in the tag release transaction" : " + the durable MAIN-env vhost"}`,
+    ...(isStaticReleaseChannel
+      ? [`#    Release-channel host-prep never creates or replaces the production vhost.`]
+      : [`#    (field-record-1#117 ITEM C, 7th drift class).`]),
     "mkdir -p /etc/caddy/sites.d",
-    `grep -q 'import sites.d/\\*.caddy' /etc/caddy/Caddyfile \\`,
+    `grep -Eq '^[[:space:]]*import[[:space:]]+(/etc/caddy/)?sites\\.d/\\*\\.caddy([[:space:]]*(#.*)?)?$' /etc/caddy/Caddyfile \\`,
     `  || printf '\\nimport sites.d/*.caddy\\n' >> /etc/caddy/Caddyfile`,
     ...mainVhostLines,
-    // When mainHost is set, samohost_apply_main_vhost() handles validate +
-    // reload internally.  When mainHost is absent, emit the top-level reload
-    // to activate the 'import sites.d/*.caddy' addition.
-    ...(app.mainHost === undefined ? ["systemctl reload caddy"] : []),
+    // A managed main vhost reloads inside samohost_apply_main_vhost(). Every
+    // other shape reloads only to activate the sites.d import; for static
+    // release channels this preserves any existing versioned production route.
+    ...(!managesMainVhost ? ["systemctl reload caddy"] : []),
     "",
     // The env-create script runs later as the non-root env user, so the envs
     // root must already exist and be writable by that user regardless of how

@@ -181,6 +181,9 @@ serviceUnit = "field-record-1"                      # systemd unit restarted on 
 # envDbVars       = ["DATABASE_URL"]                 # vars whose DB host:port is rewritten per preview env
 # rlsNonSuperuser = true                             # require non-superuser connection (RLS gate)
 # kind            = "node"                            # "node" (default) | "static"
+# releaseTagPattern = "v*"                            # opt in to tag-only production
+# releaseTagFormat  = "date"                          # required: vYYYYMMDD.N, real dates only
+# releaseCiWorkflow = ".github/workflows/ci.yml"      # required: canonical trusted Actions workflow
 
 # [provision] — OPTIONAL; parsed + validated but NOT yet consumed by app register
 # (reserved for a future `provision --from-toml`). Allowed keys only:

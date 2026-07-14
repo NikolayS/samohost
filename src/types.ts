@@ -243,7 +243,6 @@ export interface AppSpec {
    * fallback to `"template"`; any non-dblab backend must be stated explicitly here.
    */
   previewDbBackend?: EnvDbBackend;
-
   // ---- Multi-service spec model (additive; absent = legacy single-service) --
 
   /**
@@ -271,14 +270,18 @@ export interface AppSpec {
    */
   mainListen?: "cp-http80" | "tls";
   /**
-   * Optional glob pattern (e.g. `"v*"`) that the client repo carries to declare
-   * which git tags correspond to release events.
-   *
-   * IMPORTANT — accepted + persisted; the tag-gated deploy behavior is a
-   * separate, not-yet-shipped feature — prod deploys on main SHA + CI-green
-   * regardless of this value.
+   * Optional glob pattern (normally `"v*"`) selecting production release tags.
+   * When set, releaseTagFormat="date" and the canonical trusted
+   * releaseCiWorkflow path `.github/workflows/ci.yml` are mandatory.
+   * Production accepts only real-calendar `vYYYYMMDD.N` tags
+   * whose commit is on the configured main branch and whose exact workflow is
+   * green; branch-head/manual deploys are refused.
    */
   releaseTagPattern?: string;
+  /** Required release tag grammar when releaseTagPattern is set (`vYYYYMMDD.N`). */
+  releaseTagFormat?: "date";
+  /** Canonical trusted workflow path: `.github/workflows/ci.yml`. */
+  releaseCiWorkflow?: string;
 
   /**
    * App-level secret env-var NAMES samohost will auto-generate per preview env
@@ -319,6 +322,16 @@ export interface AppRecord extends AppSpec {
   deployedSha?: string;
   failedSha?: string;
   lastDeployAt?: string;
+  /**
+   * Highest release tag observed by the production tag channel. On first
+   * activation for an already-deployed app, samohost records the current tag
+   * here without deploying it; only a later, greater tag may advance prod.
+   * This prevents enabling tag delivery from rolling production back to an
+   * older historical tag.
+   */
+  releaseTagCursor?: string;
+  /** True once the tag channel has completed its rollback-safe first cycle. */
+  releaseTagChannelInitialized?: boolean;
 }
 
 /**

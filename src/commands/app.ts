@@ -20,6 +20,10 @@ import { checkCiGreen, type CiStatus } from "../app/cigate.ts";
 import { parseDeployOutcome, type DeployOutcome } from "../app/parse.ts";
 import { buildDeployScript } from "../app/script.ts";
 import {
+  CANONICAL_RELEASE_CI_WORKFLOW,
+  isCanonicalReleaseCiWorkflow,
+} from "../app/release-policy.ts";
+import {
   buildHostBootstrapScript,
   type HostBootstrapOptions,
 } from "../app/bootstrap.ts";
@@ -98,11 +102,12 @@ export interface AppRegisterInput {
    * Optional glob pattern for release tags (e.g. `"v*"`). Mirrors
    * {@link AppSpec.releaseTagPattern}.
    *
-   * IMPORTANT — accepted + persisted; the tag-gated deploy behavior is a
-   * separate, not-yet-shipped feature — prod deploys on main SHA + CI-green
-   * regardless of this value.
+   * When set, production accepts only real-calendar `vYYYYMMDD.N` release tags
+   * on the configured branch, gated by `.github/workflows/ci.yml`.
    */
   releaseTagPattern?: string;
+  releaseTagFormat?: "date";
+  releaseCiWorkflow?: string;
 
   /**
    * App-level secret env-var NAMES to auto-generate per preview env (PR-B).
@@ -147,6 +152,8 @@ export interface AppDeployInput {
   /** Git ref to resolve to a SHA via `gh api`. Defaults to the app branch. */
   ref?: string;
   skipCiGate: boolean;
+  /** Internal trigger proof that this deploy came from the resolved release tag. */
+  releaseTag?: string;
   /** Bypass the known-bad-SHA guard (issue #2: a FALSE rollback brands a good
    * SHA known-bad and wedges redeploys). Logged loudly when used. */
   force?: boolean;
@@ -212,6 +219,26 @@ export function runAppRegister(
     err(`error: VM not found in state: ${input.vm}`);
     return 1;
   }
+  if (input.releaseTagPattern !== undefined &&
+      (input.releaseTagFormat !== "date" || !isCanonicalReleaseCiWorkflow(input.releaseCiWorkflow))) {
+    err(
+      "error: releaseTagPattern requires releaseTagFormat='date' and " +
+      `releaseCiWorkflow='${CANONICAL_RELEASE_CI_WORKFLOW}'`,
+    );
+    return 1;
+  }
+  if (input.releaseCiWorkflow !== undefined &&
+      !isCanonicalReleaseCiWorkflow(input.releaseCiWorkflow)) {
+    err(
+      `error: releaseCiWorkflow must be the canonical trusted workflow path ` +
+      `'${CANONICAL_RELEASE_CI_WORKFLOW}'`,
+    );
+    return 1;
+  }
+  if (input.kind === "static" && input.releaseTagPattern !== undefined && input.mainHost === undefined) {
+    err("error: a static release-channel app requires mainHost for an owned production vhost");
+    return 1;
+  }
 
   // Fix 6a: validate service topology on the programmatic path too.
   // The TOML path runs the same check via parseSamohostToml. Without this guard,
@@ -263,9 +290,9 @@ export function runAppRegister(
     ...(input.routes !== undefined ? { routes: input.routes } : {}),
     ...(input.defaultListener !== undefined ? { defaultListener: input.defaultListener } : {}),
     ...(input.mainListen !== undefined ? { mainListen: input.mainListen } : {}),
-    // accepted + persisted; the tag-gated deploy behavior is a separate,
-    // not-yet-shipped feature — prod deploys on main SHA + CI-green regardless of this value.
     ...(input.releaseTagPattern !== undefined ? { releaseTagPattern: input.releaseTagPattern } : {}),
+    ...(input.releaseTagFormat !== undefined ? { releaseTagFormat: input.releaseTagFormat } : {}),
+    ...(input.releaseCiWorkflow !== undefined ? { releaseCiWorkflow: input.releaseCiWorkflow } : {}),
     // PR-B/PR-C schema: accepted + persisted; secret generation and DB URL rewriting
     // are separate, not-yet-shipped features.
     ...(input.secrets !== undefined ? { secrets: input.secrets } : {}),
@@ -286,6 +313,18 @@ export function runAppRegister(
       : {}),
     ...(existing?.lastDeployAt !== undefined
       ? { lastDeployAt: existing.lastDeployAt }
+      : {}),
+    ...(existing?.releaseTagPattern === input.releaseTagPattern &&
+    existing?.releaseTagFormat === input.releaseTagFormat &&
+    existing?.releaseCiWorkflow === input.releaseCiWorkflow &&
+    existing?.releaseTagCursor !== undefined
+      ? { releaseTagCursor: existing.releaseTagCursor }
+      : {}),
+    ...(existing?.releaseTagPattern === input.releaseTagPattern &&
+    existing?.releaseTagFormat === input.releaseTagFormat &&
+    existing?.releaseCiWorkflow === input.releaseCiWorkflow &&
+    existing?.releaseTagChannelInitialized === true
+      ? { releaseTagChannelInitialized: true }
       : {}),
   };
 
@@ -375,6 +414,8 @@ export function runAppRegisterFromToml(
     ...(app.defaultListener !== undefined ? { defaultListener: app.defaultListener } : {}),
     ...(app.mainListen !== undefined ? { mainListen: app.mainListen } : {}),
     ...(app.releaseTagPattern !== undefined ? { releaseTagPattern: app.releaseTagPattern } : {}),
+    ...(app.releaseTagFormat !== undefined ? { releaseTagFormat: app.releaseTagFormat } : {}),
+    ...(app.releaseCiWorkflow !== undefined ? { releaseCiWorkflow: app.releaseCiWorkflow } : {}),
     ...(app.secrets !== undefined ? { secrets: app.secrets } : {}),
     ...(app.databaseUrlEnv !== undefined ? { databaseUrlEnv: app.databaseUrlEnv } : {}),
   };
@@ -583,6 +624,8 @@ export interface AppDeployDeps {
   now: () => Date;
   /** Env override for token lookup (tests). */
   env?: Record<string, string | undefined>;
+  /** Verify that a release commit is reachable from the configured main branch. */
+  isCommitOnBranch?: CommitOnBranchVerifier;
 }
 
 export interface AppDeployReport {
@@ -615,6 +658,34 @@ export async function runAppDeploy(
     err(`error: app not found on vm ${vm.name}: ${input.app}`);
     return 1;
   }
+  if (app.releaseTagPattern !== undefined) {
+    if (app.releaseTagFormat !== "date" || !isCanonicalReleaseCiWorkflow(app.releaseCiWorkflow)) {
+      err(
+        "error: release-channel app is missing releaseTagFormat='date' or canonical " +
+        `releaseCiWorkflow='${CANONICAL_RELEASE_CI_WORKFLOW}'`,
+      );
+      return 1;
+    }
+    if (input.releaseTag === undefined) {
+      err("error: release-channel apps cannot be deployed manually by SHA/ref/branch; cut a reviewed release tag");
+      return 1;
+    }
+    if (!isDateReleaseTag(input.releaseTag)) {
+      err(`error: invalid dated release tag: ${input.releaseTag}`);
+      return 1;
+    }
+    if (!tagGlobToRegExp(app.releaseTagPattern).test(input.releaseTag)) {
+      err(`error: release tag ${input.releaseTag} does not match ${app.releaseTagPattern}`);
+      return 1;
+    }
+    if (input.skipCiGate) {
+      err("error: --skip-ci-gate is forbidden for release-channel apps");
+      return 1;
+    }
+  } else if (input.releaseTag !== undefined) {
+    err("error: internal releaseTag proof is invalid for a branch-channel app");
+    return 1;
+  }
 
   // ---- resolve the target SHA --------------------------------------------
   let sha: string;
@@ -633,6 +704,41 @@ export async function runAppDeploy(
     }
     if (!SHA_RE.test(sha)) {
       err(`error: resolved ref ${ref} to an invalid sha: ${sha}`);
+      return 1;
+    }
+  }
+
+  // A caller-provided `releaseTag` is not authority by itself. Re-resolve the
+  // immutable tag and prove that it names this exact SHA on the configured main
+  // branch before any CI or SSH side effect. This keeps the public app-deploy
+  // path from forging a tag proof around an arbitrary SHA.
+  if (input.releaseTag !== undefined) {
+    let taggedSha: string;
+    try {
+      taggedSha = (await deps.resolveRef(app.repo, input.releaseTag)).trim();
+    } catch (e) {
+      err(
+        `error: failed to verify release tag ${input.releaseTag}: ` +
+          `${e instanceof Error ? e.message : String(e)}`,
+      );
+      return 1;
+    }
+    if (!SHA_RE.test(taggedSha) || taggedSha !== sha) {
+      err(`error: release tag ${input.releaseTag} does not resolve to requested sha ${sha}`);
+      return 1;
+    }
+    if (deps.isCommitOnBranch === undefined) {
+      err("error: release ancestry verifier is unavailable; refusing deployment");
+      return 1;
+    }
+    let onMain = false;
+    try {
+      onMain = await deps.isCommitOnBranch(app.repo, sha, app.branch);
+    } catch {
+      onMain = false;
+    }
+    if (!onMain) {
+      err(`error: release sha ${sha} is not an ancestor of ${app.branch}`);
       return 1;
     }
   }
@@ -667,7 +773,7 @@ export async function runAppDeploy(
     ci = await checkCiGreen(app.repo, sha, {
       fetch: deps.fetch,
       ...(deps.env !== undefined ? { env: deps.env } : {}),
-    });
+    }, app.releaseTagPattern !== undefined ? app.releaseCiWorkflow : undefined);
     if (ci === "failure") {
       err(
         `error: CI gate refused ${sha}: GitHub Actions reports a failed/cancelled ` +
@@ -686,7 +792,10 @@ export async function runAppDeploy(
   }
 
   // ---- build + push the script over ONE connection -----------------------
-  const script = buildDeployScript(app, { sha });
+  const script = buildDeployScript(app, {
+    sha,
+    ...(input.releaseTag !== undefined ? { tag: input.releaseTag } : {}),
+  });
   let result: SpawnResult;
   try {
     result = await deps.remote(vm, script);
@@ -795,6 +904,255 @@ function defaultRefResolver(): RefResolver {
   };
 }
 
+// ---------------------------------------------------------------------------
+// Release-tag production channel (issue #132 / SPEC-DELTA §8)
+// ---------------------------------------------------------------------------
+
+/** A resolved release tag: the tag name plus the COMMIT sha it points at. */
+export interface TagRef {
+  tag: string;
+  sha: string;
+}
+
+/**
+ * Resolve the LATEST release tag matching `pattern` for `repo` → its commit
+ * sha, or `null` when no tag matches. NEVER falls back to a branch HEAD.
+ * The same type is injected into the trigger as `resolveLatestTag`.
+ */
+export type LatestTagResolver = (
+  repo: string,
+  pattern: string,
+  format?: "date",
+) => Promise<TagRef | null>;
+
+/** Prove that `sha` is an ancestor of (or identical to) `branch`. */
+export type CommitOnBranchVerifier = (
+  repo: string,
+  sha: string,
+  branch: string,
+) => Promise<boolean>;
+
+/**
+ * Low-level GitHub IO for the tag resolver, split out so the selection logic
+ * ({@link selectLatestTag}) and the deref/list orchestration are unit-tested
+ * offline with a fake, while prod wires `gh api`.
+ */
+export interface GhTagIo {
+  /** List every tag name in the repo (e.g. `gh api --paginate repos/<r>/tags`). */
+  listTags: (repo: string) => Promise<string[]>;
+  /**
+   * Dereference a tag ref to its target COMMIT sha. `gh api
+   * repos/<r>/commits/<ref>` resolves BOTH lightweight and annotated tags to
+   * the underlying commit (an annotated tag's own object sha is NOT returned).
+   */
+  resolveCommitSha: (repo: string, ref: string) => Promise<string>;
+}
+
+/** Parsed semver components; `prerelease` empty ⇒ a final release. */
+interface Semver {
+  major: number;
+  minor: number;
+  patch: number;
+  prerelease: string[];
+  raw: string;
+}
+
+/** Convert a shell-style glob (`*`, `?`, `[...]`) into an anchored RegExp. */
+export function tagGlobToRegExp(glob: string): RegExp {
+  let re = "^";
+  let i = 0;
+  while (i < glob.length) {
+    const c = glob[i]!;
+    if (c === "*") {
+      re += ".*";
+      i++;
+    } else if (c === "?") {
+      re += ".";
+      i++;
+    } else if (c === "[") {
+      // Character class: copy through the matching ']'.
+      let j = i + 1;
+      let cls = "[";
+      if (glob[j] === "!" || glob[j] === "^") {
+        cls += "^";
+        j++;
+      }
+      if (glob[j] === "]") {
+        cls += "\\]";
+        j++;
+      }
+      while (j < glob.length && glob[j] !== "]") {
+        cls += glob[j] === "\\" ? "\\\\" : glob[j];
+        j++;
+      }
+      if (j >= glob.length) {
+        // Unterminated '[' → treat as a literal '['.
+        re += "\\[";
+        i++;
+        continue;
+      }
+      re += cls + "]";
+      i = j + 1;
+    } else {
+      re += c.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      i++;
+    }
+  }
+  return new RegExp(re + "$");
+}
+
+/** Parse a (possibly `v`-prefixed) tag name into semver parts, or null. */
+function parseSemver(name: string): Semver | null {
+  const s = name.replace(/^v/, "");
+  const m = /^(\d+)(?:\.(\d+))?(?:\.(\d+))?(?:-([0-9A-Za-z.-]+))?(?:\+[0-9A-Za-z.-]+)?$/.exec(s);
+  if (m === null) return null;
+  return {
+    major: Number(m[1]),
+    minor: m[2] !== undefined ? Number(m[2]) : 0,
+    patch: m[3] !== undefined ? Number(m[3]) : 0,
+    prerelease: m[4] !== undefined ? m[4].split(".") : [],
+    raw: name,
+  };
+}
+
+/** Semver precedence (SemVer §11): negative if a < b, positive if a > b. */
+function compareSemver(a: Semver, b: Semver): number {
+  if (a.major !== b.major) return a.major - b.major;
+  if (a.minor !== b.minor) return a.minor - b.minor;
+  if (a.patch !== b.patch) return a.patch - b.patch;
+  const ap = a.prerelease;
+  const bp = b.prerelease;
+  // A final release outranks any prerelease of the same core version.
+  if (ap.length === 0 && bp.length === 0) return 0;
+  if (ap.length === 0) return 1;
+  if (bp.length === 0) return -1;
+  const n = Math.min(ap.length, bp.length);
+  for (let i = 0; i < n; i++) {
+    const x = ap[i]!;
+    const y = bp[i]!;
+    const xn = /^\d+$/.test(x);
+    const yn = /^\d+$/.test(y);
+    if (xn && yn) {
+      const d = Number(x) - Number(y);
+      if (d !== 0) return d;
+    } else if (xn) {
+      return -1; // numeric identifiers rank lower than alphanumeric
+    } else if (yn) {
+      return 1;
+    } else if (x !== y) {
+      return x < y ? -1 : 1;
+    }
+  }
+  return ap.length - bp.length;
+}
+
+/** Compare two tag names by semver precedence, or null if either is invalid. */
+export function compareReleaseTags(a: string, b: string): number | null {
+  const av = parseSemver(a);
+  const bv = parseSemver(b);
+  return av === null || bv === null ? null : compareSemver(av, bv);
+}
+
+/**
+ * From `names`, keep those matching the glob `pattern` that parse as semver,
+ * EXCLUDE prereleases unless the pattern opts in (a `-` OUTSIDE any `[...]`
+ * class), and return
+ * the greatest by semver precedence — or `null` if none qualify. Pure.
+ */
+export function selectLatestTag(
+  names: string[],
+  pattern: string,
+  format?: "date",
+): string | null {
+  const re = tagGlobToRegExp(pattern);
+  // Opt into prereleases only on a hyphen that is part of the glob's matching
+  // intent — i.e. OUTSIDE any character class. A `-` inside e.g. `[0-9]` (as in
+  // "v[0-9]*.[0-9]*.[0-9]*") must NOT enable prereleases for a prod deploy.
+  const allowPrerelease = pattern.replace(/\[[^\]]*\]/g, "").includes("-");
+  let best: Semver | null = null;
+  for (const name of names) {
+    if (!re.test(name)) continue;
+    if (format === "date" && !isDateReleaseTag(name)) continue;
+    const sv = parseSemver(name);
+    if (sv === null) continue;
+    if (!allowPrerelease && sv.prerelease.length > 0) continue;
+    if (best === null || compareSemver(sv, best) > 0) best = sv;
+  }
+  return best === null ? null : best.raw;
+}
+
+/** Strict release tag shape: vYYYYMMDD.N with a real UTC calendar date. */
+export function isDateReleaseTag(name: string): boolean {
+  const match = /^v(\d{4})(\d{2})(\d{2})\.([1-9]\d*)$/.exec(name);
+  if (match === null) return false;
+  const year = Number(match[1]);
+  const month = Number(match[2]);
+  const day = Number(match[3]);
+  const date = new Date(Date.UTC(year, month - 1, day));
+  return date.getUTCFullYear() === year &&
+    date.getUTCMonth() === month - 1 && date.getUTCDate() === day;
+}
+
+/**
+ * Build a {@link LatestTagResolver} over an injected {@link GhTagIo}: list
+ * tags, pick the latest matching semver ({@link selectLatestTag}), then deref
+ * that tag to its commit sha. Returns null (no branch fallback) when nothing
+ * matches.
+ */
+export function makeResolveLatestTag(io: GhTagIo): LatestTagResolver {
+  return async (repo, pattern, format) => {
+    const names = await io.listTags(repo);
+    const latest = selectLatestTag(names, pattern, format);
+    if (latest === null) return null;
+    const sha = (await io.resolveCommitSha(repo, latest)).trim();
+    return { tag: latest, sha };
+  };
+}
+
+/** Prod {@link GhTagIo}: `gh api` (single short-lived process per call). */
+function defaultGhTagIo(): GhTagIo {
+  return {
+    listTags: (repo) => {
+      const res = spawnSync(
+        "gh",
+        ["api", "--paginate", `repos/${repo}/tags`, "--jq", ".[].name"],
+        { encoding: "utf8", maxBuffer: 8 * 1024 * 1024 },
+      );
+      if (res.status !== 0) {
+        const msg = (res.stderr || res.error?.message || "gh api failed").trim();
+        return Promise.reject(new Error(msg));
+      }
+      const names = (res.stdout ?? "")
+        .split("\n")
+        .map((s) => s.trim())
+        .filter((s) => s.length > 0);
+      return Promise.resolve(names);
+    },
+    // Reuses the SAME endpoint as defaultRefResolver: commits/<ref> resolves an
+    // annotated tag to the target commit (not the tag object).
+    resolveCommitSha: defaultRefResolver(),
+  };
+}
+
+/** Resolve the latest matching release tag → commit sha via `gh api`. */
+export function defaultResolveLatestTag(): LatestTagResolver {
+  return makeResolveLatestTag(defaultGhTagIo());
+}
+
+/** GitHub-backed ancestry verifier. Any API/tooling error fails closed. */
+export function defaultIsCommitOnBranch(): CommitOnBranchVerifier {
+  return (repo, sha, branch) => {
+    const res = spawnSync(
+      "gh",
+      ["api", `repos/${repo}/compare/${encodeURIComponent(sha)}...${encodeURIComponent(branch)}`, "--jq", ".status"],
+      { encoding: "utf8", maxBuffer: 1024 * 1024 },
+    );
+    if (res.status !== 0) return Promise.resolve(false);
+    const status = (res.stdout ?? "").trim();
+    return Promise.resolve(status === "ahead" || status === "identical");
+  };
+}
+
 /** Default production deploy deps. */
 export function defaultAppDeployDeps(): AppDeployDeps {
   return {
@@ -802,6 +1160,7 @@ export function defaultAppDeployDeps(): AppDeployDeps {
     resolveRef: defaultRefResolver(),
     fetch: globalThis.fetch,
     now: () => new Date(),
+    isCommitOnBranch: defaultIsCommitOnBranch(),
   };
 }
 
