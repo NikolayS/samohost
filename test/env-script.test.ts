@@ -2016,7 +2016,8 @@ describe("static host-prep path (kind='static')", () => {
       appDir: "/opt/gc1/app",
     }), "samo");
     expect(s).toContain("http://game-changers.samo.team {");
-    expect(s).toContain("root * /opt/gc1/app");
+    expect(s).toContain('root * "${SAMOHOST_STATIC_DIR}"');
+    expect(s).toContain("samohost_assert_static_tree_safe");
     expect(s).toContain("try_files {path} /index.html");
     expect(s).toContain("file_server");
     expect(s).not.toContain("reverse_proxy localhost:80");
@@ -2236,22 +2237,16 @@ describe("preview-flag: static env create writes config.js with preview:true", (
     expect(s).toContain("preview: true");
   });
 
-  test("static create script writes config.js into $SAMOHOST_ENV_DIR", () => {
+  test("static create script writes config.js into the canonical static directory", () => {
     const s = buildEnvCreateScript(staticApp(), target());
-    expect(s).toContain('$SAMOHOST_ENV_DIR/config.js');
+    expect(s).toContain('"$SAMOHOST_STATIC_DIR/config.js"');
   });
 
-  test("static create script OVERWRITES config.js with > (not >>)", () => {
+  test("static create script atomically replaces config.js instead of appending", () => {
     const s = buildEnvCreateScript(staticApp(), target());
-    // Must use > (overwrite) not >> (append): the repo ships a default
-    // config.js with preview:false that must be replaced.
-    expect(s).toContain('> "$SAMOHOST_ENV_DIR/config.js"');
-    // Verify it's not an append.
-    const configJsLine = s
-      .split("\n")
-      .find((l) => l.includes("config.js"));
-    expect(configJsLine).toBeDefined();
-    expect(configJsLine).not.toMatch(/>>/);
+    expect(s).toContain('SAMOHOST_CONFIG_NEXT=$(mktemp "$SAMOHOST_STATIC_DIR/.config.next.XXXXXX")');
+    expect(s).toContain('/usr/bin/mv -f "$SAMOHOST_CONFIG_NEXT" "$SAMOHOST_STATIC_DIR/config.js"');
+    expect(s).not.toContain('>> "$SAMOHOST_STATIC_DIR/config.js"');
   });
 
   test("static create script embeds the branch from $SAMOHOST_BRANCH in config.js", () => {
@@ -2289,11 +2284,20 @@ describe("preview-flag: static env create writes config.js with preview:true", (
     // Verify the printf form that will be generated works at runtime.
     const dir = mkdtempSync(join(tmpdir(), "samohost-preview-flag-static-"));
     try {
+      const generated = buildEnvCreateScript(
+        staticApp(),
+        target({ branch: "demo/red-bg" }),
+      ).split("\n");
+      const configLines = generated.filter((line) =>
+        line.includes("SAMOHOST_CONFIG_NEXT=$(mktemp") ||
+        line.startsWith("if printf 'window.__GC1_CONFIG__"),
+      );
+      expect(configLines).toHaveLength(2);
       const prog = [
         "set -euo pipefail",
-        `SAMOHOST_ENV_DIR='${dir}'`,
+        `SAMOHOST_STATIC_DIR='${dir}'`,
         `SAMOHOST_BRANCH='demo/red-bg'`,
-        `printf 'window.__GC1_CONFIG__ = { version: "", preview: true, branch: "%s" };\\n' "$SAMOHOST_BRANCH" > "$SAMOHOST_ENV_DIR/config.js"`,
+        ...configLines,
       ].join("\n");
       const r = spawnSync("bash", ["-c", prog], { encoding: "utf8" });
       expect(r.status).toBe(0);
@@ -3486,10 +3490,12 @@ describe("buildCustomDomainVhostScript", () => {
     serviceUnit: "field-record",
   });
 
-  const staticApp = (): AppRecord => ({
+  const staticApp = (overrides: Partial<AppRecord> = {}): AppRecord => ({
     ...nodeApp(),
     kind: "static",
+    staticRoot: "dist",
     healthUrl: "http://localhost:80/",
+    ...overrides,
   });
 
   test("node app vhost uses http:// scheme (HTTP-only) not tls internal", () => {
@@ -3502,12 +3508,66 @@ describe("buildCustomDomainVhostScript", () => {
     expect(bashSyntaxOk(s)).toBe(true);
   });
 
-  test("static app vhost uses http:// scheme and file_server (not tls internal)", () => {
+  test("static app vhost imports only the structured active-deployment route", () => {
     const s = buildCustomDomainVhostScript(staticApp(), "myapp.com");
     expect(s).toContain("http://myapp.com");
     expect(s).not.toContain("tls internal");
     expect(s).toContain("file_server");
+    expect(s).toContain("SAMOHOST_STATIC_ROOT='dist'");
+    expect(s).toContain(
+      "SAMOHOST_ACTIVE_STATE='/opt/field-record/releases/.samohost-active-static.json'",
+    );
+    expect(s).toContain('root * "%s"');
+    expect(s).toContain('"$SAMOHOST_STATIC_DIR"');
+    expect(s).toContain('import "%s"');
+    expect(s).not.toContain("/opt/field-record/app");
+    expect(s).toContain("no authorized healthy static deployment is active");
+    expect(s).toContain("samohost_assert_static_tree_safe");
     expect(bashSyntaxOk(s)).toBe(true);
+  });
+
+  test("static custom-domain activation rechecks the tree around private staging and reload", () => {
+    const s = buildCustomDomainVhostScript(staticApp(), "myapp.com");
+    const directGuard =
+      'samohost_assert_static_tree_safe "$SAMOHOST_CHECKOUT_REAL" "$SAMOHOST_STATIC_DIR" "$SAMOHOST_STATIC_ROOT"';
+    const guard = "samohost_assert_custom_domain_source";
+    const stage = s.indexOf('> "$STAGED"');
+    const activate = s.indexOf('sudo /usr/bin/tee "$SNIPPET"');
+    const reload = s.indexOf("sudo /usr/bin/systemctl reload caddy", activate);
+    expect(s).toContain(directGuard);
+    expect(s.lastIndexOf(`${guard} || exit 1`, stage)).toBeGreaterThan(-1);
+    expect(s.indexOf(`${guard} || exit 1`, stage)).toBeLessThan(activate);
+    expect(s.lastIndexOf(`if ${guard} &&`, reload)).toBeGreaterThan(activate);
+    expect(s).toContain('sudo /usr/bin/tee "$SNIPPET" >/dev/null < "$BACKUP"');
+    expect(s).toContain("trap samohost_cleanup_custom_domain EXIT");
+    expect(s).not.toContain("sites.d/.samohost-");
+  });
+
+  test("release-channel static domains bind only to structured active-release state", () => {
+    const s = buildCustomDomainVhostScript(staticApp({
+      releaseTagPattern: "v*",
+      releaseTagFormat: "date",
+      releaseCiWorkflow: ".github/workflows/ci.yml",
+    }), "myapp.com");
+    expect(s).toContain("no authorized healthy static deployment is active");
+    expect(s).toContain("SAMOHOST_RELEASE_TAG_FORMAT='date'");
+    expect(s).toContain("if expected_format == 'date':");
+    expect(s).toContain(
+      "SAMOHOST_ACTIVE_STATE='/opt/field-record/releases/.samohost-active-static.json'",
+    );
+    expect(s).toContain(
+      "SAMOHOST_ACTIVE_ROUTE='/opt/field-record/releases/.samohost-active-static.caddy'",
+    );
+    expect(s).toContain("active static route does not match structured release state");
+    expect(s).toContain('import "%s"');
+    expect(s).not.toContain("/opt/field-record/app");
+    expect(bashSyntaxOk(s)).toBe(true);
+  });
+
+  test("node custom-domain vhost does not gain static filesystem guards", () => {
+    const s = buildCustomDomainVhostScript(nodeApp(), "myapp.com");
+    expect(s).not.toContain("SAMOHOST_STATIC_ROOT");
+    expect(s).not.toContain("samohost_assert_static_tree_safe");
   });
 
   test("snippet path is sites.d/10-domain-<label>.caddy (dots replaced with dashes)", () => {

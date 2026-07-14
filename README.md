@@ -181,6 +181,7 @@ serviceUnit = "field-record-1"                      # systemd unit restarted on 
 # envDbVars       = ["DATABASE_URL"]                 # vars whose DB host:port is rewritten per preview env
 # rlsNonSuperuser = true                             # require non-superuser connection (RLS gate)
 # kind            = "node"                            # "node" (default) | "static"
+# staticRoot      = "dist"                            # static only: repo-relative served directory; default repo root
 # releaseTagPattern = "v*"                            # opt in to tag-only production
 # releaseTagFormat  = "date"                          # required: vYYYYMMDD.N, real dates only
 # releaseCiWorkflow = ".github/workflows/ci.yml"      # required: canonical trusted Actions workflow

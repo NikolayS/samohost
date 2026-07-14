@@ -5,14 +5,19 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  readdirSync,
   rmSync,
   statSync,
+  symlinkSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
+import { buildHostBootstrapScript } from "../src/app/bootstrap.ts";
 import { buildDeployScript } from "../src/app/script.ts";
+import { staticReleaseStatePaths } from "../src/app/static-root.ts";
+import { buildCustomDomainVhostScript } from "../src/env/script.ts";
 import type { AppRecord } from "../src/types.ts";
 
 /** A field-record-1-like app record (the production deploy this generalizes). */
@@ -303,11 +308,30 @@ describe("buildDeployScript — static path (kind='static')", () => {
     expect(script).toContain('SAMOHOST_RELEASES_DIR=\'/opt/my-static-site/releases\'');
     expect(script).toContain('git -C "$SAMOHOST_APP_DIR" worktree add --detach');
     expect(script).toContain("umask 022");
-    expect(script).toContain('root * "${SAMOHOST_CANDIDATE_DIR}"');
+    expect(script).toContain('root * "${SAMOHOST_STATIC_DIR}"');
     expect(script).not.toContain('git reset --hard "${SAMOHOST_SHA}"');
     expect(script).toContain(
       "sudo /usr/bin/mv -- '/etc/caddy/sites.d/.samohost-next-00-main-my-static-site.caddy' '/etc/caddy/sites.d/00-main-my-static-site.caddy'",
     );
+    expect(script).toContain(
+      "SAMOHOST_ACTIVE_STATE='/opt/my-static-site/releases/.samohost-active-static.json'",
+    );
+    expect(script).toContain(
+      "SAMOHOST_ACTIVE_ROUTE='/opt/my-static-site/releases/.samohost-active-static.caddy'",
+    );
+    const activeRoute = script.indexOf(
+      '/usr/bin/mv -f "$SAMOHOST_ACTIVE_ROUTE_NEXT" "$SAMOHOST_ACTIVE_ROUTE"',
+    );
+    const reload = script.indexOf("sudo /usr/bin/systemctl reload caddy", activeRoute);
+    const activeState = script.indexOf(
+      '/usr/bin/mv -f "$SAMOHOST_ACTIVE_STATE_NEXT" "$SAMOHOST_ACTIVE_STATE"',
+      reload,
+    );
+    const healthOk = script.indexOf("<<<SAMOHOST_PHASE:health:ok>>>", activeState);
+    expect(activeRoute).toBeGreaterThan(-1);
+    expect(reload).toBeGreaterThan(activeRoute);
+    expect(activeState).toBeGreaterThan(reload);
+    expect(healthOk).toBeGreaterThan(activeState);
   });
 
   test("release static health uses intended Host identity and rollback restores untouched prior route", () => {
@@ -389,7 +413,7 @@ describe("buildDeployScript — static path (kind='static')", () => {
     }), { ...STATIC_TARGET, tag: "v20260713.1" });
     const chmod = script.indexOf('chmod 0644 "$SAMOHOST_VERSION_NEXT"');
     const rename = script.indexOf(
-      '/usr/bin/mv -f "$SAMOHOST_VERSION_NEXT" "${SAMOHOST_CANDIDATE_DIR}/version.json"',
+      '/usr/bin/mv -f "$SAMOHOST_VERSION_NEXT" "${SAMOHOST_STATIC_DIR}/version.json"',
     );
     const route = script.indexOf(
       "sudo /usr/bin/mv -- '/etc/caddy/sites.d/.samohost-next-00-main-my-static-site.caddy'",
@@ -398,9 +422,9 @@ describe("buildDeployScript — static path (kind='static')", () => {
     expect(chmod).toBeGreaterThan(-1);
     expect(rename).toBeGreaterThan(chmod);
     expect(route).toBeGreaterThan(rename);
-    expect(script).toContain('[[ -r "${SAMOHOST_CANDIDATE_DIR}/version.json" ]]');
+    expect(script).toContain('[[ -r "${SAMOHOST_STATIC_DIR}/version.json" ]]');
     expect(script).toContain(
-      '[[ "$(stat -c \'%a\' "${SAMOHOST_CANDIDATE_DIR}/version.json")" == "644" ]]',
+      '[[ "$(stat -c \'%a\' "${SAMOHOST_STATIC_DIR}/version.json")" == "644" ]]',
     );
   });
 
@@ -427,18 +451,24 @@ describe("buildDeployScript — static path (kind='static')", () => {
       git(["config", "user.name", "Samohost Test"], seed);
       git(["config", "user.email", "samohost@example.invalid"], seed);
 
-      writeFileSync(join(seed, "index.html"), "old\n");
-      git(["add", "index.html"], seed);
+      mkdirSync(join(seed, "dist"));
+      writeFileSync(join(seed, "dist", "index.html"), "old\n");
+      git(["add", "dist/index.html"], seed);
       git(["commit", "-m", "old"], seed);
       const oldSha = git(["rev-parse", "HEAD"], seed);
 
-      writeFileSync(join(seed, "index.html"), "release one\n");
+      writeFileSync(join(seed, "dist", "index.html"), "release one\n");
       git(["commit", "-am", "release one"], seed);
       const firstSha = git(["rev-parse", "HEAD"], seed);
 
-      writeFileSync(join(seed, "index.html"), "release two\n");
+      writeFileSync(join(seed, "dist", "index.html"), "release two\n");
       git(["commit", "-am", "release two"], seed);
       const secondSha = git(["rev-parse", "HEAD"], seed);
+
+      symlinkSync("index.html", join(seed, "dist", "alias.html"));
+      git(["add", "dist/alias.html"], seed);
+      git(["commit", "-m", "unsafe nested symlink"], seed);
+      const badSymlinkSha = git(["rev-parse", "HEAD"], seed);
       git(["remote", "add", "origin", origin], seed);
       git(["push", "-u", "origin", "main"], seed);
 
@@ -446,7 +476,7 @@ describe("buildDeployScript — static path (kind='static')", () => {
       git(["clone", origin, appDir]);
       git(["checkout", "--detach", oldSha], appDir);
       const originalHead = git(["rev-parse", "HEAD"], appDir);
-      const originalContent = readFileSync(join(appDir, "index.html"), "utf8");
+      const originalContent = readFileSync(join(appDir, "dist", "index.html"), "utf8");
 
       mkdirSync(join(caddyDir, "sites.d"), { recursive: true });
       mkdirSync(binDir, { recursive: true });
@@ -488,11 +518,15 @@ describe("buildDeployScript — static path (kind='static')", () => {
 
       const releaseApp = staticApp({
         appDir,
+        staticRoot: "dist",
         mainListen: "cp-http80",
         releaseTagPattern: "v*",
         releaseTagFormat: "date",
         releaseCiWorkflow: ".github/workflows/ci.yml",
       });
+      const activePaths = staticReleaseStatePaths(appDir);
+      const domainFile = join(caddyDir, "sites.d", "10-domain-client-example.caddy");
+      let lastExecutionStderr = "";
       const execute = (sha: string, tag: string, expectFailure = false): string => {
         const script = buildDeployScript(releaseApp, { sha, tag })
           .replaceAll("/etc/caddy", caddyDir);
@@ -506,9 +540,29 @@ describe("buildDeployScript — static path (kind='static')", () => {
             FAIL_VERSION_HEALTH: expectFailure ? "1" : "0",
           },
         });
+        lastExecutionStderr = result.stderr;
         if ((!expectFailure && result.status !== 0) || (expectFailure && result.status !== 1)) {
           throw new Error(
             `unexpected static deploy exit (${result.status}):\n${result.stdout}\n${result.stderr}`,
+          );
+        }
+        return script;
+      };
+      const executeDomain = (expectFailure = false): string => {
+        const script = buildCustomDomainVhostScript(releaseApp, "client.example")
+          .replaceAll("/etc/caddy", caddyDir);
+        const result = spawnSync("bash", ["-s"], {
+          input: script,
+          encoding: "utf8",
+          env: {
+            ...process.env,
+            PATH: `${binDir}:${process.env["PATH"] ?? ""}`,
+          },
+        });
+        lastExecutionStderr = result.stderr;
+        if ((!expectFailure && result.status !== 0) || (expectFailure && result.status !== 1)) {
+          throw new Error(
+            `unexpected custom-domain exit (${result.status}):\n${result.stdout}\n${result.stderr}`,
           );
         }
         return script;
@@ -518,12 +572,27 @@ describe("buildDeployScript — static path (kind='static')", () => {
         if (!match?.[1]) throw new Error("routed root missing from test vhost");
         return match[1];
       };
+      const activeRoot = (): string => {
+        const match = readFileSync(activePaths.activeRoute, "utf8").match(/root \* "([^"]+)"/);
+        if (!match?.[1]) throw new Error("active static root missing from managed route");
+        return match[1];
+      };
+
+      // Before any health-proven release, a release-channel domain cannot fall
+      // back to the stale bootstrap checkout.
+      executeDomain(true);
+      expect(lastExecutionStderr).toContain("no authorized healthy static deployment is active");
+      expect(existsSync(domainFile)).toBe(false);
 
       // A failed first activation must restore the GC-style base-file route
-      // byte-for-byte and remove the unproven sites.d route.
+      // byte-for-byte and remove all unproven public and shared routing state.
       execute(firstSha, "v20260713.1", true);
       expect(readFileSync(baseFile, "utf8")).toBe(legacyBase);
       expect(existsSync(siteFile)).toBe(false);
+      expect(existsSync(activePaths.activeState)).toBe(false);
+      expect(existsSync(activePaths.activeRoute)).toBe(false);
+      executeDomain(true);
+      expect(existsSync(domainFile)).toBe(false);
 
       const firstScript = execute(firstSha, "v20260713.2");
       const firstRoot = routedRoot();
@@ -540,9 +609,27 @@ describe("buildDeployScript — static path (kind='static')", () => {
         environment: "production",
       });
       expect(statSync(join(firstRoot, "version.json")).mode & 0o777).toBe(0o644);
+      expect(activeRoot()).toBe(firstRoot);
+      expect(JSON.parse(readFileSync(activePaths.activeState, "utf8"))).toEqual({
+        schema: 1,
+        appName: releaseApp.name,
+        sha: firstSha,
+        tag: "v20260713.2",
+        releaseDir: firstRoot.slice(0, -"/dist".length),
+        staticRoot: "dist",
+        releaseTagFormat: "date",
+      });
       expect(firstScript.indexOf("SAMOHOST_PHASE:health:ok")).toBeLessThan(
         firstScript.indexOf('worktree remove --force "$SAMOHOST_PREVIOUS_RELEASE_DIR"'),
       );
+
+      const domainScript = executeDomain();
+      const firstDomain = readFileSync(domainFile, "utf8");
+      expect(firstDomain).toContain(`import "${activePaths.activeRoute}"`);
+      expect(firstDomain).not.toContain(appDir);
+      expect(domainScript).not.toContain(`${appDir}/dist`);
+      expect(activeRoot()).toBe(firstRoot);
+      expect(spawnSync("caddy", ["validate", "--config", baseFile]).status).toBe(0);
 
       execute(secondSha, "v20260713.3");
       const secondRoot = routedRoot();
@@ -550,20 +637,292 @@ describe("buildDeployScript — static path (kind='static')", () => {
       expect(readFileSync(join(secondRoot, "index.html"), "utf8")).toBe("release two\n");
       expect(statSync(join(secondRoot, "version.json")).mode & 0o777).toBe(0o644);
       expect(existsSync(firstRoot)).toBe(false);
+      expect(activeRoot()).toBe(secondRoot);
+      expect(readFileSync(domainFile, "utf8")).toBe(firstDomain);
+      expect(JSON.parse(readFileSync(activePaths.activeState, "utf8"))).toMatchObject({
+        sha: secondSha,
+        tag: "v20260713.3",
+        releaseDir: secondRoot.slice(0, -"/dist".length),
+      });
+      expect(spawnSync("caddy", ["validate", "--config", baseFile]).status).toBe(0);
 
       const secondIdentity = readFileSync(join(secondRoot, "version.json"), "utf8");
+      const secondState = readFileSync(activePaths.activeState, "utf8");
+      const secondRoute = readFileSync(activePaths.activeRoute, "utf8");
       execute(firstSha, "v20260713.4", true);
       expect(routedRoot()).toBe(secondRoot);
+      expect(activeRoot()).toBe(secondRoot);
+      expect(readFileSync(activePaths.activeState, "utf8")).toBe(secondState);
+      expect(readFileSync(activePaths.activeRoute, "utf8")).toBe(secondRoute);
+      expect(readFileSync(domainFile, "utf8")).toBe(firstDomain);
       expect(readFileSync(join(secondRoot, "index.html"), "utf8")).toBe("release two\n");
       expect(readFileSync(join(secondRoot, "version.json"), "utf8")).toBe(secondIdentity);
       expect(git(["worktree", "list", "--porcelain"], appDir)).not.toContain(
         `${firstSha}.candidate`,
       );
 
+      execute(badSymlinkSha, "v20260713.5", true);
+      expect(lastExecutionStderr).toContain("staticRoot tree contains a symlink");
+      expect(routedRoot()).toBe(secondRoot);
+      expect(activeRoot()).toBe(secondRoot);
+      expect(readFileSync(activePaths.activeState, "utf8")).toBe(secondState);
+      expect(readFileSync(activePaths.activeRoute, "utf8")).toBe(secondRoute);
+      expect(readFileSync(domainFile, "utf8")).toBe(firstDomain);
+      expect(readFileSync(join(secondRoot, "index.html"), "utf8")).toBe("release two\n");
+      expect(readFileSync(join(secondRoot, "version.json"), "utf8")).toBe(secondIdentity);
+      expect(git(["worktree", "list", "--porcelain"], appDir)).not.toContain(
+        `${badSymlinkSha}.candidate`,
+      );
+
       // Every attempt fetched and staged elsewhere; the original checkout was
       // never reset or rewritten before any candidate health check.
       expect(git(["rev-parse", "HEAD"], appDir)).toBe(originalHead);
-      expect(readFileSync(join(appDir, "index.html"), "utf8")).toBe(originalContent);
+      expect(readFileSync(join(appDir, "dist", "index.html"), "utf8")).toBe(originalContent);
+      expect(readdirSync(join(caddyDir, "sites.d")).sort()).toEqual([
+        "00-main-my-static-site.caddy",
+        "10-domain-client-example.caddy",
+      ]);
+      expect(readdirSync(activePaths.releasesDir).some((entry) =>
+        /^\.active-(?:route|state)\.(?:next|restore)\./.test(entry)
+      )).toBe(false);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }, 15_000);
+
+  test("executed branch deploys keep custom domains on the current healthy detached candidate", () => {
+    const dir = mkdtempSync(join(tmpdir(), "samohost-static-branch-release-"));
+    const origin = join(dir, "origin.git");
+    const seed = join(dir, "seed");
+    const appDir = join(dir, "site", "app");
+    const caddyDir = join(dir, "caddy");
+    const binDir = join(dir, "bin");
+
+    const git = (args: string[], cwd = dir): string => {
+      const result = spawnSync("git", args, { cwd, encoding: "utf8" });
+      if (result.status !== 0) {
+        throw new Error(`git ${args.join(" ")} failed: ${result.stderr}`);
+      }
+      return result.stdout.trim();
+    };
+
+    try {
+      mkdirSync(seed, { recursive: true });
+      git(["init", "--bare", origin]);
+      git(["init", "--initial-branch=main"], seed);
+      git(["config", "user.name", "Samohost Test"], seed);
+      git(["config", "user.email", "samohost@example.invalid"], seed);
+      mkdirSync(join(seed, "dist"));
+      writeFileSync(join(seed, "dist", "index.html"), "bootstrap\n");
+      git(["add", "dist/index.html"], seed);
+      git(["commit", "-m", "bootstrap"], seed);
+      const oldSha = git(["rev-parse", "HEAD"], seed);
+      writeFileSync(join(seed, "dist", "index.html"), "branch A\n");
+      git(["commit", "-am", "branch A"], seed);
+      const firstSha = git(["rev-parse", "HEAD"], seed);
+      writeFileSync(join(seed, "dist", "index.html"), "branch B\n");
+      git(["commit", "-am", "branch B"], seed);
+      const secondSha = git(["rev-parse", "HEAD"], seed);
+      git(["remote", "add", "origin", origin], seed);
+      git(["push", "-u", "origin", "main"], seed);
+
+      mkdirSync(join(dir, "site"), { recursive: true });
+      git(["clone", origin, appDir]);
+      git(["checkout", "--detach", oldSha], appDir);
+      const originalHead = git(["rev-parse", "HEAD"], appDir);
+
+      mkdirSync(join(caddyDir, "sites.d"), { recursive: true });
+      mkdirSync(binDir, { recursive: true });
+      const baseFile = join(caddyDir, "Caddyfile");
+      writeFileSync(baseFile, "import sites.d/*.caddy\n");
+      const siteFile = join(caddyDir, "sites.d", "00-main-my-static-site.caddy");
+      writeFileSync(siteFile, [
+        "http://my-static-site.example.com {",
+        `\troot * "${join(appDir, "dist")}"`,
+        "\ttry_files {path} /index.html",
+        "\tfile_server",
+        "\tencode gzip",
+        "}",
+        "",
+      ].join("\n"));
+      writeFileSync(join(binDir, "sudo"), [
+        "#!/usr/bin/env bash",
+        'if [[ "${1:-}" == "/usr/bin/systemctl" ]]; then exit 0; fi',
+        'exec "$@"',
+        "",
+      ].join("\n"));
+      writeFileSync(join(binDir, "caddy"), "#!/usr/bin/env bash\nexit 0\n");
+      writeFileSync(join(binDir, "systemctl"), "#!/usr/bin/env bash\nexit 0\n");
+      writeFileSync(join(binDir, "sleep"), "#!/usr/bin/env bash\nexit 0\n");
+      writeFileSync(join(binDir, "curl"), [
+        "#!/usr/bin/env bash",
+        'if [[ "$*" == *"version.json"* ]]; then',
+        '  root=$(sed -n \'s/^[[:space:]]*root \\* "\\(.*\\)"$/\\1/p\' "$CADDY_SITE" | head -n 1)',
+        '  if [[ "${FAIL_VERSION_HEALTH:-0}" == "1" ]]; then printf \'invalid\\n\'; else cat "$root/version.json"; fi',
+        "else",
+        "  printf '200'",
+        "fi",
+        "",
+      ].join("\n"));
+      for (const command of ["sudo", "caddy", "systemctl", "sleep", "curl"]) {
+        chmodSync(join(binDir, command), 0o755);
+      }
+
+      const branchApp = staticApp({
+        appDir,
+        staticRoot: "dist",
+        mainListen: "cp-http80",
+      });
+      const activePaths = staticReleaseStatePaths(appDir);
+      const domainFile = join(caddyDir, "sites.d", "10-domain-client-example.caddy");
+      const execute = (sha: string, expectFailure = false): void => {
+        const result = spawnSync("bash", ["-s"], {
+          input: buildDeployScript(branchApp, { sha }).replaceAll("/etc/caddy", caddyDir),
+          encoding: "utf8",
+          env: {
+            ...process.env,
+            PATH: `${binDir}:${process.env["PATH"] ?? ""}`,
+            CADDY_SITE: siteFile,
+            FAIL_VERSION_HEALTH: expectFailure ? "1" : "0",
+          },
+        });
+        if ((!expectFailure && result.status !== 0) || (expectFailure && result.status !== 1)) {
+          throw new Error(
+            `unexpected branch deploy exit (${result.status}):\n${result.stdout}\n${result.stderr}`,
+          );
+        }
+      };
+      const executeDomain = (expectFailure = false): string => {
+        const result = spawnSync("bash", ["-s"], {
+          input: buildCustomDomainVhostScript(branchApp, "client.example")
+            .replaceAll("/etc/caddy", caddyDir),
+          encoding: "utf8",
+          env: { ...process.env, PATH: `${binDir}:${process.env["PATH"] ?? ""}` },
+        });
+        if ((!expectFailure && result.status !== 0) || (expectFailure && result.status !== 1)) {
+          throw new Error(
+            `unexpected branch domain exit (${result.status}):\n${result.stdout}\n${result.stderr}`,
+          );
+        }
+        return result.stderr;
+      };
+      const executeBootstrapRoute = (expectFailure = false): string => {
+        const bootstrap = buildHostBootstrapScript(branchApp, {
+          appUser: "agent",
+          appBase: join(dir, "site"),
+        });
+        const guardStart = bootstrap.indexOf("samohost_assert_static_tree_safe() {");
+        const guardEnd = bootstrap.indexOf("\n}\n", guardStart) + 3;
+        const routeStart = bootstrap.indexOf("# §9b. Production Caddy");
+        const routeEnd = bootstrap.indexOf("# §13. Self-check PASS/FAIL", routeStart);
+        if (guardStart < 0 || guardEnd < 3 || routeStart < 0 || routeEnd < 0) {
+          throw new Error("branch bootstrap route section not found");
+        }
+        const isolated = [
+          "set -euo pipefail",
+          `APP_DIR=${JSON.stringify(appDir)}`,
+          bootstrap.slice(guardStart, guardEnd),
+          bootstrap.slice(routeStart, routeEnd),
+        ].join("\n")
+          .replaceAll("/etc/caddy", caddyDir)
+          .replaceAll("/usr/bin/systemctl", join(binDir, "systemctl"));
+        const result = spawnSync("bash", ["-s"], {
+          input: isolated,
+          encoding: "utf8",
+          env: { ...process.env, PATH: `${binDir}:${process.env["PATH"] ?? ""}` },
+        });
+        if ((!expectFailure && result.status !== 0) || (expectFailure && result.status !== 1)) {
+          throw new Error(
+            `unexpected branch bootstrap exit (${result.status}):\n${result.stdout}\n${result.stderr}`,
+          );
+        }
+        return result.stderr;
+      };
+      const routedRoot = (path: string): string => {
+        const match = readFileSync(path, "utf8").match(/root \* "([^"]+)"/);
+        if (!match?.[1]) throw new Error(`routed root missing from ${path}`);
+        return match[1];
+      };
+
+      const freshMain = readFileSync(siteFile, "utf8");
+      executeBootstrapRoute();
+      executeBootstrapRoute();
+      expect(readFileSync(siteFile, "utf8")).toBe(freshMain);
+      expect(existsSync(activePaths.activeState)).toBe(false);
+      expect(existsSync(activePaths.activeRoute)).toBe(false);
+
+      expect(executeDomain(true)).toContain("no authorized healthy static deployment is active");
+      expect(existsSync(domainFile)).toBe(false);
+
+      execute(firstSha);
+      const firstRoot = routedRoot(activePaths.activeRoute);
+      expect(firstRoot).not.toBe(join(appDir, "dist"));
+      expect(readFileSync(join(firstRoot, "index.html"), "utf8")).toBe("branch A\n");
+      expect(JSON.parse(readFileSync(activePaths.activeState, "utf8"))).toMatchObject({
+        sha: firstSha,
+        tag: firstSha,
+        staticRoot: "dist",
+        releaseTagFormat: null,
+      });
+
+      executeDomain();
+      const domainSnippet = readFileSync(domainFile, "utf8");
+      expect(domainSnippet).toContain(`import "${activePaths.activeRoute}"`);
+      expect(domainSnippet).not.toContain(appDir);
+      expect(spawnSync("caddy", ["validate", "--config", baseFile]).status).toBe(0);
+
+      execute(secondSha);
+      const secondRoot = routedRoot(activePaths.activeRoute);
+      expect(secondRoot).not.toBe(firstRoot);
+      expect(readFileSync(join(secondRoot, "index.html"), "utf8")).toBe("branch B\n");
+      expect(readFileSync(domainFile, "utf8")).toBe(domainSnippet);
+      expect(existsSync(firstRoot)).toBe(false);
+      const secondState = readFileSync(activePaths.activeState, "utf8");
+      const secondRoute = readFileSync(activePaths.activeRoute, "utf8");
+      const secondMain = readFileSync(siteFile, "utf8");
+
+      executeBootstrapRoute();
+      executeBootstrapRoute();
+      expect(readFileSync(activePaths.activeState, "utf8")).toBe(secondState);
+      expect(readFileSync(activePaths.activeRoute, "utf8")).toBe(secondRoute);
+      expect(readFileSync(siteFile, "utf8")).toBe(secondMain);
+      expect(readFileSync(domainFile, "utf8")).toBe(domainSnippet);
+
+      writeFileSync(activePaths.activeState, "{}\n");
+      expect(executeBootstrapRoute(true)).toContain(
+        "active static deployment state does not match this app",
+      );
+      expect(readFileSync(activePaths.activeState, "utf8")).toBe("{}\n");
+      expect(readFileSync(activePaths.activeRoute, "utf8")).toBe(secondRoute);
+      expect(readFileSync(siteFile, "utf8")).toBe(secondMain);
+      expect(readFileSync(domainFile, "utf8")).toBe(domainSnippet);
+      writeFileSync(activePaths.activeState, secondState);
+
+      rmSync(activePaths.activeState);
+      expect(executeBootstrapRoute(true)).toContain(
+        "active static deployment state/route is incomplete or unsafe",
+      );
+      expect(existsSync(activePaths.activeState)).toBe(false);
+      expect(readFileSync(activePaths.activeRoute, "utf8")).toBe(secondRoute);
+      expect(readFileSync(siteFile, "utf8")).toBe(secondMain);
+      expect(readFileSync(domainFile, "utf8")).toBe(domainSnippet);
+      writeFileSync(activePaths.activeState, secondState);
+
+      execute(firstSha, true);
+      expect(readFileSync(activePaths.activeState, "utf8")).toBe(secondState);
+      expect(readFileSync(activePaths.activeRoute, "utf8")).toBe(secondRoute);
+      expect(routedRoot(activePaths.activeRoute)).toBe(secondRoot);
+      expect(readFileSync(domainFile, "utf8")).toBe(domainSnippet);
+      expect(readFileSync(join(secondRoot, "index.html"), "utf8")).toBe("branch B\n");
+      expect(git(["rev-parse", "HEAD"], appDir)).toBe(originalHead);
+      expect(readFileSync(join(appDir, "dist", "index.html"), "utf8")).toBe("bootstrap\n");
+      expect(readdirSync(join(caddyDir, "sites.d")).sort()).toEqual([
+        "00-main-my-static-site.caddy",
+        "10-domain-client-example.caddy",
+      ]);
+      expect(readdirSync(activePaths.releasesDir).some((entry) =>
+        /^\.active-(?:route|state)\.(?:next|restore)\./.test(entry)
+      )).toBe(false);
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }

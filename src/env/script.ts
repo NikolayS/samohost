@@ -27,6 +27,11 @@
 
 import type { AppRecord, EnvDbBackend, EnvRecord } from "../types.ts";
 import { servicesOf } from "../app/services.ts";
+import {
+  staticReleaseStatePaths,
+  staticRootOf,
+  staticTreeGuardFnLines,
+} from "../app/static-root.ts";
 import { planFromEnv, renderVhost } from "../caddy/render.ts";
 
 /** Same marker prefix as deploy scripts — one parser convention everywhere. */
@@ -935,6 +940,8 @@ function buildStaticEnvCreateScript(
   app: AppRecord,
   t: EnvScriptTarget,
 ): string {
+  const staticRoot = staticRootOf(app);
+  const servedDir = "$SAMOHOST_STATIC_DIR";
   const root = envsRoot(app);
   const lines: string[] = [
     "#!/usr/bin/env bash",
@@ -952,7 +959,10 @@ function buildStaticEnvCreateScript(
     `SAMOHOST_ENV_DIR=${sq(`${root}/${t.name}`)}`,
     `SAMOHOST_REPO=${sq(app.repo)}`,
     `SAMOHOST_APP_DIR=${sq(app.appDir)}`,
+    `SAMOHOST_STATIC_ROOT=${sq(staticRoot ?? "")}`,
     `SAMOHOST_CADDY_SNIPPET=${sq(`/etc/caddy/sites.d/${t.name}.caddy`)}`,
+    "",
+    ...staticTreeGuardFnLines(),
     "",
   ];
 
@@ -970,7 +980,18 @@ function buildStaticEnvCreateScript(
     ]),
   );
 
-  lines.push('cd "$SAMOHOST_ENV_DIR"', "");
+  lines.push(
+    "# Resolve the served directory only after clone and fail closed if a",
+    "# repository symlink escapes the checkout.",
+    'SAMOHOST_CHECKOUT_REAL=$(realpath -e "$SAMOHOST_ENV_DIR") || { echo "static checkout is missing" >&2; exit 1; }',
+    'if [[ -n "$SAMOHOST_STATIC_ROOT" ]]; then SAMOHOST_STATIC_CANDIDATE="$SAMOHOST_ENV_DIR/$SAMOHOST_STATIC_ROOT"; else SAMOHOST_STATIC_CANDIDATE="$SAMOHOST_ENV_DIR"; fi',
+    'SAMOHOST_STATIC_DIR=$(realpath -e "$SAMOHOST_STATIC_CANDIDATE") || { echo "staticRoot does not exist: $SAMOHOST_STATIC_ROOT" >&2; exit 1; }',
+    'case "$SAMOHOST_STATIC_DIR" in "$SAMOHOST_CHECKOUT_REAL"|"$SAMOHOST_CHECKOUT_REAL"/*) ;; *) echo "staticRoot escapes the checkout: $SAMOHOST_STATIC_ROOT" >&2; exit 1 ;; esac',
+    '[[ -d "$SAMOHOST_STATIC_DIR" && -f "$SAMOHOST_STATIC_DIR/index.html" ]] || { echo "staticRoot must be a directory containing index.html: $SAMOHOST_STATIC_ROOT" >&2; exit 1; }',
+    'samohost_assert_static_tree_safe "$SAMOHOST_CHECKOUT_REAL" "$SAMOHOST_STATIC_DIR" "$SAMOHOST_STATIC_ROOT" || exit 1',
+    'cd "$SAMOHOST_ENV_DIR"',
+    "",
+  );
 
   // ----- config.js: write the preview-env marker for the SPA banner -----------
   // The SPA reads window.__GC1_CONFIG__ from /config.js; the banner fires when
@@ -986,7 +1007,8 @@ function buildStaticEnvCreateScript(
   // in the branch value (e.g. demo/red-bg) is safe inside a JS string literal.
   lines.push(
     "# --- config.js: overwrite with preview marker so the SPA banner fires ---",
-    `printf 'window.__GC1_CONFIG__ = { version: "", preview: true, branch: "%s" };\\n' "$SAMOHOST_BRANCH" > "$SAMOHOST_ENV_DIR/config.js"`,
+    `SAMOHOST_CONFIG_NEXT=$(mktemp "${servedDir}/.config.next.XXXXXX")`,
+    `if printf 'window.__GC1_CONFIG__ = { version: "", preview: true, branch: "%s" };\\n' "$SAMOHOST_BRANCH" > "$SAMOHOST_CONFIG_NEXT" && chmod 0644 "$SAMOHOST_CONFIG_NEXT" && /usr/bin/mv -f "$SAMOHOST_CONFIG_NEXT" "${servedDir}/config.js"; then :; else rm -f "$SAMOHOST_CONFIG_NEXT"; exit 1; fi`,
     "",
   );
 
@@ -1003,8 +1025,9 @@ function buildStaticEnvCreateScript(
       "vhost",
       "Caddy file_server vhost snippet + reload (sites.d include applied in host-prep)",
       [
-        "if printf '%s {\\n\\ttls internal\\n\\troot * %s\\n\\theader /config.js Cache-Control \"no-cache, no-store, must-revalidate\"\\n\\ttry_files {path} /index.html\\n\\tfile_server\\n\\tencode gzip\\n}\\n' \\",
-        '     "$SAMOHOST_VHOST" "$SAMOHOST_ENV_DIR" \\',
+        'if samohost_assert_static_tree_safe "$SAMOHOST_CHECKOUT_REAL" "$SAMOHOST_STATIC_DIR" "$SAMOHOST_STATIC_ROOT" \\',
+        "   && printf '%s {\\n\\ttls internal\\n\\troot * %s\\n\\theader /config.js Cache-Control \"no-cache, no-store, must-revalidate\"\\n\\ttry_files {path} /index.html\\n\\tfile_server\\n\\tencode gzip\\n}\\n' \\",
+        `     "$SAMOHOST_VHOST" "${servedDir}" \\`,
         '   | sudo /usr/bin/tee "$SAMOHOST_CADDY_SNIPPET" >/dev/null \\',
         "   && sudo /usr/bin/systemctl reload caddy; ",
       ],
@@ -1214,6 +1237,7 @@ export function buildEnvCreateScript(
   app: AppRecord,
   t: EnvScriptTarget,
 ): string {
+  staticRootOf(app);
   // issue #36: branch on kind for static sites.
   if (app.kind === "static") {
     return buildStaticEnvCreateScript(app, t);
@@ -2304,6 +2328,7 @@ export function buildHostPrepScript(
   sshUser: string,
   firewallOpts?: HostPrepFirewallOpts,
 ): string {
+  const staticRoot = staticRootOf(app);
   const isStatic = app.kind === "static";
   const isStaticReleaseChannel = isStatic && app.releaseTagPattern !== undefined;
   const managesMainVhost = app.mainHost !== undefined && !isStaticReleaseChannel;
@@ -2394,7 +2419,7 @@ export function buildHostPrepScript(
     const mainSiteBody = isStatic
       ? [
           `${mainSiteAddress} {`,
-          `\troot * ${app.appDir}`,
+          `\troot * "\${SAMOHOST_STATIC_DIR}"`,
           `\ttry_files {path} /index.html`,
           `\tfile_server`,
           `\tencode gzip`,
@@ -2414,9 +2439,23 @@ export function buildHostPrepScript(
       `#    apply.  The guard refuses if the live file exists and differs — unless`,
       `#    force=true was baked in via --force-main-vhost at host-prep time.`,
       `#    The 00- prefix sorts the live file first in sites.d.`,
-      `cat > ${stagedPath} <<'CADDY'`,
+      ...(isStatic
+        ? [
+            `SAMOHOST_STATIC_ROOT=${sq(staticRoot ?? "")}`,
+            `SAMOHOST_CHECKOUT_REAL=$(realpath -e ${sq(app.appDir)}) || { echo "static checkout is missing" >&2; exit 1; }`,
+            `if [[ -n "$SAMOHOST_STATIC_ROOT" ]]; then SAMOHOST_STATIC_CANDIDATE=${sq(`${app.appDir}/`)}"$SAMOHOST_STATIC_ROOT"; else SAMOHOST_STATIC_CANDIDATE=${sq(app.appDir)}; fi`,
+            'SAMOHOST_STATIC_DIR=$(realpath -e "$SAMOHOST_STATIC_CANDIDATE") || { echo "staticRoot does not exist: $SAMOHOST_STATIC_ROOT" >&2; exit 1; }',
+            'case "$SAMOHOST_STATIC_DIR" in "$SAMOHOST_CHECKOUT_REAL"|"$SAMOHOST_CHECKOUT_REAL"/*) ;; *) echo "staticRoot escapes the checkout: $SAMOHOST_STATIC_ROOT" >&2; exit 1 ;; esac',
+            '[[ -d "$SAMOHOST_STATIC_DIR" && -f "$SAMOHOST_STATIC_DIR/index.html" ]] || { echo "staticRoot must contain index.html: $SAMOHOST_STATIC_ROOT" >&2; exit 1; }',
+            'samohost_assert_static_tree_safe "$SAMOHOST_CHECKOUT_REAL" "$SAMOHOST_STATIC_DIR" "$SAMOHOST_STATIC_ROOT"',
+          ]
+        : []),
+      `cat > ${stagedPath} <<${isStatic ? "CADDY" : "'CADDY'"}`,
       ...mainSiteBody,
       "CADDY",
+      ...(isStatic
+        ? ['samohost_assert_static_tree_safe "$SAMOHOST_CHECKOUT_REAL" "$SAMOHOST_STATIC_DIR" "$SAMOHOST_STATIC_ROOT"']
+        : []),
       `samohost_apply_main_vhost \\`,
       `  ${stagedPath} \\`,
       `  ${livePath} \\`,
@@ -2664,6 +2703,7 @@ export function buildHostPrepScript(
     "# Review before applying. Nothing here is executed by samohost itself.",
     "set -euo pipefail",
     "",
+    ...(isStatic && managesMainVhost ? [...staticTreeGuardFnLines(), ""] : []),
     // Guard function definition (only when mainHost is set); placed early so
     // it is in scope before the Caddy step that calls it.
     ...guardFnLines,
@@ -2716,7 +2756,8 @@ export function buildHostPrepScript(
  *
  * Serving posture — HTTP only (`http://` scheme prefix):
  *   - node apps: `http://<fqdn> { reverse_proxy localhost:<port> }`
- *   - static apps: `http://<fqdn> { root * <appDir>; file_server }`
+ *   - static apps: validate the last health-proven detached deployment and
+ *     import its stable managed route; never derive from the bootstrap appDir
  *
  * The `http://` prefix (instead of bare `<fqdn> { tls internal }`) is critical:
  * the control-plane proxies custom-domain traffic to this app VM on **port 80**
@@ -2748,13 +2789,13 @@ export function buildCustomDomainVhostScript(
   // http:// prefix → Caddy serves on :80 only, no TLS redirect.  The control
   // plane proxies custom-domain traffic over plain HTTP to this VM, so a :443
   // redirect here would break the routing chain.
-  let vhostBody: string;
-  if (app.kind === "static") {
-    vhostBody = `http://${fqdn} {\n\troot * ${app.appDir}\n\tfile_server\n}`;
-  } else {
-    const port = mainEnvPort(app);
-    vhostBody = `http://${fqdn} {\n\treverse_proxy localhost:${port}\n}`;
-  }
+  const isStatic = app.kind === "static";
+  const staticReleaseTagFormat = app.releaseTagFormat ?? "";
+  const staticRoot = staticRootOf(app);
+  const releaseState = staticReleaseStatePaths(app.appDir);
+  const vhostBody = isStatic
+    ? undefined
+    : `http://${fqdn} {\n\treverse_proxy localhost:${mainEnvPort(app)}\n}`;
 
   return [
     "#!/usr/bin/env bash",
@@ -2765,11 +2806,124 @@ export function buildCustomDomainVhostScript(
     "",
     `SNIPPET=${sq(snippetPath)}`,
     "",
-    "# Write the Caddy snippet (overwrite — idempotent; same content each time).",
-    `printf '%s\\n' ${sq(vhostBody)} | sudo /usr/bin/tee "$SNIPPET" >/dev/null`,
-    "",
-    "# Reload Caddy (reload fails on bad config; no separate validate step needed).",
-    `sudo /usr/bin/systemctl reload caddy`,
+    ...(isStatic
+      ? [
+          'STAGED=""',
+          'BACKUP=""',
+          'ACTIVE_VALUES=""',
+          'EXPECTED_ROUTE=""',
+          `SAMOHOST_STATIC_ROOT=${sq(staticRoot ?? "")}`,
+          `SAMOHOST_RELEASE_TAG_FORMAT=${sq(staticReleaseTagFormat)}`,
+          `SAMOHOST_RELEASES_DIR=${sq(releaseState.releasesDir)}`,
+          `SAMOHOST_ACTIVE_STATE=${sq(releaseState.activeState)}`,
+          `SAMOHOST_ACTIVE_ROUTE=${sq(releaseState.activeRoute)}`,
+          "",
+          ...staticTreeGuardFnLines(),
+          "",
+          "samohost_cleanup_custom_domain() {",
+          '  [[ -z "$STAGED" ]] || rm -f "$STAGED"',
+          '  [[ -z "$BACKUP" ]] || rm -f "$BACKUP"',
+          '  [[ -z "$ACTIVE_VALUES" ]] || rm -f "$ACTIVE_VALUES"',
+          '  [[ -z "$EXPECTED_ROUTE" ]] || rm -f "$EXPECTED_ROUTE"',
+          "}",
+          "trap samohost_cleanup_custom_domain EXIT",
+          "",
+
+                '[[ -r "$SAMOHOST_ACTIVE_STATE" && -r "$SAMOHOST_ACTIVE_ROUTE" ]] || { echo "no authorized healthy static deployment is active; refusing custom-domain activation" >&2; exit 1; }',
+                'ACTIVE_VALUES=$(mktemp)',
+                `if ! python3 - "$SAMOHOST_ACTIVE_STATE" ${sq(app.name)} "$SAMOHOST_STATIC_ROOT" "$SAMOHOST_RELEASE_TAG_FORMAT" > "$ACTIVE_VALUES" <<'PY'`,
+                "import datetime",
+                "import json",
+                "import re",
+                "import sys",
+                "",
+                "path, expected_app, expected_root, expected_format_raw = sys.argv[1:]",
+                "expected_format = expected_format_raw or None",
+                "with open(path, encoding='utf-8') as source:",
+                "    state = json.load(source)",
+                "if state.get('schema') != 1 or state.get('appName') != expected_app or state.get('staticRoot') != expected_root or state.get('releaseTagFormat') != expected_format:",
+                "    raise SystemExit('active static release state does not match this app')",
+                "sha = state.get('sha')",
+                "tag = state.get('tag')",
+                "release_dir = state.get('releaseDir')",
+                "if not isinstance(sha, str) or re.fullmatch(r'[0-9a-f]{7,40}', sha) is None:",
+                "    raise SystemExit('active static release state has an invalid sha')",
+                "if not isinstance(tag, str) or not tag or len(tag) > 255 or any(ord(ch) < 32 for ch in tag):",
+                "    raise SystemExit('active static release state has an invalid tag')",
+                "if expected_format == 'date':",
+                "    match = re.fullmatch(r'v([0-9]{8})[.]([1-9][0-9]*)', tag)",
+                "    if match is None:",
+                "        raise SystemExit('active static release state has an invalid dated tag')",
+                "    datetime.datetime.strptime(match.group(1), '%Y%m%d')",
+                "if not isinstance(release_dir, str) or not release_dir.startswith('/') or any(ord(ch) < 32 for ch in release_dir):",
+                "    raise SystemExit('active static release state has an invalid releaseDir')",
+                "for value in (release_dir, sha, tag):",
+                "    sys.stdout.buffer.write(value.encode('utf-8') + b'\\0')",
+                "PY",
+                "then",
+                "  exit 1",
+                "fi",
+                'SAMOHOST_ACTIVE_VALUES=()',
+                'mapfile -d "" -t SAMOHOST_ACTIVE_VALUES < "$ACTIVE_VALUES"',
+                '[[ "${#SAMOHOST_ACTIVE_VALUES[@]}" == "3" ]] || { echo "active static release state is incomplete" >&2; exit 1; }',
+                'SAMOHOST_ACTIVE_RELEASE_RAW="${SAMOHOST_ACTIVE_VALUES[0]}"',
+                'SAMOHOST_ACTIVE_SHA="${SAMOHOST_ACTIVE_VALUES[1]}"',
+                'SAMOHOST_ACTIVE_TAG="${SAMOHOST_ACTIVE_VALUES[2]}"',
+                'SAMOHOST_RELEASES_REAL=$(realpath -e "$SAMOHOST_RELEASES_DIR") || { echo "static releases directory is missing" >&2; exit 1; }',
+                '[[ ! -L "$SAMOHOST_ACTIVE_RELEASE_RAW" ]] || { echo "active static release path is a symlink" >&2; exit 1; }',
+                'SAMOHOST_CHECKOUT_REAL=$(realpath -e "$SAMOHOST_ACTIVE_RELEASE_RAW") || { echo "active static release directory is missing" >&2; exit 1; }',
+                '[[ "$SAMOHOST_ACTIVE_RELEASE_RAW" == "$SAMOHOST_CHECKOUT_REAL" ]] || { echo "active static release path is not canonical" >&2; exit 1; }',
+                'case "$SAMOHOST_CHECKOUT_REAL" in "$SAMOHOST_RELEASES_REAL"/*) ;; *) echo "active static release escapes the releases directory" >&2; exit 1 ;; esac',
+                '[[ "$(git -C "$SAMOHOST_CHECKOUT_REAL" rev-parse HEAD 2>/dev/null)" == "$SAMOHOST_ACTIVE_SHA" ]] || { echo "active static release checkout does not match its recorded sha" >&2; exit 1; }',
+                'if [[ -n "$SAMOHOST_STATIC_ROOT" ]]; then SAMOHOST_STATIC_CANDIDATE="$SAMOHOST_CHECKOUT_REAL/$SAMOHOST_STATIC_ROOT"; else SAMOHOST_STATIC_CANDIDATE="$SAMOHOST_CHECKOUT_REAL"; fi',
+                'SAMOHOST_STATIC_DIR=$(realpath -e "$SAMOHOST_STATIC_CANDIDATE") || { echo "active staticRoot does not exist" >&2; exit 1; }',
+                'case "$SAMOHOST_STATIC_DIR" in "$SAMOHOST_CHECKOUT_REAL"|"$SAMOHOST_CHECKOUT_REAL"/*) ;; *) echo "active staticRoot escapes the release checkout" >&2; exit 1 ;; esac',
+                '[[ -d "$SAMOHOST_STATIC_DIR" && -f "$SAMOHOST_STATIC_DIR/index.html" ]] || { echo "active staticRoot must contain index.html" >&2; exit 1; }',
+                'python3 - "$SAMOHOST_STATIC_DIR/version.json" "$SAMOHOST_ACTIVE_SHA" "$SAMOHOST_ACTIVE_TAG" <<\'PY\'',
+                "import json",
+                "import sys",
+                "with open(sys.argv[1], encoding='utf-8') as source:",
+                "    identity = json.load(source)",
+                "expected = {'version': sys.argv[3], 'tag': sys.argv[3], 'sha': sys.argv[2], 'environment': 'production'}",
+                "if identity != expected:",
+                "    raise SystemExit('active static release identity does not match state')",
+                "PY",
+                'EXPECTED_ROUTE=$(mktemp)',
+                'printf \'root * "%s"\\ntry_files {path} /index.html\\nfile_server\\nencode gzip\\n\' "$SAMOHOST_STATIC_DIR" > "$EXPECTED_ROUTE"',
+                'cmp -s "$EXPECTED_ROUTE" "$SAMOHOST_ACTIVE_ROUTE" || { echo "active static route does not match structured release state" >&2; exit 1; }',
+                'SAMOHOST_ACTIVE_FINGERPRINT=$(sha256sum "$SAMOHOST_ACTIVE_STATE" "$SAMOHOST_ACTIVE_ROUTE" | sha256sum | awk \'{print $1}\')',
+          "samohost_assert_custom_domain_source() {",
+          '  samohost_assert_static_tree_safe "$SAMOHOST_CHECKOUT_REAL" "$SAMOHOST_STATIC_DIR" "$SAMOHOST_STATIC_ROOT" || return 1',
+          '  local current_fingerprint',
+          '  current_fingerprint=$(sha256sum "$SAMOHOST_ACTIVE_STATE" "$SAMOHOST_ACTIVE_ROUTE" | sha256sum | awk \'{print $1}\') || return 1',
+          '  [[ "$current_fingerprint" == "$SAMOHOST_ACTIVE_FINGERPRINT" ]] || { echo "active static release changed during custom-domain activation; retry" >&2; return 1; }',
+          "}",
+          "",
+          'samohost_assert_custom_domain_source || exit 1',
+          'STAGED=$(mktemp)',
+          `printf 'http://${fqdn} {\\n\\timport "%s"\\n}\\n' "$SAMOHOST_ACTIVE_ROUTE" > "$STAGED"`,
+          'samohost_assert_custom_domain_source || exit 1',
+          "SAMOHOST_HAD_LIVE=0",
+          'if [[ -f "$SNIPPET" ]]; then BACKUP=$(mktemp); cp -- "$SNIPPET" "$BACKUP"; SAMOHOST_HAD_LIVE=1; fi',
+          'sudo /usr/bin/tee "$SNIPPET" >/dev/null < "$STAGED"',
+          'if samohost_assert_custom_domain_source && sudo /usr/bin/systemctl reload caddy; then',
+          "  :",
+          "else",
+          '  if [[ "$SAMOHOST_HAD_LIVE" == "1" ]]; then',
+          '    sudo /usr/bin/tee "$SNIPPET" >/dev/null < "$BACKUP"',
+          "  else",
+          '    sudo /usr/bin/rm -f "$SNIPPET"',
+          "  fi",
+          "  exit 1",
+          "fi",
+        ]
+      : [
+          "# Write the Caddy snippet (overwrite — idempotent; same content each time).",
+          `printf '%s\\n' ${sq(vhostBody!)} | sudo /usr/bin/tee "$SNIPPET" >/dev/null`,
+          "",
+          "# Reload Caddy (reload fails on bad config; no separate validate step needed).",
+          `sudo /usr/bin/systemctl reload caddy`,
+        ]),
     "",
     `echo "custom-domain vhost ready: ${fqdn}"`,
   ].join("\n");

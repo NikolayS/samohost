@@ -13,6 +13,7 @@
 
 import { readFileSync } from "node:fs";
 import type { Provider, ProvisionSpec } from "./types.ts";
+import { validateStaticRoot } from "./app/static-root.ts";
 import { runPreview } from "./commands/preview.ts";
 import {
   runAdopt,
@@ -267,6 +268,8 @@ app register options (write an AppRecord; offline, no network):
                              vhost (dotted lowercase DNS, e.g. app.samo.team)
   --kind <node|static>       serve kind (default: node; static = file_server vhost,
                              no service/db/build install)
+  --static-root <path>       repo-relative directory served for static apps
+                             (for example dist; default: repository root)
   --env-file <path>          remote env file; sourced (read-only) by the deploy
                              script before install — NEVER read/written by samohost
   --env-db-var <NAME>        env var whose DB URL must point at the per-env db in
@@ -294,10 +297,9 @@ app bootstrap options (PR-A1+A2 — ONE-TIME OS bootstrap + DB + env + clone;
   <vm>                       VM name or id (required)
   <app>                      app name or id (required)
   --app-user <user>          OS user created to run the app (required)
-  --db-name <name>           Database to create — REQUIRED, EXPLICIT.
-                             Never derived from app name (e.g. field_record,
-                             NOT field-record or field_record_1). Must match
-                             the actual database on the host.
+  --db-name <name>           Database to create — required for node apps and
+                             invalid for static apps. Never derived from the
+                             app name; must match the actual database.
   --app-base <path>          base directory (default: /opt/<app-name>)
   --node-major <N>           Node.js major via NodeSource (default: 22)
   --pg-major <N>             PostgreSQL major via PGDG (default: 18)
@@ -1379,6 +1381,7 @@ function parseAppRegister(
   let rlsNonSuperuser = false;
   let rlsUrlVar: string | undefined;
   let kind: "node" | "static" | undefined;
+  let staticRoot: string | undefined;
   let json = false;
 
   for (let i = 0; i < args.length; i++) {
@@ -1436,6 +1439,7 @@ function parseAppRegister(
         i++;
         break;
       }
+      case "--static-root": staticRoot = takeValue(args, i, a); i++; break;
       case "--json": json = true; break;
       default:
         if (a.startsWith("-")) throw new UsageError(`unknown flag: ${a}`);
@@ -1473,6 +1477,11 @@ function parseAppRegister(
         `e.g. APP_DATABASE_URL)`,
     );
   }
+  try {
+    validateStaticRoot(staticRoot, kind);
+  } catch (error) {
+    throw new UsageError(error instanceof Error ? error.message : String(error));
+  }
   const resolvedAppDir = appDir ?? `/opt/${name}/app`;
 
   const input: AppRegisterInput = {
@@ -1486,6 +1495,7 @@ function parseAppRegister(
     healthUrl,
     rlsNonSuperuser,
     ...(kind !== undefined ? { kind } : {}),
+    ...(staticRoot !== undefined ? { staticRoot } : {}),
     ...(mainHost !== undefined ? { mainHost } : {}),
     ...(migrateCmd !== undefined ? { migrateCmd } : {}),
     ...(seedCmd !== undefined ? { seedCmd } : {}),
@@ -1597,7 +1607,7 @@ function parseAppBootstrap(args: string[]): ParsedAppBootstrap {
 
   const { vm, app } = takeVmApp(args, (a, i) => {
     if (a === "--app-user") { appUser = takeValue(args, i, a); return i + 1; }
-    // PR-A2 REQUIRED: DB name is always explicit — never derived from app.name.
+    // Kind-aware requirement is enforced after the AppRecord lookup.
     if (a === "--db-name") { dbName = takeValue(args, i, a); return i + 1; }
     if (a === "--app-base") { appBase = takeValue(args, i, a); return i + 1; }
     if (a === "--node-major") {
@@ -1628,13 +1638,12 @@ function parseAppBootstrap(args: string[]): ParsedAppBootstrap {
   if (vm === undefined) throw new UsageError("app bootstrap requires <vm> <app>");
   if (app === undefined) throw new UsageError("app bootstrap requires <vm> <app>");
   if (appUser === undefined) throw new UsageError("app bootstrap requires --app-user <user>");
-  if (dbName === undefined) throw new UsageError("app bootstrap requires --db-name <name> (REQUIRED: must be explicit; not derived from app name)");
 
   const input: AppBootstrapInput = {
     vm,
     app,
     appUser,
-    dbName,
+    ...(dbName !== undefined ? { dbName } : {}),
     ...(appBase !== undefined ? { appBase } : {}),
     ...(nodeMajor !== undefined ? { nodeMajor } : {}),
     ...(pgMajor !== undefined ? { pgMajor } : {}),

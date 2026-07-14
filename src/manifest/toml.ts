@@ -18,6 +18,7 @@
 import { parse as parseToml } from "smol-toml";
 import type { TomlValueWithoutBigInt } from "smol-toml";
 import type { ListenerSpec, ServiceSpec, RouteSpec } from "../types.ts";
+import { validateStaticRoot } from "../app/static-root.ts";
 import {
   CANONICAL_RELEASE_CI_WORKFLOW,
   isCanonicalReleaseCiWorkflow,
@@ -62,6 +63,8 @@ export interface AppManifest {
    * Optional: absent means node.
    */
   kind?: "node" | "static";
+  /** Repo-relative output directory served for static apps. */
+  staticRoot?: string;
   /**
    * Persistent DB backend for this app's own production database.
    * `"none"` = app has no database; preview envs skip all DB phases.
@@ -155,6 +158,7 @@ const APP_KEYS = new Set<string>([
   "rlsNonSuperuser",
   // Issue #36: serve kind ("node" | "static")
   "kind",
+  "staticRoot",
   // App-level DB backend — 'none' means no database; preview envs skip DB phases.
   "dbBackend",
   // Per-app default DB backend for auto-created PR-preview envs.
@@ -742,6 +746,7 @@ export function parseSamohostToml(text: string): ParseTomlResult {
   const appUser = optionalString(raw, "appUser", errors);
   const envDbVars = optionalStringArray(raw, "envDbVars", errors);
   const rlsNonSuperuser = optionalBoolean(raw, "rlsNonSuperuser", errors);
+  const staticRoot = optionalString(raw, "staticRoot", errors);
 
   // issue #36: optional enum field (must be "node" | "static" when present)
   let kind: "node" | "static" | undefined;
@@ -756,6 +761,12 @@ export function parseSamohostToml(text: string): ParseTomlResult {
         kind = rawKind;
       }
     }
+  }
+
+  try {
+    validateStaticRoot(staticRoot, kind);
+  } catch (error) {
+    errors.push(error instanceof Error ? error.message : String(error));
   }
 
   // optional enum: dbBackend ("dblab" | "template" | "none")
@@ -1165,6 +1176,7 @@ export function parseSamohostToml(text: string): ParseTomlResult {
     ...(envDbVars !== undefined ? { envDbVars } : {}),
     ...(rlsNonSuperuser !== undefined ? { rlsNonSuperuser } : {}),
     ...(kind !== undefined ? { kind } : {}),
+    ...(staticRoot !== undefined ? { staticRoot } : {}),
     ...(dbBackend !== undefined ? { dbBackend } : {}),
     ...(previewDbBackend !== undefined ? { previewDbBackend } : {}),
     ...(services !== undefined ? { services } : {}),

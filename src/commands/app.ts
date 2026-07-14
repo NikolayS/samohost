@@ -19,6 +19,7 @@ import { spawnSync } from "node:child_process";
 import { checkCiGreen, type CiStatus } from "../app/cigate.ts";
 import { parseDeployOutcome, type DeployOutcome } from "../app/parse.ts";
 import { buildDeployScript } from "../app/script.ts";
+import { validateStaticRoot } from "../app/static-root.ts";
 import {
   CANONICAL_RELEASE_CI_WORKFLOW,
   isCanonicalReleaseCiWorkflow,
@@ -68,6 +69,8 @@ export interface AppRegisterInput {
    * Absent = node; all existing AppRecords are valid.
    */
   kind?: "node" | "static";
+  /** Repo-relative output directory served by Caddy for static apps. */
+  staticRoot?: string;
   /**
    * Persistent DB backend for this app's own production database.
    * `"none"` = app carries no database; preview envs must skip all DB phases.
@@ -178,11 +181,12 @@ export interface AppBootstrapInput {
   app: string;
   appUser: string;
   /**
-   * PR-A2 REQUIRED — the database name to create on the host.
-   * MUST be passed explicitly; never derived from app.name.
+   * Database name to create on the host. Required for non-static apps and
+   * invalid for static apps. When required it MUST be passed explicitly;
+   * never derive it from app.name.
    * See HostBootstrapOptions.dbName.
    */
-  dbName: string;
+  dbName?: string;
   appBase?: string;
   nodeMajor?: number;
   pgMajor?: number;
@@ -239,6 +243,12 @@ export function runAppRegister(
     err("error: a static release-channel app requires mainHost for an owned production vhost");
     return 1;
   }
+  try {
+    validateStaticRoot(input.staticRoot, input.kind);
+  } catch (error) {
+    err(`error: ${error instanceof Error ? error.message : String(error)}`);
+    return 1;
+  }
 
   // Fix 6a: validate service topology on the programmatic path too.
   // The TOML path runs the same check via parseSamohostToml. Without this guard,
@@ -271,6 +281,7 @@ export function runAppRegister(
     healthUrl: input.healthUrl,
     serviceUnit: input.serviceUnit,
     ...(input.kind !== undefined ? { kind: input.kind } : {}),
+    ...(input.staticRoot !== undefined ? { staticRoot: input.staticRoot } : {}),
     ...(input.mainHost !== undefined ? { mainHost: input.mainHost } : {}),
     ...(input.migrateCmd !== undefined ? { migrateCmd: input.migrateCmd } : {}),
     ...(input.seedCmd !== undefined ? { seedCmd: input.seedCmd } : {}),
@@ -399,6 +410,7 @@ export function runAppRegisterFromToml(
     healthUrl: app.healthUrl,
     rlsNonSuperuser: app.rlsNonSuperuser === true,
     ...(app.kind !== undefined ? { kind: app.kind } : {}),
+    ...(app.staticRoot !== undefined ? { staticRoot: app.staticRoot } : {}),
     ...(app.migrateCmd !== undefined ? { migrateCmd: app.migrateCmd } : {}),
     ...(app.seedCmd !== undefined ? { seedCmd: app.seedCmd } : {}),
     ...(app.envFile !== undefined ? { envFile: app.envFile } : {}),
@@ -563,8 +575,9 @@ export function runAppClearFailed(
  *
  * Scope (PR-A1): runtimes (Node/PG/Caddy), app OS user, /opt layout, sudoers,
  * MAIN systemd unit, sshd AllowUsers drop-in, Caddy base config.
- * Scope (PR-A2): DB bootstrap + createdb (dbName REQUIRED, explicit),
- * base env file seeding, full token-safe repo clone, extended self-check table.
+ * Scope (PR-A2, non-static apps): DB bootstrap + createdb (dbName required
+ * and explicit), base env file seeding, full token-safe repo clone, extended
+ * self-check table. Static apps skip every DB/env bootstrap section.
  */
 export function runAppBootstrap(
   input: AppBootstrapInput,
@@ -583,10 +596,18 @@ export function runAppBootstrap(
     err(`error: app not found on vm ${vm.name}: ${input.app}`);
     return 1;
   }
+  if (app.kind === "static" && input.dbName !== undefined) {
+    err("error: --db-name is not valid for a static app; static bootstrap creates no database");
+    return 1;
+  }
+  if (app.kind !== "static" && input.dbName === undefined) {
+    err("error: a non-static app bootstrap requires --db-name <name> (explicit; never derived)");
+    return 1;
+  }
 
   const opts: HostBootstrapOptions = {
     appUser: input.appUser,
-    dbName: input.dbName,
+    ...(input.dbName !== undefined ? { dbName: input.dbName } : {}),
     ...(input.appBase !== undefined ? { appBase: input.appBase } : {}),
     ...(input.nodeMajor !== undefined ? { nodeMajor: input.nodeMajor } : {}),
     ...(input.pgMajor !== undefined ? { pgMajor: input.pgMajor } : {}),

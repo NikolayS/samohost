@@ -45,7 +45,8 @@
  *     with `openssl rand -hex 24` (fed to psql via STDIN with dollar-quoting;
  *     NEVER in argv). Idempotent reuse from existing env file. Then idempotent
  *     `createdb <dbName>` guarded by pg_database SELECT.
- *     CRITICAL: dbName is REQUIRED and EXPLICIT — never derived from app.name.
+ *     CRITICAL for non-static apps: dbName is REQUIRED and EXPLICIT — never
+ *     derived from app.name. Static apps skip the DB and base-env sections.
  *
  *  e. Base env file seeding (600, appUser-owned): DATABASE_URL (superuser),
  *     APP_DATABASE_URL placeholder (app role + 'app_password' — rotated by
@@ -73,6 +74,11 @@
 
 import type { AppRecord } from "../types.ts";
 import { buildFirewallLines, type HostPrepFirewallOpts } from "../env/script.ts";
+import {
+  staticReleaseStatePaths,
+  staticRootOf,
+  staticTreeGuardFnLines,
+} from "./static-root.ts";
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -81,8 +87,8 @@ import { buildFirewallLines, type HostPrepFirewallOpts } from "../env/script.ts"
 /**
  * Options for the host bootstrap script (PR-A1 OS prep + PR-A2 DB/env/clone).
  *
- * `appUser` and `dbName` are REQUIRED. All other fields are optional with
- * documented defaults.
+ * `appUser` is always required. `dbName` is required for non-static apps and
+ * invalid for static apps. All other fields are optional with documented defaults.
  */
 export interface HostBootstrapOptions {
   /**
@@ -100,9 +106,8 @@ export interface HostBootstrapOptions {
    * to samohost). The critic flagged: 'field-record-1'.replace(/-/g,'_') =
    * 'field_record_1' but the live box's DB is 'field_record'.
    *
-   * Optional for static apps (`app.kind === 'static'`): static sites have no
-   * database; passing `dbName` when absent will cause the builder to throw with
-   * a clear error for non-static apps. Static calls should simply omit this field.
+   * Invalid for static apps (`app.kind === 'static'`): static sites have no
+   * database, so static calls must omit this field.
    */
   dbName?: string;
 
@@ -212,6 +217,7 @@ export function buildHostBootstrapScript(
   app: AppRecord,
   opts: HostBootstrapOptions,
 ): string {
+  const staticRoot = staticRootOf(app);
   const isStatic = app.kind === "static";
   const isStaticReleaseChannel = isStatic && app.releaseTagPattern !== undefined;
 
@@ -223,6 +229,11 @@ export function buildHostBootstrapScript(
     throw new Error(
       `buildHostBootstrapScript: dbName is required for non-static apps (app.kind is '${app.kind ?? "node"}', not 'static'). ` +
         `Pass dbName explicitly via HostBootstrapOptions — never derive it from app.name.`,
+    );
+  }
+  if (isStatic && opts.dbName !== undefined) {
+    throw new Error(
+      "buildHostBootstrapScript: dbName is not valid for static apps; static bootstrap creates no database",
     );
   }
 
@@ -244,8 +255,11 @@ export function buildHostBootstrapScript(
   const appDbRole = opts.appDbRole ?? "app_user";
   const seedOwnerLogin = opts.seedOwnerLogin ?? "owner";
   const rlsUrlVar = app.rlsUrlVar ?? "APP_DATABASE_URL";
+  const staticReleaseState = staticReleaseStatePaths(app.appDir);
+  const staticReleaseTagFormat = app.releaseTagFormat ?? "";
 
   const lines: string[] = [];
+  const staticBranchVhostLines: string[] = [];
   const push = (...l: string[]): void => {
     for (const x of l) lines.push(x);
   };
@@ -263,6 +277,9 @@ export function buildHostBootstrapScript(
     "#   NEVER in argv, NEVER in remote URL.",
     "set -euo pipefail",
     "",
+    ...(isStatic && !isStaticReleaseChannel && app.mainHost !== undefined
+      ? [...staticTreeGuardFnLines(), ""]
+      : []),
   );
 
   // ---- section 0: read GitHub token from FD 3 or pre-placed file ------------
@@ -658,35 +675,155 @@ export function buildHostBootstrapScript(
   );
 
   // ---- static branch-channel: production Caddy file_server vhost block ------
-  // Branch-channel static apps preserve the legacy bootstrap-owned appDir
-  // route. Release-channel static apps MUST NOT create or replace this vhost:
-  // only the tag-authorized deploy transaction may atomically activate a
-  // versioned candidate. This also makes bootstrap reruns preserve that route.
+  // A fresh branch-channel host may bootstrap from appDir. After the first
+  // health-proven detached deploy, however, the deploy-owned structured state
+  // and route are authoritative. Bootstrap validates and preserves that exact
+  // main vhost byte-for-byte; it never switches production back to appDir.
   if (isStatic && !isStaticReleaseChannel && app.mainHost !== undefined) {
     const caddySitePath = `/etc/caddy/sites.d/00-main-${app.name}.caddy`;
     const siteAddress = app.mainListen === "cp-http80"
       ? `http://${app.mainHost}`
       : app.mainHost;
-    push(
+    staticBranchVhostLines.push(
       `# ---------------------------------------------------------------------------`,
       `# §9b. Production Caddy file_server vhost for ${sq(app.mainHost)}.`,
-      `#      tls internal: CF Full-mode proxying; ACME cannot complete behind CF :443.`,
-      `#      file_server: serves the static checkout at ${sq(app.appDir)} directly.`,
-      `#      Idempotent: overwrite with deterministic content.`,
+      `#      Fresh host: canonical ${sq(staticRoot ?? "repository root")} under appDir.`,
+      `#      Post-deploy: validate and preserve the exact health-proven detached route.`,
+      `#      Missing/corrupt deploy state fails closed; never switch back to appDir.`,
       `# ---------------------------------------------------------------------------`,
       "",
-      `cat > ${sq(caddySitePath)} <<'CADDY_SITE'`,
+      `SAMOHOST_STATIC_ROOT=${sq(staticRoot ?? "")}`,
+      `SAMOHOST_RELEASE_TAG_FORMAT=${sq(staticReleaseTagFormat)}`,
+      `SAMOHOST_RELEASES_DIR=${sq(staticReleaseState.releasesDir)}`,
+      `SAMOHOST_ACTIVE_STATE=${sq(staticReleaseState.activeState)}`,
+      `SAMOHOST_ACTIVE_ROUTE=${sq(staticReleaseState.activeRoute)}`,
+      `SAMOHOST_MAIN_VHOST=${sq(caddySitePath)}`,
+      'SAMOHOST_BOOTSTRAP_VALUES=""',
+      'SAMOHOST_BOOTSTRAP_EXPECTED_ROUTE=""',
+      'SAMOHOST_BOOTSTRAP_EXPECTED_MAIN=""',
+      'samohost_cleanup_bootstrap_static_route() {',
+      '  [[ -z "$SAMOHOST_BOOTSTRAP_VALUES" ]] || rm -f "$SAMOHOST_BOOTSTRAP_VALUES"',
+      '  [[ -z "$SAMOHOST_BOOTSTRAP_EXPECTED_ROUTE" ]] || rm -f "$SAMOHOST_BOOTSTRAP_EXPECTED_ROUTE"',
+      '  [[ -z "$SAMOHOST_BOOTSTRAP_EXPECTED_MAIN" ]] || rm -f "$SAMOHOST_BOOTSTRAP_EXPECTED_MAIN"',
+      '}',
+      'trap samohost_cleanup_bootstrap_static_route EXIT',
+      '',
+      'if [[ -e "$SAMOHOST_ACTIVE_STATE" || -e "$SAMOHOST_ACTIVE_ROUTE" ]]; then',
+      '  [[ -f "$SAMOHOST_ACTIVE_STATE" && ! -L "$SAMOHOST_ACTIVE_STATE" && -r "$SAMOHOST_ACTIVE_STATE" && -f "$SAMOHOST_ACTIVE_ROUTE" && ! -L "$SAMOHOST_ACTIVE_ROUTE" && -r "$SAMOHOST_ACTIVE_ROUTE" ]] || { echo "active static deployment state/route is incomplete or unsafe; refusing bootstrap route change" >&2; exit 1; }',
+      '  SAMOHOST_BOOTSTRAP_VALUES=$(mktemp)',
+      `  if ! python3 - "$SAMOHOST_ACTIVE_STATE" ${sq(app.name)} "$SAMOHOST_STATIC_ROOT" "$SAMOHOST_RELEASE_TAG_FORMAT" > "$SAMOHOST_BOOTSTRAP_VALUES" <<'PY'`,
+      'import datetime',
+      'import json',
+      'import re',
+      'import sys',
+      '',
+      'path, expected_app, expected_root, expected_format_raw = sys.argv[1:]',
+      'expected_format = expected_format_raw or None',
+      "with open(path, encoding='utf-8') as source:",
+      '    state = json.load(source)',
+      "if state.get('schema') != 1 or state.get('appName') != expected_app or state.get('staticRoot') != expected_root or state.get('releaseTagFormat') != expected_format:",
+      "    raise SystemExit('active static deployment state does not match this app')",
+      "sha = state.get('sha')",
+      "tag = state.get('tag')",
+      "release_dir = state.get('releaseDir')",
+      "if not isinstance(sha, str) or re.fullmatch(r'[0-9a-f]{7,40}', sha) is None:",
+      "    raise SystemExit('active static deployment state has an invalid sha')",
+      "if not isinstance(tag, str) or not tag or len(tag) > 255 or any(ord(ch) < 32 for ch in tag):",
+      "    raise SystemExit('active static deployment state has an invalid tag')",
+      "if expected_format == 'date':",
+      "    match = re.fullmatch(r'v([0-9]{8})[.]([1-9][0-9]*)', tag)",
+      "    if match is None:",
+      "        raise SystemExit('active static deployment state has an invalid dated tag')",
+      "    datetime.datetime.strptime(match.group(1), '%Y%m%d')",
+      "if not isinstance(release_dir, str) or not release_dir.startswith('/') or any(ord(ch) < 32 for ch in release_dir):",
+      "    raise SystemExit('active static deployment state has an invalid releaseDir')",
+      'for value in (release_dir, sha, tag):',
+      "    sys.stdout.buffer.write(value.encode('utf-8') + b'\\0')",
+      'PY',
+      '  then',
+      '    exit 1',
+      '  fi',
+      '  SAMOHOST_BOOTSTRAP_ACTIVE_VALUES=()',
+      '  mapfile -d "" -t SAMOHOST_BOOTSTRAP_ACTIVE_VALUES < "$SAMOHOST_BOOTSTRAP_VALUES"',
+      '  [[ "${#SAMOHOST_BOOTSTRAP_ACTIVE_VALUES[@]}" == "3" ]] || { echo "active static deployment state is incomplete" >&2; exit 1; }',
+      '  SAMOHOST_ACTIVE_RELEASE_RAW="${SAMOHOST_BOOTSTRAP_ACTIVE_VALUES[0]}"',
+      '  SAMOHOST_ACTIVE_SHA="${SAMOHOST_BOOTSTRAP_ACTIVE_VALUES[1]}"',
+      '  SAMOHOST_ACTIVE_TAG="${SAMOHOST_BOOTSTRAP_ACTIVE_VALUES[2]}"',
+      '  SAMOHOST_RELEASES_REAL=$(realpath -e "$SAMOHOST_RELEASES_DIR") || { echo "static releases directory is missing" >&2; exit 1; }',
+      '  [[ ! -L "$SAMOHOST_ACTIVE_RELEASE_RAW" ]] || { echo "active static deployment path is a symlink" >&2; exit 1; }',
+      '  SAMOHOST_CHECKOUT_REAL=$(realpath -e "$SAMOHOST_ACTIVE_RELEASE_RAW") || { echo "active static deployment directory is missing" >&2; exit 1; }',
+      '  [[ "$SAMOHOST_ACTIVE_RELEASE_RAW" == "$SAMOHOST_CHECKOUT_REAL" ]] || { echo "active static deployment path is not canonical" >&2; exit 1; }',
+      '  case "$SAMOHOST_CHECKOUT_REAL" in "$SAMOHOST_RELEASES_REAL"/*) ;; *) echo "active static deployment escapes releases directory" >&2; exit 1 ;; esac',
+      '  [[ "$(git -C "$SAMOHOST_CHECKOUT_REAL" rev-parse HEAD 2>/dev/null)" == "$SAMOHOST_ACTIVE_SHA" ]] || { echo "active static deployment checkout does not match recorded sha" >&2; exit 1; }',
+      '  if [[ -n "$SAMOHOST_STATIC_ROOT" ]]; then SAMOHOST_STATIC_CANDIDATE="$SAMOHOST_CHECKOUT_REAL/$SAMOHOST_STATIC_ROOT"; else SAMOHOST_STATIC_CANDIDATE="$SAMOHOST_CHECKOUT_REAL"; fi',
+      '  SAMOHOST_STATIC_DIR=$(realpath -e "$SAMOHOST_STATIC_CANDIDATE") || { echo "active staticRoot does not exist" >&2; exit 1; }',
+      '  case "$SAMOHOST_STATIC_DIR" in "$SAMOHOST_CHECKOUT_REAL"|"$SAMOHOST_CHECKOUT_REAL"/*) ;; *) echo "active staticRoot escapes deployment checkout" >&2; exit 1 ;; esac',
+      '  [[ -d "$SAMOHOST_STATIC_DIR" && -f "$SAMOHOST_STATIC_DIR/index.html" ]] || { echo "active staticRoot must contain index.html" >&2; exit 1; }',
+      '  samohost_assert_static_tree_safe "$SAMOHOST_CHECKOUT_REAL" "$SAMOHOST_STATIC_DIR" "$SAMOHOST_STATIC_ROOT"',
+      '  python3 - "$SAMOHOST_STATIC_DIR/version.json" "$SAMOHOST_ACTIVE_SHA" "$SAMOHOST_ACTIVE_TAG" <<\'PY\'',
+      'import json',
+      'import sys',
+      "with open(sys.argv[1], encoding='utf-8') as source:",
+      '    identity = json.load(source)',
+      "expected = {'version': sys.argv[3], 'tag': sys.argv[3], 'sha': sys.argv[2], 'environment': 'production'}",
+      'if identity != expected:',
+      "    raise SystemExit('active static deployment identity does not match state')",
+      'PY',
+      '  SAMOHOST_BOOTSTRAP_EXPECTED_ROUTE=$(mktemp)',
+      '  printf \'root * "%s"\\ntry_files {path} /index.html\\nfile_server\\nencode gzip\\n\' "$SAMOHOST_STATIC_DIR" > "$SAMOHOST_BOOTSTRAP_EXPECTED_ROUTE"',
+      '  cmp -s "$SAMOHOST_BOOTSTRAP_EXPECTED_ROUTE" "$SAMOHOST_ACTIVE_ROUTE" || { echo "active static route does not match structured deployment state" >&2; exit 1; }',
+      '  SAMOHOST_BOOTSTRAP_EXPECTED_MAIN=$(mktemp)',
+      '  cat > "$SAMOHOST_BOOTSTRAP_EXPECTED_MAIN" <<CADDY_SITE',
       `${siteAddress} {`,
-      `  root * ${app.appDir}`,
-      `  try_files {path} /index.html`,
-      `  file_server`,
-      `  encode gzip`,
-      ...(app.mainListen === "cp-http80" ? [] : [`  tls internal`]),
+      `\t# samohost-worktree "\${SAMOHOST_CHECKOUT_REAL}"`,
+      `\troot * "\${SAMOHOST_STATIC_DIR}"`,
+      `\ttry_files {path} /index.html`,
+      `\tfile_server`,
+      `\tencode gzip`,
+      ...(app.mainListen === "cp-http80" ? [] : [`\ttls internal`]),
       `}`,
-      `CADDY_SITE`,
+      'CADDY_SITE',
+      '  [[ -f "$SAMOHOST_MAIN_VHOST" && ! -L "$SAMOHOST_MAIN_VHOST" ]] || { echo "active static main vhost is missing or unsafe; refusing bootstrap route change" >&2; exit 1; }',
+      '  cmp -s "$SAMOHOST_BOOTSTRAP_EXPECTED_MAIN" "$SAMOHOST_MAIN_VHOST" || { echo "active static main vhost diverges from structured deployment state; refusing bootstrap route change" >&2; exit 1; }',
+      '  SAMOHOST_BOOTSTRAP_FINGERPRINT=$(sha256sum "$SAMOHOST_ACTIVE_STATE" "$SAMOHOST_ACTIVE_ROUTE" "$SAMOHOST_MAIN_VHOST" | sha256sum | awk \'{print $1}\')',
+      '  samohost_assert_static_tree_safe "$SAMOHOST_CHECKOUT_REAL" "$SAMOHOST_STATIC_DIR" "$SAMOHOST_STATIC_ROOT"',
+      '  [[ "$(sha256sum "$SAMOHOST_ACTIVE_STATE" "$SAMOHOST_ACTIVE_ROUTE" "$SAMOHOST_MAIN_VHOST" | sha256sum | awk \'{print $1}\')" == "$SAMOHOST_BOOTSTRAP_FINGERPRINT" ]] || { echo "active static deployment changed during bootstrap; retry" >&2; exit 1; }',
+      '  echo "Caddy: health-proven static deployment route validated and preserved byte-for-byte."',
+      'else',
+      '  if grep -Fqs -- "import \\"$SAMOHOST_ACTIVE_ROUTE\\"" /etc/caddy/sites.d/10-domain-*.caddy 2>/dev/null; then',
+      '    echo "managed custom domain references missing active static deployment state; refusing bootstrap route change" >&2',
+      '    exit 1',
+      '  fi',
+      '  SAMOHOST_CHECKOUT_REAL=$(realpath -e "$APP_DIR") || { echo "static checkout is missing" >&2; exit 1; }',
+      '  if [[ -n "$SAMOHOST_STATIC_ROOT" ]]; then SAMOHOST_STATIC_CANDIDATE="$APP_DIR/$SAMOHOST_STATIC_ROOT"; else SAMOHOST_STATIC_CANDIDATE="$APP_DIR"; fi',
+      '  SAMOHOST_STATIC_DIR=$(realpath -e "$SAMOHOST_STATIC_CANDIDATE") || { echo "staticRoot does not exist: $SAMOHOST_STATIC_ROOT" >&2; exit 1; }',
+      '  case "$SAMOHOST_STATIC_DIR" in "$SAMOHOST_CHECKOUT_REAL"|"$SAMOHOST_CHECKOUT_REAL"/*) ;; *) echo "staticRoot escapes the checkout: $SAMOHOST_STATIC_ROOT" >&2; exit 1 ;; esac',
+      '  [[ -d "$SAMOHOST_STATIC_DIR" && -f "$SAMOHOST_STATIC_DIR/index.html" ]] || { echo "staticRoot must contain index.html: $SAMOHOST_STATIC_ROOT" >&2; exit 1; }',
+      '  samohost_assert_static_tree_safe "$SAMOHOST_CHECKOUT_REAL" "$SAMOHOST_STATIC_DIR" "$SAMOHOST_STATIC_ROOT"',
+      '  SAMOHOST_BOOTSTRAP_EXPECTED_MAIN=$(mktemp)',
+      '  cat > "$SAMOHOST_BOOTSTRAP_EXPECTED_MAIN" <<CADDY_SITE',
+      `${siteAddress} {`,
+      `\troot * "\${SAMOHOST_STATIC_DIR}"`,
+      `\ttry_files {path} /index.html`,
+      `\tfile_server`,
+      `\tencode gzip`,
+      ...(app.mainListen === "cp-http80" ? [] : [`\ttls internal`]),
+      `}`,
+      'CADDY_SITE',
+      '  chmod 0644 "$SAMOHOST_BOOTSTRAP_EXPECTED_MAIN"',
+      '  if [[ -e "$SAMOHOST_MAIN_VHOST" ]]; then',
+      '    [[ -f "$SAMOHOST_MAIN_VHOST" && ! -L "$SAMOHOST_MAIN_VHOST" ]] && cmp -s "$SAMOHOST_BOOTSTRAP_EXPECTED_MAIN" "$SAMOHOST_MAIN_VHOST" || { echo "main static vhost exists without authorized active state and is not the canonical fresh route; refusing bootstrap route change" >&2; exit 1; }',
+      '  else',
+      '    /usr/bin/mv -f "$SAMOHOST_BOOTSTRAP_EXPECTED_MAIN" "$SAMOHOST_MAIN_VHOST"',
+      '    SAMOHOST_BOOTSTRAP_EXPECTED_MAIN=""',
+      '  fi',
+      '  samohost_assert_static_tree_safe "$SAMOHOST_CHECKOUT_REAL" "$SAMOHOST_STATIC_DIR" "$SAMOHOST_STATIC_ROOT"',
+      '  echo "Caddy: canonical fresh static route ready; no health-proven detached deployment exists yet."',
+      'fi',
       `caddy validate --config /etc/caddy/Caddyfile`,
       `/usr/bin/systemctl reload caddy || /usr/bin/systemctl restart caddy`,
-      `echo "Caddy: static file_server vhost ${app.mainHost} -> ${app.appDir} written."`,
+      'samohost_cleanup_bootstrap_static_route',
+      'trap - EXIT',
       "",
     );
   }
@@ -906,6 +1043,12 @@ export function buildHostBootstrapScript(
     `fi`,
     "",
   );
+
+  // A static branch-channel route is activated only after §12 has produced a
+  // checkout and the runtime realpath containment guard above can inspect it.
+  if (staticBranchVhostLines.length > 0) {
+    push(...staticBranchVhostLines);
+  }
 
   // ---- section 13: extended self-check PASS/FAIL table (A1 + A2 rows) ------
   // §13 self-check is kind-aware: static apps omit node/pg/unit/db rows.
