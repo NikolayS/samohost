@@ -10,7 +10,14 @@ import {
   needsControlPlaneMainRoute,
   renderControlPlaneMainRoute,
 } from "../src/caddy/control-plane.ts";
+import {
+  buildProjectMainRouteBeginScript,
+  buildProjectMainRouteCommitScript,
+  buildProjectMainRoutePrepareScript,
+  buildProjectMainRouteRollbackScript,
+} from "../src/caddy/project-main.ts";
 import type { AppRecord, VmRecord } from "../src/types.ts";
+import { buildDeployScript } from "../src/app/script.ts";
 
 function app(overrides: Partial<AppRecord> = {}): AppRecord {
   return {
@@ -151,6 +158,65 @@ describe("control-plane production mainHost routing", () => {
     expect(script).toContain("systemctl reload caddy");
     expect(script).toContain("absent (no-op)");
     expect(spawnSync("bash", ["-n"], { input: script }).status).toBe(0);
+  });
+
+  test("project-VM transaction scripts are bash-clean and keep rollback state", () => {
+    const fingerprint = controlPlaneMainRouteFingerprint(app(), vm());
+    const scripts = [
+      buildProjectMainRouteBeginScript(app(), fingerprint),
+      buildProjectMainRoutePrepareScript(app(), fingerprint),
+      buildProjectMainRouteRollbackScript(app(), fingerprint),
+      buildProjectMainRouteCommitScript(app(), fingerprint),
+      buildProjectMainRoutePrepareScript(
+        app({ mainListen: "tls" }),
+        controlPlaneMainRouteFingerprint(app({ mainListen: "tls" }), vm()),
+      ),
+      buildProjectMainRoutePrepareScript(
+        app({ mainHost: undefined, mainListen: undefined }),
+        controlPlaneMainRouteFingerprint(
+          app({ mainHost: undefined, mainListen: undefined }),
+          vm(),
+        ),
+      ),
+    ];
+    for (const script of scripts) {
+      expect(spawnSync("bash", ["-n"], { input: script }).status, script).toBe(0);
+    }
+    expect(scripts[1]).toContain("project main route prepared and healthy");
+    expect(scripts[2]).toContain("restore_previous");
+    expect(scripts[2]).toContain("restored project route is not healthy");
+  });
+
+  test("release-static project transaction scripts snapshot and restore the base Caddyfile", () => {
+    const releaseApp = app({
+      releaseTagPattern: "v*",
+      releaseTagFormat: "date",
+      releaseCiWorkflow: ".github/workflows/ci.yml",
+    });
+    const fingerprint = controlPlaneMainRouteFingerprint(releaseApp, vm());
+    const scripts = [
+      buildProjectMainRouteBeginScript(releaseApp, fingerprint),
+      buildProjectMainRoutePrepareScript(releaseApp, fingerprint),
+      buildProjectMainRouteRollbackScript(releaseApp, fingerprint),
+      buildProjectMainRouteCommitScript(releaseApp, fingerprint),
+    ];
+    for (const script of scripts) {
+      expect(spawnSync("bash", ["-n"], { input: script }).status, script).toBe(0);
+    }
+    expect(scripts[0]).toContain('cat -- "$CADDYFILE" > "$TXN/base.caddy"');
+    expect(scripts[1]).toContain("restore_base_files");
+    expect(scripts[2]).toContain("/etc/caddy/.samohost-next-Caddyfile");
+  });
+
+  test("static deploy with routing drift keeps the old vhost beside a transition", () => {
+    const script = buildDeployScript(app(), {
+      sha: "a".repeat(40),
+      deferStaticCleanup: true,
+    });
+    expect(spawnSync("bash", ["-n"], { input: script }).status, script).toBe(0);
+    expect(script).toContain("SAMOHOST_OLD_ROUTE_ADDRESS");
+    expect(script).toContain("01-samohost-transition-");
+    expect(script).toContain("Prior release cleanup is deferred");
   });
 
   test("rendered route passes the installed Caddy validator", () => {

@@ -79,6 +79,7 @@ import {
   staticRootOf,
   staticTreeGuardFnLines,
 } from "./static-root.ts";
+import { assertSafeAppIdentity } from "./identity.ts";
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -217,6 +218,7 @@ export function buildHostBootstrapScript(
   app: AppRecord,
   opts: HostBootstrapOptions,
 ): string {
+  assertSafeAppIdentity(app);
   const staticRoot = staticRootOf(app);
   const isStatic = app.kind === "static";
   const isStaticReleaseChannel = isStatic && app.releaseTagPattern !== undefined;

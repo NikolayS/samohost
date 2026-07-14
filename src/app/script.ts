@@ -48,6 +48,8 @@ import {
   staticRootOf,
   staticTreeGuardFnLines,
 } from "./static-root.ts";
+import { assertSafeAppIdentity } from "./identity.ts";
+import { projectMainRouteTransitionPath } from "../caddy/project-main.ts";
 
 /** Marker prefix the parser keys on. */
 export const PHASE_PREFIX = "<<<SAMOHOST_PHASE:";
@@ -72,6 +74,8 @@ export interface DeployTarget {
   sha: string;
   /** Resolved production release tag (required for release-channel static apps). */
   tag?: string;
+  /** Keep the prior static release until the two-hop route transaction commits. */
+  deferStaticCleanup?: boolean;
 }
 
 /** Number of health-check attempts and the sleep between them. */
@@ -100,6 +104,7 @@ function marker(phase: PhaseName, status: "start" | "ok" | "fail"): string {
  * intended for `bash -s` over a single SSH connection.
  */
 export function buildDeployScript(app: AppRecord, target: DeployTarget): string {
+  assertSafeAppIdentity(app);
   const staticRoot = staticRootOf(app);
   // rlsUrlVar is interpolated into bash as `${<name>:-}` — it must be a valid
   // identifier (the CLI validates too; this guards hand-edited state files).
@@ -133,6 +138,9 @@ export function buildDeployScript(app: AppRecord, target: DeployTarget): string 
   const staticStagedSnippet = staticMainSnippet === undefined
     ? undefined
     : `/etc/caddy/sites.d/.samohost-next-00-main-${app.name}.caddy`;
+  const staticTransitionSnippet = app.kind === "static" && target.deferStaticCleanup === true
+    ? projectMainRouteTransitionPath(app)
+    : undefined;
   const staticCaddyfile = "/etc/caddy/Caddyfile";
   const staticStagedCaddyfile = "/etc/caddy/.samohost-next-Caddyfile";
   const appBase = app.appDir.replace(/\/+$/, "").split("/").slice(0, -1).join("/");
@@ -273,6 +281,9 @@ export function buildDeployScript(app: AppRecord, target: DeployTarget): string 
       "  local rb_ok=1",
       "  local rb_route_ok=1",
       `  sudo /usr/bin/rm -f ${sq(staticStagedSnippet!)} || rb_route_ok=0`,
+      ...(staticTransitionSnippet === undefined
+        ? []
+        : [`  sudo /usr/bin/rm -f ${sq(staticTransitionSnippet)} || rb_route_ok=0`]),
       '  if [[ "${SAMOHOST_OLD_VHOST_PRESENT:-0}" == "1" ]]; then',
       `    if sudo /usr/bin/tee ${sq(staticStagedSnippet!)} >/dev/null < "$SAMOHOST_VHOST_BACKUP"; then sudo /usr/bin/mv -- ${sq(staticStagedSnippet!)} ${sq(staticMainSnippet!)} || rb_route_ok=0; else rb_route_ok=0; fi`,
       `  else sudo /usr/bin/rm -f ${sq(staticMainSnippet!)} || rb_route_ok=0; fi`,
@@ -548,7 +559,29 @@ export function buildDeployScript(app: AppRecord, target: DeployTarget): string 
       `CADDY`,
       'samohost_assert_static_tree_safe "$SAMOHOST_CANDIDATE_REAL" "$SAMOHOST_STATIC_DIR" "$SAMOHOST_STATIC_ROOT" || rollback',
       '/usr/bin/mv -f "$SAMOHOST_ACTIVE_ROUTE_NEXT" "$SAMOHOST_ACTIVE_ROUTE" || rollback',
-      `sudo /usr/bin/mv -- ${sq(staticStagedSnippet!)} ${sq(staticMainSnippet!)} || rollback`,
+      ...(staticTransitionSnippet === undefined
+        ? [
+          `sudo /usr/bin/mv -- ${sq(staticStagedSnippet!)} ${sq(staticMainSnippet!)} || rollback`,
+        ]
+        : [
+          `SAMOHOST_OLD_ROUTE_ADDRESS=$(python3 - "$SAMOHOST_VHOST_BACKUP" "$SAMOHOST_OLD_VHOST_PRESENT" <<'PY'`,
+          "import re",
+          "import sys",
+          "if sys.argv[2] != '1': raise SystemExit(0)",
+          "text = open(sys.argv[1], encoding='utf-8').read()",
+          "match = re.search(r'^\\s*(?:(http)://)?([a-z0-9.-]+)(?::80)?\\s*\\{', text, re.MULTILINE)",
+          "if not match: raise SystemExit('cannot parse prior static route address')",
+          "print(('http' if match.group(1) else 'https') + '://' + match.group(2))",
+          "PY",
+          ")",
+          `SAMOHOST_NEW_ROUTE_ADDRESS=${sq(`${app.mainListen === "tls" ? "https" : "http"}://${app.mainHost}`)}`,
+          'if [[ -n "$SAMOHOST_OLD_ROUTE_ADDRESS" && "$SAMOHOST_OLD_ROUTE_ADDRESS" == "$SAMOHOST_NEW_ROUTE_ADDRESS" ]]; then',
+          `  sudo /usr/bin/mv -- ${sq(staticStagedSnippet!)} ${sq(staticMainSnippet!)} || rollback`,
+          "else",
+          `  sudo /usr/bin/rm -f ${sq(staticTransitionSnippet)} || rollback`,
+          `  sudo /usr/bin/mv -- ${sq(staticStagedSnippet!)} ${sq(staticTransitionSnippet)} || rollback`,
+          "fi",
+        ]),
       ...(isStaticReleaseChannel
         ? [
           `if [[ "$SAMOHOST_BASE_CHANGED" == "1" ]]; then sudo /usr/bin/mv -- ${sq(staticStagedCaddyfile)} ${sq(staticCaddyfile)} || rollback; fi`,
@@ -594,9 +627,15 @@ export function buildDeployScript(app: AppRecord, target: DeployTarget): string 
       "    rollback",
       "  fi",
       `  ${marker("health", "ok")}`,
-      '  if [[ -n "$SAMOHOST_PREVIOUS_RELEASE_DIR" && "$SAMOHOST_PREVIOUS_RELEASE_DIR" == "$SAMOHOST_RELEASES_DIR/"* && "$SAMOHOST_PREVIOUS_RELEASE_DIR" != "$SAMOHOST_CANDIDATE_DIR" ]]; then',
-      '    git -C "$SAMOHOST_APP_DIR" worktree remove --force "$SAMOHOST_PREVIOUS_RELEASE_DIR" || true',
-      "  fi",
+      ...(target.deferStaticCleanup === true
+        ? [
+          "  # Prior release cleanup is deferred until the two-hop route transaction commits.",
+        ]
+        : [
+          '  if [[ -n "$SAMOHOST_PREVIOUS_RELEASE_DIR" && "$SAMOHOST_PREVIOUS_RELEASE_DIR" == "$SAMOHOST_RELEASES_DIR/"* && "$SAMOHOST_PREVIOUS_RELEASE_DIR" != "$SAMOHOST_CANDIDATE_DIR" ]]; then',
+          '    git -C "$SAMOHOST_APP_DIR" worktree remove --force "$SAMOHOST_PREVIOUS_RELEASE_DIR" || true',
+          "  fi",
+        ]),
       '  git -C "$SAMOHOST_APP_DIR" worktree prune || true',
       ...(isStaticReleaseChannel
         ? [`  sudo /usr/bin/rm -f ${sq(staticStagedCaddyfile)} || true`]

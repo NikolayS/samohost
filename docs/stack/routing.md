@@ -88,24 +88,31 @@ reconciles a control-plane snippet under `/etc/caddy/sites.d/`:
 ```
 
 Registration remains offline: it records the declaration, and app bootstrap
-writes the matching `http://<mainHost>:80` vhost on the project VM. The route
-becomes public only after the first healthy production deploy. Re-registering
-the same app with a changed host/IP updates its stable managed snippet; changing
-away from `cp-http80` removes that snippet on the next trigger cycle or healthy deploy. Apps
-sharing one VM have independent files keyed by AppRecord id.
+writes the initial project-VM vhost. A production routing change is then a
+two-hop transaction: samohost snapshots the old project-VM snippet, applies
+and locally health-checks the desired project topology in a transition snippet
+while the old host remains live, and only then changes the control-plane
+snippet. If the control-plane step fails, the transition is removed and the
+project VM is restored and health-checked through its old host. Re-registering with a changed
+host/IP updates the stable managed files; changing away from `cp-http80`
+updates/removes the project topology before removing the control-plane route.
+Apps sharing one VM retain independent transaction files and route snippets.
 
 The AppRecord separately stores a fingerprint of the last successfully applied
-control-plane routing specification. `trigger run` compares that fingerprint
-before its code-SHA/tag short-circuits, so a config-only re-registration is
-reconciled even when `deployedSha` is unchanged. Host renames replace the same
-managed file; `cp-http80 → tls` and `mainHost` removal delete it. The new
-fingerprint is persisted only after Caddy validation and reload succeed.
+project-plus-control-plane routing specification. After resolving the target
+SHA, `trigger run` reconciles config-only drift when that SHA is already
+deployed. A new SHA/tag must pass CI and its healthy deploy before either route
+can advance. Host renames replace the same managed files; `cp-http80 → tls`
+and `mainHost` removal remove the control-plane hop only after the project hop
+is ready. The fingerprint, deployed SHA, and release cursor advance only after
+both Caddy transactions succeed.
 
 The reconciler never edits `/etc/caddy/Caddyfile`. The control plane must
 already have the canonical `import sites.d/*.caddy` line. It stages and
 atomically renames the snippet, validates the complete Caddy config, then
 reloads. A validation or reload failure restores and reloads the previous
-snippet; the deploy is not stamped successful, so the trigger retries.
+snippet; the project-VM transaction then restores its snapshot. The deploy is
+not stamped successful, so the trigger retries.
 If the same hostname is still declared in a legacy hand-authored file, the
 reconciler fails closed instead of creating an ambiguous duplicate or claiming
 to manage a route it cannot update.

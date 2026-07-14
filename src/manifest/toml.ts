@@ -23,6 +23,7 @@ import {
   CANONICAL_RELEASE_CI_WORKFLOW,
   isCanonicalReleaseCiWorkflow,
 } from "../app/release-policy.ts";
+import { isSafeAppName } from "../app/identity.ts";
 
 /** A plain TOML table returned by smol-toml's `parse()` (no bigint). */
 type TomlTableLike = Record<string, TomlValueWithoutBigInt>;
@@ -736,6 +737,12 @@ export function parseSamohostToml(text: string): ParseTomlResult {
   const buildCmd = requireString(raw, "buildCmd", errors);
   const healthUrl = requireString(raw, "healthUrl", errors);
   const serviceUnit = requireString(raw, "serviceUnit", errors);
+  if (name !== undefined && !isSafeAppName(name)) {
+    errors.push(
+      "field name must be a lowercase DNS label using only a-z, 0-9, and " +
+        "interior hyphens (maximum 63 characters)",
+    );
+  }
 
   // ---- 4. Validate optional app fields -------------------------------------
   const migrateCmd = optionalString(raw, "migrateCmd", errors);

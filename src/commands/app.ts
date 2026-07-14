@@ -25,10 +25,19 @@ import {
   isCanonicalReleaseCiWorkflow,
 } from "../app/release-policy.ts";
 import {
-  buildControlPlaneMainRouteReconcileScript,
+  assertSafeAppId,
+  assertSafeAppName,
+} from "../app/identity.ts";
+import {
   controlPlaneMainRouteFingerprint,
-  needsControlPlaneMainRoute,
 } from "../caddy/control-plane.ts";
+import {
+  beginTwoHopMainRoute,
+  completeTwoHopMainRoute,
+  hasMainRouteDrift,
+  rollbackTwoHopMainRoute,
+  type TwoHopRouteDeps,
+} from "../caddy/two-hop.ts";
 import {
   buildHostBootstrapScript,
   type HostBootstrapOptions,
@@ -223,6 +232,12 @@ export function runAppRegister(
   out: (s: string) => void,
   err: (s: string) => void,
 ): number {
+  try {
+    assertSafeAppName(input.name);
+  } catch (e) {
+    err(`error: ${e instanceof Error ? e.message : String(e)}`);
+    return 1;
+  }
   const vm = findVm(vmStore, input.vm);
   if (vm === undefined) {
     err(`error: VM not found in state: ${input.vm}`);
@@ -316,6 +331,14 @@ export function runAppRegister(
   };
 
   const existing = appStore.get(vm.id, input.name);
+  if (existing !== undefined) {
+    try {
+      assertSafeAppId(existing.id);
+    } catch (e) {
+      err(`error: ${e instanceof Error ? e.message : String(e)}`);
+      return 1;
+    }
+  }
   const record: AppRecord = {
     ...spec,
     id: existing?.id ?? crypto.randomUUID(),
@@ -660,6 +683,8 @@ export interface AppDeployDeps {
   isCommitOnBranch?: CommitOnBranchVerifier;
   /** Reconcile this app's managed mainHost route on the local control plane. */
   controlPlaneRoute: RemoteScriptRunner;
+  /** Run the transactional project-VM route scripts over pinned SSH. */
+  projectRoute?: RemoteScriptRunner;
 }
 
 export interface AppDeployReport {
@@ -826,15 +851,58 @@ export async function runAppDeploy(
     }
   }
 
-  // ---- build + push the script over ONE connection -----------------------
-  const script = buildDeployScript(app, {
-    sha,
-    ...(input.releaseTag !== undefined ? { tag: input.releaseTag } : {}),
-  });
+  // Snapshot project routing before a deploy can change it. CI and all other
+  // preflight failures happen above, so they never touch either routing hop.
+  let routingDrift: boolean;
+  let script: string;
+  try {
+    routingDrift = hasMainRouteDrift(app, vm);
+    script = buildDeployScript(app, {
+      sha,
+      ...(input.releaseTag !== undefined ? { tag: input.releaseTag } : {}),
+      ...(routingDrift ? { deferStaticCleanup: true } : {}),
+    });
+  } catch (e) {
+    err(`error: cannot build deploy transaction: ${e instanceof Error ? e.message : String(e)}`);
+    return 1;
+  }
+  let routeDeps: TwoHopRouteDeps | undefined;
+  if (routingDrift) {
+    if (deps.projectRoute === undefined) {
+      err("error: routing drift detected but the project-route runner is unavailable");
+      return 1;
+    }
+    routeDeps = {
+      projectRoute: deps.projectRoute,
+      controlPlaneRoute: deps.controlPlaneRoute,
+    };
+    try {
+      const begun = await beginTwoHopMainRoute(app, vm, routeDeps);
+      if (begun.code !== 0) {
+        err(
+          `error: project main-route transaction begin failed (exit ${begun.code}): ` +
+            (begun.stderr || begun.stdout),
+        );
+        return 1;
+      }
+    } catch (e) {
+      err(
+        `error: project main-route transaction begin failed: ` +
+          `${e instanceof Error ? e.message : String(e)}`,
+      );
+      return 1;
+    }
+  }
+
+  // ---- push the deploy script --------------------------------------------
   let result: SpawnResult;
   try {
     result = await deps.remote(vm, script);
   } catch (e) {
+    if (routeDeps !== undefined) {
+      const rollbackError = await rollbackTwoHopMainRoute(app, vm, routeDeps);
+      if (rollbackError !== undefined) err(`error: ${rollbackError}`);
+    }
     err(`error: remote deploy connection failed: ${e instanceof Error ? e.message : String(e)}`);
     return 1;
   }
@@ -842,33 +910,19 @@ export async function runAppDeploy(
   const combined = result.stdout + "\n" + result.stderr;
   const { outcome } = parseDeployOutcome(combined);
 
-  // ---- reconcile the control-plane mainHost route ------------------------
-  // App bootstrap/host-prep writes the VM-local :80 vhost.  For the explicit
-  // cp-http80 topology a second vhost must exist on the control plane to route
-  // public TLS traffic to this VM.  Reconcile only after the app deploy is
-  // healthy so a new hostname never points at an unready release.  The same
-  // stable per-app file is removed when a re-registration changes away from
-  // cp-http80 (the removal script is a no-op when no managed file exists).
+  // ---- complete project-VM -> control-plane route transaction ------------
   let routing: AppDeployReport["routing"] = "not-run";
-  if (outcome === "deployed") {
-    try {
-      const routingScript = buildControlPlaneMainRouteReconcileScript(app, vm);
-      const routeResult = await deps.controlPlaneRoute(vm, routingScript);
-      if (routeResult.code === 0) {
-        routing = needsControlPlaneMainRoute(app) ? "ready" : "removed";
-      } else {
-        routing = "failed";
-        err(
-          `error: control-plane main-route reconcile failed (exit ${routeResult.code}): ` +
-            routeResult.stderr,
-        );
+  if (routeDeps !== undefined) {
+    if (outcome === "deployed") {
+      const routeResult = await completeTwoHopMainRoute(app, vm, routeDeps);
+      routing = routeResult.routing;
+      if (!routeResult.ok) err(`error: ${routeResult.error ?? "two-hop route reconcile failed"}`);
+      if (routeResult.warning !== undefined) err(`warning: ${routeResult.warning}`);
+    } else {
+      const rollbackError = await rollbackTwoHopMainRoute(app, vm, routeDeps);
+      if (rollbackError !== undefined) {
+        err(`error: ${rollbackError}`);
       }
-    } catch (e) {
-      routing = "failed";
-      err(
-        `error: control-plane main-route reconcile failed: ` +
-          `${e instanceof Error ? e.message : String(e)}`,
-      );
     }
   }
 
@@ -1242,13 +1296,15 @@ export function defaultIsCommitOnBranch(): CommitOnBranchVerifier {
 
 /** Default production deploy deps. */
 export function defaultAppDeployDeps(): AppDeployDeps {
+  const remote = defaultRemoteScriptRunner();
   return {
-    remote: defaultRemoteScriptRunner(),
+    remote,
     resolveRef: defaultRefResolver(),
     fetch: globalThis.fetch,
     now: () => new Date(),
     isCommitOnBranch: defaultIsCommitOnBranch(),
     controlPlaneRoute: defaultControlPlaneRouteRunner(),
+    projectRoute: remote,
   };
 }
 

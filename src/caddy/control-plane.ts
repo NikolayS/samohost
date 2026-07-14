@@ -15,6 +15,7 @@
 import { createHash } from "node:crypto";
 import { isIP } from "node:net";
 import type { AppRecord, VmRecord } from "../types.ts";
+import { assertSafeAppIdentity } from "../app/identity.ts";
 
 const CADDYFILE = "/etc/caddy/Caddyfile";
 const SITES_DIR = "/etc/caddy/sites.d";
@@ -39,6 +40,7 @@ export function needsControlPlaneMainRoute(app: AppRecord): boolean {
 
 /** Stable, injection-safe path. Re-registering the same app updates one file. */
 export function controlPlaneMainRoutePath(app: AppRecord): string {
+  assertSafeAppIdentity(app);
   const readable = app.name
     .toLowerCase()
     .replace(/[^a-z0-9-]+/g, "-")
@@ -58,6 +60,7 @@ export function controlPlaneMainRouteFingerprint(
   app: AppRecord,
   vm: VmRecord,
 ): string {
+  assertSafeAppIdentity(app);
   const desired = needsControlPlaneMainRoute(app)
     ? {
         version: 1,
@@ -71,7 +74,23 @@ export function controlPlaneMainRouteFingerprint(
         mode: "absent",
         path: controlPlaneMainRoutePath(app),
       };
-  return createHash("sha256").update(JSON.stringify(desired)).digest("hex");
+  const project = app.mainHost === undefined
+    ? { mode: "absent" }
+    : {
+        mode: "present",
+        kind: app.kind ?? "node",
+        host: app.mainHost,
+        listen: app.mainListen ?? "cp-http80",
+        appDir: app.appDir,
+        healthUrl: app.healthUrl,
+        serviceUnit: app.serviceUnit,
+        services: app.services ?? null,
+        routes: app.routes ?? null,
+        defaultListener: app.defaultListener ?? null,
+      };
+  return createHash("sha256")
+    .update(JSON.stringify({ version: 2, project, controlPlane: desired }))
+    .digest("hex");
 }
 
 function upstream(ip: string): string {
@@ -103,7 +122,7 @@ export function renderControlPlaneMainRoute(
 
   const host = app.mainHost;
   return [
-    `# Managed by samohost for app ${app.name} (${app.id}).`,
+    "# Managed by samohost; stable route identity is encoded in the filename.",
     `# Cloudflare -> control plane TLS -> ${vm.ip}:80 (Host: ${host}).`,
     `${host} {`,
     `\ttls internal`,
@@ -169,7 +188,7 @@ export function buildControlPlaneMainRouteReconcileScript(
   const path = controlPlaneMainRoutePath(app);
   const lines = [
     "#!/usr/bin/env bash",
-    `# samohost control-plane main-route reconcile: ${app.name}`,
+    "# samohost control-plane main-route reconcile",
     ...transactionPreamble(path),
     "",
   ];

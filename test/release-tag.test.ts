@@ -43,6 +43,7 @@ import {
   type TriggerDeps,
   type TriggerRunReport,
 } from "../src/commands/trigger.ts";
+import { controlPlaneMainRouteFingerprint } from "../src/caddy/control-plane.ts";
 import { AppStore } from "../src/state/apps.ts";
 import { StateStore } from "../src/state/store.ts";
 import type { AppRecord, VmRecord } from "../src/types.ts";
@@ -609,8 +610,7 @@ describe("trigger run — release-tag production channel", () => {
 
   test("§8 #6 latest tag already deployed → up-to-date, no deploy", async () => {
     vmStore.upsert(makeVm());
-    appStore.upsert(
-      makeApp({
+    const alreadyDeployed = makeApp({
         deployedSha: SHA_TAG, // already on the latest tag's commit
         mainHost: "field-record-1.samo.team",
         releaseTagPattern: "v*",
@@ -618,8 +618,14 @@ describe("trigger run — release-tag production channel", () => {
         releaseCiWorkflow: ".github/workflows/ci.yml",
         releaseTagCursor: "v20260713.1",
         releaseTagChannelInitialized: true,
-      }),
-    );
+      });
+    appStore.upsert({
+      ...alreadyDeployed,
+      controlPlaneRouteFingerprint: controlPlaneMainRouteFingerprint(
+        alreadyDeployed,
+        makeVm(),
+      ),
+    });
 
     let deployCalls = 0;
     const { fetch: fakeFetch, callCount } = makeFakeFetch([]);
@@ -775,6 +781,7 @@ describe("release deploy authority", () => {
       now: () => new Date(),
       env: { GH_TOKEN: "test" },
       controlPlaneRoute: async () => ({ code: 0, stdout: "route ready", stderr: "" }),
+      projectRoute: async () => ({ code: 0, stdout: "project route ready", stderr: "" }),
       ...overrides,
     };
   }

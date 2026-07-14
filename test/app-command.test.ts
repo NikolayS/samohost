@@ -484,6 +484,8 @@ describe("app commands", () => {
       env: { GH_TOKEN: "tok" },
       controlPlaneRoute: (_vm, _script): Promise<SpawnResult> =>
         Promise.resolve({ code: 0, stdout: "route ready", stderr: "" }),
+      projectRoute: (_vm, _script): Promise<SpawnResult> =>
+        Promise.resolve({ code: 0, stdout: "project route ready", stderr: "" }),
       ...overrides,
     };
   }
@@ -574,7 +576,7 @@ describe("app commands", () => {
     );
     expect(code).toBe(1);
     expect(JSON.parse(c.o).routing).toBe("failed");
-    expect(c.e).toContain("control-plane main-route reconcile failed");
+    expect(c.e).toContain("control-plane route reconcile failed");
     const rec = appStore.get("vm-1111", "field-record");
     expect(rec?.deployedSha).toBeUndefined();
     expect(rec?.failedSha).toBeUndefined();
