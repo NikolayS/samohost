@@ -175,9 +175,14 @@ describe("staticRoot schema and path security", () => {
     expect(hostPrep.indexOf(guardCall, hostPrepStage)).toBeLessThan(hostPrepApply);
 
     const bootstrap = buildHostBootstrapScript(app, { appUser: "astro" });
-    const bootstrapStage = bootstrap.indexOf("cat > '/etc/caddy/sites.d/00-main-astro-site.caddy'");
+    const bootstrapStage = bootstrap.lastIndexOf("SAMOHOST_BOOTSTRAP_EXPECTED_MAIN=$(mktemp)");
+    const bootstrapApply = bootstrap.indexOf(
+      '/usr/bin/mv -f "$SAMOHOST_BOOTSTRAP_EXPECTED_MAIN" "$SAMOHOST_MAIN_VHOST"',
+      bootstrapStage,
+    );
     const bootstrapValidate = bootstrap.indexOf("caddy validate", bootstrapStage);
     expect(bootstrap.lastIndexOf(guardCall, bootstrapStage)).toBeGreaterThan(-1);
+    expect(bootstrapApply).toBeGreaterThan(bootstrapStage);
     expect(bootstrap.indexOf(guardCall, bootstrapStage)).toBeLessThan(bootstrapValidate);
 
     const deploy = buildDeployScript({

@@ -14,6 +14,7 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
+import { buildHostBootstrapScript } from "../src/app/bootstrap.ts";
 import { buildDeployScript } from "../src/app/script.ts";
 import { staticReleaseStatePaths } from "../src/app/static-root.ts";
 import { buildCustomDomainVhostScript } from "../src/env/script.ts";
@@ -740,6 +741,7 @@ describe("buildDeployScript — static path (kind='static')", () => {
         `\troot * "${join(appDir, "dist")}"`,
         "\ttry_files {path} /index.html",
         "\tfile_server",
+        "\tencode gzip",
         "}",
         "",
       ].join("\n"));
@@ -750,6 +752,7 @@ describe("buildDeployScript — static path (kind='static')", () => {
         "",
       ].join("\n"));
       writeFileSync(join(binDir, "caddy"), "#!/usr/bin/env bash\nexit 0\n");
+      writeFileSync(join(binDir, "systemctl"), "#!/usr/bin/env bash\nexit 0\n");
       writeFileSync(join(binDir, "sleep"), "#!/usr/bin/env bash\nexit 0\n");
       writeFileSync(join(binDir, "curl"), [
         "#!/usr/bin/env bash",
@@ -761,7 +764,7 @@ describe("buildDeployScript — static path (kind='static')", () => {
         "fi",
         "",
       ].join("\n"));
-      for (const command of ["sudo", "caddy", "sleep", "curl"]) {
+      for (const command of ["sudo", "caddy", "systemctl", "sleep", "curl"]) {
         chmodSync(join(binDir, command), 0o755);
       }
 
@@ -803,11 +806,50 @@ describe("buildDeployScript — static path (kind='static')", () => {
         }
         return result.stderr;
       };
+      const executeBootstrapRoute = (expectFailure = false): string => {
+        const bootstrap = buildHostBootstrapScript(branchApp, {
+          appUser: "agent",
+          appBase: join(dir, "site"),
+        });
+        const guardStart = bootstrap.indexOf("samohost_assert_static_tree_safe() {");
+        const guardEnd = bootstrap.indexOf("\n}\n", guardStart) + 3;
+        const routeStart = bootstrap.indexOf("# §9b. Production Caddy");
+        const routeEnd = bootstrap.indexOf("# §13. Self-check PASS/FAIL", routeStart);
+        if (guardStart < 0 || guardEnd < 3 || routeStart < 0 || routeEnd < 0) {
+          throw new Error("branch bootstrap route section not found");
+        }
+        const isolated = [
+          "set -euo pipefail",
+          `APP_DIR=${JSON.stringify(appDir)}`,
+          bootstrap.slice(guardStart, guardEnd),
+          bootstrap.slice(routeStart, routeEnd),
+        ].join("\n")
+          .replaceAll("/etc/caddy", caddyDir)
+          .replaceAll("/usr/bin/systemctl", join(binDir, "systemctl"));
+        const result = spawnSync("bash", ["-s"], {
+          input: isolated,
+          encoding: "utf8",
+          env: { ...process.env, PATH: `${binDir}:${process.env["PATH"] ?? ""}` },
+        });
+        if ((!expectFailure && result.status !== 0) || (expectFailure && result.status !== 1)) {
+          throw new Error(
+            `unexpected branch bootstrap exit (${result.status}):\n${result.stdout}\n${result.stderr}`,
+          );
+        }
+        return result.stderr;
+      };
       const routedRoot = (path: string): string => {
         const match = readFileSync(path, "utf8").match(/root \* "([^"]+)"/);
         if (!match?.[1]) throw new Error(`routed root missing from ${path}`);
         return match[1];
       };
+
+      const freshMain = readFileSync(siteFile, "utf8");
+      executeBootstrapRoute();
+      executeBootstrapRoute();
+      expect(readFileSync(siteFile, "utf8")).toBe(freshMain);
+      expect(existsSync(activePaths.activeState)).toBe(false);
+      expect(existsSync(activePaths.activeRoute)).toBe(false);
 
       expect(executeDomain(true)).toContain("no authorized healthy static deployment is active");
       expect(existsSync(domainFile)).toBe(false);
@@ -837,6 +879,34 @@ describe("buildDeployScript — static path (kind='static')", () => {
       expect(existsSync(firstRoot)).toBe(false);
       const secondState = readFileSync(activePaths.activeState, "utf8");
       const secondRoute = readFileSync(activePaths.activeRoute, "utf8");
+      const secondMain = readFileSync(siteFile, "utf8");
+
+      executeBootstrapRoute();
+      executeBootstrapRoute();
+      expect(readFileSync(activePaths.activeState, "utf8")).toBe(secondState);
+      expect(readFileSync(activePaths.activeRoute, "utf8")).toBe(secondRoute);
+      expect(readFileSync(siteFile, "utf8")).toBe(secondMain);
+      expect(readFileSync(domainFile, "utf8")).toBe(domainSnippet);
+
+      writeFileSync(activePaths.activeState, "{}\n");
+      expect(executeBootstrapRoute(true)).toContain(
+        "active static deployment state does not match this app",
+      );
+      expect(readFileSync(activePaths.activeState, "utf8")).toBe("{}\n");
+      expect(readFileSync(activePaths.activeRoute, "utf8")).toBe(secondRoute);
+      expect(readFileSync(siteFile, "utf8")).toBe(secondMain);
+      expect(readFileSync(domainFile, "utf8")).toBe(domainSnippet);
+      writeFileSync(activePaths.activeState, secondState);
+
+      rmSync(activePaths.activeState);
+      expect(executeBootstrapRoute(true)).toContain(
+        "active static deployment state/route is incomplete or unsafe",
+      );
+      expect(existsSync(activePaths.activeState)).toBe(false);
+      expect(readFileSync(activePaths.activeRoute, "utf8")).toBe(secondRoute);
+      expect(readFileSync(siteFile, "utf8")).toBe(secondMain);
+      expect(readFileSync(domainFile, "utf8")).toBe(domainSnippet);
+      writeFileSync(activePaths.activeState, secondState);
 
       execute(firstSha, true);
       expect(readFileSync(activePaths.activeState, "utf8")).toBe(secondState);

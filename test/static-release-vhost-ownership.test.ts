@@ -99,8 +99,8 @@ describe("static release-channel production vhost ownership", () => {
     expect(releaseScripts[0]).toContain("SAMOHOST_CADDY_INSTALLED_NOW=0");
     expect(releaseScripts[0]).toContain("SAMOHOST_CADDY_INSTALLED_NOW=1");
 
-    // Backward compatibility: non-release static apps keep the established
-    // bootstrap/host-prep-owned branch route.
+    // Branch-channel static apps bootstrap a canonical fresh route. After the
+    // first healthy detached deploy, structured active state owns that route.
     const branch = staticApp(false);
     expect(buildHostBootstrapScript(branch, { appUser: "agent" })).toContain(
       "/etc/caddy/sites.d/00-main-release-site.caddy",
