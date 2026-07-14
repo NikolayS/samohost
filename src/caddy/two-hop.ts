@@ -36,12 +36,13 @@ function appliedProbeExpectation(
   app: AppRecord,
 ): ControlPlaneProbeExpectation | undefined {
   if (app.kind !== "static" || app.deployedSha === undefined) return undefined;
-  const tag = app.releaseTagPattern === undefined
+  const expectedIdentity = app.releaseTagPattern === undefined
     ? app.deployedSha
     : app.releaseTagCursor;
+  if (expectedIdentity === undefined) return undefined;
   return {
     sha: app.deployedSha,
-    ...(tag !== undefined ? { tag } : {}),
+    expectedIdentity,
   };
 }
 

@@ -167,11 +167,11 @@ describe("control-plane production mainHost routing", () => {
     });
     const script = buildControlPlaneMainRouteReconcileScript(release, vm(), {
       sha: "b".repeat(40),
-      tag: "v20260714.1",
+      expectedIdentity: "v20260714.1",
     });
     expect(script).toContain("body.get('sha') != expected_sha");
     expect(script).toContain("body.get('environment') != 'production'");
-    expect(script).toContain("body.get('version') != expected_tag");
+    expect(script).toContain("body.get('version') != expected_identity");
     expect(script).toContain("'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb' 'v20260714.1'");
     expect(spawnSync("bash", ["-n"], { input: script }).status, script).toBe(0);
   });
@@ -219,6 +219,7 @@ describe("control-plane production mainHost routing", () => {
 
   test("release-static project transaction scripts snapshot and restore the base Caddyfile", () => {
     const releaseApp = app({
+      staticRoot: "dist",
       releaseTagPattern: "v*",
       releaseTagFormat: "date",
       releaseCiWorkflow: ".github/workflows/ci.yml",
@@ -234,8 +235,14 @@ describe("control-plane production mainHost routing", () => {
       expect(spawnSync("bash", ["-n"], { input: script }).status, script).toBe(0);
     }
     expect(scripts[0]).toContain('cat -- "$CADDYFILE" > "$TXN/base.caddy"');
+    expect(scripts[0]).toContain(".samohost-active-static.caddy");
+    expect(scripts[0]).toContain("active-route-presence");
     expect(scripts[1]).toContain("restore_base_files");
+    expect(scripts[1]).toContain("# samohost-worktree");
+    expect(scripts[1]).toContain('static route root is outside its worktree');
     expect(scripts[2]).toContain("/etc/caddy/.samohost-next-Caddyfile");
+    expect(scripts[2]).toContain('"$ACTIVE_ROUTE_BACKUP"');
+    expect(scripts[2]).toContain('worktree remove --force "$REMOVE_WORKTREE"');
   });
 
   test("static deploy with routing drift keeps the old vhost beside a transition", () => {

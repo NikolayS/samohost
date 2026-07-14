@@ -23,8 +23,8 @@ const SITES_DIR = "/etc/caddy/sites.d";
 export interface ControlPlaneProbeExpectation {
   /** Exact deployed commit identity served by static /version.json. */
   sha: string;
-  /** Exact release identity for version+tag when the release tag is known. */
-  tag?: string;
+  /** Exact value required in both version and tag. */
+  expectedIdentity: string;
 }
 
 function sq(value: string): string {
@@ -76,19 +76,19 @@ function controlPlaneProbeLines(
   if (app.kind === "static" && expectation !== undefined) {
     lines.push(
       '    if [[ "$PROBE_STATUS" == "200" ]] && /usr/bin/python3 - "$PROBE_BODY" ' +
-        `${sq(expectation.sha)} ${sq(expectation.tag ?? "")} <<'PY'`,
+        `${sq(expectation.sha)} ${sq(expectation.expectedIdentity)} <<'PY'`,
       "import json",
       "import sys",
       "",
-      "path, expected_sha, expected_tag = sys.argv[1:]",
+      "path, expected_sha, expected_identity = sys.argv[1:]",
       "try:",
       "    with open(path, encoding='utf-8') as source:",
       "        body = json.load(source)",
       "except (OSError, UnicodeError, json.JSONDecodeError):",
       "    raise SystemExit(1)",
       "if not isinstance(body, dict): raise SystemExit(1)",
+      "if body.get('version') != expected_identity or body.get('tag') != expected_identity: raise SystemExit(1)",
       "if body.get('sha') != expected_sha or body.get('environment') != 'production': raise SystemExit(1)",
-      "if expected_tag and (body.get('version') != expected_tag or body.get('tag') != expected_tag): raise SystemExit(1)",
       "PY",
       "    then",
       "      PROBE_OK=1; break",
@@ -157,6 +157,7 @@ export function controlPlaneMainRouteFingerprint(
     : {
         mode: "present",
         kind: app.kind ?? "node",
+        staticRoot: app.staticRoot ?? null,
         host: app.mainHost,
         listen: app.mainListen ?? "cp-http80",
         appDir: app.appDir,

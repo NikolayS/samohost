@@ -38,7 +38,12 @@ const NEW_SHA = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 const OLD_HOST = "old-client.samo.team";
 const NEW_HOST = "new-client.samo.team";
 
-type CpProbeMode = "success" | "unreachable" | "bad-gateway" | "wrong-identity";
+type CpProbeMode =
+  | "success"
+  | "unreachable"
+  | "bad-gateway"
+  | "wrong-identity"
+  | "branch-identity-mismatch";
 
 function vm(): VmRecord {
   return {
@@ -226,6 +231,7 @@ describe("register -> deploy/trigger two-hop routing lifecycle", () => {
       "  unreachable) exit 7 ;;",
       "  bad-gateway) printf 'upstream unavailable' > \"$output\"; printf '502' ;;",
       "  wrong-identity) printf '%s' '{\"version\":\"old\",\"tag\":\"old\",\"sha\":\"0000000000000000000000000000000000000000\",\"environment\":\"production\"}' > \"$output\"; printf '200' ;;",
+      "  branch-identity-mismatch) printf '{\"version\":\"wrong\",\"tag\":\"wrong\",\"sha\":\"%s\",\"environment\":\"production\"}' \"$CP_EXPECTED_SHA\" > \"$output\"; printf '200' ;;",
       "  success) printf '{\"version\":\"%s\",\"tag\":\"%s\",\"sha\":\"%s\",\"environment\":\"production\"}' \"$CP_EXPECTED_TAG\" \"$CP_EXPECTED_TAG\" \"$CP_EXPECTED_SHA\" > \"$output\"; printf '200' ;;",
       "  *) exit 65 ;;",
       "esac",
@@ -536,6 +542,58 @@ describe("register -> deploy/trigger two-hop routing lifecycle", () => {
       .toHaveLength(3);
     expect(result.saved.deployedSha).toBe(SHA);
     expect(result.saved.controlPlaneRouteFingerprint).toBe(result.seeded.fingerprint);
+  });
+
+  test("executed CP probe: branch static deploy rejects version/tag mismatch at the right SHA", async () => {
+    const branchSpec = input({
+      kind: "static",
+      buildCmd: "npm run build",
+      healthUrl: "http://127.0.0.1/version.json",
+    });
+    const seeded = seedAppliedRoute(branchSpec);
+    const harness = executedControlPlaneHarness(
+      seeded.app,
+      "branch-identity-mismatch",
+      { sha: NEW_SHA, tag: NEW_SHA },
+    );
+    const deps: AppDeployDeps = {
+      remote: async () => {
+        harness.events.push("deploy");
+        return ok("<<<SAMOHOST_PHASE:health:start>>>\n<<<SAMOHOST_PHASE:health:ok>>>");
+      },
+      resolveRef: async () => NEW_SHA,
+      fetch: (async () => ({
+        ok: true,
+        json: async () => ({ workflow_runs: [{ status: "completed", conclusion: "success" }] }),
+      }) as Response) as unknown as typeof fetch,
+      now: () => new Date("2026-07-14T01:00:00.000Z"),
+      env: { GH_TOKEN: "test" },
+      projectRoute: harness.projectRoute,
+      controlPlaneRoute: harness.controlPlaneRoute,
+    };
+    const c = capture();
+    const code = await runAppDeploy(
+      { vm: vm().name, app: "client-site", sha: NEW_SHA, skipCiGate: false },
+      { json: true },
+      vmStore,
+      appStore,
+      deps,
+      c.out,
+      c.err,
+    );
+    expect(code).toBe(1);
+    expect(c.e).toContain("last status: 200");
+    expect(harness.events).toEqual([
+      "project:begin",
+      "deploy",
+      "project:prepare",
+      "control-plane",
+      "project:rollback",
+    ]);
+    expect(appStore.get(vm().id, "client-site")?.deployedSha).toBe(SHA);
+    expect(
+      appStore.get(vm().id, "client-site")?.controlPlaneRouteFingerprint,
+    ).toBe(seeded.fingerprint);
   });
 
   test("executed CP probe: exact static tag/SHA identity commits both hops then stamps", async () => {

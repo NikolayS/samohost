@@ -493,6 +493,8 @@ describe("buildDeployScript — static path (kind='static')", () => {
       const baseFile = join(caddyDir, "Caddyfile");
       writeFileSync(baseFile, legacyBase);
       const siteFile = join(caddyDir, "sites.d", "00-main-my-static-site.caddy");
+      const curlLog = join(dir, "curl.log");
+      writeFileSync(curlLog, "");
 
       writeFileSync(join(binDir, "sudo"), [
         "#!/usr/bin/env bash",
@@ -504,6 +506,7 @@ describe("buildDeployScript — static path (kind='static')", () => {
       writeFileSync(join(binDir, "sleep"), "#!/usr/bin/env bash\nexit 0\n");
       writeFileSync(join(binDir, "curl"), [
         "#!/usr/bin/env bash",
+        'printf "%s\\n" "$*" >> "$CURL_LOG"',
         'if [[ "$*" == *"version.json"* ]]; then',
         '  root=$(sed -n \'s/^[[:space:]]*root \\* "\\(.*\\)"$/\\1/p\' "$CADDY_SITE" | head -n 1)',
         '  if [[ "${FAIL_VERSION_HEALTH:-0}" == "1" ]]; then printf \'invalid\\n\'; else cat "$root/version.json"; fi',
@@ -527,8 +530,18 @@ describe("buildDeployScript — static path (kind='static')", () => {
       const activePaths = staticReleaseStatePaths(appDir);
       const domainFile = join(caddyDir, "sites.d", "10-domain-client-example.caddy");
       let lastExecutionStderr = "";
-      const execute = (sha: string, tag: string, expectFailure = false): string => {
-        const script = buildDeployScript(releaseApp, { sha, tag })
+      const execute = (
+        sha: string,
+        tag: string,
+        expectFailure = false,
+        targetApp: AppRecord = releaseApp,
+        deferStaticCleanup = false,
+      ): string => {
+        const script = buildDeployScript(targetApp, {
+          sha,
+          tag,
+          ...(deferStaticCleanup ? { deferStaticCleanup: true } : {}),
+        })
           .replaceAll("/etc/caddy", caddyDir);
         const result = spawnSync("bash", ["-s"], {
           input: script,
@@ -537,6 +550,7 @@ describe("buildDeployScript — static path (kind='static')", () => {
             ...process.env,
             PATH: `${binDir}:${process.env["PATH"] ?? ""}`,
             CADDY_SITE: siteFile,
+            CURL_LOG: curlLog,
             FAIL_VERSION_HEALTH: expectFailure ? "1" : "0",
           },
         });
@@ -661,7 +675,38 @@ describe("buildDeployScript — static path (kind='static')", () => {
         `${firstSha}.candidate`,
       );
 
-      execute(badSymlinkSha, "v20260713.5", true);
+      // A manifest route change must restore and probe the snapshotted old
+      // cp-http80 host, not the desired new TLS host. Only after that proof may
+      // the failed candidate be removed and active state remain old.
+      writeFileSync(curlLog, "");
+      const driftedApp: AppRecord = {
+        ...releaseApp,
+        mainHost: "renamed-static.example.com",
+        mainListen: "tls",
+      };
+      const driftScript = execute(
+        firstSha,
+        "v20260713.5",
+        true,
+        driftedApp,
+        true,
+      );
+      const curlCalls = readFileSync(curlLog, "utf8").trim().split("\n");
+      expect(curlCalls.at(-1)).toContain("Host: my-static-site.example.com");
+      expect(curlCalls.at(-1)).toContain("http://127.0.0.1/");
+      expect(curlCalls.at(-1)).not.toContain("renamed-static.example.com");
+      expect(driftScript).toContain('SAMOHOST_OLD_ROUTE_SCHEME=""');
+      expect(driftScript).toContain('SAMOHOST_OLD_ROUTE_ADDRESS=""');
+      expect(driftScript.indexOf('"$SAMOHOST_OLD_ROUTE_SCHEME://127.0.0.1/"'))
+        .toBeLessThan(driftScript.indexOf('worktree remove --force "$SAMOHOST_CANDIDATE_DIR"'));
+      expect(routedRoot()).toBe(secondRoot);
+      expect(readFileSync(activePaths.activeState, "utf8")).toBe(secondState);
+      expect(readFileSync(activePaths.activeRoute, "utf8")).toBe(secondRoute);
+      expect(git(["worktree", "list", "--porcelain"], appDir)).not.toContain(
+        `${firstSha}.candidate`,
+      );
+
+      execute(badSymlinkSha, "v20260713.6", true);
       expect(lastExecutionStderr).toContain("staticRoot tree contains a symlink");
       expect(routedRoot()).toBe(secondRoot);
       expect(activeRoot()).toBe(secondRoot);

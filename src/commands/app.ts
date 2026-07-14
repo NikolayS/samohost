@@ -921,7 +921,7 @@ export async function runAppDeploy(
     if (outcome === "deployed") {
       const routeResult = await completeTwoHopMainRoute(app, vm, routeDeps, {
         sha,
-        ...(input.releaseTag !== undefined ? { tag: input.releaseTag } : {}),
+        expectedIdentity: input.releaseTag ?? sha,
       });
       routing = routeResult.routing;
       if (!routeResult.ok) err(`error: ${routeResult.error ?? "two-hop route reconcile failed"}`);

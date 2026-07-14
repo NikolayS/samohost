@@ -2,6 +2,7 @@
 
 import { createHash } from "node:crypto";
 import { assertSafeAppIdentity } from "../app/identity.ts";
+import { staticReleaseStatePaths, staticRootOf } from "../app/static-root.ts";
 import type { AppRecord } from "../types.ts";
 import { planFromApp, renderVhost } from "./render.ts";
 
@@ -58,8 +59,12 @@ export function projectMainRouteTransitionPath(app: AppRecord): string {
 
 function common(app: AppRecord, desiredFingerprint: string): string[] {
   assertSafeAppIdentity(app);
+  staticRootOf(app);
   assertFingerprint(desiredFingerprint, "desired");
   const txn = transactionDir(app);
+  const active = app.kind === "static"
+    ? staticReleaseStatePaths(app.appDir)
+    : undefined;
   return [
     "set -euo pipefail",
     "umask 077",
@@ -71,11 +76,27 @@ function common(app: AppRecord, desiredFingerprint: string): string[] {
     'BASE_BACKUP="$TXN/base.caddy"',
     'PRESENCE="$TXN/presence"',
     'TOKEN="$TXN/token"',
+    ...(active === undefined
+      ? []
+      : [
+        `ACTIVE_ROUTE=${sq(active.activeRoute)}`,
+        `ACTIVE_STATE=${sq(active.activeState)}`,
+        'ACTIVE_ROUTE_BACKUP="$TXN/active-route.caddy"',
+        'ACTIVE_STATE_BACKUP="$TXN/active-state.json"',
+        'ACTIVE_ROUTE_PRESENCE="$TXN/active-route-presence"',
+        'ACTIVE_STATE_PRESENCE="$TXN/active-state-presence"',
+      ]),
     `EXPECTED=${sq(desiredFingerprint)}`,
     '[[ ! -L "$TXN" && "$(stat -c %u "$TXN")" == "$(id -u)" && "$(stat -c %a "$TXN")" == "700" ]] || { echo "error: insecure project route transaction directory" >&2; exit 1; }',
     '[[ -d "$TXN" && -f "$TOKEN" && "$(cat "$TOKEN")" == "$EXPECTED" ]] || { echo "error: project route transaction token mismatch" >&2; exit 1; }',
     '[[ -f "$PRESENCE" ]] || { echo "error: project route transaction has no snapshot state" >&2; exit 1; }',
     'case "$(cat "$PRESENCE")" in present) [[ -f "$BACKUP" ]] || { echo "error: project route snapshot is missing" >&2; exit 1; } ;; absent) ;; *) echo "error: invalid project route snapshot state" >&2; exit 1 ;; esac',
+    ...(active === undefined
+      ? []
+      : [
+        'case "$(cat "$ACTIVE_ROUTE_PRESENCE")" in present) [[ -f "$ACTIVE_ROUTE_BACKUP" ]] || { echo "error: active static route snapshot is missing" >&2; exit 1; } ;; absent) ;; *) echo "error: invalid active static route snapshot state" >&2; exit 1 ;; esac',
+        'case "$(cat "$ACTIVE_STATE_PRESENCE")" in present) [[ -f "$ACTIVE_STATE_BACKUP" ]] || { echo "error: active static state snapshot is missing" >&2; exit 1; } ;; absent) ;; *) echo "error: invalid active static state snapshot state" >&2; exit 1 ;; esac',
+      ]),
     ...(app.kind === "static" && app.releaseTagPattern !== undefined
       ? ['[[ -f "$BASE_BACKUP" ]] || { echo "error: project base Caddyfile snapshot is missing" >&2; exit 1; }']
       : []),
@@ -96,6 +117,9 @@ export function buildProjectMainRouteBeginScript(
   const txn = transactionDir(app);
   const live = projectMainRoutePath(app);
   const transition = projectMainRouteTransitionPath(app);
+  const active = app.kind === "static"
+    ? staticReleaseStatePaths(app.appDir)
+    : undefined;
   return [
     "#!/usr/bin/env bash",
     "# samohost project main-route transaction begin",
@@ -105,6 +129,12 @@ export function buildProjectMainRouteBeginScript(
     `TRANSITION=${sq(transition)}`,
     `CADDYFILE=${sq(CADDYFILE)}`,
     `TXN=${sq(txn)}`,
+    ...(active === undefined
+      ? []
+      : [
+        `ACTIVE_ROUTE=${sq(active.activeRoute)}`,
+        `ACTIVE_STATE=${sq(active.activeState)}`,
+      ]),
     'TOKEN="$TXN/token"',
     `EXPECTED=${sq(desiredFingerprint)}`,
     `APPLIED=${sq(appliedFingerprint ?? "")}`,
@@ -115,6 +145,13 @@ export function buildProjectMainRouteBeginScript(
     '  if [[ "$EXISTING" == "$EXPECTED" ]]; then',
     '    [[ -f "$TXN/presence" ]] || { echo "error: resumed project route transaction has no snapshot" >&2; exit 1; }',
     '    if [[ "$(cat "$TXN/presence")" == "present" ]]; then [[ -f "$TXN/previous.caddy" ]] || { echo "error: resumed project route snapshot is missing" >&2; exit 1; }; fi',
+    ...(active === undefined
+      ? []
+      : [
+        '    [[ -f "$TXN/active-route-presence" && -f "$TXN/active-state-presence" ]] || { echo "error: resumed active static snapshot state is missing" >&2; exit 1; }',
+        '    if [[ "$(cat "$TXN/active-route-presence")" == "present" ]]; then [[ -f "$TXN/active-route.caddy" ]] || { echo "error: resumed active static route snapshot is missing" >&2; exit 1; }; fi',
+        '    if [[ "$(cat "$TXN/active-state-presence")" == "present" ]]; then [[ -f "$TXN/active-state.json" ]] || { echo "error: resumed active static state snapshot is missing" >&2; exit 1; }; fi',
+      ]),
     ...(app.kind === "static" && app.releaseTagPattern !== undefined
       ? ['    [[ -f "$TXN/base.caddy" ]] || { echo "error: resumed base Caddyfile snapshot is missing" >&2; exit 1; }']
       : []),
@@ -136,6 +173,12 @@ export function buildProjectMainRouteBeginScript(
     ...(app.kind === "static" && app.releaseTagPattern !== undefined
       ? ['cat -- "$CADDYFILE" > "$TXN/base.caddy"']
       : []),
+    ...(active === undefined
+      ? []
+      : [
+        'if [[ -f "$ACTIVE_ROUTE" ]]; then cat -- "$ACTIVE_ROUTE" > "$TXN/active-route.caddy"; printf "present\\n" > "$TXN/active-route-presence"; else printf "absent\\n" > "$TXN/active-route-presence"; fi',
+        'if [[ -f "$ACTIVE_STATE" ]]; then cat -- "$ACTIVE_STATE" > "$TXN/active-state.json"; printf "present\\n" > "$TXN/active-state-presence"; else printf "absent\\n" > "$TXN/active-state-presence"; fi',
+      ]),
     'if [[ -f "$LIVE" ]]; then',
     '  cat -- "$LIVE" > "$TXN/previous.caddy"',
     '  printf "present\\n" > "$TXN/presence"',
@@ -168,13 +211,19 @@ function restoreLines(): string[] {
 }
 
 function restoreBaseLines(app: AppRecord): string[] {
-  if (app.kind !== "static" || app.releaseTagPattern === undefined) {
+  if (app.kind !== "static") {
     return ["restore_base_files() { :; }"];
   }
   return [
     "restore_base_files() {",
-    '  sudo /usr/bin/tee /etc/caddy/.samohost-next-Caddyfile >/dev/null < "$BASE_BACKUP"',
-    "  sudo /usr/bin/mv -- /etc/caddy/.samohost-next-Caddyfile /etc/caddy/Caddyfile",
+    ...(app.releaseTagPattern !== undefined
+      ? [
+        '  sudo /usr/bin/tee /etc/caddy/.samohost-next-Caddyfile >/dev/null < "$BASE_BACKUP"',
+        "  sudo /usr/bin/mv -- /etc/caddy/.samohost-next-Caddyfile /etc/caddy/Caddyfile",
+      ]
+      : []),
+    '  if [[ "$(cat "$ACTIVE_ROUTE_PRESENCE")" == "present" ]]; then install -m 0644 "$ACTIVE_ROUTE_BACKUP" "${ACTIVE_ROUTE}.next" && /usr/bin/mv -f "${ACTIVE_ROUTE}.next" "$ACTIVE_ROUTE"; else rm -f "$ACTIVE_ROUTE" "${ACTIVE_ROUTE}.next"; fi',
+    '  if [[ "$(cat "$ACTIVE_STATE_PRESENCE")" == "present" ]]; then install -m 0644 "$ACTIVE_STATE_BACKUP" "${ACTIVE_STATE}.next" && /usr/bin/mv -f "${ACTIVE_STATE}.next" "$ACTIVE_STATE"; else rm -f "$ACTIVE_STATE" "${ACTIVE_STATE}.next"; fi',
     "}",
   ];
 }
@@ -246,29 +295,46 @@ export function buildProjectMainRoutePrepareScript(
 
   if (app.kind === "static") {
     const base = appBase(app);
+    const staticRoot = staticRootOf(app) ?? "";
+    const fallbackRoot = staticRoot === ""
+      ? app.appDir
+      : `${app.appDir.replace(/\/+$/, "")}/${staticRoot}`;
     lines.push(
-      `python3 - "$TRANSITION" "$LIVE" "$BACKUP" "$DESIRED" ${sq(app.mainHost)} ${sq(app.mainListen ?? "cp-http80")} ${sq(app.appDir)} ${sq(base)} <<'PY'`,
+      `python3 - "$TRANSITION" "$LIVE" "$BACKUP" "$DESIRED" ${sq(app.mainHost)} ${sq(app.mainListen ?? "cp-http80")} ${sq(fallbackRoot)} ${sq(app.appDir)} ${sq(base)} ${sq(staticRoot)} <<'PY'`,
       "import json",
       "import os",
       "import re",
       "import sys",
       "",
-      "transition, live, backup, desired, host, listen, fallback_root, app_base = sys.argv[1:]",
+      "transition, live, backup, desired, host, listen, fallback_root, fallback_worktree, app_base, static_root = sys.argv[1:]",
       "root_re = re.compile(r'^\\s*root\\s+\\*\\s+(?:\"([^\"]+)\"|(\\S+))\\s*$', re.MULTILINE)",
+      "worktree_re = re.compile(r'^\\s*#\\s*samohost-worktree\\s+\"([^\"]+)\"\\s*$', re.MULTILINE)",
       "root = None",
+      "worktree = None",
       "for source in (transition, live, backup):",
       "    if os.path.isfile(source):",
-      "        match = root_re.search(open(source, encoding='utf-8').read())",
-      "        if match:",
-      "            root = match.group(1) or match.group(2)",
-      "            break",
+      "        text = open(source, encoding='utf-8').read()",
+      "        root_match = root_re.search(text)",
+      "        worktree_match = worktree_re.search(text)",
+      "        if root_match and root is None: root = root_match.group(1) or root_match.group(2)",
+      "        if worktree_match and worktree is None: worktree = worktree_match.group(1)",
+      "        if root is not None and worktree is not None: break",
       "if root is None:",
       "    root = fallback_root",
+      "if worktree is None:",
+      "    suffix = '/' + static_root if static_root else ''",
+      "    if suffix and root.endswith(suffix): worktree = root[:-len(suffix)]",
+      "    elif not suffix: worktree = root",
+      "    else: worktree = fallback_worktree",
       "release_root = app_base.rstrip('/') + '/releases/'",
       "if root != fallback_root and not root.startswith(release_root):",
       "    raise SystemExit('existing static route root is outside the managed app tree')",
+      "if worktree != fallback_worktree and not worktree.startswith(release_root):",
+      "    raise SystemExit('existing static worktree is outside the managed app tree')",
+      "if root != worktree and not root.startswith(worktree.rstrip('/') + '/'):",
+      "    raise SystemExit('static route root is outside its worktree')",
       "address = f'http://{host}:80' if listen == 'cp-http80' else host",
-      "lines = [address + ' {', '\\troot * ' + json.dumps(root), '\\ttry_files {path} /index.html', '\\tfile_server', '\\tencode gzip']",
+      "lines = [address + ' {', '\\t# samohost-worktree ' + json.dumps(worktree), '\\troot * ' + json.dumps(root), '\\ttry_files {path} /index.html', '\\tfile_server', '\\tencode gzip']",
       "if listen == 'tls': lines.append('\\ttls internal')",
       "lines.append('}')",
       "with open(desired, 'w', encoding='utf-8') as output: output.write('\\n'.join(lines) + '\\n')",
@@ -317,14 +383,18 @@ export function buildProjectMainRoutePrepareScript(
 function releaseCleanupLines(app: AppRecord, remove: "old" | "new"): string[] {
   if (app.kind !== "static") return [];
   const releases = `${appBase(app)}/releases`;
+  const staticRoot = staticRootOf(app) ?? "";
   const currentFile = remove === "old" ? "$BACKUP" : "$TXN/current.caddy";
   const otherFile = remove === "old" ? "$TXN/current.caddy" : "$BACKUP";
   return [
     `RELEASES=${sq(releases)}`,
-    `REMOVE_ROOT=$(sed -n 's/^[[:space:]]*root \\* "\\(.*\\)"$/\\1/p' "${currentFile}" 2>/dev/null | head -n 1)`,
-    `KEEP_ROOT=$(sed -n 's/^[[:space:]]*root \\* "\\(.*\\)"$/\\1/p' "${otherFile}" 2>/dev/null | head -n 1)`,
-    'if [[ -n "$REMOVE_ROOT" && "$REMOVE_ROOT" == "$RELEASES/"* && "$REMOVE_ROOT" != "$KEEP_ROOT" && -d "$REMOVE_ROOT" ]]; then',
-    `  git -C ${sq(app.appDir)} worktree remove --force "$REMOVE_ROOT" || true`,
+    `STATIC_ROOT=${sq(staticRoot)}`,
+    `REMOVE_WORKTREE=$(sed -n 's/^[[:space:]]*# samohost-worktree "\\(.*\\)"$/\\1/p' "${currentFile}" 2>/dev/null | head -n 1)`,
+    `KEEP_WORKTREE=$(sed -n 's/^[[:space:]]*# samohost-worktree "\\(.*\\)"$/\\1/p' "${otherFile}" 2>/dev/null | head -n 1)`,
+    `if [[ -z "$REMOVE_WORKTREE" ]]; then REMOVE_WORKTREE=$(sed -n 's/^[[:space:]]*root \\* "\\(.*\\)"$/\\1/p' "${currentFile}" 2>/dev/null | head -n 1); [[ -z "$STATIC_ROOT" || "$REMOVE_WORKTREE" != */"$STATIC_ROOT" ]] || REMOVE_WORKTREE="${'$'}{REMOVE_WORKTREE%/"$STATIC_ROOT"}"; fi`,
+    `if [[ -z "$KEEP_WORKTREE" ]]; then KEEP_WORKTREE=$(sed -n 's/^[[:space:]]*root \\* "\\(.*\\)"$/\\1/p' "${otherFile}" 2>/dev/null | head -n 1); [[ -z "$STATIC_ROOT" || "$KEEP_WORKTREE" != */"$STATIC_ROOT" ]] || KEEP_WORKTREE="${'$'}{KEEP_WORKTREE%/"$STATIC_ROOT"}"; fi`,
+    'if [[ -n "$REMOVE_WORKTREE" && "$REMOVE_WORKTREE" == "$RELEASES/"* && "$REMOVE_WORKTREE" != "$KEEP_WORKTREE" && -d "$REMOVE_WORKTREE" ]]; then',
+    `  git -C ${sq(app.appDir)} worktree remove --force "$REMOVE_WORKTREE" || true`,
     "fi",
     `git -C ${sq(app.appDir)} worktree prune || true`,
   ];
