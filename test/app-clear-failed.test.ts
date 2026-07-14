@@ -56,6 +56,13 @@ function capture() {
   };
 }
 
+function putApp(store: AppStore, record: AppRecord): AppRecord {
+  const current = store.get(record.vmId, record.name);
+  return current === undefined
+    ? store.create(record)
+    : store.compareAndSwap(current, record);
+}
+
 const SHA = "ce9f73c3c2a937f82dfbe2c58228ece3529e3c08";
 
 const HAPPY = [
@@ -141,7 +148,7 @@ describe("failedSha escape hatches", () => {
   afterEach(() => rmSync(dir, { recursive: true, force: true }));
 
   function seedFailedSha(): void {
-    appStore.upsert({ ...appStore.get("vm-1111", "field-record")!, failedSha: SHA });
+    putApp(appStore, { ...appStore.get("vm-1111", "field-record")!, failedSha: SHA });
   }
 
   test("clear-failed empties failedSha and confirms with the cleared SHA", () => {

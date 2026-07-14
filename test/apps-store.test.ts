@@ -58,14 +58,17 @@ describe("AppStore", () => {
     expect(store.get("vm-b", "field-record")?.deployedSha).toBe("bbb");
   });
 
-  test("upsert replaces by (vmId, name) preserving id", () => {
+  test("existing records require compareAndSwap and preserve id", () => {
     const store = new AppStore(appsPath);
     const first = store.upsert(app("vm-a", "fr", { deployedSha: "old" }));
-    const second = store.upsert(
+    expect(() => store.upsert(
       app("vm-a", "fr", { id: "DIFFERENT-ID", deployedSha: "new" }),
-    );
+    )).toThrow(/changed concurrently/);
+    const second = store.compareAndSwap(first, {
+      ...first,
+      deployedSha: "new",
+    });
     expect(store.list().length).toBe(1);
-    // id of the existing record is preserved, not overwritten.
     expect(second.id).toBe(first.id);
     expect(store.get("vm-a", "fr")?.deployedSha).toBe("new");
   });

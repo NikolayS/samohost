@@ -53,6 +53,13 @@ function capture() {
   };
 }
 
+function putApp(store: AppStore, record: AppRecord): AppRecord {
+  const current = store.get(record.vmId, record.name);
+  return current === undefined
+    ? store.create(record)
+    : store.compareAndSwap(current, record);
+}
+
 const SHA = "abc1234def5678901234567890abcdef12345678";
 
 // ---------------------------------------------------------------------------
@@ -235,7 +242,7 @@ describe("app bootstrap uses the stored app kind for the database contract", () 
     vmStore = new StateStore(join(dir, "state.json"));
     appStore = new AppStore(join(dir, "apps.json"));
     vmStore.upsert(vm());
-    appStore.upsert({
+    putApp(appStore, {
       id: "app-static",
       vmId: "vm-1111",
       name: "site",
@@ -247,7 +254,7 @@ describe("app bootstrap uses the stored app kind for the database contract", () 
       healthUrl: "https://site.example.com/",
       serviceUnit: "site",
     });
-    appStore.upsert({
+    putApp(appStore, {
       id: "app-node",
       vmId: "vm-1111",
       name: "api",
@@ -295,7 +302,7 @@ describe("app bootstrap uses the stored app kind for the database contract", () 
 
   test("cp-http80 bootstrap fails closed without a control-plane IP", () => {
     const existing = appStore.get("vm-1111", "site")!;
-    appStore.upsert({
+    putApp(appStore, {
       ...existing,
       mainHost: "site.example.com",
       mainListen: "cp-http80",
@@ -315,7 +322,7 @@ describe("app bootstrap uses the stored app kind for the database contract", () 
 
   test("cp-http80 bootstrap emits only the requested source-restricted :80 rule", () => {
     const existing = appStore.get("vm-1111", "site")!;
-    appStore.upsert({
+    putApp(appStore, {
       ...existing,
       mainHost: "site.example.com",
       mainListen: "cp-http80",
@@ -336,7 +343,7 @@ describe("app bootstrap uses the stored app kind for the database contract", () 
 
   test("cp-http80 bootstrap rejects a non-IP control-plane source", () => {
     const existing = appStore.get("vm-1111", "site")!;
-    appStore.upsert({
+    putApp(appStore, {
       ...existing,
       mainHost: "site.example.com",
       mainListen: "cp-http80",
@@ -355,7 +362,7 @@ describe("app bootstrap uses the stored app kind for the database contract", () 
 
   test("cp-http80 bootstrap reuses the source IP persisted during provision", () => {
     const existing = appStore.get("vm-1111", "site")!;
-    appStore.upsert({
+    putApp(appStore, {
       ...existing,
       mainHost: "site.example.com",
       mainListen: "cp-http80",
@@ -380,7 +387,7 @@ describe("app bootstrap uses the stored app kind for the database contract", () 
       controlPlaneIp: "91.99.233.145",
     } as Partial<VmRecord> & { controlPlaneIp: string }));
     const existing = appStore.get("vm-1111", "site")!;
-    appStore.upsert({
+    putApp(appStore, {
       ...existing,
       mainHost: "site.example.com",
       mainListen: "tls",
@@ -398,7 +405,7 @@ describe("app bootstrap uses the stored app kind for the database contract", () 
 
   test("node cp-http80 bootstrap emits its source-restricted :80 rule", () => {
     const existing = appStore.get("vm-1111", "api")!;
-    appStore.upsert({
+    putApp(appStore, {
       ...existing,
       mainHost: "api.example.com",
       mainListen: "cp-http80",
@@ -417,7 +424,7 @@ describe("app bootstrap uses the stored app kind for the database contract", () 
 
   test("cp-http80 bootstrap accepts an IPv6 source but rejects an IPv6 CIDR", () => {
     const existing = appStore.get("vm-1111", "site")!;
-    appStore.upsert({
+    putApp(appStore, {
       ...existing,
       mainHost: "site.example.com",
       mainListen: "cp-http80",
@@ -446,7 +453,7 @@ describe("app bootstrap uses the stored app kind for the database contract", () 
       controlPlaneIp: "stale-not-an-ip",
     } as Partial<VmRecord> & { controlPlaneIp: string }));
     const existing = appStore.get("vm-1111", "site")!;
-    appStore.upsert({
+    putApp(appStore, {
       ...existing,
       mainHost: "site.example.com",
       mainListen: "tls",
@@ -598,7 +605,7 @@ describe("app commands", () => {
         const snapshot = super.get(vmId, name);
         if (!this.raced && snapshot === undefined) {
           this.raced = true;
-          super.upsert({
+          super.create({
             id: "first-creator",
             vmId,
             name,
@@ -829,7 +836,7 @@ describe("app commands", () => {
       deployDeps(HAPPY, {
         remote: () => {
           const current = appStore.get("vm-1111", "field-record")!;
-          appStore.upsert({
+          putApp(appStore, {
             ...current,
             deployedSha: "concurrent-sha",
             releaseTagCursor: "v20260714.2",
@@ -876,7 +883,7 @@ describe("app commands", () => {
   test("deploy rollback path: exit 1, failedSha set, deployedSha unchanged", async () => {
     register();
     // seed a prior good deploy so we can assert deployedSha is NOT advanced.
-    appStore.upsert({ ...appStore.get("vm-1111", "field-record")!, deployedSha: "GOODSHA" });
+    putApp(appStore, { ...appStore.get("vm-1111", "field-record")!, deployedSha: "GOODSHA" });
     const c = capture();
     const code = await runAppDeploy(
       { vm: "samo-we-field-record", app: "field-record", sha: SHA, skipCiGate: false },
@@ -892,7 +899,7 @@ describe("app commands", () => {
 
   test("known-bad-SHA guard refuses a recorded failedSha", async () => {
     register();
-    appStore.upsert({ ...appStore.get("vm-1111", "field-record")!, failedSha: SHA });
+    putApp(appStore, { ...appStore.get("vm-1111", "field-record")!, failedSha: SHA });
     const c = capture();
     const code = await runAppDeploy(
       { vm: "samo-we-field-record", app: "field-record", sha: SHA, skipCiGate: false },

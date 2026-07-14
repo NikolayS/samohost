@@ -4,7 +4,9 @@
  * Apps live in a SEPARATE document from VMs (`~/.samohost/apps.json`, override
  * via the `SAMOHOST_APPS` env var or the constructor `path` arg used by tests),
  * so the VM lifecycle store and the deploy bookkeeping evolve independently. The
- * crash-safe write contract is shared with {@link StateStore} via `./atomic.ts`.
+ * process-crash-safe write contract is shared with {@link StateStore} via
+ * `./atomic.ts`. It does not claim power-loss durability: the containing
+ * directory is not fsynced after rename.
  *
  * Apps are keyed by `id`, but the natural identity is (vmId, name): an app name
  * is unique per VM. {@link AppStore.get} resolves by that pair.
@@ -13,16 +15,14 @@
 import { randomUUID } from "node:crypto";
 import {
   closeSync,
-  fsyncSync,
+  existsSync,
   mkdirSync,
   openSync,
-  readFileSync,
-  statSync,
+  readdirSync,
   unlinkSync,
-  writeSync,
 } from "node:fs";
 import { homedir } from "node:os";
-import { dirname, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { isDeepStrictEqual } from "node:util";
 import type { AppRecord } from "../types.ts";
 import {
@@ -37,11 +37,11 @@ interface AppsFile {
 }
 
 const EMPTY: AppsFile = { version: 1, apps: [] };
-const INVALID_LOCK_STALE_MS = 30_000;
 
 interface LockOwner {
   pid: number;
   token: string;
+  path: string;
 }
 
 /** A compare-and-swap failed because another writer changed the AppRecord. */
@@ -74,12 +74,14 @@ export function defaultAppsPath(): string {
 export class AppStore {
   readonly path: string;
   private readonly paths: DocPaths;
-  private readonly lockPath: string;
+  private readonly lockPrefix: string;
+  private readonly legacyLockPath: string;
 
   constructor(path?: string) {
     this.path = path ?? defaultAppsPath();
     this.paths = docPaths(this.path);
-    this.lockPath = `${this.path}.lock`;
+    this.lockPrefix = `${basename(this.path)}.lock.`;
+    this.legacyLockPath = `${this.path}.lock`;
   }
 
   /** All app records (empty array if no file yet). */
@@ -97,14 +99,28 @@ export class AppStore {
     return this.read().apps.find((a) => a.id === id);
   }
 
+  /** Insert only when (vmId, name) is absent. */
+  create(record: AppRecord): AppRecord {
+    assertOptionalLinuxAppUser(record.appUser);
+    return this.withMutationLock(() => {
+      const state = this.read();
+      if (state.apps.some(
+        (app) => app.vmId === record.vmId && app.name === record.name,
+      )) {
+        throw new AppStoreConflictError(record.vmId, record.name);
+      }
+      state.apps.push(record);
+      this.write(state);
+      return record;
+    });
+  }
+
   /**
-   * Insert or replace an app. Identity is (vmId, name): if a record with the
-   * same pair exists it is replaced (preserving its id), otherwise the supplied
-   * record is appended. Returns the stored record.
+   * Backward-compatible insert alias. Existing records are never replaced;
+   * callers performing read-modify-write must use {@link compareAndSwap}.
    */
   upsert(record: AppRecord): AppRecord {
-    assertOptionalLinuxAppUser(record.appUser);
-    return this.withMutationLock(() => this.upsertUnlocked(record));
+    return this.create(record);
   }
 
   /**
@@ -153,22 +169,6 @@ export class AppStore {
     });
   }
 
-  private upsertUnlocked(record: AppRecord): AppRecord {
-    const state = this.read();
-    const idx = state.apps.findIndex(
-      (a) => a.vmId === record.vmId && a.name === record.name,
-    );
-    if (idx >= 0) {
-      const stored: AppRecord = { ...record, id: state.apps[idx]!.id };
-      state.apps[idx] = stored;
-      this.write(state);
-      return stored;
-    }
-    state.apps.push(record);
-    this.write(state);
-    return record;
-  }
-
   private withMutationLock<T>(fn: () => T): T {
     const owner = this.acquireLock();
     try {
@@ -179,85 +179,56 @@ export class AppStore {
   }
 
   private acquireLock(): LockOwner {
-    mkdirSync(dirname(this.path), { recursive: true });
+    const directory = dirname(this.path);
+    mkdirSync(directory, { recursive: true });
+    // Fail closed across upgrades. The old shared lock name cannot be safely
+    // reclaimed without risking deletion of a replacement owner.
+    if (existsSync(this.legacyLockPath)) {
+      throw new AppStoreLockedError(this.path);
+    }
     const owner: LockOwner = {
       pid: process.pid,
       token: randomUUID(),
+      path: "",
     };
+    owner.path = join(
+      directory,
+      `${this.lockPrefix}${owner.pid}.${owner.token}`,
+    );
 
-    for (let attempt = 0; attempt < 2; attempt++) {
-      try {
-        const fd = openSync(this.lockPath, "wx", 0o600);
-        try {
-          writeSync(fd, JSON.stringify(owner) + "\n");
-          fsyncSync(fd);
-        } finally {
-          closeSync(fd);
-        }
-        return owner;
-      } catch (error) {
-        if (!isErrno(error, "EEXIST")) throw error;
-      }
-
-      const existing = this.readLockOwner();
-      if (existing !== undefined) {
-        if (isProcessAlive(existing.pid)) {
-          throw new AppStoreLockedError(this.path, existing.pid);
-        }
-        this.removeStaleLock();
-        continue;
-      }
-
-      // A newly-created lock can briefly be empty while its owner writes and
-      // fsyncs the metadata. Never steal it during that window. An invalid
-      // lock older than the grace period is an abandoned pre-metadata crash.
-      let oldEnough = false;
-      try {
-        oldEnough = Date.now() - statSync(this.lockPath).mtimeMs >= INVALID_LOCK_STALE_MS;
-      } catch (error) {
-        if (isErrno(error, "ENOENT")) continue;
-        throw error;
-      }
-      if (!oldEnough) throw new AppStoreLockedError(this.path);
-      this.removeStaleLock();
-    }
-
-    throw new AppStoreLockedError(this.path);
-  }
-
-  private readLockOwner(): LockOwner | undefined {
+    const fd = openSync(owner.path, "wx", 0o600);
+    closeSync(fd);
     try {
-      const raw = JSON.parse(readFileSync(this.lockPath, "utf8")) as unknown;
-      if (
-        raw !== null &&
-        typeof raw === "object" &&
-        "pid" in raw &&
-        Number.isSafeInteger((raw as { pid: unknown }).pid) &&
-        (raw as { pid: number }).pid > 0 &&
-        "token" in raw &&
-        typeof (raw as { token: unknown }).token === "string" &&
-        (raw as { token: string }).token.length > 0
-      ) {
-        return raw as LockOwner;
-      }
-    } catch (error) {
-      if (isErrno(error, "ENOENT")) return undefined;
-    }
-    return undefined;
-  }
+      for (const name of readdirSync(directory)) {
+        if (!name.startsWith(this.lockPrefix)) continue;
+        const contenderPath = join(directory, name);
+        if (contenderPath === owner.path) continue;
 
-  private removeStaleLock(): void {
-    try {
-      unlinkSync(this.lockPath);
+        const suffix = name.slice(this.lockPrefix.length);
+        const separator = suffix.indexOf(".");
+        const pid = separator > 0 ? Number(suffix.slice(0, separator)) : NaN;
+        const token = separator > 0 ? suffix.slice(separator + 1) : "";
+        if (!Number.isSafeInteger(pid) || pid <= 0 || token.length === 0) {
+          throw new AppStoreLockedError(this.path);
+        }
+        if (isProcessAlive(pid)) {
+          throw new AppStoreLockedError(this.path, pid);
+        }
+
+        // Every contender path contains a random token and is never reused.
+        // Removing this exact dead owner's path therefore cannot unlink a
+        // replacement lock created by another reclaimer.
+        removeUniqueLock(contenderPath);
+      }
+      return owner;
     } catch (error) {
-      if (!isErrno(error, "ENOENT")) throw error;
+      removeUniqueLock(owner.path);
+      throw error;
     }
   }
 
   private releaseLock(owner: LockOwner): void {
-    const current = this.readLockOwner();
-    if (current?.token !== owner.token || current.pid !== owner.pid) return;
-    this.removeStaleLock();
+    removeUniqueLock(owner.path);
   }
 
   private read(): AppsFile {
@@ -266,6 +237,14 @@ export class AppStore {
 
   private write(state: AppsFile): void {
     writeDoc(this.paths, state);
+  }
+}
+
+function removeUniqueLock(path: string): void {
+  try {
+    unlinkSync(path);
+  } catch (error) {
+    if (!isErrno(error, "ENOENT")) throw error;
   }
 }
 

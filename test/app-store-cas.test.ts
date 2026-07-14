@@ -43,7 +43,7 @@ describe("AppStore lock/CAS", () => {
     store.upsert(app({ deployedSha: "old" }));
     const expected = store.get("vm-1", "site")!;
 
-    const concurrent = store.upsert({
+    const concurrent = store.compareAndSwap(expected, {
       ...expected,
       deployedSha: "concurrent-sha",
       releaseTagCursor: "v20260714.2",

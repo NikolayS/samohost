@@ -1,11 +1,12 @@
 /**
- * Shared crash-safe JSON document helpers (SPEC §5).
+ * Shared process-crash-safe JSON document helpers (SPEC §5).
  *
  * Both the VM {@link StateStore} and the {@link AppStore} persist a single JSON
- * document and need the same durability contract: serialize → copy current to
+ * document and need the same process-crash contract: serialize → copy current to
  * `.bak` → write `.tmp` (fsync) → atomic rename over the primary, recovering
  * from `.bak` if the primary is missing/corrupt. This module factors that out so
- * the two stores can't drift apart.
+ * the two stores can't drift apart. This is not a power-loss durability claim:
+ * the containing directory is not fsynced after rename.
  */
 
 import {
@@ -69,9 +70,9 @@ export function readDoc<T>(
 }
 
 /**
- * Atomic write: ensure dir → back up current primary to `.bak` → write `.tmp`
- * (fsync) → rename over the primary. An interrupted write leaves either the old
- * primary or a recoverable `.bak`.
+ * Process-crash-safe atomic write: ensure dir → back up current primary to `.bak`
+ * → write `.tmp` (fsync) → rename over the primary. An interrupted write
+ * leaves either the old primary or a recoverable `.bak`.
  */
 export function writeDoc(paths: DocPaths, value: unknown): void {
   mkdirSync(dirname(paths.path), { recursive: true });
