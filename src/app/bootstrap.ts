@@ -830,17 +830,20 @@ export function buildHostBootstrapScript(
     );
   }
 
-  // ---- static-only: firewall rules ------------------------------------------
+  // ---- source-restricted firewall rules ------------------------------------
   // For static apps, emit source-restricted ufw rules. The app is served
   // directly by Caddy on :443 (CF Full-mode origin): only Cloudflare edge IPs
   // may reach :443. Optionally, :80 is opened only to the control-plane IP.
   // This mirrors buildFirewallLines from env/script.ts — reused here so the
   // same CF-range-fetch logic is not duplicated.
-  if (isStatic) {
-    const fwLines = buildFirewallLines(true, appUser, opts.firewallOpts);
+  if (isStatic || opts.firewallOpts !== undefined) {
+    const fwLines = buildFirewallLines(isStatic, appUser, {
+      ...opts.firewallOpts,
+      allowCfHttps: isStatic,
+    });
     push(
       `# ---------------------------------------------------------------------------`,
-      `# §9c. Firewall (static app — source-restricted; world-open ufw allow NEVER emitted).`,
+      `# §9c. Firewall (source-restricted; world-open ufw allow NEVER emitted).`,
       `#      Mirrors buildFirewallLines (env/script.ts). CF ranges fetched at run time.`,
       `# ---------------------------------------------------------------------------`,
       "",

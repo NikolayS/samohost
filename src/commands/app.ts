@@ -642,7 +642,13 @@ export function runAppBootstrap(
     err("error: a non-static app bootstrap requires --db-name <name> (explicit; never derived)");
     return 1;
   }
-  const controlPlaneIp = input.controlPlaneIp ?? vm.controlPlaneIp;
+  if (input.controlPlaneIp !== undefined && app.mainListen !== "cp-http80") {
+    err("error: --control-plane-ip is only valid for cp-http80 apps");
+    return 1;
+  }
+  const controlPlaneIp = app.mainListen === "cp-http80"
+    ? input.controlPlaneIp ?? vm.controlPlaneIp
+    : input.controlPlaneIp;
   if (app.mainListen === "cp-http80" && controlPlaneIp === undefined) {
     err(
       "error: cp-http80 bootstrap requires --control-plane-ip <ip> " +
@@ -665,7 +671,7 @@ export function runAppBootstrap(
     ...(input.tlsMode !== undefined ? { tlsMode: input.tlsMode } : {}),
     ...(input.appDbRole !== undefined ? { appDbRole: input.appDbRole } : {}),
     ...(input.seedOwnerLogin !== undefined ? { seedOwnerLogin: input.seedOwnerLogin } : {}),
-    ...(controlPlaneIp !== undefined
+    ...(app.mainListen === "cp-http80" && controlPlaneIp !== undefined
       ? { firewallOpts: { controlPlaneIp } }
       : {}),
   };
@@ -682,6 +688,7 @@ export function runAppBootstrap(
 export type RemoteScriptRunner = (
   vm: VmRecord,
   script: string,
+  identity?: { runAsUser: string },
 ) => Promise<SpawnResult>;
 
 /** Injectable git-ref resolver (`gh api` in prod). Returns a full SHA. */
@@ -920,7 +927,11 @@ export async function runAppDeploy(
   // ---- push the deploy script --------------------------------------------
   let result: SpawnResult;
   try {
-    result = await deps.remote(vm, script);
+    result = await deps.remote(
+      vm,
+      script,
+      ...(app.appUser !== undefined ? [{ runAsUser: app.appUser }] : []),
+    );
   } catch (e) {
     if (routeDeps !== undefined) {
       const rollbackError = await rollbackTwoHopMainRoute(app, vm, routeDeps);
@@ -1018,7 +1029,7 @@ function defaultRemoteScriptRunner(): RemoteScriptRunner {
       });
     },
   };
-  return (vm, script) => {
+  return (vm, script, identity) => {
     // Pipe the script to the runner via a stdin-injecting spawn wrapper.
     const piping: RunDeps = {
       ...deps,
@@ -1035,7 +1046,14 @@ function defaultRemoteScriptRunner(): RemoteScriptRunner {
         });
       },
     };
-    return runRemote(vm, "bash -s", piping);
+    let command = "bash -s";
+    if (identity !== undefined) {
+      if (!/^[a-z_][a-z0-9_-]{0,31}$/.test(identity.runAsUser)) {
+        return Promise.reject(new Error("invalid appUser for remote deploy identity"));
+      }
+      command = `sudo -u ${identity.runAsUser} -- /usr/bin/bash -s`;
+    }
+    return runRemote(vm, command, piping);
   };
 }
 
