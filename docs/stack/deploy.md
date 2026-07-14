@@ -91,6 +91,12 @@ Source: SPEC-DELTA.md.
 field-record is on its homemade `deploy/deploy.sh` cron. samohost is NOT
 installed on that VM. Deploy is manual/cron, not trigger-driven.
 
+**This is a legacy exception specific to field-record.** All samohost-managed
+apps (including the gregg-sites static sites) deploy ONLY via the control-plane
+trigger from a tag — never via an on-VM script and never by the author SSHing
+in. No per-agent or per-author SSH key should ever be installed on a
+samohost-managed app VM for deploy purposes.
+
 ### samograph (as of 2026-07-07)
 
 Using samohost-trigger. Was broken by a stale DESTROYED app record (issue #124)

@@ -13,8 +13,11 @@ Key non-negotiables for SAMO client projects:
 - **Supabase / GoTrue**: not deployed on client VMs. Default to plain bcrypt +
   cookie sessions for new auth.
 - **ZFS pool**: named `tank` when present. App data never moves off `/tank`.
-- **Deploy**: `samohost-trigger.timer` handles auto-deploy. Verify `/api/version`
-  after any manual deploy. Tag ≠ ship.
+- **Deploy**: The samohost control plane deploys prod on a timer from a
+  CI-green dated tag on main. You only open PRs and cut release tags — you
+  never SSH into or run deploy commands on the app VM. "Manual deploy" means
+  an operator running `samohost app deploy` on the control plane, not the VM.
+  Tag ≠ ship: verify `/api/version` after every deploy.
 - **CI gate**: every PR must pass CI before samohost-trigger will auto-deploy to prod.
 <!-- SAMO-STACK:END -->
 
