@@ -28,6 +28,7 @@
 
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
+import { isIP } from "node:net";
 import type { ProvisionSpec, VmRecord } from "../types.ts";
 import type { StateStore } from "../state/store.ts";
 import type { ProviderPort } from "../providers/types.ts";
@@ -229,10 +230,14 @@ export async function runProvision(
   // root-cause fix for provision flakiness: without the exemption, 5-second
   // polling can accumulate ≥6 connections in 30s and trip the rate-limiter,
   // banning the control-plane from the VM it just created.
+  let controlPlaneIp: string | undefined;
   if (deps.detectEgressIp) {
     const egressIp = await deps.detectEgressIp();
-    if (egressIp !== null && !spec.trustedIps.includes(egressIp)) {
-      spec.trustedIps = [egressIp, ...spec.trustedIps];
+    if (egressIp !== null && isIP(egressIp) !== 0) {
+      controlPlaneIp = egressIp;
+      if (!spec.trustedIps.includes(egressIp)) {
+        spec.trustedIps = [egressIp, ...spec.trustedIps];
+      }
     }
   }
 
@@ -249,6 +254,7 @@ export async function runProvision(
     sshKeyPath: privateKeyPath,
     sshPort: spec.sshPort,
     sshUser: spec.adminUser,
+    ...(controlPlaneIp !== undefined ? { controlPlaneIp } : {}),
     hostKeyFingerprint: "",
     region: spec.region,
     type: spec.type,
