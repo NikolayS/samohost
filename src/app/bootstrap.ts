@@ -83,7 +83,7 @@ import {
   assertLinuxAppUser,
   assertOptionalLinuxAppUser,
 } from "./linux-user.ts";
-import { SAMOHOST_PROVENANCE_HEADER, staticMainVhostLines } from "./heal-script.ts";
+import { staticMainVhostLines } from "./heal-script.ts";
 
 // ---------------------------------------------------------------------------
 // Public types

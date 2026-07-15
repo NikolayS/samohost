@@ -48,7 +48,7 @@ import {
   staticRootOf,
   staticTreeGuardFnLines,
 } from "./static-root.ts";
-import { SAMOHOST_PROVENANCE_HEADER, staticMainVhostLines } from "./heal-script.ts";
+import { staticMainVhostLines } from "./heal-script.ts";
 
 /** Marker prefix the parser keys on. */
 export const PHASE_PREFIX = "<<<SAMOHOST_PHASE:";

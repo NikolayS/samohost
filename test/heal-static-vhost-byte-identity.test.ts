@@ -91,7 +91,8 @@ function extractHeredocLines(
   let start = -1;
   let matchCount = 0;
   for (let i = 0; i < lines.length; i++) {
-    if (lines[i].includes(openMarker)) {
+    const line = lines[i] ?? "";
+    if (line.includes(openMarker)) {
       if (matchCount === startAfter) {
         start = i + 1;
         break;
