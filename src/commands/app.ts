@@ -32,6 +32,7 @@ import {
 } from "../app/bootstrap.ts";
 import { AppStore } from "../state/apps.ts";
 import { StateStore } from "../state/store.ts";
+import { resolveProductionGeneratorSha } from "./generator-stale.ts";
 import {
   defaultKnownHostsDir,
   runRemote,
@@ -336,6 +337,11 @@ export function runAppRegister(
     ...(existing?.lastDeployAt !== undefined
       ? { lastDeployAt: existing.lastDeployAt }
       : {}),
+    // Phase 1: preserve generatorSha so a re-register doesn't wipe staleness
+    // tracking (operator flag-update runs are very common).
+    ...(existing?.generatorSha !== undefined
+      ? { generatorSha: existing.generatorSha }
+      : {}),
     ...(existing?.releaseTagPattern === input.releaseTagPattern &&
     existing?.releaseTagFormat === input.releaseTagFormat &&
     existing?.releaseCiWorkflow === input.releaseCiWorkflow &&
@@ -478,7 +484,16 @@ export function runAppPlan(
 
 export function runAppStatus(
   input: AppStatusInput,
-  opts: { json: boolean },
+  opts: {
+    json: boolean;
+    /**
+     * Phase 1: the current samohost generator SHA to compare against the
+     * app's stored generatorSha. When supplied, the non-JSON output includes
+     * a `gen: current | STALE | legacy` line. Absent = line is omitted
+     * (backward-compat for callers that do not inject this dep).
+     */
+    currentGeneratorSha?: string;
+  },
   vmStore: StateStore,
   appStore: AppStore,
   out: (s: string) => void,
@@ -498,6 +513,17 @@ export function runAppStatus(
     out(JSON.stringify(app, null, 2));
     return 0;
   }
+  // Phase 1: derive gen column value when currentGeneratorSha is available.
+  let genLabel: string | undefined;
+  if (opts.currentGeneratorSha !== undefined) {
+    if (app.generatorSha === undefined) {
+      genLabel = "legacy";
+    } else if (app.generatorSha === opts.currentGeneratorSha) {
+      genLabel = "current";
+    } else {
+      genLabel = "STALE";
+    }
+  }
   out(
     [
       `app: ${app.name}`,
@@ -510,6 +536,7 @@ export function runAppStatus(
       `deployed_sha: ${app.deployedSha ?? "-"}`,
       `failed_sha: ${app.failedSha ?? "-"}`,
       `last_deploy_at: ${app.lastDeployAt ?? "-"}`,
+      ...(genLabel !== undefined ? [`gen: ${genLabel}`] : []),
     ].join("\n"),
   );
   return 0;
@@ -679,6 +706,14 @@ export interface AppDeployDeps {
   env?: Record<string, string | undefined>;
   /** Verify that a release commit is reachable from the configured main branch. */
   isCommitOnBranch?: CommitOnBranchVerifier;
+  /**
+   * Returns the samohost generator SHA to stamp on successful deploy.
+   * Production default: reads ~/samohost-trigger HEAD (the canonical trigger
+   * checkout that is always reset to origin/main before each deploy cycle).
+   * Tests inject a literal string so they run offline.
+   * Phase 1 of the "never silently lose an update" fix.
+   */
+  resolveGeneratorSha?: () => string;
 }
 
 export interface AppDeployReport {
@@ -870,11 +905,21 @@ export async function runAppDeploy(
     updated.deployedSha = sha;
     // A successful deploy supersedes any prior bad-SHA guard for this app.
     delete updated.failedSha;
+    // Phase 1: stamp the generator SHA so staleness is queryable.
+    // resolveGeneratorSha is optional — absent in older callers (no-crash).
+    if (deps.resolveGeneratorSha !== undefined) {
+      try {
+        updated.generatorSha = deps.resolveGeneratorSha();
+      } catch {
+        // Non-fatal: best-effort; staleness check will treat missing as stale.
+      }
+    }
   } else if (outcome === "rolled-back" || outcome === "rollback-failed") {
     updated.failedSha = sha;
     // deployedSha is intentionally NOT advanced on failure.
+    // generatorSha is intentionally NOT written on failure.
   }
-  // 'incomplete' leaves deployedSha/failedSha unchanged (state unknown).
+  // 'incomplete' leaves deployedSha/failedSha/generatorSha unchanged (state unknown).
   appStore.upsert(updated);
 
   const exitCode = outcome === "deployed" ? 0 : 1;
@@ -1217,6 +1262,7 @@ export function defaultAppDeployDeps(): AppDeployDeps {
     fetch: globalThis.fetch,
     now: () => new Date(),
     isCommitOnBranch: defaultIsCommitOnBranch(),
+    resolveGeneratorSha: resolveProductionGeneratorSha,
   };
 }
 
