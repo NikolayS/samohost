@@ -75,22 +75,28 @@ function staticOpts(overrides: Partial<HostBootstrapOptions> = {}): HostBootstra
 // ---------------------------------------------------------------------------
 
 /**
- * Extract lines inside the FIRST heredoc whose opening line matches openMarker
- * and whose closing line exactly equals closeDelimiter.
+ * Extract lines inside a heredoc whose opening line contains openMarker and
+ * whose closing delimiter matches closeDelimiter (exact line match).
  *
+ * startAfter: skip this many matching openMarker occurrences (0 = first).
  * Returns null if the heredoc is not found.
  */
 function extractHeredocLines(
   script: string,
   openMarker: string,
   closeDelimiter: string,
+  startAfter = 0,
 ): string[] | null {
   const lines = script.split("\n");
   let start = -1;
+  let matchCount = 0;
   for (let i = 0; i < lines.length; i++) {
     if (lines[i].includes(openMarker)) {
-      start = i + 1;
-      break;
+      if (matchCount === startAfter) {
+        start = i + 1;
+        break;
+      }
+      matchCount++;
     }
   }
   if (start === -1) return null;
@@ -154,11 +160,14 @@ describe("staticMainVhostLines: shared helper emits the canonical static vhost t
   });
 
   test("helper line order: provenance, address-open, worktree, root, try_files, file_server, encode, [tls], close-brace", () => {
-    const lines = staticMainVhostLines("http://samo.team", "$REL", "$STAT", false);
+    const relVar = "$SAMOHOST_RELEASE_DIR";
+    const statVar = "$SAMOHOST_STATIC_DIR";
+    const lines = staticMainVhostLines("http://samo.team", relVar, statVar, false);
     const norm = lines.map(normalizeVarExprs);
     expect(norm[0]).toBe(SAMOHOST_PROVENANCE_HEADER);
     expect(norm[1]).toBe("http://samo.team {");
     expect(norm[2]).toContain("# samohost-worktree");
+    expect(norm[2]).toContain("<RELEASE_DIR>");
     expect(norm[3]).toContain("root *");
     expect(norm[3]).toContain("<STATIC_DIR>");
     expect(norm[4]).toBe("\ttry_files {path} {path}/ =404");
@@ -170,7 +179,7 @@ describe("staticMainVhostLines: shared helper emits the canonical static vhost t
   });
 
   test("helper adds tls internal when addTls=true, at position 7 before close-brace", () => {
-    const lines = staticMainVhostLines("samo.team", "$REL", "$STAT", true);
+    const lines = staticMainVhostLines("samo.team", "$SAMOHOST_RELEASE_DIR", "$SAMOHOST_STATIC_DIR", true);
     const norm = lines.map(normalizeVarExprs);
     expect(norm[7]).toBe("\ttls internal");
     expect(norm[8]).toBe("}");
@@ -221,8 +230,8 @@ describe("three-way byte-identity: deploy static vhost == heal static vhost == b
     const script = buildDeployScript(app, {
       sha: "abc1234abc1234abc1234abc1234abc1234abc12",
     });
-    // Extract between the 'tee <snippet> <<CADDY' line and 'CADDY' delimiter
-    const lines = extractHeredocLines(script, "sudo /usr/bin/tee", "CADDY");
+    // The static vhost heredoc uses '<<CADDY || rollback' as the opener (unique in script).
+    const lines = extractHeredocLines(script, "<<CADDY || rollback", "CADDY");
     expect(lines).not.toBeNull();
     const norm = lines!.map(normalizeVarExprs);
     expect(norm[0]).toBe(SAMOHOST_PROVENANCE_HEADER);
@@ -233,11 +242,10 @@ describe("three-way byte-identity: deploy static vhost == heal static vhost == b
 
   test("heal static vhost heredoc contains provenance + worktree + all directives", () => {
     const script = buildConfigHealScript(app);
-    // Extract between 'tee "$_new_main_vhost" <<SAMOHOST_STATIC_VHOST_CONTENT'
-    // and 'SAMOHOST_STATIC_VHOST_CONTENT' delimiter
+    // The drift-detect branch uses '<<SAMOHOST_STATIC_VHOST_CONTENT' on the tee line.
     const lines = extractHeredocLines(
       script,
-      "<<SAMOHOST_STATIC_VHOST_CONTENT",
+      ">/dev/null <<SAMOHOST_STATIC_VHOST_CONTENT",
       "SAMOHOST_STATIC_VHOST_CONTENT",
     );
     expect(lines).not.toBeNull();
@@ -249,10 +257,11 @@ describe("three-way byte-identity: deploy static vhost == heal static vhost == b
     expect(norm.some((l) => l.includes("try_files"))).toBe(true);
   });
 
-  test("bootstrap expected vhost block contains provenance + worktree + all directives", () => {
+  test("bootstrap expected vhost block (post-deploy state path) contains provenance + worktree + all directives", () => {
     const script = buildHostBootstrapScript(app, staticOpts());
-    // Extract between 'cat > "$SAMOHOST_BOOTSTRAP_EXPECTED_MAIN" <<CADDY_SITE' and 'CADDY_SITE'
-    const lines = extractHeredocLines(script, "BOOTSTRAP_EXPECTED_MAIN", "CADDY_SITE");
+    // The post-deploy (has-state) path uses 'cat > "$SAMOHOST_BOOTSTRAP_EXPECTED_MAIN" <<CADDY_SITE'.
+    // There are two CADDY_SITE heredocs; the first is the post-deploy (has-worktree) one.
+    const lines = extractHeredocLines(script, "<<CADDY_SITE", "CADDY_SITE");
     expect(lines).not.toBeNull();
     const norm = lines!.map(normalizeVarExprs);
     expect(norm[0]).toBe(SAMOHOST_PROVENANCE_HEADER);
@@ -266,10 +275,12 @@ describe("three-way byte-identity: deploy static vhost == heal static vhost == b
     });
     const healScript = buildConfigHealScript(app);
 
-    const deployLines = extractHeredocLines(deployScript, "sudo /usr/bin/tee", "CADDY");
+    // Deploy: static vhost heredoc opened with '<<CADDY || rollback'
+    const deployLines = extractHeredocLines(deployScript, "<<CADDY || rollback", "CADDY");
+    // Heal: drift-detect branch heredoc (first SAMOHOST_STATIC_VHOST_CONTENT)
     const healLines = extractHeredocLines(
       healScript,
-      "<<SAMOHOST_STATIC_VHOST_CONTENT",
+      ">/dev/null <<SAMOHOST_STATIC_VHOST_CONTENT",
       "SAMOHOST_STATIC_VHOST_CONTENT",
     );
 
@@ -290,10 +301,11 @@ describe("three-way byte-identity: deploy static vhost == heal static vhost == b
 
     const healLines = extractHeredocLines(
       healScript,
-      "<<SAMOHOST_STATIC_VHOST_CONTENT",
+      ">/dev/null <<SAMOHOST_STATIC_VHOST_CONTENT",
       "SAMOHOST_STATIC_VHOST_CONTENT",
     );
-    const bootstrapLines = extractHeredocLines(bootstrapScript, "BOOTSTRAP_EXPECTED_MAIN", "CADDY_SITE");
+    // First CADDY_SITE heredoc in bootstrap = the post-deploy (has-state) path
+    const bootstrapLines = extractHeredocLines(bootstrapScript, "<<CADDY_SITE", "CADDY_SITE");
 
     expect(healLines).not.toBeNull();
     expect(bootstrapLines).not.toBeNull();
