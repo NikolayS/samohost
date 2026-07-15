@@ -1250,6 +1250,7 @@ describe("Phase 1 — generatorSha stamped on deploy (GROUP 1)", () => {
         buildCmd: "npm run build",
         healthUrl: "http://localhost:3000/health",
         serviceUnit: "gen1",
+        rlsNonSuperuser: false,
       },
       { json: false },
       vmStore1,
@@ -1371,6 +1372,7 @@ describe("Phase 1 — generatorSha stamped on deploy (GROUP 1)", () => {
         buildCmd: "npm run build:prod",  // flag update
         healthUrl: "http://localhost:3000/health",
         serviceUnit: "gen1",
+        rlsNonSuperuser: false,
       },
       { json: false },
       vmStore1,

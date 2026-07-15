@@ -32,7 +32,6 @@ import { join } from "node:path";
 // GROUP 2 + 3: offline staleness check + status output
 import {
   checkGeneratorStaleness,
-  type GeneratorStalenessResult,
 } from "../src/commands/generator-stale.ts";
 
 import {
@@ -178,6 +177,7 @@ function registerApp(o: Partial<AppRecord> = {}) {
       buildCmd: "npm run build",
       healthUrl: "http://localhost:3000/health",
       serviceUnit: "gen-test",
+      rlsNonSuperuser: false,
     },
     { json: false },
     vmStore,
