@@ -26,11 +26,8 @@
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import {
-  existsSync,
-  mkdirSync,
   mkdtempSync,
   rmSync,
-  writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -168,13 +165,19 @@ describe("buildConfigHealScript snapshot — node app", () => {
 
   test("backs up the live vhost file before overwriting (mktemp backup pattern)", () => {
     const script = buildConfigHealScript(nodeApp());
-    expect(script).toContain("mktemp");
-    // Backup must precede any write
-    const backupIdx = script.indexOf("mktemp");
-    const teeIdx = script.indexOf("sudo /usr/bin/tee");
+    // The main vhost backup variable assignment must be present
+    expect(script).toContain('SAMOHOST_MAIN_VHOST_BACKUP="$(mktemp)"');
+    // The backup assignment must come before the actual move of staged → live
+    // (the staged→live mv is in the main body, after the provenance check and cmp)
+    const backupIdx = script.indexOf('SAMOHOST_MAIN_VHOST_BACKUP="$(mktemp)"');
+    // The live-file atomic mv (from staged to live)
+    const mvPattern = `sudo /usr/bin/mv -- '/etc/caddy/sites.d/.samohost-heal-next-00-main-field-record.caddy' '/etc/caddy/sites.d/00-main-field-record.caddy'`;
+    // Find the mv OUTSIDE the rollback function (after the rollback definition)
+    const rollbackEnd = script.indexOf("\n}\n\necho");
+    const mvIdx = script.indexOf(mvPattern, rollbackEnd);
     expect(backupIdx).toBeGreaterThanOrEqual(0);
-    expect(teeIdx).toBeGreaterThanOrEqual(0);
-    expect(backupIdx).toBeLessThan(teeIdx);
+    expect(mvIdx).toBeGreaterThanOrEqual(0);
+    expect(backupIdx).toBeLessThan(mvIdx);
   });
 
   test("uses cmp to detect no-drift before writing", () => {
@@ -338,15 +341,6 @@ describe("buildConfigHealScript snapshot — static app", () => {
 
 describe("runAppHeal — no-drift path", () => {
   const GEN_SHA = "currentgenshaaaaaaaaaaaaaaaaaaaaaaaaaaa1";
-
-  function noDriftOutput(): string {
-    // Simulate a heal script that finds all artifacts identical (cmp returns 0)
-    return [
-      `echo "${PHASE_PREFIX}heal:start>>>"`,
-      `echo "${PHASE_PREFIX}no-drift:ok>>>"`,
-      "heal complete: no changes needed",
-    ].join("\n");
-  }
 
   test("stamps generatorSha on no-drift (convergence recorded even when nothing changed)", async () => {
     const app = nodeApp({ vmId: testVm.id });

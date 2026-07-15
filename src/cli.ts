@@ -41,7 +41,9 @@ import {
   runAppStatus,
   runAppClearFailed,
   runAppBootstrap,
+  runAppHeal,
   defaultAppDeployDeps,
+  defaultAppHealDeps,
   defaultAppStore,
   type AppRegisterInput,
   type AppRegisterFromTomlInput,
@@ -50,6 +52,7 @@ import {
   type AppStatusInput,
   type AppClearFailedInput,
   type AppBootstrapInput,
+  type AppHealInput,
 } from "./commands/app.ts";
 import {
   runTriggerRun,
@@ -517,6 +520,12 @@ export interface ParsedAppBootstrap {
   input: AppBootstrapInput;
 }
 
+export interface ParsedAppHeal {
+  kind: "app-heal";
+  input: AppHealInput;
+  json: boolean;
+}
+
 export interface ParsedEnvPlan {
   kind: "env-plan";
   input: EnvPlanInput;
@@ -640,6 +649,7 @@ export type ParsedCommand =
   | ParsedAppStatus
   | ParsedAppClearFailed
   | ParsedAppBootstrap
+  | ParsedAppHeal
   | ParsedEnvPlan
   | ParsedEnvCreate
   | ParsedEnvList
@@ -1320,7 +1330,7 @@ function parseLogs(args: string[]): ParsedLogs {
   };
 }
 
-type AppSub = "register" | "plan" | "deploy" | "status" | "clear-failed" | "bootstrap";
+type AppSub = "register" | "plan" | "deploy" | "status" | "clear-failed" | "bootstrap" | "heal";
 
 const APP_SUBS: readonly AppSub[] = [
   "register",
@@ -1329,6 +1339,7 @@ const APP_SUBS: readonly AppSub[] = [
   "status",
   "clear-failed",
   "bootstrap",
+  "heal",
 ];
 
 function parseApp(args: string[]): ParsedCommand {
@@ -1355,6 +1366,8 @@ function parseApp(args: string[]): ParsedCommand {
       return parseAppClearFailed(rest);
     case "bootstrap":
       return parseAppBootstrap(rest);
+    case "heal":
+      return parseAppHeal(rest);
   }
 }
 
@@ -1667,6 +1680,52 @@ function parseAppBootstrap(args: string[]): ParsedAppBootstrap {
     ...(controlPlaneIp !== undefined ? { controlPlaneIp } : {}),
   };
   return { kind: "app-bootstrap", input };
+}
+
+function parseAppHeal(args: string[]): ParsedAppHeal {
+  let vm: string | undefined;
+  let app: string | undefined;
+  let all = false;
+  let apply = false;
+  let json = false;
+
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i]!;
+    switch (a) {
+      case "--app":
+        app = takeValue(args, i, a);
+        i++;
+        break;
+      case "--all":
+        all = true;
+        break;
+      case "--apply":
+        apply = true;
+        break;
+      case "--json":
+        json = true;
+        break;
+      default:
+        if (a.startsWith("-")) throw new UsageError(`unknown flag: ${a}`);
+        if (vm !== undefined) {
+          // Second positional: treat as app name (convenience positional form)
+          if (app !== undefined) throw new UsageError(`unexpected extra argument: ${a}`);
+          app = a;
+        } else {
+          vm = a;
+        }
+    }
+  }
+
+  if (vm === undefined) throw new UsageError("app heal requires <vm>");
+
+  const input: AppHealInput = {
+    vm,
+    apply,
+    ...(app !== undefined ? { app } : {}),
+    ...(all ? { all: true } : {}),
+  };
+  return { kind: "app-heal", input, json };
 }
 
 // ---------------------------------------------------------------------------
@@ -2373,6 +2432,16 @@ export async function main(
         cmd.input,
         new StateStore(),
         defaultAppStore(),
+        out,
+        err,
+      );
+    case "app-heal":
+      return runAppHeal(
+        cmd.input,
+        { json: cmd.json },
+        new StateStore(),
+        defaultAppStore(),
+        defaultAppHealDeps(),
         out,
         err,
       );

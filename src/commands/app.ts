@@ -20,6 +20,7 @@ import { isIP } from "node:net";
 import { checkCiGreen, type CiStatus } from "../app/cigate.ts";
 import { parseDeployOutcome, type DeployOutcome } from "../app/parse.ts";
 import { buildDeployScript } from "../app/script.ts";
+import { buildConfigHealScript } from "../app/heal-script.ts";
 import { validateStaticRoot } from "../app/static-root.ts";
 import { linuxAppUserError } from "../app/linux-user.ts";
 import {
@@ -1269,4 +1270,229 @@ export function defaultAppDeployDeps(): AppDeployDeps {
 /** Construct the default app store (honors SAMOHOST_APPS). */
 export function defaultAppStore(): AppStore {
   return new AppStore();
+}
+
+// ---------------------------------------------------------------------------
+// heal
+// ---------------------------------------------------------------------------
+
+/**
+ * Input for `app heal` — reconcile live Caddy artifacts to the current
+ * generator WITHOUT a content redeploy. Dry-run by default; --apply to
+ * actually write. Either --app <name> or --all selects which apps to heal.
+ *
+ * Phase 2 of the "never silently lose an update" fix.
+ */
+export interface AppHealInput {
+  /** VM name or id to heal apps on. */
+  vm: string;
+  /** App name to heal (mutually exclusive with `all`). */
+  app?: string;
+  /** Heal ALL apps registered on the VM (mutually exclusive with `app`). */
+  all?: boolean;
+  /**
+   * When false (default), print unified diffs of what would change but do NOT
+   * write anything and do NOT call the remote runner. When true, write the
+   * regenerated artifacts and trigger caddy reload + health probe.
+   */
+  apply: boolean;
+}
+
+/** Typed heal outcome, mirroring DeployOutcome for bookkeeping consistency. */
+export type HealOutcome =
+  | "healed"       // artifacts changed, caddy reloaded, health probe passed
+  | "no-drift"     // all artifacts already identical to the regenerated versions
+  | "drift-foreign" // one or more files lack the samohost provenance header — NOT healed
+  | "rolled-back"   // health probe failed, backups restored
+  | "rollback-failed" // health probe failed AND rollback itself failed
+  | "incomplete";  // script did not emit a conclusive terminal marker
+
+export interface AppHealReport {
+  app: string;
+  vm: string;
+  outcome: HealOutcome;
+  exitCode: number;
+}
+
+/** Injectable remote runner (same type as RemoteScriptRunner). */
+export interface AppHealDeps {
+  /** Run the heal script remotely over one SSH connection (stdin). */
+  remote: RemoteScriptRunner;
+  /** Clock for lastHealAt timestamps. */
+  now: () => Date;
+  /**
+   * Returns the samohost generator SHA to stamp on successful heal.
+   * Tests inject a literal string so they run offline.
+   */
+  resolveGeneratorSha?: () => string;
+}
+
+/** Parse the combined stdout+stderr of a heal script run into a HealOutcome. */
+function parseHealOutcome(combined: string): HealOutcome {
+  const hasForeignDrift = combined.includes("drift-foreign:");
+  if (combined.includes(`<<<SAMOHOST_PHASE:no-drift:ok>>>`)) {
+    return "no-drift";
+  }
+  if (combined.includes(`<<<SAMOHOST_PHASE:rollback:fail>>>`)) {
+    return "rollback-failed";
+  }
+  if (combined.includes(`<<<SAMOHOST_PHASE:rollback:ok>>>`)) {
+    return "rolled-back";
+  }
+  if (combined.includes(`<<<SAMOHOST_PHASE:heal:ok>>>`)) {
+    // heal:ok can appear after drift-foreign (file preserved but not healed)
+    if (hasForeignDrift) return "drift-foreign";
+    return "healed";
+  }
+  return "incomplete";
+}
+
+/**
+ * Run `samohost app heal` for a single app: build the config-heal script,
+ * push it over SSH, parse the outcome, and update AppStore bookkeeping.
+ *
+ * DRY-RUN BY DEFAULT (apply=false): prints what would change without calling
+ * the remote runner or mutating AppStore.
+ */
+export async function runAppHeal(
+  input: AppHealInput,
+  opts: { json: boolean },
+  vmStore: StateStore,
+  appStore: AppStore,
+  deps: AppHealDeps,
+  out: (s: string) => void,
+  err: (s: string) => void,
+): Promise<number> {
+  const vm = findVm(vmStore, input.vm);
+  if (vm === undefined) {
+    err(`error: VM not found in state: ${input.vm}`);
+    return 1;
+  }
+
+  // ---- Resolve target app(s) -----------------------------------------------
+  let apps: AppRecord[];
+  if (input.all === true) {
+    apps = appStore.list().filter((a) => a.vmId === vm.id);
+    if (apps.length === 0) {
+      err(`error: no apps registered on vm ${vm.name}`);
+      return 1;
+    }
+  } else if (input.app !== undefined) {
+    const found = appStore.get(vm.id, input.app);
+    if (found === undefined) {
+      err(`error: app not found on vm ${vm.name}: ${input.app}`);
+      return 1;
+    }
+    apps = [found];
+  } else {
+    err("error: app heal requires --app <name> or --all");
+    return 1;
+  }
+
+  // ---- Validate all apps before starting any SSH ---------------------------
+  for (const app of apps) {
+    if (app.mainHost === undefined) {
+      err(`error: app "${app.name}" has no mainHost — cannot regenerate Caddy vhost; set mainHost via app register`);
+      return 1;
+    }
+  }
+
+  // ---- Dry-run mode: print what would change WITHOUT SSH -------------------
+  if (!input.apply) {
+    out(`dry-run: would heal ${apps.length} app(s) on vm ${vm.name} — pass --apply to write changes`);
+    for (const app of apps) {
+      try {
+        const script = buildConfigHealScript(app);
+        out(`[dry-run] heal script for ${app.name} (${script.split("\n").length} lines) — not executing`);
+      } catch (e) {
+        err(`error: cannot build heal script for ${app.name}: ${e instanceof Error ? e.message : String(e)}`);
+      }
+    }
+    return 0;
+  }
+
+  // ---- Apply mode: run each app's heal script over SSH --------------------
+  let anyFailure = false;
+
+  for (const app of apps) {
+    let script: string;
+    try {
+      script = buildConfigHealScript(app);
+    } catch (e) {
+      err(`error: cannot build heal script for ${app.name}: ${e instanceof Error ? e.message : String(e)}`);
+      anyFailure = true;
+      continue;
+    }
+
+    let result: SpawnResult;
+    try {
+      // Mirror deploy fix #161/#164: SSH as app.appUser when set.
+      result = await deps.remote(
+        app.appUser !== undefined ? { ...vm, sshUser: app.appUser } : vm,
+        script,
+      );
+    } catch (e) {
+      err(`error: remote heal connection failed for ${app.name}: ${e instanceof Error ? e.message : String(e)}`);
+      anyFailure = true;
+      continue;
+    }
+
+    const combined = result.stdout + "\n" + result.stderr;
+    const outcome = parseHealOutcome(combined);
+
+    // Emit combined output for visibility (suppress in JSON mode — JSON report follows)
+    if (!opts.json) {
+      if (result.stdout.trim()) out(result.stdout);
+      if (result.stderr.trim()) err(result.stderr);
+    }
+
+    // ---- Bookkeeping --------------------------------------------------------
+    const stamped = deps.now().toISOString();
+    const updated: AppRecord = { ...app };
+
+    if (outcome === "healed" || outcome === "no-drift") {
+      // Stamp generatorSha + lastHealAt on successful convergence.
+      updated.lastHealAt = stamped;
+      if (deps.resolveGeneratorSha !== undefined) {
+        try {
+          updated.generatorSha = deps.resolveGeneratorSha();
+        } catch {
+          // Non-fatal: best-effort.
+        }
+      }
+    }
+    // drift-foreign, rolled-back, rollback-failed, incomplete: do NOT stamp.
+
+    appStore.upsert(updated);
+
+    const exitCode = (outcome === "healed" || outcome === "no-drift" || outcome === "drift-foreign") ? 0 : 1;
+    const report: AppHealReport = {
+      app: app.name,
+      vm: vm.name,
+      outcome,
+      exitCode,
+    };
+
+    if (opts.json) {
+      out(JSON.stringify(report, null, 2));
+    } else {
+      out(`heal ${app.name} on ${vm.name}: ${outcome}`);
+      if (exitCode !== 0) {
+        err(`heal did not succeed (outcome=${outcome}); see remote output above`);
+      }
+    }
+
+    if (exitCode !== 0) anyFailure = true;
+  }
+
+  return anyFailure ? 1 : 0;
+}
+
+/** Default heal deps for production. */
+export function defaultAppHealDeps(): AppHealDeps {
+  return {
+    remote: defaultRemoteScriptRunner(),
+    now: () => new Date(),
+    resolveGeneratorSha: resolveProductionGeneratorSha,
+  };
 }
