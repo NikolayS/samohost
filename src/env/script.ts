@@ -192,7 +192,7 @@ function buildCloneFnLines(
     // so that private-repo re-fetches authenticate. The clone strategies already
     // carry credHelper; the fetch path was the odd one out (samorev finding).
     `    ${gitCmd}${credHelper} -C "$SAMOHOST_ENV_DIR" fetch origin "$SAMOHOST_BRANCH" \\`,
-    `      && ${gitCmd} -C "$SAMOHOST_ENV_DIR" checkout -B "$SAMOHOST_BRANCH" "origin/$SAMOHOST_BRANCH"`,
+    `      && ${gitCmd} -C "$SAMOHOST_ENV_DIR" checkout -fB "$SAMOHOST_BRANCH" "origin/$SAMOHOST_BRANCH"`,
     "    return",
     "  fi",
     `  if ${gitCmd}${credHelper} clone --reference "$SAMOHOST_APP_DIR" --dissociate \\`,
