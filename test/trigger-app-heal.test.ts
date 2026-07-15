@@ -36,11 +36,11 @@ import {
   type TriggerDeps,
   type TriggerRunReport,
   type AppHealPassSummary,
+  type AppHealResult,
 } from "../src/commands/trigger.ts";
 import { AppStore } from "../src/state/apps.ts";
 import { StateStore } from "../src/state/store.ts";
 import type { AppRecord, VmRecord } from "../src/types.ts";
-import type { AppHealResult } from "../src/commands/trigger.ts";
 
 // ---------------------------------------------------------------------------
 // Shared SHA constants
@@ -48,8 +48,6 @@ import type { AppHealResult } from "../src/commands/trigger.ts";
 
 const CURRENT_HEAD_SHA = "cccccccccccccccccccccccccccccccccccccc01";
 const OLD_GEN_SHA      = "0000000000000000000000000000000000000001";
-const DEPLOYED_SHA     = "dddddddddddddddddddddddddddddddddddddd01";
-const FAILED_SHA       = "ffffffffffffffffffffffffffffffffffffffff";
 
 // ---------------------------------------------------------------------------
 // Fixtures
