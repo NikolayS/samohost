@@ -2330,7 +2330,13 @@ describe("preview-flag: static env create writes config.js with preview:true", (
 // mktemp/mv sequence is emitted unchanged.
 // ---------------------------------------------------------------------------
 
-describe("issue #162: static+appUser config.js write runs as app user (shared-web fix)", () => {
+// Issue #162 originally fixed the config.js write for static+appUser apps by
+// using 'sudo -u <appUser> /usr/bin/tee'. That approach was superseded by #163
+// (SSH-as-appUser runner seam): the SSH session IS the dir owner, so the plain
+// mktemp/mv form works in BOTH appUser and no-appUser paths without any sudo.
+//
+// These tests are updated to reflect the #163 approach.
+describe("issue #162 (superseded by #163): static+appUser config.js write runs as app user (shared-web fix)", () => {
   function staticApp(o: Partial<AppRecord> = {}): AppRecord {
     return app({
       kind: "static",
@@ -2346,33 +2352,35 @@ describe("issue #162: static+appUser config.js write runs as app user (shared-we
     return staticApp({ appUser: "friends-site", ...o });
   }
 
-  // RED: static+appUser must NOT use the bare mktemp in $SAMOHOST_STATIC_DIR
-  // (samo cannot write the app-user-owned dir).
-  test("static+appUser: script does NOT contain bare mktemp in $SAMOHOST_STATIC_DIR (samo cannot write it)", () => {
+  // #163 approach: static+appUser now uses the same atomic mktemp/mv path as
+  // no-appUser (SSH session IS the dir owner — no sudo-u needed).
+  test("static+appUser: script uses atomic mktemp/mv for config.js write (SSH user is dir owner)", () => {
     const s = buildEnvCreateScript(staticAppWithUser(), target());
-    expect(s).not.toContain('SAMOHOST_CONFIG_NEXT=$(mktemp "$SAMOHOST_STATIC_DIR/.config.next.XXXXXX")');
+    // The mktemp must use $SAMOHOST_STATIC_DIR (owned by SSH user = appUser).
+    expect(s).toContain('SAMOHOST_CONFIG_NEXT=$(mktemp');
+    expect(s).toContain('/usr/bin/mv -f "$SAMOHOST_CONFIG_NEXT"');
   });
 
-  // GREEN: static+appUser must use sudo -u <appUser> tee for the config.js write.
-  test("static+appUser: script contains sudo -u friends-site /usr/bin/tee for config.js write", () => {
+  // #163: sudo -u appUser tee is NOT emitted (it was #162's now-superseded form).
+  test("static+appUser: script does NOT contain sudo -u friends-site /usr/bin/tee for config.js write", () => {
     const s = buildEnvCreateScript(staticAppWithUser(), target());
-    expect(s).toContain("sudo -u 'friends-site' /usr/bin/tee \"$SAMOHOST_STATIC_DIR/config.js\"");
+    expect(s).not.toContain("sudo -u 'friends-site' /usr/bin/tee");
   });
 
-  // config.js still has preview:true in the appUser path.
+  // config.js still has preview:true.
   test("static+appUser: config.js write still contains preview: true", () => {
     const s = buildEnvCreateScript(staticAppWithUser(), target());
     expect(s).toContain("preview: true");
   });
 
-  // $SAMOHOST_BRANCH is still threaded through in the appUser path.
+  // $SAMOHOST_BRANCH is still threaded through.
   test("static+appUser: config.js write still contains $SAMOHOST_BRANCH", () => {
     const s = buildEnvCreateScript(staticAppWithUser(), target({ branch: "demo/red-bg" }));
     expect(s).toContain("$SAMOHOST_BRANCH");
     expect(s).toContain("SAMOHOST_BRANCH='demo/red-bg'");
   });
 
-  // Bash syntax check for the appUser path.
+  // Bash syntax check.
   test("static+appUser: bash syntax is valid (bash -n)", () => {
     expect(bashSyntaxOk(buildEnvCreateScript(staticAppWithUser(), target()))).toBe(true);
   });
@@ -3037,44 +3045,34 @@ describe("unit phase restarts an already-active instance via disable--now+enable
 // GIT_CONFIG_GLOBAL passes through sudo.
 // ---------------------------------------------------------------------------
 
+// Issue #97 originally fixed git ownership by adding 'sudo -u <appUser> git'.
+// Issue #163 superseded that approach by having the runner SSH AS appUser
+// instead. With SSH-as-appUser the SSH session IS the dir owner and plain
+// git works directly — no sudo-u delegation and no SETENV grant needed.
+// These tests are updated to reflect the #163 approach.
 describe("issue #97: env-create clone + preview unit must use the registered app user", () => {
   // Fixture: samohost-fixture owns /opt/samohost-fixture/app.
-  // The SSH user (samo) runs env-create but cannot access the app checkout
-  // or read the 600 token; all git ops must delegate to samohost-fixture.
   const APP_USER = "samohost-fixture";
   const appWithUser = () =>
     app({ appUser: APP_USER, appDir: "/opt/samohost-fixture/app" });
 
   // Paths derived from appDir at generation time (mirrors bootstrap.ts §12):
   //   appBase    = /opt/samohost-fixture
-  //   gitSafeConf = /opt/samohost-fixture/git-safe.conf
   //   tokenFile  = /opt/samohost-fixture/.gh-token
-  const SAFE_CONF = "/opt/samohost-fixture/git-safe.conf";
   const TOKEN_FILE = "/opt/samohost-fixture/.gh-token";
 
-  test("clone function runs ALL git ops with sudo -u <appUser> (not plain git as samo)", () => {
+  // #163: clone uses plain git (SSH session IS appUser) — no sudo-u prefix.
+  test("clone function runs git as plain git (SSH user IS appUser, no sudo-u delegation needed)", () => {
     const s = buildEnvCreateScript(appWithUser(), target());
-    // Every git invocation in the generated clone function must delegate to
-    // the app user so git does not see a dubious-ownership mismatch.
-    expect(s).toContain(`sudo -u '${APP_USER}'`);
-    // Full-path /usr/bin/git is required for the NOPASSWD sudoers grant.
-    expect(s).toContain("/usr/bin/git");
-    // The sudo invocations must include GIT_CONFIG_GLOBAL so they use the
-    // bootstrap-written safe.directory config (verified in separate test).
-    expect(s).toContain(`sudo -u '${APP_USER}' GIT_CONFIG_GLOBAL=`);
+    // Plain git calls are present.
+    expect(s).toContain("git clone");
+    // Sudo-u delegation to appUser is NOT emitted for git (SSH user already IS appUser).
+    expect(s).not.toContain(`sudo -u '${APP_USER}' GIT_CONFIG_GLOBAL=`);
     // Confirm bash validity.
     expect(bashSyntaxOk(s)).toBe(true);
   });
 
-  test("clone function uses GIT_CONFIG_GLOBAL pointing at the bootstrap-written git-safe.conf", () => {
-    const s = buildEnvCreateScript(appWithUser(), target());
-    // GIT_CONFIG_GLOBAL lets git bypass the safe.directory check that git
-    // ≥ 2.35.2 enforces even for the checkout owner when running via sudo.
-    // The path is derived from appDir at generation time (literal, not a
-    // shell variable), mirroring bootstrap.ts §12.
-    expect(s).toContain(`GIT_CONFIG_GLOBAL='${SAFE_CONF}'`);
-  });
-
+  // Credential helper still uses literal token file path (not $TOKEN_FILE).
   test("clone uses a literal-path credential helper (not unexported $TOKEN_FILE)", () => {
     const s = buildEnvCreateScript(appWithUser(), target());
     // The inline credential helper must embed the TOKEN FILE PATH as a literal
@@ -3086,38 +3084,34 @@ describe("issue #97: env-create clone + preview unit must use the registered app
     expect(s).not.toContain("cat $TOKEN_FILE");
   });
 
-  test("static env-create with appUser also uses sudo -u <appUser> for the clone", () => {
+  // #163: static env-create with appUser also uses plain git (not sudo-u).
+  test("static env-create with appUser uses plain git (no sudo-u: SSH user IS appUser)", () => {
     const s = buildEnvCreateScript({ ...appWithUser(), kind: "static" }, target({ dbBackend: "none" }));
-    expect(s).toContain(`sudo -u '${APP_USER}'`);
-    expect(s).toContain("/usr/bin/git");
+    expect(s).toContain("git clone");
+    expect(s).not.toContain(`sudo -u '${APP_USER}'`);
     expect(bashSyntaxOk(s)).toBe(true);
   });
 
   test("preview template unit User= matches the app user, not the SSH user", () => {
     const s = buildHostPrepScript(appWithUser(), "samo");
     // The preview systemd instance runs as the app user so it can access files
-    // created by the sudo-u-appUser clone (owned by appUser).
+    // in the appUser-owned env dir.
     expect(s).toContain(`User=${APP_USER}`);
     // Must NOT set User= to the SSH user (samo).
-    // Use a line-anchored regex: "User=samo" would match as a substring of
-    // "User=samohost-fixture", so we need to ensure the SSH user's name ends
-    // the line (no further characters that would make it the app user).
     expect(s).not.toMatch(/^User=samo$/m);
     expect(bashSyntaxOk(s)).toBe(true);
   });
 
-  test("host-prep sudoers grants samo the SETENV: /usr/bin/git right to run as appUser", () => {
+  // #163: no (appUser) sudoers grant for git — it's no longer needed.
+  test("host-prep sudoers does NOT grant samo SETENV: /usr/bin/git as appUser (no longer needed after #163)", () => {
     const s = buildHostPrepScript(appWithUser(), "samo");
-    // SETENV: is required so GIT_CONFIG_GLOBAL passes through sudo to git.
-    // Without it, sudo strips the env var and git falls back to the default
-    // global config, losing the safe.directory override.
-    expect(s).toContain(`samo ALL=(${APP_USER}) NOPASSWD: SETENV: /usr/bin/git`);
+    // SSH-as-appUser means samo never impersonates appUser via sudo for git.
+    expect(s).not.toContain(`samo ALL=(${APP_USER}) NOPASSWD: SETENV: /usr/bin/git`);
   });
 
   test("host-prep envs root is created owned by appUser (not sshUser) when appUser is set", () => {
-    // The envs root must be owned by appUser so that `sudo -u appUser git clone`
-    // can create the env subdirectory inside it. With sshUser ownership + mode 755,
-    // appUser has no write permission and clone fails with EACCES.
+    // The envs root must be owned by appUser so that the SSH session (running
+    // AS appUser) can write the env subdirectory inside it.
     const s = buildHostPrepScript(appWithUser(), "samo");
     const root = envsRoot(appWithUser());
     expect(s).toContain(
@@ -3129,12 +3123,11 @@ describe("issue #97: env-create clone + preview unit must use the registered app
 
   test("backward compat: when appUser is absent, no sudo for git (old plain-git behavior)", () => {
     // Existing AppRecords without appUser keep working — plain git is used,
-    // which matches the pre-#97 behavior (and only breaks on hosts where the
-    // app dir is owned by a different user, i.e. the bug being fixed).
+    // same as before.
     const s = buildEnvCreateScript(app(), target());
     // No git-specific sudo delegation when appUser is not set.
     expect(s).not.toMatch(/sudo -u '[^']+'\s.*\/usr\/bin\/git/);
-    // Plain git calls are still present (the old CLONE_FN_LINES behavior).
+    // Plain git calls are still present.
     expect(s).toContain("git clone");
   });
 
@@ -3175,14 +3168,18 @@ describe("issue #97: env-create clone + preview unit must use the registered app
 //      to the fetch invocation.
 // ---------------------------------------------------------------------------
 
+// Issue #98 originally fixed install/build by adding 'sudo -u appUser npm' and
+// 'sudoWrapBuildCmd'. Issue #163 superseded that approach: the runner SSHes AS
+// appUser, so the SSH session IS the dir owner and plain npm/buildCmd work
+// directly. The sudo-u wrapping and corresponding sudoers grants are removed.
 describe("#98 follow-up: install + build run as the app user; fetch path carries credential helper", () => {
   const APP_USER = "samohost-fixture";
   const TOKEN_FILE = "/opt/samohost-fixture/.gh-token";
   const appWithUser = () =>
     app({ appUser: APP_USER, appDir: "/opt/samohost-fixture/app" });
 
-  // (A) install phase ---------------------------------------------------------
-  test("(A-install) install phase emits sudo -u appUser /usr/bin/npm when appUser is set", () => {
+  // (A) install phase — #163: plain npm (SSH user IS appUser) -----------------
+  test("(A-install) install phase emits plain npm (no sudo-u: SSH user IS appUser)", () => {
     const s = buildEnvCreateScript(appWithUser(), target());
     // Slice out just the install phase block.
     const installStart = s.indexOf("<<<SAMOHOST_PHASE:install:start>>>");
@@ -3190,31 +3187,26 @@ describe("#98 follow-up: install + build run as the app user; fetch path carries
     expect(installStart).toBeGreaterThan(-1);
     expect(buildStart).toBeGreaterThan(installStart);
     const installBlock = s.slice(installStart, buildStart);
-    // Both npm-ci and npm-install paths must delegate to the app user so the
-    // write into the app-user-owned env dir does not EACCES.
-    expect(installBlock).toContain(`sudo -u '${APP_USER}' /usr/bin/npm ci`);
-    expect(installBlock).toContain(`sudo -u '${APP_USER}' /usr/bin/npm install`);
-    // The bare (non-sudoed) form must NOT appear: running npm as samo →
-    // EACCES when writing node_modules into the appUser-owned env dir.
-    expect(installBlock).not.toContain("then npm ci");
-    expect(installBlock).not.toContain("else npm install");
+    // #163: npm runs directly as SSH user (= appUser) — no sudo-u needed.
+    expect(installBlock).toContain("npm ci");
+    expect(installBlock).toContain("npm install");
+    // sudo-u delegation to appUser must NOT appear in the install phase.
+    expect(installBlock).not.toContain(`sudo -u '${APP_USER}'`);
     expect(bashSyntaxOk(s)).toBe(true);
   });
 
-  // (A) build phase -----------------------------------------------------------
-  test("(A-build) build phase emits sudo -u appUser when appUser is set", () => {
-    // Use dbBackend:none so the next phase after build is envfile (no db-preflight
-    // in between), making the slice boundary unambiguous.
+  // (A) build phase — #163: plain buildCmd (SSH user IS appUser) ---------------
+  test("(A-build) build phase emits plain buildCmd (no sudo-u: SSH user IS appUser)", () => {
     const s = buildEnvCreateScript(appWithUser(), target({ dbBackend: "none" }));
     const buildStart = s.indexOf("<<<SAMOHOST_PHASE:build:start>>>");
     const envfileStart = s.indexOf("<<<SAMOHOST_PHASE:envfile:start>>>");
     expect(buildStart).toBeGreaterThan(-1);
     expect(envfileStart).toBeGreaterThan(buildStart);
     const buildBlock = s.slice(buildStart, envfileStart);
-    // The build command must run as the app user.
-    expect(buildBlock).toContain(`sudo -u '${APP_USER}'`);
-    // Full-path npm is required for the exact-path NOPASSWD grant to match.
-    expect(buildBlock).toContain("/usr/bin/npm");
+    // Build command runs as the SSH user (= appUser) — no sudo-u needed.
+    expect(buildBlock).not.toContain(`sudo -u '${APP_USER}'`);
+    // The build command itself should be present (e.g. 'npm run build').
+    expect(buildBlock).toContain("npm run build");
     expect(bashSyntaxOk(s)).toBe(true);
   });
 
@@ -3225,20 +3217,17 @@ describe("#98 follow-up: install + build run as the app user; fetch path carries
     const envfileStart = s.indexOf("<<<SAMOHOST_PHASE:envfile:start>>>");
     expect(installStart).toBeGreaterThan(-1);
     const installBuildBlock = s.slice(installStart, envfileStart);
-    // No appUser → install + build remain unwrapped (pre-#98 behavior preserved
-    // for AppRecords that predate the appUser field).
+    // No appUser → install + build remain unwrapped.
     expect(installBuildBlock).not.toContain("sudo -u");
     expect(installBuildBlock).toContain("npm ci");
     expect(bashSyntaxOk(s)).toBe(true);
   });
 
-  // (C) host-prep sudoers -----------------------------------------------------
-  test("(C) host-prep sudoers includes /usr/bin/npm NOPASSWD grant for appUser", () => {
+  // (C) host-prep sudoers — #163: no (appUser) npm grant needed ---------------
+  test("(C) host-prep sudoers does NOT include /usr/bin/npm NOPASSWD grant for appUser (no longer needed after #163)", () => {
     const s = buildHostPrepScript(appWithUser(), "samo");
-    // A single /usr/bin/npm grant covers npm ci, npm install, and npm run build.
-    // Without this grant the `sudo -u appUser /usr/bin/npm` calls emitted by
-    // the install + build phases fail at runtime with 'a password is required'.
-    expect(s).toContain(`samo ALL=(${APP_USER}) NOPASSWD: /usr/bin/npm`);
+    // #163: SSH-as-appUser means samo never needs to impersonate appUser for npm.
+    expect(s).not.toContain(`samo ALL=(${APP_USER}) NOPASSWD: /usr/bin/npm`);
     expect(bashSyntaxOk(s)).toBe(true);
   });
 
@@ -3300,17 +3289,18 @@ describe("#98 follow-up: install + build run as the app user; fetch path carries
 //   vhost        — B (sudo tee /etc/caddy/... + sudo systemctl reload; no env-dir writes)
 //   health       — B (curl localhost; no writes)
 // ---------------------------------------------------------------------------
-describe("#101: envfile phase runs all env-dir writes as appUser (complete whack-a-mole audit)", () => {
+// Issue #101 originally fixed envfile writes by adding scoped
+// 'sudo -u appUser install/tee/chmod' calls. Issue #163 superseded that
+// approach: SSH-as-appUser means the SSH session IS the dir owner and plain
+// install/tee/chmod work directly — no (appUser) sudoers grants needed.
+describe("#101: envfile phase runs all env-dir writes as the dir owner (complete whack-a-mole audit)", () => {
   const APP_USER = "samohost-fixture";
   const appWithUser = () =>
     app({ appUser: APP_USER, appDir: "/opt/samohost-fixture/app" });
 
-  // (A) envfile phase delegates to appUser via scoped tee/chmod — NOT via bash subshell.
-  // Security fix: the broad /usr/bin/bash SETENV grant is replaced by scoped
-  // /usr/bin/tee and /usr/bin/chmod grants; the compose runs as samo in a temp
-  // file, and only the final write uses sudo -u appUser.
+  // (A) #163: envfile uses plain /usr/bin/install + /usr/bin/tee + chmod (no sudo-u appUser).
   for (const db of ["dblab", "template", "none"] as const) {
-    test(`(A-${db}) envfile phase uses sudo -u appUser /usr/bin/tee (not bash) when appUser is set (${db})`, () => {
+    test(`(A-${db}) envfile phase uses plain /usr/bin/install + /usr/bin/tee (no sudo-u appUser, SSH user IS appUser) (${db})`, () => {
       const s = buildEnvCreateScript(
         appWithUser(),
         target({ dbBackend: db, dbName: "test_env_name" }),
@@ -3320,13 +3310,13 @@ describe("#101: envfile phase runs all env-dir writes as appUser (complete whack
       expect(envfileStart).toBeGreaterThan(-1);
       expect(envfileOk).toBeGreaterThan(envfileStart);
       const envfileBlock = s.slice(envfileStart, envfileOk);
-      // Final write to the envfile MUST use scoped tee as appUser.
-      expect(envfileBlock).toContain(`sudo -u '${APP_USER}' /usr/bin/tee`);
-      // Must NOT use a bash subshell (that required the broad SETENV bash grant).
-      expect(envfileBlock).not.toContain(`sudo -u '${APP_USER}' /usr/bin/bash`);
-      // The heredoc sentinel must be absent (no bash subshell).
+      // #163: plain /usr/bin/tee (no sudo-u appUser prefix) — SSH user IS appUser.
+      expect(envfileBlock).toContain("/usr/bin/tee");
+      // sudo-u delegation to appUser must NOT appear.
+      expect(envfileBlock).not.toContain(`sudo -u '${APP_USER}'`);
+      // Must NOT use a bash subshell (heredoc approach still rejected).
       expect(envfileBlock).not.toContain("SAMOHOST_ENVFILE_EOF");
-      // Valid bash after the change.
+      // Valid bash.
       expect(bashSyntaxOk(s)).toBe(true);
     });
   }
@@ -3345,24 +3335,20 @@ describe("#101: envfile phase runs all env-dir writes as appUser (complete whack
     }
   });
 
-  // (C) host-prep sudoers must grant scoped /usr/bin/tee and /usr/bin/chmod for
-  //     appUser (tied to the envs-root path pattern), NOT the broad bash grant.
-  test("(C) host-prep sudoers grants scoped /usr/bin/tee + /usr/bin/chmod for appUser — NO bash SETENV grant", () => {
+  // (C) #163: host-prep sudoers must NOT grant (appUser) install/tee/chmod — no longer needed.
+  test("(C) host-prep sudoers does NOT grant (appUser) tee/chmod for envfile — SSH user IS appUser (#163)", () => {
     const prep = buildHostPrepScript(appWithUser(), "samo");
     const root = envsRoot(appWithUser());
-    // Scoped tee grant: write-only to the env file path pattern.
-    expect(prep).toContain(`samo ALL=(${APP_USER}) NOPASSWD: /usr/bin/tee ${root}/*/.env`);
-    // Scoped chmod grant: set mode 600 on the env file.
-    expect(prep).toContain(`samo ALL=(${APP_USER}) NOPASSWD: /usr/bin/chmod 600 ${root}/*/.env`);
-    // The broad bash grant that let samo run arbitrary commands as appUser must be GONE.
+    // #163: no (appUser) sudoers grants for envfile writes.
+    expect(prep).not.toContain(`samo ALL=(${APP_USER}) NOPASSWD: /usr/bin/tee ${root}/*/.env`);
+    expect(prep).not.toContain(`samo ALL=(${APP_USER}) NOPASSWD: /usr/bin/chmod 600 ${root}/*/.env`);
+    // The broad bash grant must still be absent (never added even pre-#163).
     expect(prep).not.toContain(`SETENV: /usr/bin/bash`);
-    expect(prep).not.toContain(`/usr/bin/bash`);
     expect(bashSyntaxOk(prep)).toBe(true);
   });
 
-  // (D) structural: every write to the appUser-owned envDir path must itself be
-  //     a sudo -u appUser call (tee, chmod, install) — no bare write by samo.
-  test("(D) structural: every env-dir write in the generated script is a sudo -u appUser scoped call", () => {
+  // (D) #163: structural — env-dir writes reference envDir directly (SSH user owns dir).
+  test("(D) structural: env-dir writes in the generated script do NOT use sudo -u appUser (SSH user IS appUser)", () => {
     const envDir = "/opt/samohost-fixture/envs/field-record-1-feat-x";
     for (const db of ["dblab", "template", "none"] as const) {
       const s = buildEnvCreateScript(
@@ -3383,14 +3369,11 @@ describe("#101: envfile phase runs all env-dir writes as appUser (complete whack
           (/\bmv\b/.test(line) && !line.trimStart().startsWith("#")) ||
           (/>/.test(line) && !/^#/.test(line.trimStart()));
         if (!isWriteOp) continue;
-        // Every write to the envDir must itself be a sudo -u appUser call.
-        // (With the temp-file approach the intermediate cp/grep/mv all operate on
-        // $tmpfile in /tmp; only install, tee, and chmod reference the literal
-        // envDir path, and all three go through sudo -u appUser.)
+        // #163: writes to envDir must NOT use sudo -u appUser (SSH session IS appUser).
         expect(
           line,
-          `db=${db}, line ${i}: un-delegated write to envDir: ${JSON.stringify(line)}`,
-        ).toContain(`sudo -u '${APP_USER}'`);
+          `db=${db}, line ${i}: unexpected sudo -u appUser write to envDir: ${JSON.stringify(line)}`,
+        ).not.toContain(`sudo -u '${APP_USER}'`);
       }
     }
   });

@@ -355,7 +355,10 @@ describe("GAP 1: migrate phase — schema in branch applied to clone before app 
     expect(migrateBlock).toMatch(/\. .*\.env/);
   });
 
-  test("script text: appUser-wrapped — sudo -u <appUser> when appUser is set", () => {
+  // Issue #163: SSH-as-appUser means the migrate command runs as the dir owner
+  // directly — no sudo-u delegation needed. Both appUser and no-appUser paths
+  // now source .env in a subshell before migrateCmd.
+  test("script text: appUser path sources .env before migrateCmd (no sudo-u: SSH user IS appUser)", () => {
     const s = buildEnvCreateScript(
       app({ migrateCmd: "node migrate.js", appUser: "field-record" }),
       target(),
@@ -370,8 +373,12 @@ describe("GAP 1: migrate phase — schema in branch applied to clone before app 
     const migrateBlock = lines
       .slice(migrateStartLine, migrateOkLine + 1)
       .join("\n");
-    // The migrate command must be wrapped as the app user.
-    expect(migrateBlock).toContain("sudo -u 'field-record'");
+    // #163: plain migrateCmd (no sudo-u prefix); .env is still sourced.
+    expect(migrateBlock).not.toContain("sudo -u 'field-record'");
+    // The .env must still be sourced so DATABASE_URL → clone URL is visible.
+    expect(migrateBlock).toMatch(/\. .*\.env/);
+    // The migrate command is present.
+    expect(migrateBlock).toContain("node migrate.js");
   });
 
   test("executed: migrate phase is FAIL-CLOSED — migrate:fail + exit 1 when command fails", () => {
@@ -708,18 +715,16 @@ describe("BLOCKER 2: scoped emitted-count parity gate (non-vacuous + non-brickin
 });
 
 // ---------------------------------------------------------------------------
-// NEEDED: bun → absolute path in resolveBuildBin so appUser sudoers grant
-// for migrateCmd "bun packages/..." is a valid exact-path NOPASSWD line.
+// Issue #163: SSH-as-appUser removes all (appUser) sudoers grants from
+// buildHostPrepScript. The bun-absolute-path concern from pre-#163 is
+// therefore moot: no 'bun' sudoers grant is emitted at all.
 // ---------------------------------------------------------------------------
 
 describe("NEEDED: bun migrateCmd produces absolute-path sudoers grant", () => {
   test("bun migrateCmd resolves to absolute path in appUser sudoers (visudo-safe)", () => {
-    // `bun packages/shared/db/migrate.ts` is the motivating migrateCmd for
-    // samograph. Without a `bun` mapping in resolveBuildBin, the sudoers line
-    // becomes `NOPASSWD: bun` (relative path) — visudo -cf rejects it, the
-    // host-prep script aborts after writing the file, and `sudo -u <appUser>
-    // bun ...` matches no grant → migrate always fails on the appUser path.
-    // Fix: map bun → /usr/bin/bun (system-wide; matches ExecStart in docs/).
+    // Issue #163: the entire (appUser) sudoers block is removed — samo never
+    // impersonates appUser via sudo any more (SSH-as-appUser approach).
+    // There is no bun grant to validate; instead confirm no (appUser) grants at all.
     const s = buildHostPrepScript(
       app({
         migrateCmd: "bun packages/shared/db/migrate.ts",
@@ -727,15 +732,10 @@ describe("NEEDED: bun migrateCmd produces absolute-path sudoers grant", () => {
       }),
       "samo",
     );
-    // Must emit the absolute-path grant — not the bare binary name.
-    expect(s).toContain("NOPASSWD: /usr/bin/bun");
-    // Bare `bun` with no leading slash must NOT appear as a sudoers Cmnd.
-    // (The path may legitimately appear in comments or environment strings,
-    // so we check the NOPASSWD pattern specifically.)
-    const sudoersLine = s
-      .split("\n")
-      .find((l) => l.includes("NOPASSWD:") && l.includes("bun") && !l.includes("/usr/bin/bun"));
-    expect(sudoersLine).toBeUndefined();
+    // No (appUser) sudoers grants emitted after #163.
+    expect(s).not.toContain("samo ALL=(field-record)");
+    // System grants (Caddy, postgres) must still be present.
+    expect(s).toContain("samo ALL=(root) NOPASSWD: /usr/bin/tee /etc/caddy/sites.d/");
   });
 });
 
