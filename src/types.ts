@@ -350,6 +350,14 @@ export interface AppRecord extends AppSpec {
   releaseTagCursor?: string;
   /** True once the tag channel has completed its rollback-safe first cycle. */
   releaseTagChannelInitialized?: boolean;
+  /**
+   * Count of consecutive auto-heal failures in the trigger cycle (Phase 3 of
+   * the "never silently lose an update" fix). Bumped by 1 on each heal-failed
+   * outcome; reset to 0 on healed or no-drift. When this count reaches
+   * HEAL_FAIL_ALERT_THRESHOLD (3) an alert is filed via the alertRepo path.
+   * Absent on legacy records — treated as 0.
+   */
+  healFailCount?: number;
 }
 
 /**
