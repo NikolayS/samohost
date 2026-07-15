@@ -1203,3 +1203,184 @@ describe("issue #98 — appUser threading through runAppRegister / --from-toml",
     expect(rec?.appUser).toBeUndefined();
   });
 });
+
+// ---------------------------------------------------------------------------
+// GROUP 1 — Phase 1 "never silently lose an update": deploy stamps generatorSha
+// All tests RED before implementation; GREEN after Phase 1 lands.
+// ---------------------------------------------------------------------------
+
+describe("Phase 1 — generatorSha stamped on deploy (GROUP 1)", () => {
+  let dir1: string;
+  let vmStore1: StateStore;
+  let appStore1: AppStore;
+
+  const GEN_SHA  = "cccc1234567890abcdef1234567890abcdef1234";
+  const APP_SHA  = "abc1234def5678901234567890abcdef12345678";
+
+  const HAPPY_PHASES = [
+    "<<<SAMOHOST_PHASE:fetch:start>>>", "<<<SAMOHOST_PHASE:fetch:ok>>>",
+    "<<<SAMOHOST_PHASE:build:start>>>", "<<<SAMOHOST_PHASE:build:ok>>>",
+    "<<<SAMOHOST_PHASE:restart:start>>>", "<<<SAMOHOST_PHASE:restart:ok>>>",
+    "<<<SAMOHOST_PHASE:health:start>>>", "<<<SAMOHOST_PHASE:health:ok>>>",
+  ].join("\n");
+
+  const ROLLED_BACK_PHASES = [
+    "<<<SAMOHOST_PHASE:build:start>>>", "<<<SAMOHOST_PHASE:build:ok>>>",
+    "<<<SAMOHOST_PHASE:health:start>>>", "<<<SAMOHOST_PHASE:health:fail>>>",
+    "<<<SAMOHOST_PHASE:rollback:ok>>>",
+  ].join("\n");
+
+  const INCOMPLETE_PHASES = "";
+
+  beforeEach(() => {
+    dir1 = mkdtempSync(join(tmpdir(), "samohost-gen1-"));
+    vmStore1 = new StateStore(join(dir1, "vms.json"));
+    appStore1 = new AppStore(join(dir1, "apps.json"));
+
+    // Reuse the shared vm() + register() pattern from the parent describe block
+    vmStore1.upsert(vm());
+    const regCapture = capture();
+    runAppRegister(
+      {
+        vm: "samo-we-field-record",
+        name: "gen1-app",
+        repo: "samo-agent/gen1",
+        branch: "main",
+        appDir: "/home/gen1/app",
+        buildCmd: "npm run build",
+        healthUrl: "http://localhost:3000/health",
+        serviceUnit: "gen1",
+      },
+      { json: false },
+      vmStore1,
+      appStore1,
+      regCapture.out,
+      regCapture.err,
+    );
+  });
+
+  afterEach(() => {
+    rmSync(dir1, { recursive: true, force: true });
+  });
+
+  function genDeps(phaseStream: string, overrides: Partial<AppDeployDeps> = {}): AppDeployDeps {
+    return {
+      remote: (_vm, _script): Promise<SpawnResult> =>
+        Promise.resolve({ code: 0, stdout: phaseStream, stderr: "" }),
+      resolveRef: (_repo, _ref) => Promise.resolve(APP_SHA),
+      fetch: (async () =>
+        ({ ok: true, json: async () => ({ workflow_runs: [{ conclusion: "success" }] }) }) as Response) as unknown as typeof fetch,
+      now: () => new Date("2026-07-14T00:00:00.000Z"),
+      env: { GH_TOKEN: "tok" },
+      // Phase 1: injected generator sha resolver — tests use a literal string,
+      // production defaults to reading ~/samohost-trigger HEAD.
+      resolveGeneratorSha: () => GEN_SHA,
+      ...overrides,
+    };
+  }
+
+  test("gen1-1: successful deploy stamps generatorSha = injected GEN_SHA on AppRecord", async () => {
+    const c = capture();
+    const code = await runAppDeploy(
+      { vm: "samo-we-field-record", app: "gen1-app", sha: APP_SHA, skipCiGate: true },
+      { json: true },
+      vmStore1,
+      appStore1,
+      genDeps(HAPPY_PHASES),
+      c.out,
+      c.err,
+    );
+    expect(code).toBe(0);
+    const rec = appStore1.get("vm-1111", "gen1-app");
+    expect(rec?.generatorSha).toBe(GEN_SHA);
+  });
+
+  test("gen1-2: rolled-back deploy does NOT write generatorSha", async () => {
+    const c = capture();
+    const code = await runAppDeploy(
+      { vm: "samo-we-field-record", app: "gen1-app", sha: APP_SHA, skipCiGate: true },
+      { json: true },
+      vmStore1,
+      appStore1,
+      genDeps(ROLLED_BACK_PHASES),
+      c.out,
+      c.err,
+    );
+    expect(code).toBe(1);
+    const rec = appStore1.get("vm-1111", "gen1-app");
+    expect(rec?.generatorSha).toBeUndefined();
+  });
+
+  test("gen1-3: incomplete outcome does NOT write generatorSha", async () => {
+    const c = capture();
+    await runAppDeploy(
+      { vm: "samo-we-field-record", app: "gen1-app", sha: APP_SHA, skipCiGate: true },
+      { json: true },
+      vmStore1,
+      appStore1,
+      genDeps(INCOMPLETE_PHASES),
+      c.out,
+      c.err,
+    );
+    const rec = appStore1.get("vm-1111", "gen1-app");
+    expect(rec?.generatorSha).toBeUndefined();
+  });
+
+  test("gen1-4: legacy app (no generatorSha before deploy) gets generatorSha set on success", async () => {
+    // Before deploy, confirm no generatorSha
+    const before = appStore1.get("vm-1111", "gen1-app");
+    expect(before?.generatorSha).toBeUndefined();
+
+    const c = capture();
+    await runAppDeploy(
+      { vm: "samo-we-field-record", app: "gen1-app", sha: APP_SHA, skipCiGate: true },
+      { json: true },
+      vmStore1,
+      appStore1,
+      genDeps(HAPPY_PHASES),
+      c.out,
+      c.err,
+    );
+    const after = appStore1.get("vm-1111", "gen1-app");
+    expect(after?.generatorSha).toBe(GEN_SHA);
+  });
+
+  test("gen1-5: re-register after deploy preserves generatorSha", async () => {
+    // Deploy first to stamp generatorSha
+    const c = capture();
+    await runAppDeploy(
+      { vm: "samo-we-field-record", app: "gen1-app", sha: APP_SHA, skipCiGate: true },
+      { json: true },
+      vmStore1,
+      appStore1,
+      genDeps(HAPPY_PHASES),
+      c.out,
+      c.err,
+    );
+    expect(appStore1.get("vm-1111", "gen1-app")?.generatorSha).toBe(GEN_SHA);
+
+    // Re-register (operator updates a flag)
+    const regC = capture();
+    runAppRegister(
+      {
+        vm: "samo-we-field-record",
+        name: "gen1-app",
+        repo: "samo-agent/gen1",
+        branch: "main",
+        appDir: "/home/gen1/app",
+        buildCmd: "npm run build:prod",  // flag update
+        healthUrl: "http://localhost:3000/health",
+        serviceUnit: "gen1",
+      },
+      { json: false },
+      vmStore1,
+      appStore1,
+      regC.out,
+      regC.err,
+    );
+
+    // generatorSha must survive the re-register
+    const rec = appStore1.get("vm-1111", "gen1-app");
+    expect(rec?.generatorSha).toBe(GEN_SHA);
+  });
+});
