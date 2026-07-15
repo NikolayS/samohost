@@ -164,18 +164,12 @@ const PORT_CHECK_FN_LINES: string[] = [
  */
 function buildCloneFnLines(
   appUser?: string,
-  gitSafeConf?: string,
   tokenFile?: string,
 ): string[] {
   // Issue #163: the runner now SSHes AS appUser (when set), so git already runs
   // as the dir owner — no sudo-u delegation needed. Use plain git in all cases.
   // (The prior 'sudo -u appUser GIT_CONFIG_GLOBAL=... /usr/bin/git' form relied
   // on a NOPASSWD grant that is not present on hardened VMs.)
-  //
-  // When gitSafeConf is supplied it is still set via GIT_CONFIG_GLOBAL in the
-  // outer bash environment (the env-create script sets it unconditionally before
-  // calling this function), so the safe.directory override still applies without
-  // needing SETENV: in sudoers.
   const gitCmd = "git";
 
   // Inline credential helper: embeds the token file path as a LITERAL so
@@ -970,13 +964,12 @@ function buildStaticEnvCreateScript(
     "",
   ];
 
-  // ----- clone: use app user when registered (issue #97) -------------------
-  // Derive bootstrap-written paths from appDir at generation time (same as
-  // bootstrap.ts §12: appBase = dirname(appDir)).
+  // ----- clone: embed credential helper path derived from appDir -----------
+  // Issue #163: SSH runs AS appUser so plain git is used; the credential
+  // helper still reads the token from the bootstrap-written path.
   const appBase = app.appDir.replace(/\/+$/, "").split("/").slice(0, -1).join("/");
-  const gitSafeConf = `${appBase}/git-safe.conf`;
   const tokenFile = `${appBase}/.gh-token`;
-  lines.push(...buildCloneFnLines(app.appUser, gitSafeConf, tokenFile), "");
+  lines.push(...buildCloneFnLines(app.appUser, tokenFile), "");
   lines.push(
     ...phaseBlock("clone", "branch checkout into the env dir", [
       'mkdir -p "$SAMOHOST_ENVS_ROOT"',
@@ -1082,47 +1075,6 @@ function buildStaticEnvCreateScript(
   );
 
   return lines.join("\n");
-}
-
-/**
- * Resolve the first token of a build command to its canonical absolute path on
- * Ubuntu so that an exact-path sudoers NOPASSWD grant can match it. Unknown
- * names are returned as-is (the operator must arrange the grant manually for
- * non-standard toolchains).
- *
- * Used by buildEnvCreateScript when wrapping install / build under
- * `sudo -u <appUser>` (issue #98 follow-up).
- */
-function resolveBuildBin(buildCmd: string): string {
-  const first = buildCmd.split(/\s+/)[0] ?? "";
-  const UBUNTU_PATHS: Record<string, string> = {
-    npm: "/usr/bin/npm",
-    node: "/usr/bin/node",
-    npx: "/usr/bin/npx",
-    // bun: system-wide path (matches ExecStart in docs/control-plane-setup.md
-    // and the ExecStart used in app-bootstrap tests). Without this mapping,
-    // `bun packages/shared/db/migrate.ts` as migrateCmd produces
-    // `NOPASSWD: bun` (relative path) — visudo -cf rejects it and the
-    // host-prep script aborts. `sudo -u <appUser> bun ...` also matches no
-    // grant → migrate always fails on the appUser path.
-    bun: "/usr/bin/bun",
-  };
-  return UBUNTU_PATHS[first] ?? first;
-}
-
-/**
- * Wrap a build command under `sudo -u <appUser>`, replacing the leading bare
- * binary name with its Ubuntu absolute path (e.g. `npm` → `/usr/bin/npm`).
- * Preserves all arguments verbatim.
- *
- * Used by buildEnvCreateScript for the build phase when appUser is set.
- */
-function sudoWrapBuildCmd(buildCmd: string, appUser: string): string {
-  const tokens = buildCmd.split(/\s+/);
-  const first = tokens[0] ?? "";
-  const bin = resolveBuildBin(first);
-  const resolved = [bin, ...tokens.slice(1)].join(" ");
-  return `sudo -u ${sq(appUser)} ${resolved}`;
 }
 
 /**
@@ -1355,11 +1307,11 @@ export function buildEnvCreateScript(
   // ----- clone: reference clone from the production checkout (cheap) with an
   // explicit plain-clone fallback for shallow/unusable references (issue #11
   // finding 5); existing env dirs take the fetch+checkout path.
-  // Issue #97: delegate git ops to the app user when appUser is registered.
+  // Issue #163: SSH runs AS appUser so plain git is used; credential helper
+  // still reads the token from the bootstrap-written path.
   const appBase = app.appDir.replace(/\/+$/, "").split("/").slice(0, -1).join("/");
-  const gitSafeConf = `${appBase}/git-safe.conf`;
   const tokenFile = `${appBase}/.gh-token`;
-  lines.push(...buildCloneFnLines(app.appUser, gitSafeConf, tokenFile), "");
+  lines.push(...buildCloneFnLines(app.appUser, tokenFile), "");
   lines.push(
     ...phaseBlock("clone", "branch checkout into the env dir", [
       'mkdir -p "$SAMOHOST_ENVS_ROOT"',

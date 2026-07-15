@@ -646,8 +646,6 @@ describe("issue #163: env runner SSHes as app.appUser on shared-web VMs", () => 
         branch: "feat/banner",
         db: "none",
         previewDomain: "samo.cat",
-        destroy: false,
-        hostPrep: false,
       },
       { json: false },
       vmStore,
@@ -704,8 +702,6 @@ describe("issue #163: env runner SSHes as app.appUser on shared-web VMs", () => 
         branch: "feat/banner",
         db: "none",
         previewDomain: "samo.cat",
-        destroy: false,
-        hostPrep: false,
       },
       { json: false },
       vmStore,
@@ -732,7 +728,6 @@ describe("issue #163: env runner SSHes as app.appUser on shared-web VMs", () => 
       vhost: "friends-site-feat-banner.samo.cat",
       dbBackend: "none",
       createdAt: "2026-01-01T00:00:00.000Z",
-      updatedAt: "2026-01-01T00:00:00.000Z",
     });
 
     const { deps, capturedVms } = fakeDepsCapture();
@@ -742,8 +737,6 @@ describe("issue #163: env runner SSHes as app.appUser on shared-web VMs", () => 
         vm: SHARED_VM_NAME,
         app: "friends-site",
         branch: "feat/banner",
-        destroy: false,
-        hostPrep: false,
       },
       { json: false },
       vmStore,
@@ -769,7 +762,6 @@ describe("issue #163: env runner SSHes as app.appUser on shared-web VMs", () => 
       vhost: "friends-site-feat-old.samo.cat",
       dbBackend: "none",
       createdAt: "2026-01-01T00:00:00.000Z",
-      updatedAt: "2026-01-01T00:00:00.000Z",
     });
 
     const { deps, capturedVms } = fakeDepsCapture();
@@ -792,7 +784,6 @@ describe("issue #163: env runner SSHes as app.appUser on shared-web VMs", () => 
         vm: SHARED_VM_NAME,
         app: "friends-site",
         reap: true,
-        json: false,
       },
       { json: false },
       vmStore,
