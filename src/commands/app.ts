@@ -851,7 +851,10 @@ export async function runAppDeploy(
   });
   let result: SpawnResult;
   try {
-    result = await deps.remote(vm, script);
+    result = await deps.remote(
+      app.appUser !== undefined ? { ...vm, sshUser: app.appUser } : vm,
+      script,
+    );
   } catch (e) {
     err(`error: remote deploy connection failed: ${e instanceof Error ? e.message : String(e)}`);
     return 1;
