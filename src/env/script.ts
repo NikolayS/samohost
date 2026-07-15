@@ -1006,12 +1006,32 @@ function buildStaticEnvCreateScript(
   // phase marker is required.
   // $SAMOHOST_BRANCH is already sq()-escaped at the top of the script; a slash
   // in the branch value (e.g. demo/red-bg) is safe inside a JS string literal.
-  lines.push(
-    "# --- config.js: overwrite with preview marker so the SPA banner fires ---",
-    `SAMOHOST_CONFIG_NEXT=$(mktemp "${servedDir}/.config.next.XXXXXX")`,
-    `if printf 'window.__GC1_CONFIG__ = { version: "", preview: true, branch: "%s" };\\n' "$SAMOHOST_BRANCH" > "$SAMOHOST_CONFIG_NEXT" && chmod 0644 "$SAMOHOST_CONFIG_NEXT" && /usr/bin/mv -f "$SAMOHOST_CONFIG_NEXT" "${servedDir}/config.js"; then :; else rm -f "$SAMOHOST_CONFIG_NEXT"; exit 1; fi`,
-    "",
-  );
+  //
+  // Issue #162 — shared-web VMs: when appUser is set, $SAMOHOST_STATIC_DIR is
+  // owned by the app user and samo (the SSH user) cannot write into it. The
+  // mktemp/mv sequence requires write access to the target directory. Fix: when
+  // appUser is defined, pipe printf output through
+  //   sudo -u <appUser> /usr/bin/tee "$SAMOHOST_STATIC_DIR/config.js" >/dev/null
+  // so the file write executes as the app user. printf itself needs no
+  // filesystem write and runs as samo. This mirrors the established pattern in
+  // buildEnvfileScopedBodyLines (lines ~1213-1217). When appUser is absent
+  // (game-changers and other no-appUser static apps) the atomic mktemp/mv form
+  // is emitted unchanged.
+  if (app.appUser !== undefined) {
+    lines.push(
+      "# --- config.js: overwrite with preview marker so the SPA banner fires ---",
+      `# Issue #162: $SAMOHOST_STATIC_DIR is owned by ${app.appUser}; write via sudo -u tee.`,
+      `printf 'window.__GC1_CONFIG__ = { version: "", preview: true, branch: "%s" };\\n' "$SAMOHOST_BRANCH" | sudo -u ${sq(app.appUser)} /usr/bin/tee "${servedDir}/config.js" >/dev/null`,
+      "",
+    );
+  } else {
+    lines.push(
+      "# --- config.js: overwrite with preview marker so the SPA banner fires ---",
+      `SAMOHOST_CONFIG_NEXT=$(mktemp "${servedDir}/.config.next.XXXXXX")`,
+      `if printf 'window.__GC1_CONFIG__ = { version: "", preview: true, branch: "%s" };\\n' "$SAMOHOST_BRANCH" > "$SAMOHOST_CONFIG_NEXT" && chmod 0644 "$SAMOHOST_CONFIG_NEXT" && /usr/bin/mv -f "$SAMOHOST_CONFIG_NEXT" "${servedDir}/config.js"; then :; else rm -f "$SAMOHOST_CONFIG_NEXT"; exit 1; fi`,
+      "",
+    );
+  }
 
   // ----- vhost: Caddy file_server (tls internal — CF Full-mode proxied origin)
   // The record is PROXIED (orange cloud), so CF edge fronts the origin. Caddy
