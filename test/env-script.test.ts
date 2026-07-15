@@ -3808,3 +3808,152 @@ describe("3-pre clone table list: fail-closed on query failure + IN-scoping (#14
     expect(r.applied).toContain("GRANT SELECT ON public.app_users TO app_user");
   });
 });
+
+// ---------------------------------------------------------------------------
+// Issue #163 — when env runner SSHes AS appUser, env scripts must NOT emit
+// 'sudo -u <appUser>' for any app-dir operation.  The SSH session already runs
+// as the dir owner; self-delegation ('sudo -u appUser /usr/bin/git' as
+// appUser) is a NOPASSWD miss on hardened VMs and is redundant.
+//
+// System sudos (Caddy tee, systemctl) are NOT appUser and must stay.
+//
+// Tests assert the generated script strings directly (unit-level, fast, no
+// process spawn).
+// ---------------------------------------------------------------------------
+
+describe("issue #163: SSH-as-appUser makes sudo -u <appUser> redundant in env scripts", () => {
+  const APP_USER = "friends-site";
+
+  function staticAppWithUser(o: Partial<AppRecord> = {}): AppRecord {
+    return app({
+      kind: "static",
+      buildCmd: "true",
+      serviceUnit: "friends-site",
+      repo: "samo-agent/friends-of-twin-peaks",
+      appDir: "/opt/friends-site/app",
+      appUser: APP_USER,
+      ...o,
+    });
+  }
+
+  function nodeAppWithUser(o: Partial<AppRecord> = {}): AppRecord {
+    return app({
+      kind: "node",
+      buildCmd: "npm run build",
+      serviceUnit: "friends-site",
+      repo: "samo-agent/friends-of-twin-peaks",
+      appDir: "/opt/friends-site/app",
+      appUser: APP_USER,
+      databaseUrlEnv: "DATABASE_URL",
+      ...o,
+    });
+  }
+
+  // --- static app: config.js write must be a plain write (no sudo -u appUser tee) ---
+
+  test("static+appUser: config.js write must NOT contain 'sudo -u friends-site /usr/bin/tee' (SSH user IS appUser)", () => {
+    const s = buildEnvCreateScript(staticAppWithUser(), target());
+    // After #163 fix: SSH user == appUser, plain printf redirect is sufficient.
+    expect(s).not.toContain(`sudo -u '${APP_USER}' /usr/bin/tee`);
+  });
+
+  test("static+appUser: config.js write DOES still contain printf with preview: true", () => {
+    const s = buildEnvCreateScript(staticAppWithUser(), target());
+    expect(s).toContain("preview: true");
+    expect(s).toContain("config.js");
+  });
+
+  test("static+appUser: script DOES still contain sudo for Caddy tee (system op, not appUser)", () => {
+    const s = buildEnvCreateScript(staticAppWithUser(), target());
+    // Caddy snippet write uses 'sudo /usr/bin/tee' (no -u appUser) — must be kept.
+    expect(s).toContain("sudo /usr/bin/tee");
+  });
+
+  test("static+appUser: script DOES still contain sudo for systemctl (system op)", () => {
+    const s = buildEnvCreateScript(staticAppWithUser(), target());
+    expect(s).toContain("sudo /usr/bin/systemctl");
+  });
+
+  test("static+appUser: bash syntax is valid after removing sudo-u-tee", () => {
+    expect(bashSyntaxOk(buildEnvCreateScript(staticAppWithUser(), target()))).toBe(true);
+  });
+
+  // --- clone function: git must be plain (no 'sudo -u appUser git') ---
+
+  test("static+appUser: samohost_clone_env_dir must NOT contain 'sudo -u friends-site'", () => {
+    const s = buildEnvCreateScript(staticAppWithUser(), target());
+    expect(s).not.toContain(`sudo -u '${APP_USER}'`);
+  });
+
+  // --- node app: npm install / build must be plain (no sudo -u appUser npm) ---
+
+  test("node+appUser: install phase must NOT contain 'sudo -u friends-site /usr/bin/npm'", () => {
+    const s = buildEnvCreateScript(nodeAppWithUser(), target({ dbBackend: "none" }));
+    expect(s).not.toContain(`sudo -u '${APP_USER}' /usr/bin/npm`);
+  });
+
+  test("node+appUser: build phase must NOT contain 'sudo -u friends-site'", () => {
+    const s = buildEnvCreateScript(nodeAppWithUser(), target({ dbBackend: "none" }));
+    // After fix: buildCmd runs as the SSH user (appUser) directly — no sudo-u prefix.
+    expect(s).not.toContain(`sudo -u '${APP_USER}'`);
+  });
+
+  test("node+appUser: envfile write must NOT contain 'sudo -u friends-site /usr/bin/install'", () => {
+    const s = buildEnvCreateScript(nodeAppWithUser(), target({ dbBackend: "none" }));
+    expect(s).not.toContain(`sudo -u '${APP_USER}' /usr/bin/install`);
+  });
+
+  test("node+appUser: envfile write must NOT contain 'sudo -u friends-site /usr/bin/tee'", () => {
+    const s = buildEnvCreateScript(nodeAppWithUser(), target({ dbBackend: "none" }));
+    expect(s).not.toContain(`sudo -u '${APP_USER}' /usr/bin/tee`);
+  });
+
+  test("node+appUser: envfile write must NOT contain 'sudo -u friends-site /usr/bin/chmod'", () => {
+    const s = buildEnvCreateScript(nodeAppWithUser(), target({ dbBackend: "none" }));
+    expect(s).not.toContain(`sudo -u '${APP_USER}' /usr/bin/chmod`);
+  });
+
+  test("node+appUser: bash syntax is valid after removing all sudo -u appUser ops", () => {
+    expect(bashSyntaxOk(buildEnvCreateScript(nodeAppWithUser(), target({ dbBackend: "none" })))).toBe(true);
+  });
+
+  // --- no-appUser path: no regression ---
+
+  test("static without appUser: script is byte-identical to before (no regression)", () => {
+    const sWithout = buildEnvCreateScript(
+      app({ kind: "static", buildCmd: "true", serviceUnit: "gc1",
+            repo: "samo-agent/game-changers", appDir: "/opt/gc1/app" }),
+      target(),
+    );
+    // The no-appUser branch must still work: contains bare mktemp/mv.
+    expect(sWithout).toContain('SAMOHOST_CONFIG_NEXT=$(mktemp');
+    expect(sWithout).toContain('/usr/bin/mv -f "$SAMOHOST_CONFIG_NEXT"');
+    // And must NOT have sudo -u anything for app-dir ops.
+    expect(sWithout).not.toContain(`sudo -u '${APP_USER}'`);
+  });
+
+  // --- buildHostPrepScript: dead sudo-u-appUser sudoers entries removed ---
+
+  test("buildHostPrepScript with appUser must NOT emit sudo -u appUser git grant", () => {
+    const s = buildHostPrepScript(nodeAppWithUser(), "samo");
+    // After #163 fix: samo no longer needs (appUser) git/npm/install/tee/chmod grants.
+    expect(s).not.toContain(`samo ALL=(${APP_USER}) NOPASSWD: SETENV: /usr/bin/git`);
+  });
+
+  test("buildHostPrepScript with appUser must NOT emit sudo -u appUser npm grant", () => {
+    const s = buildHostPrepScript(nodeAppWithUser(), "samo");
+    expect(s).not.toContain(`samo ALL=(${APP_USER}) NOPASSWD: /usr/bin/npm`);
+  });
+
+  test("buildHostPrepScript with appUser must NOT emit sudo -u appUser install/tee/chmod .env grants", () => {
+    const s = buildHostPrepScript(nodeAppWithUser(), "samo");
+    expect(s).not.toContain(`samo ALL=(${APP_USER}) NOPASSWD: /usr/bin/install`);
+    expect(s).not.toContain(`samo ALL=(${APP_USER}) NOPASSWD: /usr/bin/tee`);
+    expect(s).not.toContain(`samo ALL=(${APP_USER}) NOPASSWD: /usr/bin/chmod`);
+  });
+
+  test("buildHostPrepScript still emits Caddy sudo grant (system op)", () => {
+    const s = buildHostPrepScript(nodeAppWithUser(), "samo");
+    expect(s).toContain("samo ALL=(root) NOPASSWD: /usr/bin/tee /etc/caddy/sites.d/");
+  });
+});
