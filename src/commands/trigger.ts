@@ -96,6 +96,49 @@ export interface GcSummary {
   pruned: number;
 }
 
+// ---------------------------------------------------------------------------
+// Phase-3 types: app-config heal pass
+// ---------------------------------------------------------------------------
+
+/**
+ * The outcome of a single app's heal attempt in the trigger auto-heal pass.
+ * Mirrors AppHealReport.outcome plus a 'deferred' value for rate-limited apps.
+ */
+export type AppHealPassAction =
+  | "healed"
+  | "no-drift"
+  | "drift-foreign"
+  | "rolled-back"
+  | "rollback-failed"
+  | "heal-failed"
+  | "incomplete"
+  | "deferred"
+  | "skipped";
+
+/** Per-app summary entry in TriggerRunReport.appHeal. */
+export interface AppHealPassSummary {
+  app: string;
+  vm: string;
+  action: AppHealPassAction;
+  reason?: string;
+}
+
+/**
+ * The outcome returned by deps.appHeal after healing a single app.
+ * The 'app' field carries the app name for bookkeeping.
+ */
+export interface AppHealResult {
+  outcome:
+    | "healed"
+    | "no-drift"
+    | "drift-foreign"
+    | "rolled-back"
+    | "rollback-failed"
+    | "heal-failed"
+    | "incomplete";
+  app: string;
+}
+
 export interface TriggerRunInput {
   /** Narrow to a single VM by name or id (optional). */
   vm?: string;
@@ -151,6 +194,25 @@ export interface TriggerRunInput {
    * SAMOHOST_IDLE_REAP env var gates whether actual destruction occurs.
    */
   idleGc?: boolean;
+  /**
+   * When true, run the app-config heal pass after the deploy loop.
+   * Heals apps whose generator is stale (generatorSha != currentGeneratorSha)
+   * and whose deploy outcome this cycle was 'up-to-date'. Rate-limited to
+   * HEAL_VM_CAP=2 VMs per cycle. DEFAULT: false (OPT-IN for safety).
+   * Phase 3 of the "never silently lose an update" fix.
+   */
+  appHeal?: boolean;
+  /**
+   * The SHA of the current samohost generator HEAD. Used to detect stale
+   * apps in the app-config heal pass. Required when appHeal=true; ignored
+   * when appHeal is false or absent.
+   */
+  currentGeneratorSha?: string;
+  /**
+   * GitHub "owner/repo" for filing persistent-heal-failure alert issues.
+   * When absent, alerts are only emitted as warnings via err(). Optional.
+   */
+  alertRepo?: string;
 }
 
 export interface TriggerAppResult {
@@ -192,6 +254,12 @@ export interface TriggerRunReport {
    * clone re-cut after the daily DBLab snapshot refresh reaped it.
    */
   heal?: HealSummary[];
+  /**
+   * Per-app config-heal pass summaries (Phase 3 of "never silently lose an
+   * update"). Present when input.appHeal was true and at least one app was
+   * eligible for healing this cycle.
+   */
+  appHeal?: AppHealPassSummary[];
 }
 
 /**
@@ -330,6 +398,29 @@ export interface TriggerDeps {
       readRemoteLog: EnvIdleGcDeps["readRemoteLog"];
     },
   ) => Promise<GcSummary>;
+  /**
+   * OPTIONAL: Curried Phase-2 heal function for the trigger auto-heal pass
+   * (Phase 3 of "never silently lose an update"). When present and
+   * input.appHeal is true, called once per eligible stale-generator app
+   * (after the deploy loop, after GC, before batchedVmCycle). The dep owns
+   * health-gating and rollback (inherited from Phase-2 runAppHeal internals).
+   *
+   * Production wiring: wrap runAppHeal(app, { apply: true }, ...).
+   * Tests: inject a fake that records calls and returns configurable outcomes.
+   *
+   * OPTIONAL so all existing test fixtures that build TriggerDeps without
+   * appHeal continue to compile and run unchanged.
+   */
+  appHeal?: (app: AppRecord, opts: { apply: boolean }) => Promise<AppHealResult>;
+  /**
+   * OPTIONAL: Injectable alert function for persistent heal failures.
+   * When healFailCount reaches HEAL_FAIL_ALERT_THRESHOLD (3), this is called
+   * with the app name and current fail count. Production wiring calls
+   * upsertGhIssue on input.alertRepo; tests inject a recording closure.
+   *
+   * OPTIONAL so existing test fixtures compile unchanged.
+   */
+  fileHealAlert?: (appName: string, failCount: number) => Promise<void>;
 }
 
 // ---------------------------------------------------------------------------
@@ -790,6 +881,178 @@ export async function runTriggerRun(
     }
   }
 
+  // ---- App-config heal pass (Phase 3 of "never silently lose an update") ----
+  //
+  // Runs AFTER gc + idle-gc, BEFORE the preview batchedVmCycle.
+  //
+  // Selection criteria (ALL must hold):
+  //   1. input.appHeal === true AND deps.appHeal is wired.
+  //   2. input.dryRun is false (heal is a live write operation).
+  //   3. input.currentGeneratorSha is provided (required to detect staleness).
+  //   4. App's deploy outcome this cycle was 'up-to-date' (derive from results).
+  //      Apps deployed this cycle are NEVER healed in the same cycle
+  //      (mutual exclusion: guard from results array, NOT lastDeployAt).
+  //   5. app.generatorSha !== input.currentGeneratorSha (stale generator).
+  //      Absent generatorSha also counts as stale.
+  //   6. app.failedSha !== input.currentGeneratorSha (known-bad heal guard).
+  //   7. (now - Date.parse(app.lastDeployAt)) >= 600_000 (10-min grace window).
+  //
+  // Rate limit: at most HEAL_VM_CAP (2) VMs healed per cycle.
+  // Per-app isolation: one app's failure must not abort the pass.
+  // Bookkeeping: healFailCount bumped on failure, reset on success.
+  // Alert: when healFailCount reaches HEAL_FAIL_ALERT_THRESHOLD, calls
+  //   deps.fileHealAlert (injectable; production wires upsertGhIssue).
+  //
+  const HEAL_VM_CAP = 2;
+  const HEAL_FAIL_ALERT_THRESHOLD = 3;
+
+  let appHealSummaries: AppHealPassSummary[] | undefined;
+
+  if (
+    input.appHeal === true &&
+    !input.dryRun &&
+    deps.appHeal !== undefined &&
+    input.currentGeneratorSha !== undefined
+  ) {
+    // Build the set of app names deployed this cycle (mutual exclusion guard).
+    const deployedThisCycle = new Set<string>(
+      results
+        .filter((r) => r.action === "deployed")
+        .map((r) => r.app),
+    );
+
+    // Build list of eligible apps for the heal pass.
+    const healCandidates: Array<{ app: AppRecord; vm: VmRecord }> = [];
+
+    for (const result of results) {
+      if (result.action !== "up-to-date") continue;
+      if (deployedThisCycle.has(result.app)) continue; // should not happen, but guard
+
+      const appRecord = candidates.find((a) => a.name === result.app);
+      if (appRecord === undefined) continue;
+
+      const vmRecord = allVms.find((v) => v.id === appRecord.vmId);
+      if (vmRecord === undefined) continue;
+      if (!LIVE_STATES.has(vmRecord.lifecycleState)) continue;
+
+      // Skip if generatorSha already matches (already converged).
+      if (
+        appRecord.generatorSha !== undefined &&
+        appRecord.generatorSha === input.currentGeneratorSha
+      ) continue;
+
+      // Skip if failedSha matches currentGeneratorSha (known-bad heal guard).
+      if (
+        appRecord.failedSha !== undefined &&
+        appRecord.failedSha === input.currentGeneratorSha
+      ) continue;
+
+      // 10-min manual-deploy grace window: skip apps deployed very recently.
+      const lastDeployMs = Date.parse(appRecord.lastDeployAt ?? "0");
+      if (deps.now().getTime() - lastDeployMs < 600_000) continue;
+
+      healCandidates.push({ app: appRecord, vm: vmRecord });
+    }
+
+    if (healCandidates.length > 0) {
+      appHealSummaries = [];
+      let healedVmCount = 0;
+
+      for (const { app: appRecord, vm: vmRecord } of healCandidates) {
+        // Rate limit: cap at HEAL_VM_CAP VMs per cycle.
+        if (healedVmCount >= HEAL_VM_CAP) {
+          appHealSummaries.push({
+            app: appRecord.name,
+            vm: vmRecord.name,
+            action: "deferred",
+            reason: "heal-vm-cap-reached",
+          });
+          continue;
+        }
+
+        try {
+          const healResult = await deps.appHeal(appRecord, { apply: true });
+          healedVmCount++;
+
+          // Successful outcomes: healed, no-drift, drift-foreign.
+          const isSuccess =
+            healResult.outcome === "healed" ||
+            healResult.outcome === "no-drift" ||
+            healResult.outcome === "drift-foreign";
+
+          if (isSuccess) {
+            // Reset healFailCount on success.
+            const current = appStore.get(appRecord.vmId, appRecord.name) ?? appRecord;
+            if ((current.healFailCount ?? 0) !== 0) {
+              appStore.upsert({ ...current, healFailCount: 0 });
+            }
+          } else {
+            // Failure: bump healFailCount.
+            const current = appStore.get(appRecord.vmId, appRecord.name) ?? appRecord;
+            const newFailCount = (current.healFailCount ?? 0) + 1;
+            appStore.upsert({ ...current, healFailCount: newFailCount });
+
+            // Alert on persistent failure.
+            if (newFailCount >= HEAL_FAIL_ALERT_THRESHOLD) {
+              if (deps.fileHealAlert !== undefined) {
+                try {
+                  await deps.fileHealAlert(appRecord.name, newFailCount);
+                } catch (alertErr) {
+                  err(
+                    `samohost: warning: failed to file heal alert for ${appRecord.name}: ` +
+                      (alertErr instanceof Error ? alertErr.message : String(alertErr)),
+                  );
+                }
+              } else {
+                err(
+                  `samohost: warning: persistent heal failures (${newFailCount}) for app ` +
+                    `${appRecord.name} — set input.alertRepo + deps.fileHealAlert to file an issue`,
+                );
+              }
+            }
+          }
+
+          const action: AppHealPassAction = isSuccess
+            ? (healResult.outcome as AppHealPassAction)
+            : (healResult.outcome === "heal-failed" ? "heal-failed" : (healResult.outcome as AppHealPassAction));
+
+          appHealSummaries.push({
+            app: appRecord.name,
+            vm: vmRecord.name,
+            action,
+          });
+
+          if (!opts.json && isSuccess && healResult.outcome === "healed") {
+            out(`  app-heal ${vmRecord.name}/${appRecord.name}: healed (generator converged)`);
+          }
+        } catch (e) {
+          // Per-app isolation: one app's error must not abort the pass.
+          err(
+            `samohost: warning: app-config heal pass failed for ${appRecord.name}: ` +
+              (e instanceof Error ? e.message : String(e)),
+          );
+          appHealSummaries.push({
+            app: appRecord.name,
+            vm: vmRecord.name,
+            action: "heal-failed",
+            reason: e instanceof Error ? e.message : String(e),
+          });
+          // Bump healFailCount even on exception.
+          try {
+            const current = appStore.get(appRecord.vmId, appRecord.name) ?? appRecord;
+            const newFailCount = (current.healFailCount ?? 0) + 1;
+            appStore.upsert({ ...current, healFailCount: newFailCount });
+            if (newFailCount >= HEAL_FAIL_ALERT_THRESHOLD && deps.fileHealAlert !== undefined) {
+              await deps.fileHealAlert(appRecord.name, newFailCount).catch(() => undefined);
+            }
+          } catch {
+            // Non-fatal bookkeeping failure.
+          }
+        }
+      }
+    }
+  }
+
   // ---- Self-heal + PR-preview pass ----------------------------------------
   //
   // BATCHED PATH (preferred, when deps.batchedVmCycle is wired):
@@ -949,6 +1212,7 @@ export async function runTriggerRun(
     ...(gcByVm !== undefined ? { gc: gcByVm } : {}),
     ...(healSummaries !== undefined ? { heal: healSummaries } : {}),
     ...(prPreviewSummaries !== undefined ? { prPreviews: prPreviewSummaries } : {}),
+    ...(appHealSummaries !== undefined ? { appHeal: appHealSummaries } : {}),
   };
 
   if (opts.json) {
