@@ -38,11 +38,14 @@ import {
   defaultIsCommitOnBranch,
   defaultResolveLatestTag,
   isDateReleaseTag,
+  runAppHeal,
+  defaultAppHealDeps,
   type AppDeployInput,
   type RefResolver,
   type LatestTagResolver,
   type CommitOnBranchVerifier,
 } from "./app.ts";
+import { upsertGhIssue } from "../util/gh-comment.ts";
 import { checkCiGreen } from "../app/cigate.ts";
 import {
   CANONICAL_RELEASE_CI_WORKFLOW,
@@ -1348,6 +1351,15 @@ export interface TriggerDepsOpts {
    * Production: absent → real Promise-based setTimeout(ms).
    */
   sleep?: (ms: number) => Promise<void>;
+  /**
+   * Injectable generator SHA resolver (for integration tests — avoids the real
+   * `git -C ~/samohost-trigger rev-parse HEAD` call). When provided,
+   * defaultTriggerDeps uses it inside the appHeal closure instead of
+   * resolveProductionGeneratorSha. Only relevant when SAMOHOST_APP_HEAL is set.
+   *
+   * Production: absent → resolveProductionGeneratorSha() called at heal time.
+   */
+  resolveGeneratorSha?: () => string;
 }
 
 /**
@@ -1813,6 +1825,112 @@ export function defaultTriggerDeps(opts: TriggerDepsOpts = {}): TriggerDeps {
         reaped: report.reaped.length,
         pruned: 0,
       };
+    },
+
+    // -----------------------------------------------------------------------
+    // Phase 3: appHeal dep — curried runAppHeal with { apply: true }.
+    //
+    // GATING (critical): only wired when SAMOHOST_APP_HEAL is set to a truthy
+    // value in the environment. When the dep is absent (default), the heal pass
+    // in runTriggerRun silently skips (input.appHeal guard). This ensures that
+    // merging this PR does NOT change the running trigger's behavior — it keeps
+    // running exactly as before until the operator adds a one-line systemd
+    // drop-in: EnvironmentFile=/etc/systemd/.../autoheal.conf (SAMOHOST_APP_HEAL=1).
+    //
+    // Truthy = any non-empty value that is not "0" or "false".
+    // -----------------------------------------------------------------------
+    ...(((): Pick<TriggerDeps, "appHeal"> => {
+      const appHealEnv = process.env["SAMOHOST_APP_HEAL"] ?? "";
+      const enabled =
+        appHealEnv !== "" &&
+        appHealEnv !== "0" &&
+        appHealEnv.toLowerCase() !== "false";
+      if (!enabled) return {};
+
+      return {
+        appHeal: async (appRecord: AppRecord, healOpts: { apply: boolean }): Promise<AppHealResult> => {
+          // runAppHeal requires a VM name, app name, and apply flag.
+          // We need vmStore and appStore — open default stores (same pattern
+          // as the gc and idleGc closures above).
+          const { StateStore: HealVmStore } = await import("../state/store.ts");
+          const { AppStore: HealAppStore } = await import("../state/apps.ts");
+          const healVmStore = new HealVmStore();
+          const healAppStore = new HealAppStore();
+          const healDeps = defaultAppHealDeps();
+          // Inject the test-friendly resolveGeneratorSha when provided.
+          if (opts.resolveGeneratorSha !== undefined) {
+            healDeps.resolveGeneratorSha = opts.resolveGeneratorSha;
+          }
+          const noop = (_s: string) => {};
+
+          // Look up the VM record to get the VM name for runAppHeal.
+          const allVmsForHeal = healVmStore.list();
+          const vmForHeal = allVmsForHeal.find((v) => v.id === appRecord.vmId);
+          if (vmForHeal === undefined) {
+            return { outcome: "heal-failed", app: appRecord.name };
+          }
+
+          let outStr = "";
+          const captureOut = (s: string) => { outStr += s; };
+
+          const exitCode = await runAppHeal(
+            { vm: vmForHeal.name, app: appRecord.name, apply: healOpts.apply },
+            { json: true },
+            healVmStore,
+            healAppStore,
+            healDeps,
+            captureOut,
+            noop,
+          );
+
+          // Parse the JSON output to extract the outcome.
+          if (exitCode === 0) {
+            try {
+              const report = JSON.parse(outStr) as import("./app.ts").AppHealReport;
+              return { outcome: report.outcome, app: appRecord.name };
+            } catch {
+              return { outcome: "healed", app: appRecord.name };
+            }
+          } else {
+            return { outcome: "heal-failed", app: appRecord.name };
+          }
+        },
+      };
+    })()),
+
+    // -----------------------------------------------------------------------
+    // Phase 3: fileHealAlert dep — wires upsertGhIssue for persistent failures.
+    //
+    // Always wired (regardless of SAMOHOST_APP_HEAL) so that when healFailCount
+    // reaches threshold and alertRepo is set, the dep exists. The dep is only
+    // CALLED by runTriggerRun when both input.appHeal=true AND deps.appHeal is
+    // wired AND the fail count crosses HEAL_FAIL_ALERT_THRESHOLD (3).
+    // -----------------------------------------------------------------------
+    fileHealAlert: async (appName: string, failCount: number): Promise<void> => {
+      const alertRepo = process.env["SAMOHOST_HEAL_ALERT_REPO"];
+      if (alertRepo === undefined || alertRepo === "") {
+        // No alert repo configured — emit to stderr (caller logs a warning).
+        process.stderr.write(
+          `samohost: heal-alert: persistent heal failures (${failCount}) for ` +
+            `${appName} — set SAMOHOST_HEAL_ALERT_REPO to file a GitHub issue\n`,
+        );
+        return;
+      }
+      const HEAL_ALERT_MARKER = "<!-- samohost-heal-alert -->";
+      upsertGhIssue({
+        repo: alertRepo,
+        title: `[samohost] Persistent heal failure: ${appName} (${failCount} consecutive failures)`,
+        marker: HEAL_ALERT_MARKER,
+        body:
+          `${HEAL_ALERT_MARKER}\n` +
+          `**App:** \`${appName}\`\n` +
+          `**Consecutive heal failures:** ${failCount}\n\n` +
+          `The Phase-3 auto-heal pass has failed ${failCount} consecutive times for this app.\n` +
+          `Inspect the samohost trigger journal for details:\n` +
+          `\`\`\`\njournalctl -u samohost-trigger.service -n 200\n\`\`\`\n` +
+          `Once resolved, reset the fail counter:\n` +
+          `\`\`\`\nsamohost app clear-failed --vm <vm> --app ${appName}\n\`\`\``,
+      });
     },
 
     // -----------------------------------------------------------------------

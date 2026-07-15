@@ -60,6 +60,7 @@ import {
   checkTriggerPrereqs,
   type TriggerRunInput,
 } from "./commands/trigger.ts";
+import { resolveProductionGeneratorSha } from "./commands/generator-stale.ts";
 import {
   runEnvPlan,
   runEnvCreate,
@@ -745,6 +746,13 @@ export function parseArgs(
   }
   throw new UsageError(`unknown command: ${first}`);
 }
+
+/**
+ * Alias for {@link parseArgs} exported for unit-testing CLI flag parsing
+ * without running the full process dispatch. Tests import this to verify
+ * flag parsing without needing a real environment.
+ */
+export const parseCliCommand = parseArgs;
 
 function parsePreview(
   args: string[],
@@ -2037,6 +2045,11 @@ function parseTriggerRun(args: string[]): ParsedTriggerRun {
   let heal: boolean | undefined;
   let prPreviews: boolean | undefined;
   let idleGc: boolean | undefined;
+  // --app-heal: opt-in CLI flag for manual / dry-run exercise of the Phase-3
+  // auto-heal pass. The flag is also activated by the SAMOHOST_APP_HEAL env gate
+  // (see below) so the trigger service can be opted in via a systemd drop-in
+  // without touching the binary's arguments.
+  let appHeal: boolean | undefined;
 
   for (let i = 0; i < args.length; i++) {
     const a = args[i]!;
@@ -2067,10 +2080,25 @@ function parseTriggerRun(args: string[]): ParsedTriggerRun {
       case "--idle-gc":
         idleGc = true;
         break;
+      case "--app-heal":
+        // Explicit CLI flag: opt-in to the Phase-3 auto-heal pass for this run.
+        // Useful for one-off manual invocations and --dry-run exercises.
+        appHeal = true;
+        break;
       default:
         throw new UsageError(`unknown flag: ${a}`);
     }
   }
+
+  // SAMOHOST_APP_HEAL env gate (default OFF).
+  // Truthy = any non-empty string that is not "0" or "false".
+  // The running trigger service picks this up from its systemd EnvironmentFile
+  // drop-in without requiring an argument change. Merging this PR does NOT
+  // activate autonomous healing because the env flag is absent by default.
+  const appHealEnv = process.env["SAMOHOST_APP_HEAL"] ?? "";
+  const appHealGated =
+    appHealEnv !== "" && appHealEnv !== "0" && appHealEnv.toLowerCase() !== "false";
+  if (appHealGated) appHeal = true;
 
   const input: TriggerRunInput = {
     dryRun,
@@ -2080,6 +2108,7 @@ function parseTriggerRun(args: string[]): ParsedTriggerRun {
     ...(heal !== undefined ? { heal } : {}),
     ...(prPreviews !== undefined ? { prPreviews } : {}),
     ...(idleGc !== undefined ? { idleGc } : {}),
+    ...(appHeal !== undefined ? { appHeal } : {}),
   };
   return { kind: "trigger-run", input, json };
 }
@@ -2549,15 +2578,36 @@ export async function main(
         out,
         err,
       );
-    case "trigger-run":
+    case "trigger-run": {
       // Fail loud at startup when a required operator prerequisite is absent.
       // Without CLOUDFLARE_SAMOCAT every preview cycle silently skips DNS —
       // previews are never reachable but the trigger exits 0 with no signal.
       if (!checkTriggerPrereqs({ env: process.env, err })) {
         return 1;
       }
+
+      // Phase 3 wiring: when the appHeal pass is active, resolve the current
+      // samohost generator SHA from ~/samohost-trigger and inject it into the
+      // input so runTriggerRun can detect stale-generator apps without hitting
+      // git on every inner loop iteration. Done once here at the dispatch layer.
+      let triggerInput = cmd.input;
+      if (triggerInput.appHeal === true && triggerInput.currentGeneratorSha === undefined) {
+        try {
+          const currentGeneratorSha = resolveProductionGeneratorSha();
+          triggerInput = { ...triggerInput, currentGeneratorSha };
+        } catch (e) {
+          // ~/samohost-trigger absent or git failed — emit a warning but
+          // proceed without appHeal (the pass will be skipped because
+          // currentGeneratorSha remains absent, which is the safe default).
+          err(
+            `samohost: warning: could not resolve generator SHA for app-heal ` +
+              `(${e instanceof Error ? e.message : String(e)}); app-heal pass skipped this cycle`,
+          );
+        }
+      }
+
       return runTriggerRun(
-        cmd.input,
+        triggerInput,
         { json: cmd.json },
         new StateStore(),
         defaultAppStore(),
@@ -2565,6 +2615,7 @@ export async function main(
         out,
         err,
       );
+    }
     case "domain-add":
       return runDomainAdd(
         cmd.input,
