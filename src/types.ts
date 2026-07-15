@@ -328,6 +328,13 @@ export interface AppRecord extends AppSpec {
   failedSha?: string;
   lastDeployAt?: string;
   /**
+   * SHA of the samohost generator (~/samohost-trigger HEAD) that last
+   * successfully deployed this app. Absent on legacy records — treated as
+   * stale. Set on every successful deploy; preserved across re-register.
+   * Phase 1 of the "never silently lose an update" fix.
+   */
+  generatorSha?: string;
+  /**
    * Highest release tag observed by the production tag channel. On first
    * activation for an already-deployed app, samohost records the current tag
    * here without deploying it; only a later, greater tag may advance prod.
