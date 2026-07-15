@@ -48,6 +48,7 @@ import {
   staticRootOf,
   staticTreeGuardFnLines,
 } from "./static-root.ts";
+import { SAMOHOST_PROVENANCE_HEADER } from "./heal-script.ts";
 
 /** Marker prefix the parser keys on. */
 export const PHASE_PREFIX = "<<<SAMOHOST_PHASE:";
@@ -547,6 +548,9 @@ export function buildDeployScript(app: AppRecord, target: DeployTarget): string 
       'samohost_assert_static_tree_safe "$SAMOHOST_CANDIDATE_REAL" "$SAMOHOST_STATIC_DIR" "$SAMOHOST_STATIC_ROOT" || rollback',
       `sudo /usr/bin/rm -f ${sq(staticStagedSnippet!)} || rollback`,
       `sudo /usr/bin/tee ${sq(staticStagedSnippet!)} >/dev/null <<CADDY || rollback`,
+      // Provenance header MUST be line 1 of the written file so heal's
+      // `head -1` provenance gate recognises it on the next cycle.
+      SAMOHOST_PROVENANCE_HEADER,
       `${address} {`,
       `\t# samohost-worktree "\${SAMOHOST_CANDIDATE_DIR}"`,
       `\troot * "${staticServedDir}"`,

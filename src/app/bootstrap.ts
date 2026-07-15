@@ -83,6 +83,7 @@ import {
   assertLinuxAppUser,
   assertOptionalLinuxAppUser,
 } from "./linux-user.ts";
+import { SAMOHOST_PROVENANCE_HEADER } from "./heal-script.ts";
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -778,6 +779,9 @@ export function buildHostBootstrapScript(
       '  cmp -s "$SAMOHOST_BOOTSTRAP_EXPECTED_ROUTE" "$SAMOHOST_ACTIVE_ROUTE" || { echo "active static route does not match structured deployment state" >&2; exit 1; }',
       '  SAMOHOST_BOOTSTRAP_EXPECTED_MAIN=$(mktemp)',
       '  cat > "$SAMOHOST_BOOTSTRAP_EXPECTED_MAIN" <<CADDY_SITE',
+      // Provenance header must be line 1 — matches buildDeployScript's static heredoc
+      // and heal's regeneration format. The cmp check requires byte-identity.
+      SAMOHOST_PROVENANCE_HEADER,
       `${siteAddress} {`,
       `\t# samohost-worktree "\${SAMOHOST_CHECKOUT_REAL}"`,
       `\troot * "\${SAMOHOST_STATIC_DIR}"`,

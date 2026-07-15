@@ -934,6 +934,11 @@ export async function runTriggerRun(
       const appRecord = candidates.find((a) => a.name === result.app);
       if (appRecord === undefined) continue;
 
+      // Skip never-deployed apps: heal reconciles the LIVE vhost written by deploy;
+      // if the app was never deployed there is no vhost to reconcile and no
+      // active-state JSON to read the served directory from.
+      if (appRecord.deployedSha === undefined) continue;
+
       const vmRecord = allVms.find((v) => v.id === appRecord.vmId);
       if (vmRecord === undefined) continue;
       if (!LIVE_STATES.has(vmRecord.lifecycleState)) continue;

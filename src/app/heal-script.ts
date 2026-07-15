@@ -47,6 +47,17 @@ import { staticReleaseStatePaths } from "./static-root.ts";
 import { renderVhost, planFromApp } from "../caddy/render.ts";
 import { PHASE_PREFIX } from "./script.ts";
 
+/**
+ * Build the static main-vhost address expression — matches the deploy path
+ * in buildDeployScript (src/app/script.ts).
+ *
+ *   cp-http80 → "http://<host>"   (no :80 suffix — deploy format)
+ *   otherwise → "<host>"           (bare; tls internal added inside block)
+ */
+export function staticVhostAddress(mainHost: string, mainListen: string | undefined): string {
+  return mainListen === "cp-http80" ? `http://${mainHost}` : mainHost;
+}
+
 /** Phase names for the heal script. */
 export type HealPhaseName =
   | "heal"
@@ -104,9 +115,17 @@ export function buildConfigHealScript(app: AppRecord): string {
   const isStatic = app.kind === "static";
   const staticPaths = isStatic ? staticReleaseStatePaths(app.appDir) : undefined;
 
-  // ---- Regenerated main vhost content (rendered at build time) --------------
-  // planFromApp / renderVhost throws if mainHost is absent — already guarded above.
-  const regeneratedMainVhost = renderVhost(planFromApp(app));
+  // ---- Regenerated main vhost content ----------------------------------------
+  // For NODE apps: render at build time via renderVhost (deterministic, no runtime
+  // state needed).
+  //
+  // For STATIC apps: the served directory is only known at runtime (read from
+  // .samohost-active-static.json). We cannot embed the content at build time.
+  // Instead the bash script reads the active-state JSON at runtime and generates
+  // the vhost content using a bash heredoc with variable substitution.
+  // renderVhost is NOT called for static apps — it would produce a node-style
+  // reverse_proxy block, which is wrong for static apps.
+  const regeneratedMainVhost = isStatic ? undefined : renderVhost(planFromApp(app));
 
   // ---- Script header --------------------------------------------------------
   push(
@@ -198,103 +217,222 @@ export function buildConfigHealScript(app: AppRecord): string {
     "",
   );
 
-  // ---- Main vhost artifact --------------------------------------------------
-  push(
-    "# --- main vhost: check provenance, backup, compare, stage ---",
-    "SAMOHOST_MAIN_VHOST_BACKUP=\"$(mktemp)\"",
-    "SAMOHOST_MAIN_VHOST_HAD_BACKUP=0",
-    `if [[ -f ${sq(mainVhostPath)} ]]; then`,
-    `  cp ${sq(mainVhostPath)} "$SAMOHOST_MAIN_VHOST_BACKUP"`,
-    "  SAMOHOST_MAIN_VHOST_HAD_BACKUP=1",
-    "  # Provenance gate: only overwrite files with the samohost header on line 1.",
-    "  # A hand-edited file → drift-foreign finding; NEVER overwritten.",
-    `  _provenance=$(head -1 ${sq(mainVhostPath)} 2>/dev/null || true)`,
-    `  if [[ "$_provenance" != ${sq(SAMOHOST_PROVENANCE_HEADER)} ]]; then`,
-    `    echo "drift-foreign: ${mainVhostPath} lacks samohost provenance header"`,
-    "    SAMOHOST_HEAL_DRIFT_FOREIGN=1",
-    "  else",
-    "    # Write regenerated content to temp, compare with live",
-    `    _new_main_vhost=$(mktemp)`,
-    // Write the regenerated vhost (rendered at build time in TypeScript) to the temp file.
-    // We use a heredoc to avoid shell-interpreting the vhost content.
-    `    sudo /usr/bin/tee "$_new_main_vhost" >/dev/null <<'SAMOHOST_MAIN_VHOST_CONTENT'`,
-    ...regeneratedMainVhost.split("\n"),
-    "SAMOHOST_MAIN_VHOST_CONTENT",
-    `    if cmp -s ${sq(mainVhostPath)} "$_new_main_vhost"; then`,
-    `      rm -f "$_new_main_vhost"`,
-    "      echo \"main vhost: no drift\"",
-    "    else",
-    "      # Stage: tee to staged path, then atomic mv",
-    `      if sudo /usr/bin/tee ${sq(stagedMainVhost)} >/dev/null < "$_new_main_vhost"; then`,
-    `        sudo /usr/bin/mv -- ${sq(stagedMainVhost)} ${sq(mainVhostPath)} || rollback`,
-    "        echo \"main vhost: regenerated\"",
-    "        SAMOHOST_HEAL_ANY_CHANGED=1",
-    "      else",
-    "        rollback",
-    "      fi",
-    `      rm -f "$_new_main_vhost"`,
-    "    fi",
-    "  fi",
-    'elif [[ "${SAMOHOST_MAIN_VHOST_BACKUP:-}" != "" ]]; then',
-    "  # File did not exist — no provenance check needed, write fresh",
-    `  if sudo /usr/bin/tee ${sq(mainVhostPath)} >/dev/null <<'SAMOHOST_MAIN_VHOST_CONTENT'`,
-    ...regeneratedMainVhost.split("\n"),
-    "SAMOHOST_MAIN_VHOST_CONTENT",
-    "  then",
-    "    echo \"main vhost: created\"",
-    "    SAMOHOST_HEAL_ANY_CHANGED=1",
-    "  else rollback; fi",
-    "fi",
-    "",
-  );
-
-  // ---- Static app: active-route artifact ------------------------------------
+  // ---- Static app: read active-state JSON first (before main vhost section) --
+  // For static apps, the served directory ($SAMOHOST_STATIC_DIR) is only known
+  // at runtime — it's stored in .samohost-active-static.json written by deploy.
+  // We read it here, before the main vhost section, so both the main vhost and
+  // the active-route snippet can reference $SAMOHOST_STATIC_DIR.
   if (isStatic && staticPaths !== undefined) {
     push(
-      "# --- static active-route: read releaseDir from active-state JSON, regenerate snippet ---",
-      "# The active-route file is a raw Caddy snippet (NOT a site block / NOT renderVhost output).",
-      "# Format: root * \"<releaseDir>\"\\ntry_files {path} {path}/ =404\\nfile_server\\nencode gzip\\n",
+      "# --- static: read active-state JSON to resolve the current served directory ---",
+      "# Both the main vhost and the active-route snippet reference SAMOHOST_STATIC_DIR.",
       `SAMOHOST_RELEASES_DIR=${sq(staticPaths.releasesDir)}`,
+      `SAMOHOST_STATIC_DIR_RESOLVED=0`,
+      `SAMOHOST_RELEASE_DIR=""`,
+      `SAMOHOST_STATIC_ROOT_VAL=""`,
+      `SAMOHOST_STATIC_DIR=""`,
       `if [[ ! -f ${sq(staticPaths.activeState)} ]]; then`,
-      `  echo "heal: active-state JSON not found at ${sq(staticPaths.activeState)} — skipping active-route regeneration"`,
+      `  echo "heal: active-state JSON not found at ${sq(staticPaths.activeState)} — cannot regenerate static vhost or active-route"`,
       "else",
-      "  # Parse releaseDir from the active-state JSON using python3.",
-      "  # The active-state JSON schema: { schema:1, releaseDir: \"...\", staticRoot: \"...\", ... }",
+      "  # Parse releaseDir + staticRoot from the active-state JSON using python3.",
+      "  # Schema: { schema:1, releaseDir: \"...\", staticRoot: \"...\", ... }",
       `  SAMOHOST_RELEASE_DIR=$(python3 -c "import json,sys; d=json.load(open(sys.argv[1])); print(d['releaseDir'])" ${sq(staticPaths.activeState)} 2>/dev/null || true)`,
-      `  SAMOHOST_STATIC_ROOT=$(python3 -c "import json,sys; d=json.load(open(sys.argv[1])); print(d.get('staticRoot',''))" ${sq(staticPaths.activeState)} 2>/dev/null || true)`,
+      `  SAMOHOST_STATIC_ROOT_VAL=$(python3 -c "import json,sys; d=json.load(open(sys.argv[1])); print(d.get('staticRoot',''))" ${sq(staticPaths.activeState)} 2>/dev/null || true)`,
       '  if [[ -z "$SAMOHOST_RELEASE_DIR" ]]; then',
-      `    echo "heal: could not read releaseDir from ${sq(staticPaths.activeState)} — skipping active-route regeneration"`,
+      `    echo "heal: could not read releaseDir from ${sq(staticPaths.activeState)} — cannot regenerate static vhost or active-route"`,
       "  else",
-      '    if [[ -n "$SAMOHOST_STATIC_ROOT" ]]; then',
-      '      SAMOHOST_STATIC_DIR="$SAMOHOST_RELEASE_DIR/$SAMOHOST_STATIC_ROOT"',
+      '    if [[ -n "$SAMOHOST_STATIC_ROOT_VAL" ]]; then',
+      '      SAMOHOST_STATIC_DIR="$SAMOHOST_RELEASE_DIR/$SAMOHOST_STATIC_ROOT_VAL"',
       "    else",
       '      SAMOHOST_STATIC_DIR="$SAMOHOST_RELEASE_DIR"',
       "    fi",
-      "    # Backup the live active-route snippet",
-      '    SAMOHOST_ACTIVE_ROUTE_BACKUP="$(mktemp)"',
-      "    SAMOHOST_ACTIVE_ROUTE_HAD_BACKUP=0",
-      `    if [[ -f ${sq(staticPaths.activeRoute)} ]]; then`,
-      `      cp ${sq(staticPaths.activeRoute)} "$SAMOHOST_ACTIVE_ROUTE_BACKUP"`,
-      "      SAMOHOST_ACTIVE_ROUTE_HAD_BACKUP=1",
-      "    fi",
-      "    # Generate the regenerated active-route snippet to a temp file",
-      '    SAMOHOST_ACTIVE_ROUTE_STAGED="$(mktemp "${SAMOHOST_RELEASES_DIR}/.active-route.heal.XXXXXX")"',
-      '    if printf \'root * "%s"\\ntry_files {path} {path}/ =404\\nfile_server\\nencode gzip\\n\' "$SAMOHOST_STATIC_DIR" > "$SAMOHOST_ACTIVE_ROUTE_STAGED" && chmod 0644 "$SAMOHOST_ACTIVE_ROUTE_STAGED"; then',
-      "      # cmp: if identical → no drift",
-      `      if [[ -f ${sq(staticPaths.activeRoute)} ]] && cmp -s ${sq(staticPaths.activeRoute)} "$SAMOHOST_ACTIVE_ROUTE_STAGED"; then`,
-      '        rm -f "$SAMOHOST_ACTIVE_ROUTE_STAGED"',
-      '        echo "active-route: no drift"',
-      "      else",
-      "        # Atomic mv into place",
-      `        if /usr/bin/mv -f "$SAMOHOST_ACTIVE_ROUTE_STAGED" ${sq(staticPaths.activeRoute)}; then`,
-      '          echo "active-route: regenerated"',
-      "          SAMOHOST_HEAL_ANY_CHANGED=1",
-      "        else rollback; fi",
-      "      fi",
+      "    SAMOHOST_STATIC_DIR_RESOLVED=1",
+      "  fi",
+      "fi",
+      "",
+    );
+  }
+
+  // ---- Main vhost artifact --------------------------------------------------
+  //
+  // NODE apps: content is rendered at TypeScript build time (renderVhost output
+  // embedded in the heredoc with single-quoted delimiter → no shell expansion).
+  //
+  // STATIC apps: content is generated at bash runtime using $SAMOHOST_STATIC_DIR
+  // (read from active-state JSON above). The heredoc delimiter is UNQUOTED so
+  // bash expands $SAMOHOST_STATIC_DIR into the actual path.
+  // The vhost format for static apps matches buildDeployScript exactly:
+  //   <provenance header>
+  //   <address> {
+  //     root * "$SAMOHOST_STATIC_DIR"
+  //     try_files {path} {path}/ =404
+  //     file_server
+  //     encode gzip
+  //     [tls internal]  (if not cp-http80)
+  //   }
+  // This ensures that after the first heal (which adds the provenance header),
+  // subsequent heals see no drift (byte-identical regeneration).
+  const address = isStatic && app.mainHost !== undefined
+    ? staticVhostAddress(app.mainHost, app.mainListen)
+    : undefined;
+  const tlsLine = isStatic && app.mainListen !== "cp-http80" ? `\ttls internal` : undefined;
+
+  if (!isStatic) {
+    // NODE app path: embed renderVhost output at build time.
+    push(
+      "# --- main vhost (node app): check provenance, backup, compare, stage ---",
+      "SAMOHOST_MAIN_VHOST_BACKUP=\"$(mktemp)\"",
+      "SAMOHOST_MAIN_VHOST_HAD_BACKUP=0",
+      `if [[ -f ${sq(mainVhostPath)} ]]; then`,
+      `  cp ${sq(mainVhostPath)} "$SAMOHOST_MAIN_VHOST_BACKUP"`,
+      "  SAMOHOST_MAIN_VHOST_HAD_BACKUP=1",
+      "  # Provenance gate: only overwrite files with the samohost header on line 1.",
+      "  # A hand-edited file → drift-foreign finding; NEVER overwritten.",
+      `  _provenance=$(head -1 ${sq(mainVhostPath)} 2>/dev/null || true)`,
+      `  if [[ "$_provenance" != ${sq(SAMOHOST_PROVENANCE_HEADER)} ]]; then`,
+      `    echo "drift-foreign: ${mainVhostPath} lacks samohost provenance header"`,
+      "    SAMOHOST_HEAL_DRIFT_FOREIGN=1",
+      "  else",
+      "    # Write regenerated content to temp, compare with live",
+      `    _new_main_vhost=$(mktemp)`,
+      // Write the regenerated vhost (rendered at build time in TypeScript) to the temp file.
+      // Single-quoted heredoc delimiter → no shell expansion of vhost content.
+      `    sudo /usr/bin/tee "$_new_main_vhost" >/dev/null <<'SAMOHOST_MAIN_VHOST_CONTENT'`,
+      ...regeneratedMainVhost!.split("\n"),
+      "SAMOHOST_MAIN_VHOST_CONTENT",
+      `    if cmp -s ${sq(mainVhostPath)} "$_new_main_vhost"; then`,
+      `      rm -f "$_new_main_vhost"`,
+      "      echo \"main vhost: no drift\"",
       "    else",
-      '      rm -f "$SAMOHOST_ACTIVE_ROUTE_STAGED" || true',
-      "      rollback",
+      "      # Stage: tee to staged path, then atomic mv",
+      `      if sudo /usr/bin/tee ${sq(stagedMainVhost)} >/dev/null < "$_new_main_vhost"; then`,
+      `        sudo /usr/bin/mv -- ${sq(stagedMainVhost)} ${sq(mainVhostPath)} || rollback`,
+      "        echo \"main vhost: regenerated\"",
+      "        SAMOHOST_HEAL_ANY_CHANGED=1",
+      "      else",
+      "        rollback",
+      "      fi",
+      `      rm -f "$_new_main_vhost"`,
       "    fi",
+      "  fi",
+      'elif [[ "${SAMOHOST_MAIN_VHOST_BACKUP:-}" != "" ]]; then',
+      "  # File did not exist — no provenance check needed, write fresh",
+      `  if sudo /usr/bin/tee ${sq(mainVhostPath)} >/dev/null <<'SAMOHOST_MAIN_VHOST_CONTENT'`,
+      ...regeneratedMainVhost!.split("\n"),
+      "SAMOHOST_MAIN_VHOST_CONTENT",
+      "  then",
+      "    echo \"main vhost: created\"",
+      "    SAMOHOST_HEAL_ANY_CHANGED=1",
+      "  else rollback; fi",
+      "fi",
+      "",
+    );
+  } else {
+    // STATIC app path: generate main vhost at bash runtime using $SAMOHOST_STATIC_DIR.
+    // Only runs if SAMOHOST_STATIC_DIR_RESOLVED=1 (active-state JSON was readable).
+    // Heredoc delimiter is UNQUOTED (SAMOHOST_STATIC_VHOST_CONTENT) → bash expands
+    // $SAMOHOST_STATIC_DIR, $SAMOHOST_RELEASES_DIR, etc. inside the block.
+    push(
+      "# --- main vhost (static app): generated at runtime from active-state ---",
+      "# The served directory is read from .samohost-active-static.json above.",
+      "# Content format matches buildDeployScript's static vhost heredoc exactly.",
+      "SAMOHOST_MAIN_VHOST_BACKUP=\"$(mktemp)\"",
+      "SAMOHOST_MAIN_VHOST_HAD_BACKUP=0",
+      'if [[ "$SAMOHOST_STATIC_DIR_RESOLVED" == "1" ]]; then',
+      `  if [[ -f ${sq(mainVhostPath)} ]]; then`,
+      `    cp ${sq(mainVhostPath)} "$SAMOHOST_MAIN_VHOST_BACKUP"`,
+      "    SAMOHOST_MAIN_VHOST_HAD_BACKUP=1",
+      "    # Provenance gate: only overwrite files with the samohost header on line 1.",
+      "    # A hand-edited file → drift-foreign finding; NEVER overwritten.",
+      `    _provenance=$(head -1 ${sq(mainVhostPath)} 2>/dev/null || true)`,
+      `    if [[ "$_provenance" != ${sq(SAMOHOST_PROVENANCE_HEADER)} ]]; then`,
+      `      echo "drift-foreign: ${mainVhostPath} lacks samohost provenance header"`,
+      "      SAMOHOST_HEAL_DRIFT_FOREIGN=1",
+      "    else",
+      "      # Write regenerated static vhost content to temp file (runtime expansion)",
+      `      _new_main_vhost=$(mktemp)`,
+      // Unquoted heredoc delimiter → $SAMOHOST_STATIC_DIR is expanded by bash.
+      // The provenance header is the FIRST line so heal's own provenance gate
+      // accepts the file on the next cycle (byte-identical regeneration).
+      `      sudo /usr/bin/tee "$_new_main_vhost" >/dev/null <<SAMOHOST_STATIC_VHOST_CONTENT`,
+      SAMOHOST_PROVENANCE_HEADER,
+      `${address} {`,
+      `\troot * "$SAMOHOST_STATIC_DIR"`,
+      `\ttry_files {path} {path}/ =404`,
+      `\tfile_server`,
+      `\tencode gzip`,
+      ...(tlsLine !== undefined ? [tlsLine] : []),
+      `}`,
+      "SAMOHOST_STATIC_VHOST_CONTENT",
+      `      if cmp -s ${sq(mainVhostPath)} "$_new_main_vhost"; then`,
+      `        rm -f "$_new_main_vhost"`,
+      '        echo "main vhost: no drift"',
+      "      else",
+      "        # Stage: tee to staged path, then atomic mv",
+      `        if sudo /usr/bin/tee ${sq(stagedMainVhost)} >/dev/null < "$_new_main_vhost"; then`,
+      `          sudo /usr/bin/mv -- ${sq(stagedMainVhost)} ${sq(mainVhostPath)} || rollback`,
+      '          echo "main vhost: regenerated"',
+      "          SAMOHOST_HEAL_ANY_CHANGED=1",
+      "        else",
+      "          rollback",
+      "        fi",
+      `        rm -f "$_new_main_vhost"`,
+      "      fi",
+      "    fi",
+      "  else",
+      "    # File did not exist — write fresh (no provenance check needed)",
+      `    if sudo /usr/bin/tee ${sq(mainVhostPath)} >/dev/null <<SAMOHOST_STATIC_VHOST_CONTENT`,
+      SAMOHOST_PROVENANCE_HEADER,
+      `${address} {`,
+      `\troot * "$SAMOHOST_STATIC_DIR"`,
+      `\ttry_files {path} {path}/ =404`,
+      `\tfile_server`,
+      `\tencode gzip`,
+      ...(tlsLine !== undefined ? [tlsLine] : []),
+      `}`,
+      "SAMOHOST_STATIC_VHOST_CONTENT",
+      "    then",
+      '      echo "main vhost: created"',
+      "      SAMOHOST_HEAL_ANY_CHANGED=1",
+      "    else rollback; fi",
+      "  fi",
+      "fi",
+      "",
+    );
+  }
+
+  // ---- Static app: active-route artifact ------------------------------------
+  // Runs only when SAMOHOST_STATIC_DIR_RESOLVED=1 (active-state JSON was readable).
+  if (isStatic && staticPaths !== undefined) {
+    push(
+      "# --- static active-route: regenerate snippet using SAMOHOST_STATIC_DIR ---",
+      "# The active-route file is a raw Caddy snippet (NOT a site block).",
+      "# Format: root * \"<dir>\"\\ntry_files {path} {path}/ =404\\nfile_server\\nencode gzip\\n",
+      'if [[ "$SAMOHOST_STATIC_DIR_RESOLVED" == "1" ]]; then',
+      "  # Backup the live active-route snippet",
+      '  SAMOHOST_ACTIVE_ROUTE_BACKUP="$(mktemp)"',
+      "  SAMOHOST_ACTIVE_ROUTE_HAD_BACKUP=0",
+      `  if [[ -f ${sq(staticPaths.activeRoute)} ]]; then`,
+      `    cp ${sq(staticPaths.activeRoute)} "$SAMOHOST_ACTIVE_ROUTE_BACKUP"`,
+      "    SAMOHOST_ACTIVE_ROUTE_HAD_BACKUP=1",
+      "  fi",
+      "  # Generate the regenerated active-route snippet to a temp file",
+      '  SAMOHOST_ACTIVE_ROUTE_STAGED="$(mktemp "${SAMOHOST_RELEASES_DIR}/.active-route.heal.XXXXXX")"',
+      '  if printf \'root * "%s"\\ntry_files {path} {path}/ =404\\nfile_server\\nencode gzip\\n\' "$SAMOHOST_STATIC_DIR" > "$SAMOHOST_ACTIVE_ROUTE_STAGED" && chmod 0644 "$SAMOHOST_ACTIVE_ROUTE_STAGED"; then',
+      "    # cmp: if identical → no drift",
+      `    if [[ -f ${sq(staticPaths.activeRoute)} ]] && cmp -s ${sq(staticPaths.activeRoute)} "$SAMOHOST_ACTIVE_ROUTE_STAGED"; then`,
+      '      rm -f "$SAMOHOST_ACTIVE_ROUTE_STAGED"',
+      '      echo "active-route: no drift"',
+      "    else",
+      "      # Atomic mv into place",
+      `      if /usr/bin/mv -f "$SAMOHOST_ACTIVE_ROUTE_STAGED" ${sq(staticPaths.activeRoute)}; then`,
+      '        echo "active-route: regenerated"',
+      "        SAMOHOST_HEAL_ANY_CHANGED=1",
+      "      else rollback; fi",
+      "    fi",
+      "  else",
+      '    rm -f "$SAMOHOST_ACTIVE_ROUTE_STAGED" || true',
+      "    rollback",
       "  fi",
       "fi",
       "",

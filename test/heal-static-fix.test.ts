@@ -157,21 +157,21 @@ describe("BUG-2: deploy writes provenance header on static vhost (provenance con
     expect(script).toContain(SAMOHOST_PROVENANCE_HEADER);
   });
 
-  test("heal-2b: the provenance header in deploy's static vhost is the FIRST line of the site block content", () => {
+  test("heal-2b: the provenance header in deploy's static vhost is the FIRST line of the file (before the address line)", () => {
     const app = staticApp({ releaseTagPattern: undefined });
     const script = buildDeployScript(app, {
       sha: "def5678def5678def5678def5678def567890ab",
     });
     // Find the heredoc content block for the static vhost.
     // The heredoc delimiter is CADDY (unquoted, so vars expand).
-    // The provenance header should appear as the first non-address line after
-    // the opening tee line.
+    // The provenance header MUST be the first line written (before the address)
+    // so that heal's `head -1` provenance gate can detect it.
     const lines = script.split("\n");
     const heredocStart = lines.findIndex((l) => l.includes("sudo /usr/bin/tee") && l.includes("CADDY"));
     expect(heredocStart).toBeGreaterThanOrEqual(0);
-    // The very next line after the tee line is the address line (e.g. "http://samo.team {")
-    // The line AFTER that must be the provenance header
-    const provenanceLine = lines[heredocStart + 2];
+    // The very next line after the tee/heredoc line must be the provenance header
+    // (so it becomes line 1 of the written file)
+    const provenanceLine = lines[heredocStart + 1];
     expect(provenanceLine).toContain(SAMOHOST_PROVENANCE_HEADER);
   });
 
@@ -306,11 +306,14 @@ describe("BUG-3: never-deployed apps skipped from heal candidate selection (no S
   test("heal-3c: deployed app IS selected as heal candidate (control — skip only affects never-deployed)", async () => {
     setup();
     try {
-      // Same app but WITH deployedSha (it was deployed) — should be selected
+      // Same app but WITH deployedSha (it was deployed) — should be selected.
+      // lastDeployAt must be 30 min before deps.now() (not before real Date.now())
+      // so the 10-min grace window does not block this app.
+      const nowFixed = new Date("2026-07-15T12:00:00.000Z");
       const app = staticApp({
         deployedSha: CURRENT_GEN_SHA, // matches resolveRef output → up-to-date
         generatorSha: "old-gen-sha-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa1", // stale → eligible
-        lastDeployAt: new Date(Date.now() - 30 * 60 * 1000).toISOString(), // 30 min ago
+        lastDeployAt: new Date(nowFixed.getTime() - 30 * 60 * 1000).toISOString(),
       });
       appStore.upsert(app);
 
