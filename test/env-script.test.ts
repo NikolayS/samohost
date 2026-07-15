@@ -2313,6 +2313,79 @@ describe("preview-flag: static env create writes config.js with preview:true", (
 });
 
 // ---------------------------------------------------------------------------
+// Issue #162 — static env create config.js write must run as app user when
+// appUser is set (shared-web VMs: friends-site owns the checkout, samo cannot
+// write into app-user-owned dist/).
+//
+// Root cause: buildStaticEnvCreateScript's mktemp + printf + mv sequence ran
+// as samo (the SSH user) against $SAMOHOST_STATIC_DIR, which is owned by the
+// app user on shared-web VMs. "mktemp: Permission denied" -> exit 1 -> vhost
+// phase never reached -> Caddy has no route -> CF 521.
+//
+// Fix: when app.appUser is defined, replace the mktemp/mv sequence with a
+// `printf ... | sudo -u <appUser> /usr/bin/tee "$SAMOHOST_STATIC_DIR/config.js" >/dev/null`
+// form (mirrors buildEnvfileScopedBodyLines §tee pattern). printf itself
+// requires no filesystem write and runs as samo; tee writes the file as
+// appUser. When appUser is undefined (game-changers), the existing
+// mktemp/mv sequence is emitted unchanged.
+// ---------------------------------------------------------------------------
+
+describe("issue #162: static+appUser config.js write runs as app user (shared-web fix)", () => {
+  function staticApp(o: Partial<AppRecord> = {}): AppRecord {
+    return app({
+      kind: "static",
+      buildCmd: "true",
+      serviceUnit: "gc1",
+      repo: "samo-agent/game-changers",
+      appDir: "/opt/gc1/app",
+      ...o,
+    });
+  }
+
+  function staticAppWithUser(o: Partial<AppRecord> = {}): AppRecord {
+    return staticApp({ appUser: "friends-site", ...o });
+  }
+
+  // RED: static+appUser must NOT use the bare mktemp in $SAMOHOST_STATIC_DIR
+  // (samo cannot write the app-user-owned dir).
+  test("static+appUser: script does NOT contain bare mktemp in $SAMOHOST_STATIC_DIR (samo cannot write it)", () => {
+    const s = buildEnvCreateScript(staticAppWithUser(), target());
+    expect(s).not.toContain('SAMOHOST_CONFIG_NEXT=$(mktemp "$SAMOHOST_STATIC_DIR/.config.next.XXXXXX")');
+  });
+
+  // GREEN: static+appUser must use sudo -u <appUser> tee for the config.js write.
+  test("static+appUser: script contains sudo -u friends-site /usr/bin/tee for config.js write", () => {
+    const s = buildEnvCreateScript(staticAppWithUser(), target());
+    expect(s).toContain("sudo -u 'friends-site' /usr/bin/tee \"$SAMOHOST_STATIC_DIR/config.js\"");
+  });
+
+  // config.js still has preview:true in the appUser path.
+  test("static+appUser: config.js write still contains preview: true", () => {
+    const s = buildEnvCreateScript(staticAppWithUser(), target());
+    expect(s).toContain("preview: true");
+  });
+
+  // $SAMOHOST_BRANCH is still threaded through in the appUser path.
+  test("static+appUser: config.js write still contains $SAMOHOST_BRANCH", () => {
+    const s = buildEnvCreateScript(staticAppWithUser(), target({ branch: "demo/red-bg" }));
+    expect(s).toContain("$SAMOHOST_BRANCH");
+    expect(s).toContain("SAMOHOST_BRANCH='demo/red-bg'");
+  });
+
+  // Bash syntax check for the appUser path.
+  test("static+appUser: bash syntax is valid (bash -n)", () => {
+    expect(bashSyntaxOk(buildEnvCreateScript(staticAppWithUser(), target()))).toBe(true);
+  });
+
+  // Non-regression: no-appUser path (game-changers) still uses bare mktemp/mv.
+  test("static without appUser: script still contains bare mktemp/mv (no-appUser path unchanged)", () => {
+    const s = buildEnvCreateScript(staticApp(), target());
+    expect(s).toContain('SAMOHOST_CONFIG_NEXT=$(mktemp "$SAMOHOST_STATIC_DIR/.config.next.XXXXXX")');
+    expect(s).toContain('/usr/bin/mv -f "$SAMOHOST_CONFIG_NEXT" "$SAMOHOST_STATIC_DIR/config.js"');
+  });
+});
+
+// ---------------------------------------------------------------------------
 // PR #62 — static vhost must serve /config.js with no-cache so CF edge does
 // not cache it (preview banner never shows when CF returns a stale config.js
 // with preview:false from its 4h edge cache). Prod already serves config.js
