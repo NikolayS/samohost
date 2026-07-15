@@ -749,7 +749,10 @@ export async function runEnvCreate(
   const script = buildEnvCreateScript(r.app, target);
   let result: SpawnResult;
   try {
-    result = await deps.remote(r.vm, script);
+    result = await deps.remote(
+      r.app.appUser !== undefined ? { ...r.vm, sshUser: r.app.appUser } : r.vm,
+      script,
+    );
   } catch (e) {
     err(
       `error: remote env-create connection failed: ${e instanceof Error ? e.message : String(e)}`,
@@ -912,7 +915,10 @@ export async function runEnvDestroy(
   const script = buildEnvDestroyScript(r.app, targetFromRecord(env));
   let result: SpawnResult;
   try {
-    result = await deps.remote(r.vm, script);
+    result = await deps.remote(
+      r.app.appUser !== undefined ? { ...r.vm, sshUser: r.app.appUser } : r.vm,
+      script,
+    );
   } catch (e) {
     err(
       `error: remote env-destroy connection failed: ${e instanceof Error ? e.message : String(e)}`,
@@ -1409,7 +1415,10 @@ export async function runEnvGc(
     const script = buildEnvDestroyScript(appRec, targetFromRecord(env));
     let destroyResult: SpawnResult;
     try {
-      destroyResult = await deps.remote(liveVm, script);
+      destroyResult = await deps.remote(
+        appRec.appUser !== undefined ? { ...liveVm, sshUser: appRec.appUser } : liveVm,
+        script,
+      );
     } catch (e) {
       // SSH threw (timeout, connection refused, etc.) → failed/KEEP, continue.
       const msg = e instanceof Error ? e.message : String(e);

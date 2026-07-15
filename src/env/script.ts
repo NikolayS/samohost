@@ -164,16 +164,13 @@ const PORT_CHECK_FN_LINES: string[] = [
  */
 function buildCloneFnLines(
   appUser?: string,
-  gitSafeConf?: string,
   tokenFile?: string,
 ): string[] {
-  // Prefix for every git invocation: when appUser is set, delegate via sudo
-  // with GIT_CONFIG_GLOBAL (env var passes through thanks to the SETENV:
-  // sudoers tag emitted by buildHostPrepScript) and use the full /usr/bin/git
-  // path (required for exact-path NOPASSWD grants).
-  const gitCmd = appUser !== undefined && gitSafeConf !== undefined
-    ? `sudo -u ${sq(appUser)} GIT_CONFIG_GLOBAL=${sq(gitSafeConf)} /usr/bin/git`
-    : "git";
+  // Issue #163: the runner now SSHes AS appUser (when set), so git already runs
+  // as the dir owner — no sudo-u delegation needed. Use plain git in all cases.
+  // (The prior 'sudo -u appUser GIT_CONFIG_GLOBAL=... /usr/bin/git' form relied
+  // on a NOPASSWD grant that is not present on hardened VMs.)
+  const gitCmd = "git";
 
   // Inline credential helper: embeds the token file path as a LITERAL so
   // the helper subprocess can read it without $TOKEN_FILE in scope (proven
@@ -967,13 +964,12 @@ function buildStaticEnvCreateScript(
     "",
   ];
 
-  // ----- clone: use app user when registered (issue #97) -------------------
-  // Derive bootstrap-written paths from appDir at generation time (same as
-  // bootstrap.ts §12: appBase = dirname(appDir)).
+  // ----- clone: embed credential helper path derived from appDir -----------
+  // Issue #163: SSH runs AS appUser so plain git is used; the credential
+  // helper still reads the token from the bootstrap-written path.
   const appBase = app.appDir.replace(/\/+$/, "").split("/").slice(0, -1).join("/");
-  const gitSafeConf = `${appBase}/git-safe.conf`;
   const tokenFile = `${appBase}/.gh-token`;
-  lines.push(...buildCloneFnLines(app.appUser, gitSafeConf, tokenFile), "");
+  lines.push(...buildCloneFnLines(app.appUser, tokenFile), "");
   lines.push(
     ...phaseBlock("clone", "branch checkout into the env dir", [
       'mkdir -p "$SAMOHOST_ENVS_ROOT"',
@@ -1007,31 +1003,21 @@ function buildStaticEnvCreateScript(
   // $SAMOHOST_BRANCH is already sq()-escaped at the top of the script; a slash
   // in the branch value (e.g. demo/red-bg) is safe inside a JS string literal.
   //
-  // Issue #162 — shared-web VMs: when appUser is set, $SAMOHOST_STATIC_DIR is
-  // owned by the app user and samo (the SSH user) cannot write into it. The
-  // mktemp/mv sequence requires write access to the target directory. Fix: when
-  // appUser is defined, pipe printf output through
-  //   sudo -u <appUser> /usr/bin/tee "$SAMOHOST_STATIC_DIR/config.js" >/dev/null
-  // so the file write executes as the app user. printf itself needs no
-  // filesystem write and runs as samo. This mirrors the established pattern in
-  // buildEnvfileScopedBodyLines (lines ~1213-1217). When appUser is absent
-  // (game-changers and other no-appUser static apps) the atomic mktemp/mv form
-  // is emitted unchanged.
-  if (app.appUser !== undefined) {
-    lines.push(
-      "# --- config.js: overwrite with preview marker so the SPA banner fires ---",
-      `# Issue #162: $SAMOHOST_STATIC_DIR is owned by ${app.appUser}; write via sudo -u tee.`,
-      `printf 'window.__GC1_CONFIG__ = { version: "", preview: true, branch: "%s" };\\n' "$SAMOHOST_BRANCH" | sudo -u ${sq(app.appUser)} /usr/bin/tee "${servedDir}/config.js" >/dev/null`,
-      "",
-    );
-  } else {
-    lines.push(
-      "# --- config.js: overwrite with preview marker so the SPA banner fires ---",
-      `SAMOHOST_CONFIG_NEXT=$(mktemp "${servedDir}/.config.next.XXXXXX")`,
-      `if printf 'window.__GC1_CONFIG__ = { version: "", preview: true, branch: "%s" };\\n' "$SAMOHOST_BRANCH" > "$SAMOHOST_CONFIG_NEXT" && chmod 0644 "$SAMOHOST_CONFIG_NEXT" && /usr/bin/mv -f "$SAMOHOST_CONFIG_NEXT" "${servedDir}/config.js"; then :; else rm -f "$SAMOHOST_CONFIG_NEXT"; exit 1; fi`,
-      "",
-    );
-  }
+  // Issue #163 — runner now SSHes AS appUser (when set) so the SSH session is
+  // already the dir owner; no sudo-u delegation needed.  Use the atomic
+  // mktemp/mv form in ALL cases (appUser and no-appUser alike).
+  //
+  // The #162 'sudo -u <appUser> /usr/bin/tee' form is removed: it relied on a
+  // sudoers grant that was never emitted by buildHostPrepScript (the missing
+  // /usr/bin/tee path for config.js), and only worked via the cloud-init
+  // NOPASSWD:ALL backdoor.  With SSH-as-appUser the SSH user owns $SAMOHOST_STATIC_DIR
+  // directly and the plain redirect succeeds without any extra grant.
+  lines.push(
+    "# --- config.js: overwrite with preview marker so the SPA banner fires ---",
+    `SAMOHOST_CONFIG_NEXT=$(mktemp "${servedDir}/.config.next.XXXXXX")`,
+    `if printf 'window.__GC1_CONFIG__ = { version: "", preview: true, branch: "%s" };\\n' "$SAMOHOST_BRANCH" > "$SAMOHOST_CONFIG_NEXT" && chmod 0644 "$SAMOHOST_CONFIG_NEXT" && /usr/bin/mv -f "$SAMOHOST_CONFIG_NEXT" "${servedDir}/config.js"; then :; else rm -f "$SAMOHOST_CONFIG_NEXT"; exit 1; fi`,
+    "",
+  );
 
   // ----- vhost: Caddy file_server (tls internal — CF Full-mode proxied origin)
   // The record is PROXIED (orange cloud), so CF edge fronts the origin. Caddy
@@ -1092,82 +1078,31 @@ function buildStaticEnvCreateScript(
 }
 
 /**
- * Resolve the first token of a build command to its canonical absolute path on
- * Ubuntu so that an exact-path sudoers NOPASSWD grant can match it. Unknown
- * names are returned as-is (the operator must arrange the grant manually for
- * non-standard toolchains).
- *
- * Used by buildEnvCreateScript when wrapping install / build under
- * `sudo -u <appUser>` (issue #98 follow-up).
- */
-function resolveBuildBin(buildCmd: string): string {
-  const first = buildCmd.split(/\s+/)[0] ?? "";
-  const UBUNTU_PATHS: Record<string, string> = {
-    npm: "/usr/bin/npm",
-    node: "/usr/bin/node",
-    npx: "/usr/bin/npx",
-    // bun: system-wide path (matches ExecStart in docs/control-plane-setup.md
-    // and the ExecStart used in app-bootstrap tests). Without this mapping,
-    // `bun packages/shared/db/migrate.ts` as migrateCmd produces
-    // `NOPASSWD: bun` (relative path) — visudo -cf rejects it and the
-    // host-prep script aborts. `sudo -u <appUser> bun ...` also matches no
-    // grant → migrate always fails on the appUser path.
-    bun: "/usr/bin/bun",
-  };
-  return UBUNTU_PATHS[first] ?? first;
-}
-
-/**
- * Wrap a build command under `sudo -u <appUser>`, replacing the leading bare
- * binary name with its Ubuntu absolute path (e.g. `npm` → `/usr/bin/npm`).
- * Preserves all arguments verbatim.
- *
- * Used by buildEnvCreateScript for the build phase when appUser is set.
- */
-function sudoWrapBuildCmd(buildCmd: string, appUser: string): string {
-  const tokens = buildCmd.split(/\s+/);
-  const first = tokens[0] ?? "";
-  const bin = resolveBuildBin(first);
-  const resolved = [bin, ...tokens.slice(1)].join(" ");
-  return `sudo -u ${sq(appUser)} ${resolved}`;
-}
-
-/**
  * Generate the envfile phase body lines for the scoped file-write approach
  * (samorev security fix for issue #101).
  *
- * Security rationale: the prior implementation wrapped the entire compose in
- * `sudo -u <appUser> /usr/bin/bash -s << 'HEREDOC'`, which required a broad
- * `SETENV: /usr/bin/bash` sudoers grant — letting the SSH user `samo` run
- * ARBITRARY commands as appUser. This is replaced by composing the .env
- * content entirely in the outer bash (as samo, using a samo-owned temp file
- * in /tmp) and then writing it to the appUser-owned envfile via three
- * specific, non-executing binaries:
+ * Issue #163: the runner now SSHes AS appUser, so the SSH session is already
+ * the dir owner.  Plain /usr/bin/install, /usr/bin/tee and chmod work directly
+ * without any sudo-u delegation.  The .env content is still composed in a
+ * scratch temp file (/tmp, owned by the SSH user) and written to the final
+ * appUser-owned path in three steps for security:
  *
- *   1. sudo -u appUser /usr/bin/install -m 600 /dev/null <envfile>
- *      Pre-create the envfile at mode 600 as appUser before any content is
- *      written, closing the brief world-readable window that bare tee would
- *      leave (tee creates files at umask-derived 644 if the file is absent).
+ *   1. /usr/bin/install -m 600 /dev/null <envfile>
+ *      Pre-create the envfile at mode 600 BEFORE tee writes content, closing
+ *      the brief world-readable window that bare tee would leave (tee creates
+ *      files at umask-derived 644 if the file is absent).
  *
- *   2. sudo -u appUser /usr/bin/tee <envfile> >/dev/null < <tmpfile>
- *      Write the composed content atomically from stdin. The file already
+ *   2. /usr/bin/tee <envfile> >/dev/null < <tmpfile>
+ *      Write the composed content atomically from stdin.  The file already
  *      exists at 600 so tee does not change permissions.
  *
- *   3. sudo -u appUser /usr/bin/chmod 600 <envfile>
+ *   3. chmod 600 <envfile>
  *      Belt-and-suspenders re-assertion of mode 600.
  *
+ * No sudoers grants are required for these ops (SSH user IS appUser).
  * The rewire functions (samohost_rewire_db_vars / samohost_rewire_db_hostport)
- * operate on the samo-owned temp file in /tmp — they are already defined in
- * the outer bash from the db-phase setup for template/dblab backends. For the
- * dblab backend, SAMOHOST_DB_PORT is already set in the outer bash (by
- * `samohost_clone_port` in the db phase); no KEY=val sudo prefix is needed.
- *
- * Sudoers changes required in buildHostPrepScript:
- *   REMOVE: sshUser ALL=(appUser) NOPASSWD: SETENV: /usr/bin/bash
- *   ADD:    sshUser ALL=(appUser) NOPASSWD: /usr/bin/install -m 600 /dev/null ROOT-star-.env
- *           sshUser ALL=(appUser) NOPASSWD: /usr/bin/tee ROOT-star-.env
- *           sshUser ALL=(appUser) NOPASSWD: /usr/bin/chmod 600 ROOT-star-.env
- *   (where ROOT = envsRoot(app) and star = env-name wildcard)
+ * operate on the scratch temp file in /tmp — defined in the outer bash from
+ * the db-phase setup for template/dblab backends.
  */
 function buildEnvfileScopedBodyLines(
   app: AppRecord,
@@ -1230,13 +1165,15 @@ function buildEnvfileScopedBodyLines(
     `   && mv "$_sh_env2" "$_sh_env" \\`,
     `   && chmod 600 "$_sh_env" \\`,
     `   && printf 'BASE_URL=https://%s\\n' ${sq(t.vhost)} >> "$_sh_env" \\`,
-    // Pre-create the envfile at 600 as appUser BEFORE tee writes content,
-    // avoiding the brief world-readable window that bare tee would create.
-    `   && sudo -u ${sq(app.appUser!)} /usr/bin/install -m 600 /dev/null ${sq(envFile)} \\`,
-    // Write composed content from stdin via scoped tee (file already 600).
-    `   && sudo -u ${sq(app.appUser!)} /usr/bin/tee ${sq(envFile)} >/dev/null < "$_sh_env" \\`,
+    // Issue #163: runner SSHes AS appUser, so the SSH session is already the
+    // dir owner.  Plain install/tee/chmod work directly — no sudo-u needed.
+    // Pre-create the envfile at 600 before tee writes content (avoids the brief
+    // world-readable window that bare tee creates when creating a new file).
+    `   && /usr/bin/install -m 600 /dev/null ${sq(envFile)} \\`,
+    // Write composed content from stdin via tee (file already 600).
+    `   && /usr/bin/tee ${sq(envFile)} >/dev/null < "$_sh_env" \\`,
     // Belt-and-suspenders re-assertion of 600 after tee.
-    `   && sudo -u ${sq(app.appUser!)} /usr/bin/chmod 600 ${sq(envFile)} \\`,
+    `   && chmod 600 ${sq(envFile)} \\`,
     // Clean up samo-owned temp files.
     `   && rm -f "$_sh_env" "$_sh_env2"; `,
   );
@@ -1370,11 +1307,11 @@ export function buildEnvCreateScript(
   // ----- clone: reference clone from the production checkout (cheap) with an
   // explicit plain-clone fallback for shallow/unusable references (issue #11
   // finding 5); existing env dirs take the fetch+checkout path.
-  // Issue #97: delegate git ops to the app user when appUser is registered.
+  // Issue #163: SSH runs AS appUser so plain git is used; credential helper
+  // still reads the token from the bootstrap-written path.
   const appBase = app.appDir.replace(/\/+$/, "").split("/").slice(0, -1).join("/");
-  const gitSafeConf = `${appBase}/git-safe.conf`;
   const tokenFile = `${appBase}/.gh-token`;
-  lines.push(...buildCloneFnLines(app.appUser, gitSafeConf, tokenFile), "");
+  lines.push(...buildCloneFnLines(app.appUser, tokenFile), "");
   lines.push(
     ...phaseBlock("clone", "branch checkout into the env dir", [
       'mkdir -p "$SAMOHOST_ENVS_ROOT"',
@@ -1391,14 +1328,9 @@ export function buildEnvCreateScript(
   // set -euo pipefail aborts the whole script before .env/systemd/Caddy are
   // written → no :443 listener → CF 521).
   //
-  // Issue #98 follow-up: when appUser is registered the env dir is owned by
-  // appUser (the sudo-u-appUser clone created it that way). npm writes
-  // node_modules into the env dir; running npm as the SSH user (samo) →
-  // EACCES. Wrap both npm invocations under sudo -u <appUser> /usr/bin/npm so
-  // they run as the owner. The exact-path grant is added in buildHostPrepScript.
-  const npmPrefix = app.appUser !== undefined
-    ? `sudo -u ${sq(app.appUser)} /usr/bin/npm`
-    : "npm";
+  // Issue #163: runner SSHes AS appUser so the SSH session is already the
+  // dir owner — no sudo-u delegation needed.  Use plain 'npm' in all cases.
+  const npmPrefix = "npm";
   lines.push(
     ...phaseBlock(
       "install",
@@ -1409,11 +1341,8 @@ export function buildEnvCreateScript(
     ),
   );
 
-  // Issue #98 follow-up: build command inherits the same appUser delegation so
-  // the build output lands in the app-user-owned dir without EACCES.
-  const buildCmdExpr = app.appUser !== undefined
-    ? `if ${sudoWrapBuildCmd(app.buildCmd, app.appUser)}; `
-    : `if ${app.buildCmd}; `;
+  // Issue #163: SSH user IS appUser; plain buildCmd runs as the dir owner.
+  const buildCmdExpr = `if ${app.buildCmd}; `;
   lines.push(
     ...phaseBlock("build", "build", [buildCmdExpr]),
   );
@@ -1766,17 +1695,14 @@ export function buildEnvCreateScript(
   // Fail-closed: a non-zero exit from migrateCmd emits migrate:fail + exit 1,
   // same as every other phase. Idempotent runners no-op when already current.
   if (app.migrateCmd !== undefined && (t.dbBackend === "dblab" || t.dbBackend === "template")) {
-    const migrateCmdExpr = app.appUser !== undefined
-      // appUser case: wrap with sudo -u <appUser>, same pattern as build.
-      // The migration tool (appUser-owned env dir) loads .env from cwd.
-      ? `if ${sudoWrapBuildCmd(app.migrateCmd, app.appUser)}; `
-      // no-appUser case: source composed .env in a subshell before migrateCmd
-      // so DATABASE_URL (rewritten to the clone) is available to the command.
-      // cd to SAMOHOST_ENV_DIR first: buildCmd may have done `cd apps/web` (or
-      // similar) which changes the outer shell's CWD; the subshell inherits it.
-      // migrateCmd paths (e.g. `bun packages/shared/db/migrate.ts`) are relative
-      // to the repo root, not a sub-directory, so we must reset before running.
-      : `if (cd "$SAMOHOST_ENV_DIR" && set -a && . "$SAMOHOST_ENV_DIR/.env" && set +a && ${app.migrateCmd}); `;
+    // Issue #163: SSH user IS appUser when appUser is set, so migrateCmd runs
+    // directly as the dir owner — no sudo-u delegation needed.
+    // Both paths source .env in a subshell so DATABASE_URL (rewritten to the
+    // clone) is visible to the migration tool.
+    // cd to SAMOHOST_ENV_DIR first: buildCmd may have done `cd apps/web` (or
+    // similar) which changes the outer shell's CWD; the subshell inherits it.
+    const migrateCmdExpr =
+      `if (cd "$SAMOHOST_ENV_DIR" && set -a && . "$SAMOHOST_ENV_DIR/.env" && set +a && ${app.migrateCmd}); `;
     lines.push(
       ...phaseBlock(
         "migrate",
@@ -2650,59 +2576,19 @@ export function buildHostPrepScript(
       `${sshUser} ALL=(postgres) NOPASSWD: /usr/bin/createdb, /usr/bin/dropdb, /usr/bin/psql`,
     );
   }
-  // Issue #97: when appUser is registered, grant sshUser the right to run
-  // /usr/bin/git as appUser with SETENV so that GIT_CONFIG_GLOBAL passes
-  // through to the git subprocess. Without SETENV, sudo strips the variable
-  // and git loses the safe.directory override.
+  // Issue #163: the env runner now SSHes AS appUser (when set), so 'sshUser'
+  // never needs to delegate to 'appUser' via sudo for any app-dir operation.
+  // The entire (appUser) sudoers block is removed:
+  //   - git: SSH user IS appUser, runs as dir owner, no sudo-u needed.
+  //   - npm (install/build): same.
+  //   - install/tee/chmod (.env write): same — the .env is inside the
+  //     appUser-owned envs dir, writable by the SSH session directly.
+  // Removing these grants hardens the host: 'sshUser' (samo) can no longer
+  // impersonate 'appUser' at all — the only granted impersonation target
+  // remaining is postgres (db ops) and root (Caddy/systemctl).
   //
-  // Issue #98 follow-up: also grant /usr/bin/npm so that the install phase
-  // (npm ci / npm install) and build phase (npm run build) can run as appUser.
-  // A single /usr/bin/npm entry covers all three. The npm grant does NOT need
-  // SETENV (no environment variable is forwarded to npm); a separate plain
-  // NOPASSWD line is cleaner and avoids unnecessarily widening SETENV scope.
-  //
-  // samorev security fix (#101): the prior broad `SETENV: /usr/bin/bash` grant
-  // let samo run ARBITRARY commands as appUser. It is replaced by three scoped
-  // file-write-only grants tied to the envs-root path pattern:
-  //   /usr/bin/install -m 600 /dev/null <root>/*/.env — pre-create at 600
-  //   /usr/bin/tee <root>/*/.env                      — write content
-  //   /usr/bin/chmod 600 <root>/*/.env                — re-assert mode
-  // None of these binaries execute arbitrary code. The compose logic runs as
-  // samo in a mktemp temp file; only the final write touches the appUser dir.
-  if (app.appUser !== undefined) {
-    // Resolve the build-command binary so a non-npm build tool also gets a
-    // grant (e.g. `node ./build.js` → /usr/bin/node). When buildCmd is already
-    // npm-based the resolved binary equals /usr/bin/npm and we omit the
-    // duplicate; the single /usr/bin/npm line covers install + build.
-    const buildBin = resolveBuildBin(app.buildCmd);
-    // Resolve the migrate-command binary (migrateCmd may use a different binary
-    // than buildCmd, e.g. `npx prisma migrate deploy` vs `npm run build`).
-    // When migrateCmd is absent or resolves to the same binary as buildCmd or npm,
-    // no duplicate line is added.
-    const migrateBin = app.migrateCmd !== undefined
-      ? resolveBuildBin(app.migrateCmd)
-      : undefined;
-    sudoersLines.push(
-      `${sshUser} ALL=(${app.appUser}) NOPASSWD: SETENV: /usr/bin/git`,
-      `${sshUser} ALL=(${app.appUser}) NOPASSWD: /usr/bin/npm`,
-      ...(buildBin !== "/usr/bin/npm"
-        ? [`${sshUser} ALL=(${app.appUser}) NOPASSWD: ${buildBin}`]
-        : []),
-      // migrateCmd binary grant: only when it differs from npm and buildBin
-      // (avoid duplicate sudoers lines for the same exact path).
-      ...(migrateBin !== undefined &&
-        migrateBin !== "/usr/bin/npm" &&
-        migrateBin !== buildBin
-        ? [`${sshUser} ALL=(${app.appUser}) NOPASSWD: ${migrateBin}`]
-        : []),
-      // Scoped envfile write grants (samorev security fix — replaces the broad
-      // /usr/bin/bash SETENV grant). Path pattern uses the envs root so the
-      // sudoers glob covers any env name without allowing writes elsewhere.
-      `${sshUser} ALL=(${app.appUser}) NOPASSWD: /usr/bin/install -m 600 /dev/null ${root}/*/.env`,
-      `${sshUser} ALL=(${app.appUser}) NOPASSWD: /usr/bin/tee ${root}/*/.env`,
-      `${sshUser} ALL=(${app.appUser}) NOPASSWD: /usr/bin/chmod 600 ${root}/*/.env`,
-    );
-  }
+  // (Prior issues #97/#98/#101 added these grants when samo ran the env
+  // scripts; #163 removes them by changing who runs the scripts instead.)
   // Grant ONE exact-path NOPASSWD for the samohost-secrets helper when:
   //   - the app declares secrets[] (init/get for app secrets), OR
   //   - databaseUrlEnv is set (init/get for the clone-role password).

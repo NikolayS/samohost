@@ -1149,10 +1149,14 @@ describe("issue #98 — appUser threading through runAppRegister / --from-toml",
     expect(rec?.appUser).toBe("samohost-fixture");
   });
 
-  test("reg-au-3: AppRecord.appUser drives sudo-based git in buildEnvCreateScript", () => {
+  // Issue #163: SSH-as-appUser makes sudo-based git unnecessary. The test now
+  // verifies that AppRecord.appUser is correctly persisted (enabling the runner
+  // seam in env.ts to SSH as appUser) and that the clone function uses plain git
+  // with the credential helper (no sudo-u prefix).
+  test("reg-au-3: AppRecord.appUser persisted correctly and env script uses plain git (SSH-as-appUser, #163)", () => {
     // End-to-end consequence: a correctly-registered app (appUser set) must
-    // produce a clone script that uses `sudo -u <appUser> ... /usr/bin/git`
-    // rather than plain git — preventing the dubious-ownership failure.
+    // persist appUser in the AppRecord so the env runner can SSH as appUser.
+    // The clone function uses plain git (SSH user IS appUser) — no sudo-u needed.
     const tomlPath = writeToml98('appUser = "samohost-fixture"');
     const c = capture98();
     runAppRegisterFromToml(
@@ -1165,6 +1169,8 @@ describe("issue #98 — appUser threading through runAppRegister / --from-toml",
     );
     const rec = appStore.get("vm-2222", "samohost-fixture");
     expect(rec).toBeDefined();
+    // appUser must be persisted (enables the runner seam in env.ts).
+    expect(rec?.appUser).toBe("samohost-fixture");
     const envTarget: EnvScriptTarget = {
       name: "samohost-fixture-feat-x",
       branch: "feat/x",
@@ -1173,10 +1179,10 @@ describe("issue #98 — appUser threading through runAppRegister / --from-toml",
       dbBackend: "none",
     };
     const script = buildEnvCreateScript(rec!, envTarget);
-    // Fails today: rec.appUser is undefined → buildCloneFnLines generates
-    // plain `git clone` instead of `sudo -u 'samohost-fixture' ... /usr/bin/git`.
-    expect(script).toContain("sudo -u 'samohost-fixture'");
-    expect(script).toContain("/usr/bin/git");
+    // #163: plain git (no sudo-u prefix) — SSH session IS appUser.
+    expect(script).not.toContain("sudo -u 'samohost-fixture'");
+    // Plain git clone must still be present.
+    expect(script).toContain("git clone");
   });
 
   test("reg-au-4: absent appUser leaves AppRecord.appUser undefined (no regression)", () => {

@@ -9,6 +9,7 @@ import {
   runEnvCreate,
   runEnvList,
   runEnvDestroy,
+  runEnvGc,
   type EnvExecDeps,
 } from "../src/commands/env.ts";
 import { DEFAULT_POOL } from "../src/env/ports.ts";
@@ -547,5 +548,252 @@ describe("env commands", () => {
       ),
     ).toBe(1);
     expect(c2.e).toContain("app not found");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Issue #163 — env-create / env-destroy / env-gc must SSH as app.appUser on
+// shared-web VMs (mirrors deploy fix #161).
+//
+// Root cause: env-create runner passed `r.vm` (sshUser='samo') to deps.remote,
+// but on shared-web VMs the app dir is owned by a dedicated OS user (appUser).
+// The correct fix: substitute sshUser = appUser when app.appUser is set,
+// making the SSH session run as the dir owner — so NO sudo-u grants are needed.
+//
+// Tests:
+//   env-appuser-1: runEnvCreate with appUser set -> deps.remote receives sshUser = appUser
+//   env-appuser-2: runEnvCreate with appUser absent -> deps.remote receives original vm.sshUser
+//   env-appuser-3: runEnvDestroy with appUser set -> deps.remote receives sshUser = appUser
+//   env-appuser-4: runEnvGc (reap) with appUser set -> deps.remote receives sshUser = appUser
+// ---------------------------------------------------------------------------
+
+describe("issue #163: env runner SSHes as app.appUser on shared-web VMs", () => {
+  let dir: string;
+  let vmStore: StateStore;
+  let appStore: AppStore;
+  let envStore: EnvStore;
+
+  const SHARED_VM_NAME = "samo-we-shared";
+  const APP_USER = "friends-site";
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), "samohost-env-appuser-"));
+    vmStore = new StateStore(join(dir, "vms.json"));
+    appStore = new AppStore(join(dir, "apps.json"));
+    envStore = new EnvStore(join(dir, "envs.json"));
+
+    // Register a shared-web VM (sshUser = 'samo').
+    vmStore.upsert({
+      id: "vm-shared",
+      provider: "hetzner",
+      providerId: "999999",
+      name: SHARED_VM_NAME,
+      ip: "1.2.3.4",
+      sshKeyPath: "/home/u/.ssh/id_ed25519",
+      sshPort: 22,
+      sshUser: "samo",
+      hostKeyFingerprint: "SHA256:" + "B".repeat(43),
+      region: "fsn1",
+      type: "cx23",
+      modules: [],
+      lifecycleState: "adopted",
+      createdAt: "2026-01-01T00:00:00.000Z",
+      updatedAt: "2026-01-01T00:00:00.000Z",
+    });
+
+    // Register a static app WITH appUser (shared-web pattern).
+    appStore.upsert({
+      id: "app-shared",
+      vmId: "vm-shared",
+      name: "friends-site",
+      repo: "samo-agent/friends-of-twin-peaks",
+      branch: "main",
+      appDir: "/opt/friends-site/app",
+      buildCmd: "true",
+      healthUrl: "http://localhost:8080/",
+      serviceUnit: "friends-site",
+      kind: "static",
+      appUser: APP_USER,
+    });
+  });
+
+  afterEach(() => rmSync(dir, { recursive: true }));
+
+  function fakeDepsCapture(): { deps: EnvExecDeps; capturedVms: VmRecord[] } {
+    const capturedVms: VmRecord[] = [];
+    const M = (p: string, s: string) => `<<<SAMOHOST_PHASE:${p}:${s}>>>`;
+    const CREATE_OK = ["clone", "vhost", "health"]
+      .flatMap((p) => [M(p, "start"), M(p, "ok")])
+      .join("\n");
+    const deps: EnvExecDeps = {
+      remote: (receivedVm, _script) => {
+        capturedVms.push(receivedVm);
+        return Promise.resolve({ code: 0, stdout: CREATE_OK, stderr: "" });
+      },
+      now: () => new Date("2026-06-11T12:00:00.000Z"),
+      uuid: () => "uuid-test",
+    };
+    return { deps, capturedVms };
+  }
+
+  test("env-appuser-1: runEnvCreate with appUser set sends sshUser = appUser to remote", async () => {
+    const { deps, capturedVms } = fakeDepsCapture();
+    const c = capture();
+    await runEnvCreate(
+      {
+        vm: SHARED_VM_NAME,
+        app: "friends-site",
+        branch: "feat/banner",
+        db: "none",
+        previewDomain: "samo.cat",
+      },
+      { json: false },
+      vmStore,
+      appStore,
+      envStore,
+      deps,
+      c.out,
+      c.err,
+    );
+    expect(capturedVms.length).toBeGreaterThan(0);
+    // The runner MUST receive sshUser = appUser, not vm.sshUser ('samo').
+    expect(capturedVms[0]!.sshUser).toBe(APP_USER);
+  });
+
+  test("env-appuser-2: runEnvCreate without appUser sends original vm.sshUser unchanged", async () => {
+    // Register a second app WITHOUT appUser (single-app VM pattern).
+    vmStore.upsert({
+      id: "vm-single",
+      provider: "hetzner",
+      providerId: "888888",
+      name: "samo-we-single",
+      ip: "5.6.7.8",
+      sshKeyPath: "/home/u/.ssh/id_ed25519",
+      sshPort: 22,
+      sshUser: "agent",
+      hostKeyFingerprint: "SHA256:" + "C".repeat(43),
+      region: "fsn1",
+      type: "cx23",
+      modules: [],
+      lifecycleState: "adopted",
+      createdAt: "2026-01-01T00:00:00.000Z",
+      updatedAt: "2026-01-01T00:00:00.000Z",
+    });
+    appStore.upsert({
+      id: "app-single",
+      vmId: "vm-single",
+      name: "single-app",
+      repo: "samo-agent/single-app",
+      branch: "main",
+      appDir: "/opt/single-app/app",
+      buildCmd: "true",
+      healthUrl: "http://localhost:8080/",
+      serviceUnit: "single-app",
+      kind: "static",
+      // appUser is intentionally absent
+    });
+
+    const { deps, capturedVms } = fakeDepsCapture();
+    const c = capture();
+    await runEnvCreate(
+      {
+        vm: "samo-we-single",
+        app: "single-app",
+        branch: "feat/banner",
+        db: "none",
+        previewDomain: "samo.cat",
+      },
+      { json: false },
+      vmStore,
+      appStore,
+      envStore,
+      deps,
+      c.out,
+      c.err,
+    );
+    expect(capturedVms.length).toBeGreaterThan(0);
+    // No appUser: original vm.sshUser must be passed through unchanged.
+    expect(capturedVms[0]!.sshUser).toBe("agent");
+  });
+
+  test("env-appuser-3: runEnvDestroy with appUser set sends sshUser = appUser to remote", async () => {
+    // Pre-seed an env record so destroy can find it.
+    envStore.upsert({
+      id: "env-1",
+      vmId: "vm-shared",
+      appName: "friends-site",
+      name: "friends-site-feat-banner",
+      branch: "feat/banner",
+      port: 3100,
+      vhost: "friends-site-feat-banner.samo.cat",
+      dbBackend: "none",
+      createdAt: "2026-01-01T00:00:00.000Z",
+    });
+
+    const { deps, capturedVms } = fakeDepsCapture();
+    const c = capture();
+    await runEnvDestroy(
+      {
+        vm: SHARED_VM_NAME,
+        app: "friends-site",
+        branch: "feat/banner",
+      },
+      { json: false },
+      vmStore,
+      appStore,
+      envStore,
+      deps,
+      c.out,
+      c.err,
+    );
+    expect(capturedVms.length).toBeGreaterThan(0);
+    expect(capturedVms[0]!.sshUser).toBe(APP_USER);
+  });
+
+  test("env-appuser-4: runEnvGc reap with appUser set sends sshUser = appUser to remote", async () => {
+    // Pre-seed an env record with a gone branch so GC will reap it.
+    envStore.upsert({
+      id: "env-gc-1",
+      vmId: "vm-shared",
+      appName: "friends-site",
+      name: "friends-site-feat-old",
+      branch: "feat/old",
+      port: 3100,
+      vhost: "friends-site-feat-old.samo.cat",
+      dbBackend: "none",
+      createdAt: "2026-01-01T00:00:00.000Z",
+    });
+
+    const { deps, capturedVms } = fakeDepsCapture();
+    const M = (p: string, s: string) => `<<<SAMOHOST_PHASE:${p}:${s}>>>`;
+    const DESTROY_OK = ["unit-stop", "vhost-remove", "db-drop", "dir-remove"]
+      .flatMap((p) => [M(p, "start"), M(p, "ok")])
+      .join("\n");
+    const gcDeps = {
+      ...deps,
+      remote: (receivedVm: VmRecord, _script: string) => {
+        capturedVms.push(receivedVm);
+        return Promise.resolve({ code: 0, stdout: DESTROY_OK, stderr: "" });
+      },
+      branchState: async (_repo: string, _branch: string) => "gone" as const,
+    };
+
+    const c = capture();
+    await runEnvGc(
+      {
+        vm: SHARED_VM_NAME,
+        app: "friends-site",
+        reap: true,
+      },
+      { json: false },
+      vmStore,
+      appStore,
+      envStore,
+      gcDeps,
+      c.out,
+      c.err,
+    );
+    expect(capturedVms.length).toBeGreaterThan(0);
+    expect(capturedVms[0]!.sshUser).toBe(APP_USER);
   });
 });
