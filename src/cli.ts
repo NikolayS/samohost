@@ -96,6 +96,7 @@ import {
 import { runDestroy, defaultConfirm, type DestroyInput } from "./commands/destroy.ts";
 import { runDoctor } from "./commands/doctor.ts";
 import { runFleetDoctor } from "./commands/fleet-doctor.ts";
+import { resolveProductionGeneratorSha } from "./commands/generator-stale.ts";
 import {
   runDomainAdd,
   runDomainCheck,
@@ -2338,15 +2339,26 @@ export async function main(
         out,
         err,
       );
-    case "app-status":
+    case "app-status": {
+      let currentGeneratorSha: string | undefined;
+      if (!cmd.json) {
+        try {
+          currentGeneratorSha = resolveProductionGeneratorSha();
+        } catch {
+          // ~/samohost-trigger checkout absent or git failed — omit gen: column
+          // rather than crashing the status command.
+          currentGeneratorSha = undefined;
+        }
+      }
       return runAppStatus(
         cmd.input,
-        { json: cmd.json },
+        { json: cmd.json, currentGeneratorSha },
         new StateStore(),
         defaultAppStore(),
         out,
         err,
       );
+    }
     case "app-clear-failed":
       return runAppClearFailed(
         cmd.input,

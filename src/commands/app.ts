@@ -32,6 +32,7 @@ import {
 } from "../app/bootstrap.ts";
 import { AppStore } from "../state/apps.ts";
 import { StateStore } from "../state/store.ts";
+import { resolveProductionGeneratorSha } from "./generator-stale.ts";
 import {
   defaultKnownHostsDir,
   runRemote,
@@ -1261,6 +1262,7 @@ export function defaultAppDeployDeps(): AppDeployDeps {
     fetch: globalThis.fetch,
     now: () => new Date(),
     isCommitOnBranch: defaultIsCommitOnBranch(),
+    resolveGeneratorSha: resolveProductionGeneratorSha,
   };
 }
 

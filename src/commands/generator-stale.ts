@@ -14,6 +14,7 @@
  * Phase 2 (heal command) and Phase 3 (trigger auto-heal) are NOT in scope here.
  */
 
+import { execSync } from "node:child_process";
 import type { AppRecord } from "../types.ts";
 
 // ---------------------------------------------------------------------------
@@ -79,7 +80,6 @@ export function checkGeneratorStaleness(
  * AppDeployDeps.resolveGeneratorSha.
  */
 export function resolveProductionGeneratorSha(): string {
-  const { execSync } = require("node:child_process") as typeof import("node:child_process");
   return execSync(
     "git -C ~/samohost-trigger rev-parse HEAD",
     { encoding: "utf8" },
