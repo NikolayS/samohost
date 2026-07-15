@@ -815,6 +815,78 @@ describe("app commands", () => {
     expect(rec?.failedSha).toBeUndefined();
     expect(rec?.lastDeployAt).toBe("2026-06-11T12:00:00.000Z"); // attempt stamped
   });
+
+  // ---------------------------------------------------------------------------
+  // Issue #161 — deploy must SSH as app.appUser on shared-web VMs
+  //
+  // On shared-web VMs each app is owned by a dedicated OS user (e.g. friends-site).
+  // The VM's vm.sshUser is 'samo' (the control-plane user) which does NOT own the
+  // app dir, so git ops fail with "dubious ownership / Permission denied".
+  // Bootstrap already writes the deploy key into /home/<appUser>/.ssh/authorized_keys,
+  // so the correct fix is: when app.appUser is set, SSH as app.appUser instead of
+  // vm.sshUser.  When app.appUser is absent (single-app VMs), behaviour is unchanged.
+  // ---------------------------------------------------------------------------
+
+  test("deploy-appuser-1: when app.appUser is set, remote receives vm with sshUser = appUser", async () => {
+    // Register app WITH appUser (shared-web VM pattern: friends-site owns /opt/friends-site).
+    const c = capture();
+    const code = runAppRegister(
+      {
+        vm: "samo-we-field-record",
+        name: "friends-site",
+        repo: "samo-agent/friends-of-twin-peaks",
+        branch: "main",
+        appDir: "/opt/friends-site/app",
+        buildCmd: "npm run build",
+        serviceUnit: "friends-site",
+        healthUrl: "http://localhost:3000/health",
+        rlsNonSuperuser: false,
+        appUser: "friends-site",
+      },
+      { json: false }, vmStore, appStore, c.out, c.err,
+    );
+    expect(code).toBe(0);
+
+    // Capture the VmRecord that the remote runner receives.
+    let capturedVm: VmRecord | undefined;
+    const deps = deployDeps(HAPPY, {
+      remote: (receivedVm, _script) => {
+        capturedVm = receivedVm;
+        return Promise.resolve({ code: 0, stdout: HAPPY, stderr: "" });
+      },
+    });
+
+    const dc = capture();
+    const deployCode = await runAppDeploy(
+      { vm: "samo-we-field-record", app: "friends-site", sha: SHA, skipCiGate: true },
+      { json: true }, vmStore, appStore, deps, dc.out, dc.err,
+    );
+    expect(deployCode).toBe(0);
+    // The remote runner MUST receive sshUser = 'friends-site', not 'agent' (vm.sshUser).
+    expect(capturedVm?.sshUser).toBe("friends-site");
+  });
+
+  test("deploy-appuser-2: when app.appUser is absent, remote receives original vm.sshUser (no regression)", async () => {
+    // register() sets up 'field-record' with NO appUser — single-app VM pattern.
+    register();
+
+    let capturedVm: VmRecord | undefined;
+    const deps = deployDeps(HAPPY, {
+      remote: (receivedVm, _script) => {
+        capturedVm = receivedVm;
+        return Promise.resolve({ code: 0, stdout: HAPPY, stderr: "" });
+      },
+    });
+
+    const c = capture();
+    const code = await runAppDeploy(
+      { vm: "samo-we-field-record", app: "field-record", sha: SHA, skipCiGate: true },
+      { json: true }, vmStore, appStore, deps, c.out, c.err,
+    );
+    expect(code).toBe(0);
+    // vm.sshUser is 'agent' (set in the vm() helper); must be passed through unchanged.
+    expect(capturedVm?.sshUser).toBe("agent");
+  });
 });
 
 // ---------------------------------------------------------------------------
