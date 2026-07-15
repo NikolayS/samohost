@@ -1962,7 +1962,12 @@ export function defaultTriggerDeps(opts: TriggerDepsOpts = {}): TriggerDeps {
         const workRemote = opts.remote ?? mkEnvExecDeps2({ timeoutMs: scaledTimeoutMs }).remote;
 
         batchResult = await runBatch({
-          vm: vmRecord,
+          // SSH as the app's dedicated OS user when appUser is set (shared-web VMs).
+          // The envs dir is owned by appUser, so connecting as vmRecord.sshUser
+          // ('samo') causes "dubious ownership" git errors. The probe (SSH #1) stays
+          // on vmRecord.sshUser because it only runs read-only system commands (dblab
+          // status + ss -ltnH) that do not touch appUser-owned directories.
+          vm: app.appUser !== undefined ? { ...vmRecord, sshUser: app.appUser } : vmRecord,
           app,
           prs: effectivePrWorkItems,
           deadClones: deadCloneItems,
