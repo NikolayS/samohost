@@ -60,7 +60,6 @@ import {
   checkTriggerPrereqs,
   type TriggerRunInput,
 } from "./commands/trigger.ts";
-import { resolveProductionGeneratorSha } from "./commands/generator-stale.ts";
 import {
   runEnvPlan,
   runEnvCreate,
