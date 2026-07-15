@@ -838,6 +838,95 @@ describe("issue #11 finding 5: clone fallback when the appDir checkout is shallo
   });
 });
 
+// ---------------------------------------------------------------------------
+// issue #166: static-preview re-provision freezes because config.js (a tracked
+// file) is rewritten by the create step, then the next trigger cycle runs
+// `git checkout -B` without -f and git refuses:
+//   "Your local changes would be overwritten by checkout: config.js"
+// Fix: use `checkout -fB` on the re-provision path so the intentionally-rewritten
+// config.js (and any other tracked file the create step rewrites) is force-
+// discarded before re-fetch, then re-written by the create step.
+// ---------------------------------------------------------------------------
+describe("issue #166: static-preview re-provision must use force checkout (-fB) so config.js conflict does not freeze updates", () => {
+  test("re-provision branch checkout uses -fB flag (regression gate)", () => {
+    const s = buildEnvCreateScript(app(), target());
+    expect(s).toContain("checkout -fB");
+  });
+
+  test("executed: re-provision with modified tracked config.js succeeds (no conflict error)", () => {
+    // Build a git fixture with config.js committed into origin.
+    const dir = mkdtempSync(join(tmpdir(), "samohost-reprovision-"));
+    try {
+      const origin = join(dir, "origin");
+      const git = (args: string[], cwd: string) => {
+        const r = spawnSync(
+          "git",
+          ["-c", "user.email=t@example.com", "-c", "user.name=t", ...args],
+          { cwd, encoding: "utf8" },
+        );
+        if (r.status !== 0) throw new Error(`git ${args.join(" ")}: ${r.stderr}`);
+        return r;
+      };
+      spawnSync("mkdir", ["-p", origin]);
+      git(["init", "-b", "main"], origin);
+      // Commit config.js into origin — this simulates a static-site repo
+      // that ships config.js as a tracked file (preview:false by default).
+      writeFileSync(join(origin, "config.js"), "window.__GC1_CONFIG__ = { preview: false };\n");
+      git(["add", "config.js"], origin);
+      git(["commit", "-m", "add config.js"], origin);
+      git(["branch", "sbx/pr4"], origin);
+      // Add a second commit so we can assert the envDir HEAD advances.
+      writeFileSync(join(origin, "f.txt"), "v2\n");
+      git(["add", "f.txt"], origin);
+      git(["commit", "-m", "c2"], origin);
+      git(["branch", "-f", "sbx/pr4", "HEAD"], origin);
+
+      // First provision: clone the envDir from origin.
+      const appDir = join(dir, "appdir");
+      spawnSync("git", ["clone", `file://${origin}`, appDir], { encoding: "utf8" });
+
+      function runCloneFixture(envDir: string) {
+        const fn = extractFn(buildEnvCreateScript(app(), target()), "samohost_clone_env_dir");
+        const prog = [
+          "set -uo pipefail",
+          `SAMOHOST_APP_DIR='${appDir}'`,
+          `SAMOHOST_ENV_DIR='${envDir}'`,
+          `SAMOHOST_BRANCH='sbx/pr4'`,
+          fn,
+          "samohost_clone_env_dir",
+        ].join("\n");
+        return spawnSync("bash", ["-c", prog], { encoding: "utf8" });
+      }
+
+      const envDir = join(dir, "envs", "gc1-pr4");
+      const r1 = runCloneFixture(envDir);
+      expect(r1.status).toBe(0);
+
+      // Simulate what the create step does: overwrite config.js with preview:true.
+      // This leaves a dirty tracked file in envDir — exactly the pre-fix state.
+      writeFileSync(join(envDir, "config.js"), 'window.__GC1_CONFIG__ = { preview: true, branch: "sbx/pr4" };\n');
+
+      // Now push a new commit to origin/sbx/pr4 to simulate a PR update.
+      writeFileSync(join(origin, "game.js"), "// update\n");
+      git(["add", "game.js"], origin);
+      git(["commit", "-m", "c3"], origin);
+      git(["branch", "-f", "sbx/pr4", "HEAD"], origin);
+      const tipSha = git(["rev-parse", "sbx/pr4"], origin).stdout.trim();
+
+      // Second provision (re-provision): the envDir already exists as a git checkout
+      // and has a dirty config.js. This is the path that was broken before the fix.
+      const r2 = runCloneFixture(envDir);
+      expect(r2.status).toBe(0); // must not fail with "would be overwritten" error
+
+      // The envDir HEAD must now be at the new tip of origin/sbx/pr4.
+      const head = spawnSync("git", ["-C", envDir, "rev-parse", "HEAD"], { encoding: "utf8" });
+      expect(head.stdout.trim()).toBe(tipSha);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
 describe("issue #11 finding 6: --template-db override", () => {
   test("templateDb on the target overrides the convention name", () => {
     const s = buildEnvCreateScript(
