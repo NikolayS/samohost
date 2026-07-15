@@ -335,6 +335,12 @@ export interface AppRecord extends AppSpec {
    */
   generatorSha?: string;
   /**
+   * ISO-8601 timestamp of the most-recent successful config heal (Phase 2
+   * of the "never silently lose an update" fix). Set by `samohost app heal`
+   * on successful apply or no-drift outcome. Absent until first heal run.
+   */
+  lastHealAt?: string;
+  /**
    * Highest release tag observed by the production tag channel. On first
    * activation for an already-deployed app, samohost records the current tag
    * here without deploying it; only a later, greater tag may advance prod.
