@@ -272,6 +272,167 @@ describe("(1) SSH-count — heal cycle makes ≤ budget remote() calls per VM", 
 });
 
 // ---------------------------------------------------------------------------
+// (3) APPUSER-SSH: batchedVmCycle work-batch SSHes as app.appUser when set
+//
+// ROOT CAUSE: trigger.ts:1965 passes `vm: vmRecord` unmodified to runBatch;
+// the vmRecord.sshUser is 'samo' (the VM's OS-level SSH user), but on shared-web
+// VMs the app's files are owned by a dedicated OS user (appUser = e.g. 'gregg-site').
+// The fix: `vm: app.appUser !== undefined ? { ...vmRecord, sshUser: app.appUser } : vmRecord`.
+//
+// RED: current code → work-batch remote call receives vm.sshUser = 'samo' (wrong).
+// GREEN after fix: work-batch remote call receives vm.sshUser = 'gregg-site' (correct).
+//
+// Probe call (SSH #1) MUST stay on vmRecord.sshUser='samo' — it's a read-only
+// system probe (dblab status + ss -ltnH) that does NOT touch appUser-owned dirs.
+// ---------------------------------------------------------------------------
+
+describe("(3) APPUSER-SSH — batchedVmCycle work-batch SSHes as app.appUser when set", () => {
+  let dir: string;
+  let vmStore: StateStore;
+  let appStore: AppStore;
+  let envStore: EnvStore;
+
+  const VM_SSH_USER = "samo";
+  const APP_USER = "gregg-site";
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), "samohost-appuser-ssh-"));
+    vmStore = new StateStore(join(dir, "state.json"));
+    appStore = new AppStore(join(dir, "apps.json"));
+    envStore = new EnvStore(join(dir, "envs.json"));
+
+    // Shared-web VM: sshUser is the platform user 'samo', NOT the app user.
+    vmStore.upsert(makeVm({ sshUser: VM_SSH_USER }));
+
+    // App with appUser set (shared-web pattern — multiple apps per VM, each with
+    // a dedicated OS user owning its files).
+    appStore.upsert(makeApp({ appUser: APP_USER }));
+  });
+
+  afterEach(() => rmSync(dir, { recursive: true, force: true }));
+
+  test(
+    "work-batch remote() call receives vm.sshUser = app.appUser (not vm.sshUser) when appUser is set",
+    async () => {
+      // Set up: 1 dblab env whose clone is dead — this causes a work-batch SSH call.
+      const env = makeEnvRecord({ dbBackend: "dblab", dbName: "field-record-pr-1" });
+      envStore.upsert(env);
+
+      // Spy remote: records the vm.sshUser passed to each call.
+      // call 1 (probe): returns dead clone output → triggers work batch.
+      // call 2 (batch): returns success-shaped batch output.
+      const capturedSshUsers: string[] = [];
+      const spyRemote = async (vm: VmRecord, _script: string) => {
+        capturedSshUsers.push(vm.sshUser);
+        if (capturedSshUsers.length === 1) {
+          // First call = Phase-1 probe; return dead-clone output.
+          return {
+            code: 0,
+            stdout: FAKE_PROBE_DEAD("field-record-pr-1"),
+            stderr: "",
+          };
+        }
+        // Second call = work-batch; return success-shaped output.
+        const healId = "heal-field-record-pr-1-field-record-pr-1";
+        return {
+          code: 0,
+          stdout: FAKE_BATCH_SUCCESS(healId),
+          stderr: "",
+        };
+      };
+
+      const { defaultTriggerDeps } = await import("../src/commands/trigger.ts");
+      const deps = defaultTriggerDeps({
+        envStore,
+        remote: spyRemote,
+      } as Parameters<typeof defaultTriggerDeps>[0]);
+
+      await runTriggerRun(
+        { heal: true, prPreviews: false, dryRun: false },
+        { json: false },
+        vmStore,
+        appStore,
+        deps,
+        noop,
+        noop,
+      );
+
+      // The spy must have been called at least twice (probe + work batch).
+      expect(capturedSshUsers.length).toBeGreaterThanOrEqual(2);
+
+      // Probe call (SSH #1): MUST use vm.sshUser ('samo') — it's a system-level
+      // probe (dblab status + ss -ltnH), no appUser-owned dir access.
+      expect(capturedSshUsers[0]).toBe(VM_SSH_USER);
+
+      // Work-batch call (SSH #2):
+      //   RED:   receives 'samo' (vmRecord.sshUser, unchanged) → test FAILS.
+      //   GREEN: receives 'gregg-site' (app.appUser override) → test PASSES.
+      expect(capturedSshUsers[1]).toBe(APP_USER);
+    },
+  );
+
+  test(
+    "work-batch remote() call keeps vm.sshUser unchanged when app has NO appUser (no regression)",
+    async () => {
+      // Register a second app WITHOUT appUser (single-app VM pattern).
+      vmStore.upsert(makeVm({
+        id: "vm-single",
+        name: "samo-we-single",
+        sshUser: "agent",
+        providerId: "999999",
+        hostKeyFingerprint: "SHA256:" + "B".repeat(43),
+      }));
+      appStore.upsert(makeApp({
+        id: "app-single",
+        vmId: "vm-single",
+        name: "field-record-single",
+        // appUser intentionally absent
+      }));
+      envStore.upsert(makeEnvRecord({
+        id: "env-single",
+        vmId: "vm-single",
+        appName: "field-record-single",
+        dbBackend: "dblab",
+        dbName: "field-record-pr-1",
+      }));
+
+      // Only watch the single-app VM (narrow by vm name).
+      const capturedSshUsers: string[] = [];
+      const spyRemote = async (vm: VmRecord, _script: string) => {
+        capturedSshUsers.push(vm.sshUser);
+        if (capturedSshUsers.length === 1) {
+          return { code: 0, stdout: FAKE_PROBE_DEAD("field-record-pr-1"), stderr: "" };
+        }
+        const healId = "heal-field-record-pr-1-field-record-pr-1";
+        return { code: 0, stdout: FAKE_BATCH_SUCCESS(healId), stderr: "" };
+      };
+
+      const { defaultTriggerDeps } = await import("../src/commands/trigger.ts");
+      // Narrow to the single-app VM so the shared-web app above is not processed.
+      const deps = defaultTriggerDeps({
+        envStore,
+        remote: spyRemote,
+      } as Parameters<typeof defaultTriggerDeps>[0]);
+
+      await runTriggerRun(
+        { heal: true, prPreviews: false, dryRun: false, vm: "samo-we-single" },
+        { json: false },
+        vmStore,
+        appStore,
+        deps,
+        noop,
+        noop,
+      );
+
+      // When appUser is absent, the work-batch call must use the original vm.sshUser.
+      // This guards against the fix accidentally overriding non-shared-web apps.
+      expect(capturedSshUsers.length).toBeGreaterThanOrEqual(2);
+      expect(capturedSshUsers[1]).toBe("agent");
+    },
+  );
+});
+
+// ---------------------------------------------------------------------------
 // (2) PREREQ-WIRED: trigger-run fails loud when CLOUDFLARE_SAMOCAT absent
 // ---------------------------------------------------------------------------
 
