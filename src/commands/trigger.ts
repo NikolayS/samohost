@@ -460,7 +460,10 @@ export async function runTriggerRun(
             app.deployedSha !== undefined &&
             app.releaseTagChannelInitialized !== true
           ) {
-            appStore.upsert({ ...app, releaseTagChannelInitialized: true });
+            appStore.compareAndSwap(app, {
+              ...app,
+              releaseTagChannelInitialized: true,
+            });
           }
           results.push({
             app: app.name,
@@ -502,7 +505,7 @@ export async function runTriggerRun(
         app.deployedSha !== resolvedSha
       ) {
         if (!input.dryRun) {
-          appStore.upsert({
+          appStore.compareAndSwap(app, {
             ...app,
             releaseTagCursor: resolvedTag,
             releaseTagChannelInitialized: true,
@@ -527,7 +530,7 @@ export async function runTriggerRun(
           resolvedTag !== undefined &&
           app.releaseTagChannelInitialized !== true
         ) {
-          appStore.upsert({
+          appStore.compareAndSwap(app, {
             ...app,
             releaseTagCursor: resolvedTag,
             releaseTagChannelInitialized: true,
@@ -650,7 +653,7 @@ export async function runTriggerRun(
       if (deployExit === 0) {
         if (resolvedTag !== undefined) {
           const deployed = appStore.get(app.vmId, app.name) ?? app;
-          appStore.upsert({
+          appStore.compareAndSwap(deployed, {
             ...deployed,
             releaseTagCursor: resolvedTag,
             releaseTagChannelInitialized: true,

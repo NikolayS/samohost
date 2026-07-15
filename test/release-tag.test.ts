@@ -684,7 +684,7 @@ describe("trigger run — release-tag production channel", () => {
     ) => {
       deployCalls++;
       const rec = store.get("vm-1111", input.app)!;
-      store.upsert({ ...rec, failedSha: input.sha! });
+      store.compareAndSwap(rec, { ...rec, failedSha: input.sha! });
       return 1; // deploy failed
     };
 
@@ -807,7 +807,9 @@ describe("release deploy authority", () => {
   });
 
   test("hand-edited state with a non-canonical workflow fails closed before CI or SSH", async () => {
-    appStore.upsert(makeApp({
+    const existing = appStore.get("vm-1111", "field-record")!;
+    appStore.compareAndSwap(existing, makeApp({
+      id: existing.id,
       releaseTagPattern: "v*",
       releaseTagFormat: "date",
       releaseCiWorkflow: ".github/workflows/release.yml",

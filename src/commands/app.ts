@@ -30,7 +30,11 @@ import {
   buildHostBootstrapScript,
   type HostBootstrapOptions,
 } from "../app/bootstrap.ts";
-import { AppStore } from "../state/apps.ts";
+import {
+  AppStore,
+  AppStoreConflictError,
+  AppStoreLockedError,
+} from "../state/apps.ts";
 import { StateStore } from "../state/store.ts";
 import {
   defaultKnownHostsDir,
@@ -350,7 +354,18 @@ export function runAppRegister(
       : {}),
   };
 
-  const saved = appStore.upsert(record);
+  let saved: AppRecord;
+  try {
+    saved = existing === undefined
+      ? appStore.create(record)
+      : appStore.compareAndSwap(existing, record);
+  } catch (error) {
+    if (isAppStoreMutationError(error)) {
+      err(`error: cannot register app: ${error.message}`);
+      return 1;
+    }
+    throw error;
+  }
   if (opts.json) {
     out(JSON.stringify(saved, null, 2));
   } else {
@@ -559,7 +574,16 @@ export function runAppClearFailed(
   const cleared = app.failedSha;
   const updated: AppRecord = { ...app };
   delete updated.failedSha;
-  const saved = appStore.upsert(updated);
+  let saved: AppRecord;
+  try {
+    saved = appStore.compareAndSwap(app, updated);
+  } catch (error) {
+    if (isAppStoreMutationError(error)) {
+      err(`error: cannot clear failedSha: ${error.message}`);
+      return 1;
+    }
+    throw error;
+  }
 
   if (opts.json) {
     out(JSON.stringify(saved, null, 2));
@@ -875,7 +899,18 @@ export async function runAppDeploy(
     // deployedSha is intentionally NOT advanced on failure.
   }
   // 'incomplete' leaves deployedSha/failedSha unchanged (state unknown).
-  appStore.upsert(updated);
+  try {
+    appStore.compareAndSwap(app, updated);
+  } catch (e) {
+    if (isAppStoreMutationError(e)) {
+      err(
+        `error: remote deploy completed (outcome=${outcome}) but local state ` +
+          `was not stamped: ${e.message}`,
+      );
+      return 1;
+    }
+    throw e;
+  }
 
   const exitCode = outcome === "deployed" ? 0 : 1;
   const report: AppDeployReport = {
@@ -896,6 +931,13 @@ export async function runAppDeploy(
     }
   }
   return exitCode;
+}
+
+function isAppStoreMutationError(
+  error: unknown,
+): error is AppStoreConflictError | AppStoreLockedError {
+  return error instanceof AppStoreConflictError ||
+    error instanceof AppStoreLockedError;
 }
 
 // ---------------------------------------------------------------------------

@@ -11,7 +11,7 @@
  */
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { parseArgs } from "../src/cli.ts";
@@ -23,7 +23,7 @@ import {
 } from "../src/commands/app.ts";
 import { AppStore } from "../src/state/apps.ts";
 import { StateStore } from "../src/state/store.ts";
-import type { VmRecord } from "../src/types.ts";
+import type { AppRecord, VmRecord } from "../src/types.ts";
 
 function vm(): VmRecord {
   return {
@@ -54,6 +54,13 @@ function capture() {
     get o() { return out; },
     get e() { return err; },
   };
+}
+
+function putApp(store: AppStore, record: AppRecord): AppRecord {
+  const current = store.get(record.vmId, record.name);
+  return current === undefined
+    ? store.create(record)
+    : store.compareAndSwap(current, record);
 }
 
 const SHA = "ce9f73c3c2a937f82dfbe2c58228ece3529e3c08";
@@ -141,7 +148,7 @@ describe("failedSha escape hatches", () => {
   afterEach(() => rmSync(dir, { recursive: true, force: true }));
 
   function seedFailedSha(): void {
-    appStore.upsert({ ...appStore.get("vm-1111", "field-record")!, failedSha: SHA });
+    putApp(appStore, { ...appStore.get("vm-1111", "field-record")!, failedSha: SHA });
   }
 
   test("clear-failed empties failedSha and confirms with the cleared SHA", () => {
@@ -156,6 +163,54 @@ describe("failedSha escape hatches", () => {
     expect(c.o).toContain(SHA);
     const rec = appStore.get("vm-1111", "field-record");
     expect(rec?.failedSha).toBeUndefined();
+  });
+
+  test("clear-failed CAS rejects a stale snapshot without erasing newer state", () => {
+    seedFailedSha();
+    class RacingStore extends AppStore {
+      private raced = false;
+
+      override get(vmId: string, name: string): AppRecord | undefined {
+        const snapshot = super.get(vmId, name);
+        if (!this.raced && snapshot !== undefined) {
+          this.raced = true;
+          super.compareAndSwap(snapshot, {
+            ...snapshot,
+            deployedSha: "concurrent-sha",
+            releaseTagCursor: "v20260714.2",
+          });
+        }
+        return snapshot;
+      }
+    }
+    const racingStore = new RacingStore(appStore.path);
+    const c = capture();
+    const code = runAppClearFailed(
+      { vm: "samo-we-field-record", app: "field-record" },
+      { json: false }, vmStore, racingStore, c.out, c.err,
+    );
+
+    expect(code).toBe(1);
+    expect(c.e).toContain("changed concurrently");
+    expect(appStore.get("vm-1111", "field-record")).toMatchObject({
+      failedSha: SHA,
+      deployedSha: "concurrent-sha",
+      releaseTagCursor: "v20260714.2",
+    });
+  });
+
+  test("clear-failed reports a live AppStore lock without throwing", () => {
+    seedFailedSha();
+    writeFileSync(`${appStore.path}.lock.${process.pid}.live-clear`, "");
+    const c = capture();
+    const code = runAppClearFailed(
+      { vm: "samo-we-field-record", app: "field-record" },
+      { json: false }, vmStore, appStore, c.out, c.err,
+    );
+
+    expect(code).toBe(1);
+    expect(c.e).toContain("locked by live process");
+    expect(appStore.get("vm-1111", "field-record")?.failedSha).toBe(SHA);
   });
 
   test("clear-failed with nothing recorded is a no-op with a clear message", () => {
