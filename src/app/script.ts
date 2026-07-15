@@ -48,6 +48,7 @@ import {
   staticRootOf,
   staticTreeGuardFnLines,
 } from "./static-root.ts";
+import { staticMainVhostLines } from "./heal-script.ts";
 
 /** Marker prefix the parser keys on. */
 export const PHASE_PREFIX = "<<<SAMOHOST_PHASE:";
@@ -547,14 +548,14 @@ export function buildDeployScript(app: AppRecord, target: DeployTarget): string 
       'samohost_assert_static_tree_safe "$SAMOHOST_CANDIDATE_REAL" "$SAMOHOST_STATIC_DIR" "$SAMOHOST_STATIC_ROOT" || rollback',
       `sudo /usr/bin/rm -f ${sq(staticStagedSnippet!)} || rollback`,
       `sudo /usr/bin/tee ${sq(staticStagedSnippet!)} >/dev/null <<CADDY || rollback`,
-      `${address} {`,
-      `\t# samohost-worktree "\${SAMOHOST_CANDIDATE_DIR}"`,
-      `\troot * "${staticServedDir}"`,
-      `\ttry_files {path} {path}/ =404`,
-      `\tfile_server`,
-      `\tencode gzip`,
-      ...(app.mainListen === "cp-http80" ? [] : [`\ttls internal`]),
-      `}`,
+      // staticMainVhostLines() is the shared three-way contract (deploy == heal == bootstrap).
+      // Provenance header is line 1 so heal's provenance gate accepts the file on next cycle.
+      ...staticMainVhostLines(
+        address!,
+        "${SAMOHOST_CANDIDATE_DIR}",
+        "${SAMOHOST_STATIC_DIR}",
+        app.mainListen !== "cp-http80",
+      ),
       `CADDY`,
       'samohost_assert_static_tree_safe "$SAMOHOST_CANDIDATE_REAL" "$SAMOHOST_STATIC_DIR" "$SAMOHOST_STATIC_ROOT" || rollback',
       '/usr/bin/mv -f "$SAMOHOST_ACTIVE_ROUTE_NEXT" "$SAMOHOST_ACTIVE_ROUTE" || rollback',

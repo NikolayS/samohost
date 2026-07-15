@@ -280,7 +280,7 @@ describe("buildConfigHealScript snapshot — static app", () => {
     expect(script).toContain("encode gzip");
   });
 
-  test("also regenerates the main vhost via renderVhost for static apps that have mainHost", () => {
+  test("also regenerates the main vhost (via runtime bash heredoc, NOT renderVhost) for static apps that have mainHost", () => {
     const script = buildConfigHealScript(staticApp());
     expect(script).toContain("/etc/caddy/sites.d/00-main-samo-site.caddy");
     expect(script).toContain("samo.team");

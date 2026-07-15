@@ -83,6 +83,7 @@ import {
   assertLinuxAppUser,
   assertOptionalLinuxAppUser,
 } from "./linux-user.ts";
+import { staticMainVhostLines } from "./heal-script.ts";
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -778,14 +779,14 @@ export function buildHostBootstrapScript(
       '  cmp -s "$SAMOHOST_BOOTSTRAP_EXPECTED_ROUTE" "$SAMOHOST_ACTIVE_ROUTE" || { echo "active static route does not match structured deployment state" >&2; exit 1; }',
       '  SAMOHOST_BOOTSTRAP_EXPECTED_MAIN=$(mktemp)',
       '  cat > "$SAMOHOST_BOOTSTRAP_EXPECTED_MAIN" <<CADDY_SITE',
-      `${siteAddress} {`,
-      `\t# samohost-worktree "\${SAMOHOST_CHECKOUT_REAL}"`,
-      `\troot * "\${SAMOHOST_STATIC_DIR}"`,
-      `\ttry_files {path} {path}/ =404`,
-      `\tfile_server`,
-      `\tencode gzip`,
-      ...(app.mainListen === "cp-http80" ? [] : [`\ttls internal`]),
-      `}`,
+      // staticMainVhostLines() is the shared three-way contract (deploy == heal == bootstrap).
+      // Provenance header is line 1; cmp check at the next line requires byte-identity.
+      ...staticMainVhostLines(
+        siteAddress,
+        "${SAMOHOST_CHECKOUT_REAL}",
+        "${SAMOHOST_STATIC_DIR}",
+        app.mainListen !== "cp-http80",
+      ),
       'CADDY_SITE',
       '  [[ -f "$SAMOHOST_MAIN_VHOST" && ! -L "$SAMOHOST_MAIN_VHOST" ]] || { echo "active static main vhost is missing or unsafe; refusing bootstrap route change" >&2; exit 1; }',
       '  cmp -s "$SAMOHOST_BOOTSTRAP_EXPECTED_MAIN" "$SAMOHOST_MAIN_VHOST" || { echo "active static main vhost diverges from structured deployment state; refusing bootstrap route change" >&2; exit 1; }',
