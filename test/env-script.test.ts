@@ -3053,13 +3053,30 @@ describe("port-check — same-env cgroup ownership (Bug fix: failed sibling unit
     expect(fn).toContain("samohost_read_cgroup_for_pid");
   });
 
-  // (f6) The per-listener invocation site must pass the env name as third arg.
-  test("(f6) generated port-check invocations include the env name as third argument", () => {
-    const s = buildEnvCreateScript(app(), target());
-    // The env name is in SAMOHOST_ENV_NAME. The call must reference it.
-    // Look for the samohost_port_check_ok call pattern.
-    const callPattern = /samohost_port_check_ok\s+\S+\s+\S+\s+\S+/;
-    expect(callPattern.test(s)).toBe(true);
+  // (f6) The per-listener invocation site must pass the EXACT env name as the
+  //      third arg. A blank, wrong, or missing third arg must be caught.
+  //      The env name for app()+target() is "field-record-1-feat-x".
+  test("(f6) generated port-check invocations pass the exact env name as third argument", () => {
+    const t = target(); // name = "field-record-1-feat-x"
+    const s = buildEnvCreateScript(app(), t);
+    // Extract every samohost_port_check_ok call line from the script.
+    // The call form is: samohost_port_check_ok '<port>' '<unit>' '<env-name>'
+    // We want to assert the THIRD token is the env name (quoted or unquoted).
+    const calls = s
+      .split("\n")
+      .filter((l) => l.includes("samohost_port_check_ok ") && !l.includes("()"));
+    expect(calls.length).toBeGreaterThan(0); // at least one call site exists
+    for (const call of calls) {
+      // The third positional token (after the function name) must be the env name.
+      // Strip leading `if ! ` prefix and the trailing `; then` suffix, then split.
+      const stripped = call.replace(/^\s*if\s*!\s*/, "").replace(/;\s*then\s*$/, "").trim();
+      // Tokens may be single-quoted: 'field-record-1-feat-x'
+      const tokens = stripped.match(/\S+/g) ?? [];
+      // tokens[0] = function name, [1] = port, [2] = unit, [3] = env name
+      expect(tokens.length).toBeGreaterThanOrEqual(4);
+      const envToken = tokens[3]!.replace(/^'|'$/g, ""); // strip single quotes
+      expect(envToken).toBe(t.name); // must be the EXACT env name
+    }
   });
 
   // (f7) Backward compat: is-active check is STILL present (fast path for the
@@ -3068,6 +3085,39 @@ describe("port-check — same-env cgroup ownership (Bug fix: failed sibling unit
     const s = buildEnvCreateScript(app(), target());
     const fn = extractFn(s, "samohost_port_check_ok");
     expect(fn).toContain("systemctl is-active");
+  });
+
+  // (f8) awk-portability regression: the PID extraction must NOT use the
+  //      3-arg match() form (gawk extension, silent-fail on mawk which is the
+  //      Ubuntu default alternative). The generated function must use
+  //      `grep -oP 'pid=\K[0-9]+'` instead — GNU grep is always present.
+  //      Also verifies the extraction works with the host's actual awk/grep
+  //      so this regression cannot be masked by a CI-only environment.
+  test("(f8) PID extraction uses grep -oP not gawk match() — portable on mawk hosts", () => {
+    const s = buildEnvCreateScript(app(), target());
+    const fn = extractFn(s, "samohost_port_check_ok");
+
+    // Must NOT use the gawk 3-arg match form.
+    expect(fn).not.toMatch(/match\s*\(\s*\$0\s*,\s*\/[^/]+\/\s*,\s*\w+\s*\)/);
+
+    // Must use grep -oP for PID extraction.
+    expect(fn).toContain("grep -oP");
+    expect(fn).toContain("pid=");
+
+    // Integration: run the grep fragment against a synthetic ss-style line
+    // using the HOST's actual grep, to confirm it extracts the PID correctly.
+    // This catches any environment where grep -oP is unavailable.
+    const syntheticLine =
+      'LISTEN 0 128 *:3107 *:* users:(("node",pid=12345,fd=13),("bun",pid=99,fd=5))';
+    const result = spawnSync(
+      "bash",
+      ["-c", `echo ${JSON.stringify(syntheticLine)} | grep -oP 'pid=\\K[0-9]+'`],
+      { encoding: "utf8" },
+    );
+    expect(result.status).toBe(0);
+    const pids = result.stdout.trim().split("\n").filter(Boolean);
+    expect(pids).toContain("12345");
+    expect(pids).toContain("99");
   });
 });
 
