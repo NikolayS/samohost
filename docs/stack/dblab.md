@@ -76,6 +76,17 @@ runbook targets 8 GB+ VMs. Treat cx23 as a verified option pending owner
 sign-off — not as the mandated baseline. When in doubt, use CX33 with an
 attached volume (Nik's blessed sizing).
 
+**Boot ordering bug (Bug B, 2026-07-16):** `dblab-loopback.service` did NOT
+come up after 3 reboots on samograph because `zfs-import-cache.service` raced
+the loopback setup and aborted (signal=ABRT). The loopback unit's
+`Before=zfs-import.target` is not sufficient; `zfs-import-cache.service`
+starts independently without waiting for it. Fix: add
+`Before=zfs-import-cache.service` to the loopback unit AND a drop-in
+`Requires=dblab-loopback.service` to `zfs-import-cache`. Full operator steps
+in `docs/dblab-install-runbook.md` (Loopback ZFS — boot ordering fix). This
+fix is NOT yet in samohost provisioning (bake into cloud-init module, PR #128
+follow-up).
+
 ZFS ARC cap is mandatory on CX23. Without it, ARC defaults to ~50% of 3.7 GB
 = ~1.85 GB, leaving almost nothing for the app. Set via `/etc/modprobe.d/zfs.conf`:
 ```

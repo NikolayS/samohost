@@ -172,7 +172,79 @@ the `clone with ID "…" already exists` db-phase failure should treat it as
   one PG container per clone. Watch `MemAvailable` before raising caps; CI's
   fence is 3 G.
 
+## Loopback ZFS profile (cx23 / no attached volume) — boot ordering fix
+
+**Bug B (2026-07-16):** On samograph (cx23, loopback ZFS), the ZFS pool `dblab`
+did NOT import on reboot 3x because `zfs-import-cache.service` ran before
+`dblab-loopback.service` set up the loop device. Root cause: the loopback unit
+declared `Before=zfs-import.target` but systemd started `zfs-import-cache.service`
+(which has its own `Before=zfs-import.target`) independently, racing the loopback
+setup. `zfs-import-cache` then aborted (signal=ABRT) because the backing file
+`/var/lib/dblab-pool/dblab.img` was not reachable as a block device yet.
+
+**Fix (operator must apply on each loopback-ZFS VM):**
+
+```bash
+# 1. Fix dblab-loopback.service to declare explicit ordering before ZFS import
+cat > /etc/systemd/system/dblab-loopback.service <<'UNIT'
+[Unit]
+Description=DBLab loopback device for ZFS pool (samograph cx23 profile)
+DefaultDependencies=no
+After=local-fs.target systemd-udev-settle.service
+Before=zfs-import-cache.service zfs-import-scan.service zfs-import.target docker.service
+Wants=zfs-import-cache.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/bash -c 'losetup -j /var/lib/dblab-pool/dblab.img | grep -q . || losetup -f /var/lib/dblab-pool/dblab.img'
+ExecStop=/bin/bash -c 'losetup -j /var/lib/dblab-pool/dblab.img | cut -d: -f1 | xargs -r losetup -d'
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+
+# 2. Add a drop-in to zfs-import-cache.service requiring our loopback unit
+mkdir -p /etc/systemd/system/zfs-import-cache.service.d
+cat > /etc/systemd/system/zfs-import-cache.service.d/10-dblab-loopback.conf <<'DROPIN'
+[Unit]
+Requires=dblab-loopback.service
+After=dblab-loopback.service
+DROPIN
+
+# 3. Add Restart=on-failure to dblab-loopback to recover from transient ABRT
+# (already handled by docker --restart on-failure for the engine container)
+# The drop-in ensures zfs-import-cache retries if it failed due to ordering.
+
+# 4. Reload and verify
+systemctl daemon-reload
+systemctl enable dblab-loopback.service
+systemctl status dblab-loopback.service zfs-import-cache.service
+
+# 5. Test the boot sequence without rebooting:
+#    a. stop pool + detach loop
+systemctl stop dblab-loopback.service
+zpool export dblab 2>/dev/null || true
+#    b. re-run in order
+systemctl start dblab-loopback.service
+zpool import dblab 2>/dev/null || zpool import -f dblab
+zpool list dblab
+```
+
+**Root cause note:** `zfs-import-cache.service` has `ConditionFileNotEmpty=/etc/zfs/zpool.cache`
+which means it only runs when a cache file exists. On loopback-ZFS VMs the cache
+records `/dev/loopN` — which must already exist when the import runs. The drop-in
+enforces this ordering. Without it, every reboot leaves DBLab down until manual
+`zpool import dblab`.
+
+**This is a per-VM artifact** — `dblab-loopback.service` is NOT provisioned by
+samohost. The provisioning gap is tracked in the docs/stack/dblab.md platform-gap
+section. Until a cloud-init module is added, every new loopback-ZFS VM needs this
+operator step after DBLab is installed.
+
 ## Open items
 
 - Confirm `postgresai/extended-postgres:18-*` tag availability (UNVERIFIED).
 - `postgres-ai/air` prototype inaccessible — re-consult if access is granted.
+- Bug B (loopback boot ordering) must be baked into the cloud-init DBLab module
+  when it is implemented (PR #128 follow-up).

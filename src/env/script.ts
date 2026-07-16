@@ -96,28 +96,52 @@ export function readDblabLeaseMinutes(): number {
 }
 
 /**
+ * Bash helper: read /proc/<pid>/cgroup for a given PID. Extracted as a named
+ * function so tests can stub it without real /proc access.
+ *
+ * (Closing brace at column 0 — tests extract and execute this function.)
+ */
+const READ_CGROUP_FN_LINES: string[] = [
+  "samohost_read_cgroup_for_pid() {",
+  '  cat "/proc/$1/cgroup" 2>/dev/null || true',
+  "}",
+];
+
+/**
  * Bash function: check whether the allocated port is free for this env.
  * Returns 0 (ok — proceed) when:
  *   a) nothing is listening on the port at all, OR
- *   b) the port is held by THIS preview's own systemd instance (idempotent
- *      re-create of an already-running env — the unit phase will restart it).
+ *   b) the port is held by OUR own active unit (fast path — idempotent
+ *      re-create of an already-running env), OR
+ *   c) the port is held by ANY process whose cgroup contains the env-name
+ *      suffix `@<envName>.service` — this covers:
+ *        • a FAILED same-env unit (systemctl is-active → 1) that systemd is
+ *          about to restart, or
+ *        • a SIBLING service of the same multi-service env that happens to
+ *          hold the port (e.g. all listeners share the same port value due
+ *          to a port-allocation regression — Bug A on samograph 2026-07-16).
+ *      In both cases the port belongs to OUR env; deleting the Caddy vhost
+ *      is the wrong action.
  * Returns non-zero (fail — abort) when a FOREIGN process holds the port.
  *
- * Detection uses `ss -ltnH` which is available without sudo on Ubuntu hosts
- * and lists TCP listen sockets in the form:
- *   LISTEN 0 128 0.0.0.0:<port>   0.0.0.0:*
- * Both `0.0.0.0:<port>` and `127.0.0.1:<port>` bindings are matched so that
- * a process bound to INADDR_ANY is caught (the observed squatter case).
+ * Detection uses `ss -ltnH` (no sudo on Ubuntu). Ownership signal:
+ *   1. `systemctl is-active "$unit"` returning active (fast path).
+ *   2. For each PID listening on the port: `/proc/<pid>/cgroup` contains
+ *      `@<envName>.service` (cgroup path written by systemd for every
+ *      process spawned by a unit — readable without sudo).
+ * A truly foreign process would have none of our env's unit names in its
+ * cgroup path.
  *
- * Ownership signal: `systemctl is-active "$unit"` returning active means the
- * unit samohost started IS the listener — the port is legitimately ours.
- * If we cannot cleanly attribute the listener to our unit we fail CLOSED.
+ * Parameters:
+ *   $1 — port number
+ *   $2 — primary unit instance (e.g. "samograph-live@env.service")
+ *   $3 — env name (e.g. "samograph-env-name"); used for cgroup matching
  *
  * (Closing brace at column 0 — tests extract and execute this function.)
  */
 const PORT_CHECK_FN_LINES: string[] = [
   "samohost_port_check_ok() {",
-  '  local port="$1" unit="$2"',
+  '  local port="$1" unit="$2" env_name="${3:-}"',
   "  # Match every local-address form ss prints for a listener on this port:",
   "  #   IPv4 wildcard/loopback: 0.0.0.0:PORT, 127.0.0.1:PORT",
   "  #   IPv6 wildcard/loopback: [::]:PORT, [::1]:PORT, and the bare *:PORT form.",
@@ -129,10 +153,36 @@ const PORT_CHECK_FN_LINES: string[] = [
   "    # Nothing listening on this port — free to proceed.",
   "    return 0",
   "  fi",
-  "  # Something is listening. Check if it is OUR own active unit.",
+  "  # Fast path: port held by our own ACTIVE unit — idempotent re-create, allow.",
   '  if systemctl is-active "$unit" >/dev/null 2>&1; then',
-  "    # Port held by our own running instance — idempotent re-create, allow.",
   "    return 0",
+  "  fi",
+  "  # Cgroup fallback: port may be held by a sibling unit of the same env (e.g.",
+  "  # a multi-service app where all listeners share one port value) or by this",
+  "  # exact unit in FAILED/activating state. Check every PID listening on the",
+  "  # port; if any has a cgroup containing @<envName>.service, it is ours.",
+  "  #",
+  "  # PID extraction uses `grep -oP 'pid=\\K[0-9]+'` (GNU grep, always present",
+  "  # on Ubuntu). The 3-argument match() form used previously is a gawk extension",
+  "  # that silently fails on mawk (Ubuntu default awk alternative) — the PIDs",
+  "  # would never be extracted, the cgroup check skipped, and the function would",
+  "  # fall through to return 1 (foreign squatter), reproducing the exact bug this",
+  "  # fix is meant to prevent. grep -oP has no such portability issue.",
+  '  if [[ -n "$env_name" ]]; then',
+  "    local pid",
+  '    while IFS= read -r pid; do',
+  '      [[ -z "$pid" ]] && continue',
+  '      local cgroup',
+  '      cgroup=$(samohost_read_cgroup_for_pid "$pid")',
+  '      if echo "$cgroup" | grep -qF "@${env_name}.service"; then',
+  "        # Port held by a process from our own env — treat as ours.",
+  "        return 0",
+  "      fi",
+  "    done < <(",
+  "      ss -tlnHp 2>/dev/null |",
+  "      grep -F \":${port} \" |",
+  "      grep -oP 'pid=\\K[0-9]+'",
+  "    )",
   "  fi",
   "  # Foreign process holds the port — fail CLOSED.",
   "  return 1",
@@ -1274,9 +1324,15 @@ export function buildEnvCreateScript(
   // by a foreign process. Loops all allocated listener ports. Detection uses
   // `ss -ltnH` (no sudo on Ubuntu). If a port is held by OUR OWN active
   // systemd unit (idempotent re-create) it is allowed; any other occupant
-  // fails CLOSED, removes the stale Caddy snippet (URL goes DARK), and exits 1.
+  // from the SAME env (detected via /proc/<pid>/cgroup containing
+  // @<envName>.service) is also allowed — fixes Bug A where a FAILED or
+  // sibling same-env unit was misclassified as a foreign squatter, causing
+  // the Caddy snippet to be deleted on every heal cycle. A truly foreign
+  // occupant fails CLOSED, removes the stale snippet (URL goes DARK), exits 1.
   // Reuses the existing sudo rm/reload caddy grants from host-prep sudoers.
   lines.push(
+    ...READ_CGROUP_FN_LINES,
+    "",
     ...PORT_CHECK_FN_LINES,
     "",
     `# --- port-check: abort if any foreign process holds a listener port ---`,
@@ -1287,7 +1343,7 @@ export function buildEnvCreateScript(
     const allocatedPort = portMap.get(listener.name) ?? t.port;
     const unitInstance = `${unit}@${t.name}.service`;
     lines.push(
-      `if ! samohost_port_check_ok ${sq(String(allocatedPort))} ${sq(unitInstance)}; then`,
+      `if ! samohost_port_check_ok ${sq(String(allocatedPort))} ${sq(unitInstance)} ${sq(t.name)}; then`,
       `  echo "samohost: port-check FAILED — a foreign process is already listening on port ${allocatedPort} (listener ${listener.name}, unit ${unitInstance}); allocate a different port or clean up the occupant before retrying" >&2`,
       "  port_check_all_ok=0",
       "fi",
