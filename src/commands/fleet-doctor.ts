@@ -23,6 +23,7 @@ import {
   remediateSafeVm,
   type FleetRemediationResult,
 } from "../remediate/firewall-lock.ts";
+import { checkDblabNotOversized } from "../doctor/dblab-sizing.ts";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -201,11 +202,31 @@ export async function runFleetDoctor(
 
   const results: FleetVmResult[] = [];
 
+  // Pre-compute the full app list once (used for per-VM local checks below).
+  const allApps = appStore.list();
+
   // STRICTLY SEQUENTIAL — for...of, NOT Promise.all.
   for (const record of vms) {
-    const app = appStore.list().find((a) => a.vmId === record.id);
+    const app = allApps.find((a) => a.vmId === record.id);
     try {
       const checks = await auditVm(record, app, runner);
+
+      // ---------------------------------------------------------------------------
+      // LOCAL-ONLY checks — injected per-VM after the SSH probe, no extra
+      // connection required. The result is appended to the checks array so it
+      // participates in the failingVms counter and appears in fleet JSON output.
+      //
+      // dblab-not-oversized: reads state.json + apps.json only. Scoped to THIS
+      // VM so each VM's checks[] reflects whether that specific VM is oversized.
+      // A VM with no dblab app, or with a dblab app on an approved type, gets
+      // status="pass" and does NOT inflate the failingVms counter.
+      // ---------------------------------------------------------------------------
+      const thisDblabCheck = checkDblabNotOversized(
+        [record],
+        allApps.filter((a) => a.vmId === record.id),
+      );
+      checks.push(thisDblabCheck as DoctorResult);
+
       results.push({ vmId: record.id, vmName: record.name, checks });
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
