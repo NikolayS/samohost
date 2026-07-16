@@ -25,6 +25,7 @@ import {
   evaluateDblabPreflight,
   type DblabPreflightReport,
 } from "../dblab/preflight.ts";
+import { DBLAB_API_PORT } from "../cloudinit/dblab.ts";
 import { parseEnvOutcome, type EnvOutcome } from "../env/parse.ts";
 import { envName } from "../env/name.ts";
 import {
@@ -521,6 +522,25 @@ export interface EnvExecDeps {
    * to store-only (pre-existing behaviour) and #71 alone guards the bind.
    */
   inUsePorts?: (vm: VmRecord) => Promise<readonly number[]>;
+  /**
+   * DBLab engine preflight gate for db=dblab env creates (issue #127 honesty gate).
+   *
+   * Called BEFORE the create script runs when `target.dbBackend === "dblab"`.
+   * Returns "READY" (engine healthy on :2345), "BLOCKED" (engine down/missing),
+   * or "UNKNOWN" (probe could not reach the engine). Any non-READY result exits
+   * the create with an error message and NO env record written — prevents creating
+   * fake/empty dblab records against a non-running engine (samograph's broken path).
+   *
+   * THROWS on SSH connection failure. The caller treats a throw identically to
+   * BLOCKED (exit 1, no record written).
+   *
+   * The field is OPTIONAL so that ALL existing test fixtures that build
+   * `{ remote, now, uuid }` continue to compile and run unchanged. When absent,
+   * no preflight runs and env-create proceeds as before (back-compat).
+   *
+   * Production impl runs the healthz curl probe over the pinned SSH runner.
+   */
+  dblabPreflight?: (vm: VmRecord) => Promise<"READY" | "BLOCKED" | "UNKNOWN">;
 }
 
 /**
@@ -728,6 +748,37 @@ export async function runEnvCreate(
   if ("error" in target) {
     err(`error: ${target.error}`);
     return 1;
+  }
+
+  // ---- DBLab honesty gate (issue #127) ----
+  // For db=dblab creates: verify the engine is healthy on :2345 BEFORE
+  // running the create script or writing any record. A non-READY result exits
+  // immediately with a clear error and NO record written — prevents fake/empty
+  // dblab records (samograph's broken path: env record written, clone never
+  // existed, reconciler saw needDeploy=false and never retried).
+  //
+  // The gate is OPTIONAL (dblabPreflight is an optional dep) so all existing
+  // tests that build { remote, now, uuid } continue to pass unchanged.
+  if (target.dbBackend === "dblab" && deps.dblabPreflight !== undefined) {
+    let engineStatus: "READY" | "BLOCKED" | "UNKNOWN";
+    try {
+      engineStatus = await deps.dblabPreflight(r.vm);
+    } catch (e) {
+      err(
+        `error: dblab preflight probe failed on ${r.vm.name}: ` +
+          `${e instanceof Error ? e.message : String(e)} — refusing to create ` +
+          `a dblab env (cannot verify engine health; no record written)`,
+      );
+      return 1;
+    }
+    if (engineStatus !== "READY") {
+      err(
+        `error: dblab engine is ${engineStatus} on ${r.vm.name}:${DBLAB_API_PORT} — ` +
+          `run \`samohost env preflight ${r.vm.name}\` for details; refusing to ` +
+          `create a dblab env against a non-running engine (no record written)`,
+      );
+      return 1;
+    }
   }
 
   // Ensure the per-preview DNS A record BEFORE pushing the create script so
@@ -1178,6 +1229,36 @@ export function defaultEnvExecDeps(opts?: { timeoutMs?: number }): EnvExecDeps {
       // The caller treats a throw as indeterminate and KEEPS the env (fail-closed).
       const detail = res.stderr?.trim() || `exit ${code}`;
       throw new Error(`git ls-remote failed (exit ${code}): ${detail}`);
+    },
+    // DBLab engine preflight for the env-create honesty gate (issue #128).
+    //
+    // Runs the full DBLAB_PROBES audit script over ONE pinned SSH connection
+    // (same fail2ban-safety requirement as all audit probes). Reuses
+    // evaluateDblabPreflight for the verdict so the gate and `env preflight`
+    // cannot diverge.
+    //
+    // Returns:
+    //   "READY"   — healthz answers on :2345 AND the dblab CLI resolves.
+    //   "BLOCKED" — healthz dead or CLI missing (engine not running/installed).
+    //   "UNKNOWN" — SSH connection failed or probe output was empty.
+    //
+    // THROWS only on hard SSH setup errors (bad known_hosts, etc.); routine
+    // connection failures (host unreachable, timeout) are caught and returned
+    // as "UNKNOWN" so runEnvCreate can surface a clear message rather than an
+    // unhandled exception.
+    dblabPreflight: async (vm: import("../types.ts").VmRecord): Promise<"READY" | "BLOCKED" | "UNKNOWN"> => {
+      const script = buildAuditScript(DBLAB_PROBES);
+      const runner = defaultRemoteScriptRunner(remoteTimeoutMs);
+      let result: SpawnResult;
+      try {
+        result = await runner(vm, script);
+      } catch {
+        // SSH connection / setup failure → cannot determine engine state.
+        return "UNKNOWN";
+      }
+      const sections = parseAuditOutput(result.stdout, DBLAB_PROBES);
+      const { engine } = evaluateDblabPreflight(sections);
+      return engine;
     },
   };
 }

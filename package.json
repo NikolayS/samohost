@@ -16,6 +16,8 @@
     "typescript": "^6.0.3"
   },
   "dependencies": {
+    "@types/js-yaml": "^4.0.9",
+    "js-yaml": "^5.2.1",
     "smol-toml": "^1.6.1"
   }
 }
