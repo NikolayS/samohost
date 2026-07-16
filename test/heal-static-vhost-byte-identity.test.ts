@@ -160,7 +160,7 @@ describe("staticMainVhostLines: shared helper emits the canonical static vhost t
     expect(worktreeLine).toContain("$MY_RELEASE_VAR");
   });
 
-  test("helper line order: provenance, address-open, worktree, root, try_files, file_server, encode, [tls], close-brace", () => {
+  test("helper line order: provenance, address-open, worktree, root, cache policy, serving, [tls], close-brace", () => {
     const relVar = "$SAMOHOST_RELEASE_DIR";
     const statVar = "$SAMOHOST_STATIC_DIR";
     const lines = staticMainVhostLines("http://samo.team", relVar, statVar, false);
@@ -171,25 +171,43 @@ describe("staticMainVhostLines: shared helper emits the canonical static vhost t
     expect(norm[2]).toContain("<RELEASE_DIR>");
     expect(norm[3]).toContain("root *");
     expect(norm[3]).toContain("<STATIC_DIR>");
-    expect(norm[4]).toBe("\ttry_files {path} {path}/ =404");
-    expect(norm[5]).toBe("\tfile_server");
-    expect(norm[6]).toBe("\tencode gzip");
+    expect(norm[4]).toContain("@samohost_immutable path_regexp");
+    expect(norm[5]).toContain("max-age=31536000, immutable");
+    expect(norm[6]).toContain("@samohost_documents path");
+    expect(norm[7]).toContain('Cache-Control "no-cache"');
+    expect(norm[8]).toBe("\ttry_files {path} {path}/ =404");
+    expect(norm[9]).toBe("\tfile_server");
+    expect(norm[10]).toBe("\tencode gzip");
     // no tls internal when addTls=false
-    expect(norm[7]).toBe("}");
-    expect(norm.length).toBe(8);
+    expect(norm[11]).toBe("}");
+    expect(norm.length).toBe(12);
   });
 
-  test("helper adds tls internal when addTls=true, at position 7 before close-brace", () => {
+  test("helper adds tls internal immediately before the close-brace", () => {
     const lines = staticMainVhostLines("samo.team", "$SAMOHOST_RELEASE_DIR", "$SAMOHOST_STATIC_DIR", true);
     const norm = lines.map(normalizeVarExprs);
-    expect(norm[7]).toBe("\ttls internal");
-    expect(norm[8]).toBe("}");
-    expect(norm.length).toBe(9);
+    expect(norm[11]).toBe("\ttls internal");
+    expect(norm[12]).toBe("}");
+    expect(norm.length).toBe(13);
   });
 
   test("helper does NOT add tls internal when addTls=false", () => {
     const lines = staticMainVhostLines("http://samo.team", "$REL", "$STAT", false);
     expect(lines.join("\n")).not.toContain("tls internal");
+  });
+
+  test("helper gives fingerprinted assets immutable caching and documents revalidation", () => {
+    const rendered = staticMainVhostLines(
+      "http://samo.team",
+      "$REL",
+      "$STAT",
+      false,
+    ).join("\n");
+
+    expect(rendered).toContain("@samohost_immutable path_regexp");
+    expect(rendered).toContain('Cache-Control "public, max-age=31536000, immutable"');
+    expect(rendered).toContain("@samohost_documents path / */ *.html /config.js /version.json");
+    expect(rendered).toContain('Cache-Control "no-cache"');
   });
 });
 

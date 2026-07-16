@@ -2486,8 +2486,8 @@ describe("issue #162 (superseded by #163): static+appUser config.js write runs a
 // PR #62 — static vhost must serve /config.js with no-cache so CF edge does
 // not cache it (preview banner never shows when CF returns a stale config.js
 // with preview:false from its 4h edge cache). Prod already serves config.js
-// with Cache-Control: no-cache, no-store, must-revalidate; the preview static
-// vhost must mirror that posture.
+// with Cache-Control: no-cache; the preview static vhost must mirror that
+// revalidation posture while fingerprinted assets remain immutable.
 // ---------------------------------------------------------------------------
 
 describe("static vhost: /config.js served with no-cache Cache-Control header", () => {
@@ -2502,11 +2502,13 @@ describe("static vhost: /config.js served with no-cache Cache-Control header", (
     });
   }
 
-  const NOCACHE_HEADER = 'header /config.js Cache-Control "no-cache, no-store, must-revalidate"';
+  const NOCACHE_HEADER = 'header @samohost_documents Cache-Control "no-cache"';
 
   test("static create script vhost block contains the config.js Cache-Control no-cache directive", () => {
     const s = buildEnvCreateScript(staticApp(), target({ dbBackend: "none" }));
+    expect(s).toContain("@samohost_documents path / */ *.html /config.js /version.json");
     expect(s).toContain(NOCACHE_HEADER);
+    expect(s).toContain('Cache-Control "public, max-age=31536000, immutable"');
   });
 
   test("the no-cache directive is inside the site block (appears between root * and the file_server directive in the printf format string)", () => {
@@ -3665,6 +3667,8 @@ describe("buildCustomDomainVhostScript", () => {
     expect(s).toContain('root * "%s"');
     expect(s).toContain('"$SAMOHOST_STATIC_DIR"');
     expect(s).toContain('import "%s"');
+    expect(s).toContain('Cache-Control "public, max-age=31536000, immutable"');
+    expect(s).toContain('Cache-Control "no-cache"');
     expect(s).not.toContain("/opt/field-record/app");
     expect(s).toContain("no authorized healthy static deployment is active");
     expect(s).toContain("samohost_assert_static_tree_safe");
@@ -3713,6 +3717,7 @@ describe("buildCustomDomainVhostScript", () => {
     const s = buildCustomDomainVhostScript(nodeApp(), "myapp.com");
     expect(s).not.toContain("SAMOHOST_STATIC_ROOT");
     expect(s).not.toContain("samohost_assert_static_tree_safe");
+    expect(s).not.toContain("@samohost_immutable");
   });
 
   test("snippet path is sites.d/10-domain-<label>.caddy (dots replaced with dashes)", () => {
@@ -3737,6 +3742,16 @@ describe("buildCustomDomainVhostRemoveScript", () => {
 });
 
 describe("buildControlPlaneCustomDomainVhostScript", () => {
+  test("preserves the origin Cache-Control policy", () => {
+    const s = buildControlPlaneCustomDomainVhostScript(
+      "myapp.com",
+      "1.2.3.4",
+      "field-record-1.samo.team",
+    );
+    expect(s).not.toContain("no-cache, no-store, must-revalidate");
+    expect(s).not.toContain("Cache-Control");
+  });
+
   test("snippet routes custom domain → app VM IP:80 with tls internal", () => {
     // Control-plane block: CF → CP:443 (tls internal) → app VM:80 (HTTP)
     const s = buildControlPlaneCustomDomainVhostScript(

@@ -26,6 +26,7 @@
  */
 
 import type { AppRecord, EnvDbBackend, EnvRecord } from "../types.ts";
+import { staticCacheHeaderLines } from "../static-cache.ts";
 import { servicesOf } from "../app/services.ts";
 import { assertOptionalLinuxAppUser } from "../app/linux-user.ts";
 import {
@@ -940,6 +941,7 @@ function buildStaticEnvCreateScript(
 ): string {
   const staticRoot = staticRootOf(app);
   const servedDir = "$SAMOHOST_STATIC_DIR";
+  const cacheHeadersPrintf = staticCacheHeaderLines("\\t").join("\\n");
   const root = envsRoot(app);
   const lines: string[] = [
     "#!/usr/bin/env bash",
@@ -1033,7 +1035,7 @@ function buildStaticEnvCreateScript(
       "Caddy file_server vhost snippet + reload (sites.d include applied in host-prep)",
       [
         'if samohost_assert_static_tree_safe "$SAMOHOST_CHECKOUT_REAL" "$SAMOHOST_STATIC_DIR" "$SAMOHOST_STATIC_ROOT" \\',
-        "   && printf '%s {\\n\\ttls internal\\n\\troot * %s\\n\\theader /config.js Cache-Control \"no-cache, no-store, must-revalidate\"\\n\\ttry_files {path} {path}/ =404\\n\\tfile_server\\n\\tencode gzip\\n}\\n' \\",
+        `   && printf '%s {\\n\\ttls internal\\n\\troot * %s\\n${cacheHeadersPrintf}\\n\\ttry_files {path} {path}/ =404\\n\\tfile_server\\n\\tencode gzip\\n}\\n' \\`,
         `     "$SAMOHOST_VHOST" "${servedDir}" \\`,
         '   | sudo /usr/bin/tee "$SAMOHOST_CADDY_SNIPPET" >/dev/null \\',
         "   && sudo /usr/bin/systemctl reload caddy; ",
@@ -2703,6 +2705,7 @@ export function buildCustomDomainVhostScript(
   const staticReleaseTagFormat = app.releaseTagFormat ?? "";
   const staticRoot = staticRootOf(app);
   const releaseState = staticReleaseStatePaths(app.appDir);
+  const cacheHeadersPrintf = staticCacheHeaderLines("\\t").join("\\n");
   const vhostBody = isStatic
     ? undefined
     : `http://${fqdn} {\n\treverse_proxy localhost:${mainEnvPort(app)}\n}`;
@@ -2811,7 +2814,7 @@ export function buildCustomDomainVhostScript(
           "",
           'samohost_assert_custom_domain_source || exit 1',
           'STAGED=$(mktemp)',
-          `printf 'http://${fqdn} {\\n\\timport "%s"\\n}\\n' "$SAMOHOST_ACTIVE_ROUTE" > "$STAGED"`,
+          `printf 'http://${fqdn} {\\n${cacheHeadersPrintf}\\n\\timport "%s"\\n}\\n' "$SAMOHOST_ACTIVE_ROUTE" > "$STAGED"`,
           'samohost_assert_custom_domain_source || exit 1',
           "SAMOHOST_HAD_LIVE=0",
           'if [[ -f "$SNIPPET" ]]; then BACKUP=$(mktemp); cp -- "$SNIPPET" "$BACKUP"; SAMOHOST_HAD_LIVE=1; fi',
@@ -2936,7 +2939,6 @@ export function buildControlPlaneCustomDomainVhostScript(
     `\t}`,
     `\theader {`,
     `\t\tX-Content-Type-Options nosniff`,
-    `\t\tCache-Control "no-cache, no-store, must-revalidate"`,
     `\t}`,
     `}`,
   ].join("\n");

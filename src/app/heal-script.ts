@@ -43,6 +43,7 @@
  */
 
 import type { AppRecord } from "../types.ts";
+import { staticCacheHeaderLines } from "../static-cache.ts";
 import { staticReleaseStatePaths } from "./static-root.ts";
 import { renderVhost, planFromApp } from "../caddy/render.ts";
 import { PHASE_PREFIX } from "./script.ts";
@@ -103,6 +104,7 @@ export function staticMainVhostLines(
     `${address} {`,
     `\t# samohost-worktree "${releaseDirVar}"`,
     `\troot * "${staticDirVar}"`,
+    ...staticCacheHeaderLines(),
     `\ttry_files {path} {path}/ =404`,
     `\tfile_server`,
     `\tencode gzip`,
