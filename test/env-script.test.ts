@@ -2902,6 +2902,176 @@ describe("port-check phase — foreign-occupant detection", () => {
 });
 
 // ---------------------------------------------------------------------------
+// Bug fix: failed same-env unit must not be misclassified as foreign squatter
+//
+// Root cause (samograph VM, 2026-07-16): for multi-service apps the port-check
+// calls `samohost_port_check_ok <port> <listener-unit>@<env>.service` for each
+// listener. When the listener's unit (e.g. samograph-live@env) is in FAILED
+// state but the port is held by a SIBLING unit from the same env (e.g.
+// samograph-web@env holds port 3111 when all ports share one value), the check
+// sees: port IS held + target unit is NOT active → classifies as foreign
+// squatter → deletes the Caddy vhost → CF 525.
+//
+// The same misfire occurs even for a single-service app when systemd is in the
+// process of restarting the unit (activating state) or when the unit is in
+// FAILED state but systemd's restart timer hasn't fired yet — the port may
+// still be held by a previous PID in TIME_WAIT, or by the process of another
+// unit in the same env that shares the same port value (misconfigured env).
+//
+// Fix contract (verified by these tests):
+//   1. Port held by any process whose cgroup (readable at /proc/<pid>/cgroup)
+//      contains the env-name suffix @<envName>.service → classify as OWN, not
+//      foreign → return 0 (allow).
+//   2. Port held by a process with a foreign cgroup → return non-zero (reject).
+//   3. The Caddy snippet MUST NOT be removed when the occupant is our own env.
+//   4. Backward-compat: legacy single-service apps still work (unit name from
+//      `unit` param still checked via is-active first; cgroup is the fallback).
+// ---------------------------------------------------------------------------
+
+/**
+ * Run `samohost_port_check_ok` with a REAL bound socket whose owning process
+ * has a spoofed /proc/<pid>/cgroup entry that matches (or does not match) the
+ * given envName. Returns exit status.
+ *
+ * Implementation: the function reads /proc/<pid>/cgroup so we write a fake
+ * cgroup file into a temp dir and override the SAMOHOST_CGROUP_ROOT env var
+ * (if the implementation uses it) OR we inject the cgroup string inline via
+ * a helper function override that reads from a controlled path.
+ *
+ * Since the generated bash function uses `cat /proc/$pid/cgroup`, we intercept
+ * via a bash function `samohost_read_cgroup_for_pid` that the implementation
+ * must call (replaces direct `cat /proc/$pid/cgroup`). The stub returns a
+ * cgroup line containing the desired unit name so tests can control ownership.
+ */
+function runPortCheckWithCgroupStub(
+  port: number,
+  unitName: string, // e.g. "field-record@field-record-1-feat-x.service"
+  envName: string,  // e.g. "field-record-1-feat-x"
+  cgroupLine: string, // what /proc/<pid>/cgroup returns for the port holder
+): ReturnType<typeof spawnSync> {
+  const script = buildEnvCreateScript(app(), target({ port }));
+  const fn = extractFn(script, "samohost_port_check_ok");
+  // Stub systemctl is-active to always return 1 (not active) — this is the
+  // failure scenario: the unit is failed/restarting, not active.
+  const systemctlStub = [
+    "systemctl() {",
+    "  return 1  # always not-active for this test",
+    "}",
+  ].join("\n");
+  // Stub samohost_read_cgroup_for_pid to return the controlled cgroup line.
+  const cgroupStub = [
+    "samohost_read_cgroup_for_pid() {",
+    `  echo ${JSON.stringify(cgroupLine)}`,
+    "}",
+  ].join("\n");
+  const prog = [
+    "set -uo pipefail",
+    systemctlStub,
+    cgroupStub,
+    fn,
+    `samohost_port_check_ok ${port} ${JSON.stringify(unitName)} ${JSON.stringify(envName)}`,
+  ].join("\n");
+  return spawnSync("bash", ["-c", prog], { encoding: "utf8" });
+}
+
+describe("port-check — same-env cgroup ownership (Bug fix: failed sibling unit)", () => {
+  const _servers: net.Server[] = [];
+  afterEach(async () => {
+    await Promise.all(_servers.map((s) => new Promise<void>((r) => s.close(() => r()))));
+    _servers.length = 0;
+  });
+
+  function bindListener(): Promise<{ server: net.Server; port: number }> {
+    return new Promise((resolve, reject) => {
+      const server = net.createServer();
+      _servers.push(server);
+      server.listen(0, "127.0.0.1", () => {
+        const addr = server.address();
+        if (!addr || typeof addr === "string") return reject(new Error("bad addr"));
+        resolve({ server, port: addr.port });
+      });
+      server.on("error", reject);
+    });
+  }
+
+  // (f1) RED test: port held by a sibling same-env unit (cgroup matches
+  //      @<envName>.service) must return 0 (not foreign).
+  test("(f1) executed: port held by same-env sibling unit in cgroup → return 0 (own env, not foreign)", async () => {
+    const { port } = await bindListener();
+    const envName = "field-record-1-feat-x";
+    // The LISTENER unit being checked is field-record@env.service.
+    // The cgroup for the port holder says it belongs to
+    // field-record-worker@env.service (a sibling). Both are the same env.
+    const cgroupLine = `0::/system.slice/field-record-worker@${envName}.service`;
+    const r = runPortCheckWithCgroupStub(
+      port,
+      `field-record@${envName}.service`,
+      envName,
+      cgroupLine,
+    );
+    expect(r.status).toBe(0); // must NOT classify as foreign
+  });
+
+  // (f2) RED test: port held by a FAILED same-env unit (cgroup matches this
+  //      exact unit but systemctl is-active returns 1) → return 0.
+  //      This is the primary scenario: samograph-live@env fails (EADDRINUSE)
+  //      but the port is held by samograph-live@env itself from a previous
+  //      process or by a sibling. Unit name in cgroup = exact listener unit.
+  test("(f2) executed: port held by exact same unit (failed, is-active=1) but cgroup matches → return 0", async () => {
+    const { port } = await bindListener();
+    const envName = "field-record-1-feat-x";
+    const unitName = `field-record@${envName}.service`;
+    const cgroupLine = `0::/system.slice/${unitName}`;
+    const r = runPortCheckWithCgroupStub(port, unitName, envName, cgroupLine);
+    expect(r.status).toBe(0); // failed but ours → not foreign
+  });
+
+  // (f3) RED test: port held by a FOREIGN process (cgroup does NOT contain
+  //      @<envName>.service) → return non-zero (real squatter).
+  test("(f3) executed: port held by foreign process (cgroup has no env-name match) → return non-zero", async () => {
+    const { port } = await bindListener();
+    const envName = "field-record-1-feat-x";
+    const unitName = `field-record@${envName}.service`;
+    // Cgroup belongs to a completely unrelated service
+    const cgroupLine = "0::/system.slice/nginx.service";
+    const r = runPortCheckWithCgroupStub(port, unitName, envName, cgroupLine);
+    expect(r.status).not.toBe(0); // foreign → must reject
+  });
+
+  // (f4) Content test: the generated function must include the env_name
+  //      parameter and the cgroup-based ownership check.
+  test("(f4) generated samohost_port_check_ok accepts a third env_name argument", () => {
+    const s = buildEnvCreateScript(app(), target());
+    const fn = extractFn(s, "samohost_port_check_ok");
+    // Must declare env_name as a local variable
+    expect(fn).toContain("env_name");
+  });
+
+  test("(f5) generated samohost_port_check_ok calls samohost_read_cgroup_for_pid", () => {
+    const s = buildEnvCreateScript(app(), target());
+    const fn = extractFn(s, "samohost_port_check_ok");
+    expect(fn).toContain("samohost_read_cgroup_for_pid");
+  });
+
+  // (f6) The per-listener invocation site must pass the env name as third arg.
+  test("(f6) generated port-check invocations include the env name as third argument", () => {
+    const s = buildEnvCreateScript(app(), target());
+    // The env name is in SAMOHOST_ENV_NAME. The call must reference it.
+    // Look for the samohost_port_check_ok call pattern.
+    const callPattern = /samohost_port_check_ok\s+\S+\s+\S+\s+\S+/;
+    expect(callPattern.test(s)).toBe(true);
+  });
+
+  // (f7) Backward compat: is-active check is STILL present (fast path for the
+  //      normal active case — avoids the cgroup lookup overhead).
+  test("(f7) generated function still includes systemctl is-active check (fast path preserved)", () => {
+    const s = buildEnvCreateScript(app(), target());
+    const fn = extractFn(s, "samohost_port_check_ok");
+    expect(fn).toContain("systemctl is-active");
+  });
+});
+
+// ---------------------------------------------------------------------------
 // #89 used `sudo /usr/bin/systemctl restart` for the already-active case.
 // ADOPTED VMs (field-record, cut-over not provisioned from scratch) never
 // received a NOPASSWD `restart` grant — only `enable --now`, `disable --now`,
