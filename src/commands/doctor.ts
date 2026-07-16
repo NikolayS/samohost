@@ -414,11 +414,12 @@ const GROUP_HEADERS: Record<DoctorGroup, string> = {
   "core-liveness": "CORE — liveness",
   "core-suspicious": "CORE — suspicious",
   "app-db": "APP / DATABASE",
+  "infra-sizing": "INFRA — sizing",
 };
 
 function formatDoctor(results: DoctorResult[]): string {
   const lines: string[] = [];
-  const groups: DoctorGroup[] = ["core-host", "core-liveness", "core-suspicious", "app-db"];
+  const groups: DoctorGroup[] = ["core-host", "core-liveness", "core-suspicious", "app-db", "infra-sizing"];
 
   for (const group of groups) {
     const groupResults = results.filter((r) => r.group === group);

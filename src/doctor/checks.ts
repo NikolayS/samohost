@@ -13,7 +13,7 @@
 import type { AuditCheck } from "../types.ts";
 import { hardeningModule } from "../cloudinit/hardening.ts";
 
-export type DoctorGroup = "core-host" | "core-liveness" | "core-suspicious" | "app-db";
+export type DoctorGroup = "core-host" | "core-liveness" | "core-suspicious" | "app-db" | "infra-sizing";
 export type DoctorKind = "match" | "liveness" | "suspicious";
 
 export interface DoctorCheck extends AuditCheck {
