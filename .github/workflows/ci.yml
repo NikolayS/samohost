@@ -46,6 +46,10 @@ jobs:
           # whole rig green with zero adapt validation. Hard-fail here ensures
           # the caddy install step above is never silently bypassed.
           SAMOHOST_REQUIRE_CADDY: "1"
+          # Required by packages/auth/test/pg.test.ts which is discovered by root
+          # bun test. The test throws (not skips) on missing PG_TEST_URL — this
+          # is intentional so CI always exercises the real Postgres path.
+          PG_TEST_URL: postgres://authtest:authtest@localhost:5432/authtest
       # @samo/auth package — typecheck + unit tests (SQLite) + real-Postgres integration tests
       - name: Install @samo/auth deps
         run: cd packages/auth && bun install --frozen-lockfile
