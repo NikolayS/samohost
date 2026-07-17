@@ -11,7 +11,9 @@ Key non-negotiables for SAMO client projects:
 - **Postgres version**: 18 is the standard. Do not downgrade.
 - **Preview databases**: ALWAYS DBLab thin clones. Never a template/dump fallback.
 - **Supabase / GoTrue**: not deployed on client VMs. Default to plain bcrypt +
-  cookie sessions for new auth.
+  cookie sessions for new auth via `@samo/auth` (see
+  `packages/auth/migrations/0001_auth.sql` in samohost for the canonical
+  `app_users` / `app_sessions` bootstrap migration).
 - **ZFS pool**: named `tank` when present. App data never moves off `/tank`.
 - **Deploy**: The samohost control plane deploys prod on a timer from a
   CI-green dated tag on main. You only open PRs and cut release tags — you

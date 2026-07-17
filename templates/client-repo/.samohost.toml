@@ -8,6 +8,10 @@
 #
 # All fields map 1:1 to the AppSpec interface.  Unknown keys are REJECTED.
 # Secrets never belong here — they live in the server-side env file.
+#
+# DEFAULT SHAPE: managed-DB node app (most clients need this).
+# For a genuinely static brochure site (rare opt-out), see the comment block
+# at the bottom of this file.
 
 # ---- required fields -------------------------------------------------------
 name        = "{{APP_NAME}}"                        # unique app name per VM
@@ -15,18 +19,39 @@ repo        = "{{REPO}}"                            # GitHub owner/name
 branch      = "main"                                # tracked branch (deploy source)
 appDir      = "/opt/{{APP_NAME}}/app"              # checkout dir on the VM
 buildCmd    = "npm run build"                       # build command run on deploy
-healthUrl   = "http://127.0.0.1:3000/api/version"  # post-deploy health URL
+healthUrl   = "http://127.0.0.1:3000/api/version"  # post-deploy health URL (node app on :3000)
 serviceUnit = "{{APP_NAME}}"                        # systemd unit restarted on deploy
 
+# ---- database (managed-DB node app defaults) --------------------------------
+# dblab = samohost-managed DBLab thin clones for PR previews.
+# The baseline auth migration (@samo/auth packages/auth/migrations/0001_auth.sql)
+# creates app_users/app_sessions/login_attempts. Run it as your first migration.
+dbBackend       = "dblab"
+databaseUrlEnv  = "DATABASE_URL"                   # env var holding the DB connection URL
+migrateCmd      = "npm run migrate"                 # applies migrations in order before deploy
+rlsNonSuperuser = true                              # enforce non-superuser RLS gate
+envDbVars       = ["DATABASE_URL"]                  # vars rewritten per preview env
+
 # ---- optional fields -------------------------------------------------------
-# migrateCmd     = "npm run migrate"
 # seedCmd        = "npm run db:seed"
 # mainHost       = "{{APP_NAME}}.samo.team"         # public hostname for Caddy vhost
 # envFile        = "/opt/{{APP_NAME}}/staging.env"  # server-side env file (read-only)
 # rlsUrlVar      = "APP_DATABASE_URL"               # non-superuser URL var for RLS gate
-# envDbVars      = ["DATABASE_URL"]                 # vars rewritten per preview env
-# rlsNonSuperuser = true                            # enforce non-superuser RLS gate
-# kind           = "node"                           # "node" (default) or "static"
+
+# ---- static opt-out (genuinely static brochure sites only — rare) ----------
+# Most client apps need a real database. If your app is truly static (no DB,
+# no server-side logic, just files served from a CDN/file server), you can
+# opt out by overriding as follows:
+#
+#   kind        = "static"
+#   staticRoot  = "dist"                         # repo-relative output directory
+#   healthUrl   = "http://127.0.0.1:8080/index.html"  # static file-server port
+#
+# IMPORTANT when opting out of DB:
+#   - Remove ALL DB fields: dbBackend, databaseUrlEnv, migrateCmd, rlsNonSuperuser, envDbVars
+#   - Do NOT combine kind="static" with any DB field — samohost will reject that combination
+#   - kind="node" (the default when kind is absent) is correct for any app that
+#     has a server process, an API, or uses a database.
 
 # ---- provision (reserved for future provision --from-toml) -----------------
 # [provision]
