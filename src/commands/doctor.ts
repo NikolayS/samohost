@@ -391,6 +391,12 @@ export function parseDarkDbOutput(
   if (hasAppDatabases) found.push(`databases: ${appDatabases.join(", ")}`);
   if (hasAppRoles) found.push(`roles: ${appRoles.join(", ")}`);
 
+  // Include the expected env var name in the recommendation when the record
+  // has a databaseUrlEnv hint (helps the operator know which var to set).
+  const urlHint = databaseUrlEnv
+    ? ` Set databaseUrlEnv="${databaseUrlEnv}" when re-registering.`
+    : "";
+
   return {
     status: "fail",
     stdout: out,
@@ -398,7 +404,7 @@ export function parseDarkDbOutput(
     description:
       `dark (undeclared) Postgres ${found.join("; ")} found on VM ` +
       `but AppRecord declares no DB backend (dbBackend absent/none). ` +
-      `Fold into managed flow: re-register with dbBackend=dblab and run migrations.`,
+      `Fold into managed flow: re-register with dbBackend=dblab and run migrations.${urlHint}`,
   };
 }
 
