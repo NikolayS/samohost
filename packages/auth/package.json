@@ -1,0 +1,28 @@
+{
+  "name": "@samo/auth",
+  "version": "0.1.0",
+  "description": "Canonical bcrypt+cookie client-app auth module for SAMO client apps. Productized from field-record-1.",
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts",
+    "./password": "./src/password.ts",
+    "./session": "./src/session.ts",
+    "./cookie": "./src/cookie.ts",
+    "./middleware": "./src/middleware.ts",
+    "./throttle": "./src/throttle.ts",
+    "./pg": "./src/pg.ts"
+  },
+  "scripts": {
+    "test": "bun test test/",
+    "typecheck": "bunx tsc --noEmit"
+  },
+  "dependencies": {
+    "bcryptjs": "^2.4.3",
+    "postgres": "^3.4.9"
+  },
+  "devDependencies": {
+    "@types/bcryptjs": "^2.4.6",
+    "@types/bun": "^1.3.14",
+    "typescript": "^6.0.3"
+  }
+}
