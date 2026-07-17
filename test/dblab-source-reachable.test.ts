@@ -65,12 +65,12 @@ const LIVE_VM_WITH_SOURCE = {
 /**
  * Source BROKEN shape: postgres started before docker0 was assigned —
  * only binds 127.0.0.1, never 172.17.0.1. nc from the dblab container
- * returns "Connection refused". This is the time-bomb state found on
- * 2026-07-16.
+ * fails; the probe echoes "NO_SOURCE: <nc error>". This is the time-bomb
+ * state found on 2026-07-16.
  */
 const SOURCE_BROKEN = {
   ...LIVE_VM_WITH_SOURCE,
-  "dblab-source-reachable": "nc: connect to host.docker.internal (172.17.0.1) port 5432 (tcp) failed: Connection refused",
+  "dblab-source-reachable": "NO_SOURCE: nc: connect to host.docker.internal (172.17.0.1) port 5432 (tcp) failed: Connection refused",
 };
 
 /** Source probe not yet installed (old dblab container without --add-host). */
@@ -169,9 +169,11 @@ describe("runbook content — docker run includes --add-host (Bug C regression g
     expect(runbook).toContain("--add-host=host.docker.internal:host-gateway");
     // The source connection must reference host.docker.internal (not a raw IP).
     expect(runbook).toContain("host.docker.internal");
-    // The postgresql ordering drop-in must be documented.
-    expect(runbook).toContain("After=docker.service");
+    // The postgresql ordering drop-in must be documented:
+    // the drop-in ensures postgres starts after docker.service on every boot.
     expect(runbook).toContain("postgresql@");
+    expect(runbook).toContain("docker.service");
+    expect(runbook).toContain("10-docker-after.conf");
     // maxCloneCount guidance must be present.
     expect(runbook).toContain("maxCloneCount");
   });
