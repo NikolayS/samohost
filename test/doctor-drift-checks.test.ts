@@ -116,8 +116,8 @@ function makePassRunner(overrides: Record<string, string> = {}): RemoteRunner {
       "only-intended-ports": "",
       "env-file-perms": "600 agent",
       "git-remote-no-token": "origin\thttps://github.com/Tanya301/gamechangers (fetch)",
-      "ss-listeners": "LISTEN 0 128 0.0.0.0:2223 0.0.0.0:*\nLISTEN 0 511 0.0.0.0:443 0.0.0.0:*",
-      "caddy-serving": "LISTEN 0 128 0.0.0.0:2223 0.0.0.0:*\nLISTEN 0 511 0.0.0.0:443 0.0.0.0:*",
+      "ss-listeners": "LISTEN 0 128 0.0.0.0:2223 0.0.0.0:*\nLISTEN 0 511 0.0.0.0:80 0.0.0.0:*\nLISTEN 0 511 0.0.0.0:443 0.0.0.0:*",
+      "caddy-serving": "LISTEN 0 128 0.0.0.0:2223 0.0.0.0:*\nLISTEN 0 511 0.0.0.0:80 0.0.0.0:*\nLISTEN 0 511 0.0.0.0:443 0.0.0.0:*",
       "fail2ban-jail": "Status for the jail: sshd",
       "service-crash-loop": "Started gamechangers.service.",
       "failed-auth-burst": "Accepted publickey",
@@ -371,9 +371,9 @@ describe("2. parseDarkDbOutput — dark (undeclared) database detection", () => 
   test("2c. dbBackend absent + real app role on VM → FAIL", () => {
     // Probe lists both pg_database and pg_roles; an app role named "gamechangers_user"
     // that is NOT a system role signals a hand-installed DB.
+    // Format matches real probe output: echo 'DATABASES:'; psql ...; echo 'ROLES:'; psql ...
     const result = parseDarkDbOutput(
-      // Format: DB section then ROLES section, or combined — impl determines
-      "DATABASES:postgres\ntemplate0\ntemplate1\nROLES:postgres\npg_monitor\npg_read_all_settings\ngamechangers_user",
+      "DATABASES:\npostgres\ntemplate0\ntemplate1\nROLES:\npostgres\npg_monitor\npg_read_all_settings\ngamechangers_user",
       undefined,
       undefined,
     );
@@ -417,8 +417,9 @@ describe("2. parseDarkDbOutput — dark (undeclared) database detection", () => 
   });
 
   test("2g. only system roles + dbBackend absent → PASS", () => {
+    // Format matches real probe output: echo 'DATABASES:'; psql ...; echo 'ROLES:'; psql ...
     const result = parseDarkDbOutput(
-      "DATABASES:postgres\ntemplate0\ntemplate1\nROLES:postgres\npg_monitor\npg_read_all_settings\npg_read_all_stats\npg_stat_scan_tables\npg_read_server_files\npg_write_server_files\npg_execute_server_program\npg_signal_backend\npg_checkpoint",
+      "DATABASES:\npostgres\ntemplate0\ntemplate1\nROLES:\npostgres\npg_monitor\npg_read_all_settings\npg_read_all_stats\npg_stat_scan_tables\npg_read_server_files\npg_write_server_files\npg_execute_server_program\npg_signal_backend\npg_checkpoint",
       undefined,
       undefined,
     );
