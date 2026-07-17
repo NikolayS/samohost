@@ -60,21 +60,34 @@ curl -sSL https://gitlab.com/postgres-ai/database-lab/-/raw/v4.1.3/engine/config
 #   server.port: 2345
 #   poolManager.mountDir: /var/lib/dblab
 #   provision.portPool: {from: 6000, to: 6099}
-#   provision.dockerImage: "postgresai/extended-postgres:18-0.6.2"
+#   provision.dockerImage: "postgresai/extended-postgres:16-0.6.2"  # match host PG major
 #   provision.cloneAccessAddresses: "127.0.0.1"
-#   retrieval (logical): source = host PG18 at 172.17.0.1:5432 (or host-gateway),
-#     db field_record, a read-only dump role; schedule: nightly
-#   databaseConfigs: shared_buffers 256MB, work_mem small  # 8GB VM — see sizing
-# NOTE: host PG must accept connections from the Docker bridge for logicalDump
-# (pg_hba.conf + listen_addresses) — add a dump-only role, scram, bridge subnet.
+#   cloning.maxCloneCount: 8  # default 4 is too low for multi-PR workloads
+#   retrieval (logical):
+#     source.connection.host: "host.docker.internal"  # NOT 172.17.0.1 (Bug C: IP is dynamic)
+#     source.connection.port: 5432
+#     db <appdb>, a read-only dump role; schedule: "0 3 * * 0" (weekly off-peak)
+#   databaseConfigs: shared_buffers 128MB (cx23) or 256MB (cx33), work_mem small
+# NOTE: host PG must accept connections from the Docker bridge for logicalDump:
+#   - pg_hba.conf: host all all 172.16.0.0/12 trust  (covers docker0 + bridge nets)
+#   - listen_addresses: 'localhost,172.17.0.1'  (or '*' with tight hba)
+#   - AND postgresql@.service must start AFTER docker.service (see Bug C below)
 
 # 4. Run the engine (Docker supervises; API on localhost only)
+#
+# --add-host=host.docker.internal:host-gateway is REQUIRED (Bug C fix,
+# 2026-07-16): it makes `host.docker.internal` resolve to the host's
+# docker0 gateway IP inside the container. Without it, the logicalDump
+# job (which runs pg_dump in a sub-container that ALSO needs this alias)
+# cannot reach host postgres, and the weekly refresh marks the pool
+# "empty" → DROPS ALL LIVE CLONES. See "Bug C" section below.
 docker run --name dblab_server --label dblab_control --privileged \
   --publish 127.0.0.1:2345:2345 \
   --volume /var/run/docker.sock:/var/run/docker.sock \
   --volume /var/lib/dblab:/var/lib/dblab/:rshared \
   --volume /root/.dblab/engine/configs:/home/dblab/configs:ro \
   --volume /root/.dblab/engine/meta:/home/dblab/meta \
+  --add-host=host.docker.internal:host-gateway \
   --detach --restart on-failure \
   postgresai/dblab-server:4.1.3
 
@@ -242,9 +255,96 @@ samohost. The provisioning gap is tracked in the docs/stack/dblab.md platform-ga
 section. Until a cloud-init module is added, every new loopback-ZFS VM needs this
 operator step after DBLab is installed.
 
+## Bug C — postgres-before-docker source break (2026-07-16)
+
+**Root cause:** When `dockerd` restarts (or starts after a crash) while
+`postgresql@16-main` is already running, postgres has already bound its
+addresses from `listen_addresses`. If `listen_addresses` includes `172.17.0.1`
+(the docker0 bridge IP) but docker0 was not assigned that IP at the time
+postgres started, the bind silently fails — postgres only holds `127.0.0.1`.
+The DBLab engine's `logicalDump` job spawns a temporary
+`postgresai/extended-postgres` container and runs `pg_dump` against the
+configured `source.connection.host`. When that host is `172.17.0.1` and the
+socket is not bound there, pg_dump gets "Connection refused", the retrieval job
+fails, and the engine marks the pool `empty` → **drops all live clones**.
+
+`skipStartRefresh: true` hides the break at startup, but a scheduled weekly
+refresh (`timetable: "0 3 * * 0"`) triggers the same chain. The failure mode
+is silent until Sunday 03:00 UTC.
+
+**Durable fix (apply to every loopback-ZFS and CX23 VM):**
+
+```bash
+# 1. Restart postgres so it binds listen_addresses including 172.17.0.1
+#    (one-time; apps use a connection pool and reconnect within seconds).
+systemctl restart postgresql@16-main
+pg_isready -h 172.17.0.1 -p 5432  # must say "accepting connections"
+
+# 2. Add a drop-in so postgres starts AFTER docker on every boot,
+#    ensuring docker0 exists before postgres tries to bind it.
+mkdir -p /etc/systemd/system/postgresql@16-main.service.d
+cat > /etc/systemd/system/postgresql@16-main.service.d/10-docker-after.conf <<'DROPIN'
+[Unit]
+# postgres must start AFTER docker so docker0 (172.17.0.1) exists when
+# postgres binds listen_addresses (Bug C fix, 2026-07-16).
+After=network.target docker.service
+Wants=docker.service
+DROPIN
+systemctl daemon-reload
+
+# 3. Use host.docker.internal in server.yml (NOT the raw 172.17.0.1 IP)
+#    and recreate the container with --add-host so the alias resolves:
+#
+#    In /root/.dblab/engine/configs/server.yml:
+#      retrieval.spec.logicalDump.options.source.connection.host: "host.docker.internal"
+#
+#    Then recreate (clones blip briefly while the engine reconnects):
+docker stop dblab_server && docker rm dblab_server
+docker run --name dblab_server --label dblab_control --privileged \
+  --publish 127.0.0.1:2345:2345 \
+  --volume /var/run/docker.sock:/var/run/docker.sock \
+  --volume /var/lib/dblab:/var/lib/dblab/:rshared \
+  --volume /root/.dblab/engine/configs:/home/dblab/configs:ro \
+  --volume /root/.dblab/engine/meta:/home/dblab/meta \
+  --add-host=host.docker.internal:host-gateway \
+  --detach --restart on-failure \
+  postgresai/dblab-server:4.1.3
+
+# 4. Verify source is reachable from inside the container:
+docker exec dblab_server sh -c 'nc -w2 -z host.docker.internal 5432 && echo OK || echo FAIL'
+# Must print OK.
+
+# 5. Verify preflight now reports source: READY
+samohost env preflight <vm-name>   # source: READY expected
+```
+
+**Why `host.docker.internal` and not the raw IP `172.17.0.1`?**
+The `--add-host=host.docker.internal:host-gateway` flag wires the alias to
+whatever the docker0 gateway IP is at runtime (determined by `ip route`
+inside the container). This is resilient to docker0 getting a different IP
+on different VMs or after a manual docker network reset. The raw IP is
+fragile — if docker0 ever changes, the source connection breaks again.
+
+**`maxCloneCount` note:** The default `maxCloneCount: 4` in server.yml is
+too low for a VM with multiple active PR previews. Raise it to at least 8
+for client projects with concurrent open PRs:
+
+```yaml
+cloning:
+  maxCloneCount: 8   # was 4; 6+ clones refused new previews on samograph
+```
+
+**This is a per-VM artifact** — the postgresql ordering drop-in and the
+dblab container re-creation must be applied to every affected VM by the
+operator. Until samohost provisions these automatically (cloud-init module
+follow-up), new VMs may silently have this bug after a dockerd restart.
+
 ## Open items
 
 - Confirm `postgresai/extended-postgres:18-*` tag availability (UNVERIFIED).
 - `postgres-ai/air` prototype inaccessible — re-consult if access is granted.
 - Bug B (loopback boot ordering) must be baked into the cloud-init DBLab module
   when it is implemented (PR #128 follow-up).
+- Bug C (postgres-before-docker source break) must be baked into the cloud-init
+  DBLab module (postgresql ordering drop-in + host.docker.internal in server.yml
+  + --add-host in the container run command).
