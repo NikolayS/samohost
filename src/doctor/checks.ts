@@ -336,6 +336,32 @@ export const appDbCheckTemplates: DoctorCheck[] = [
     group: "app-db",
     appScoped: true,
   },
+  {
+    id: "dark-db",
+    description: "no undeclared (hand-installed) Postgres databases or roles on VM",
+    // Probe: list non-system databases and non-system roles via local socket
+    // (sudo -u postgres so we can reach the system Postgres cluster without
+    // credentials). The output has a labelled structure so the parser can
+    // split the DB list from the role list:
+    //
+    //   DATABASES:<newline-delimited db names>
+    //   ROLES:<newline-delimited role names>
+    //
+    // System databases excluded: postgres, template0, template1.
+    // System roles excluded (pg_* prefix + postgres superuser).
+    //
+    // If psql is absent or postgres socket unreachable, the { } 2>&1 || true
+    // wrapper in buildAuditScript ensures the section contains the error text
+    // (not empty). parseDarkDbOutput treats non-empty non-DB output as
+    // "unknown" (fail-safe), so the sweep continues safely.
+    //
+    // Folded into the EXISTING single-SSH auditVm batch — NOT a separate call.
+    probeCommand:
+      "{ echo 'DATABASES:'; sudo -u postgres psql -tAc \"SELECT datname FROM pg_database WHERE datname NOT IN ('postgres','template0','template1') ORDER BY datname\" 2>/dev/null; echo 'ROLES:'; sudo -u postgres psql -tAc \"SELECT rolname FROM pg_roles WHERE rolname NOT LIKE 'pg_%' AND rolname <> 'postgres' ORDER BY rolname\" 2>/dev/null; } 2>&1 || true",
+    expect: /.*/,
+    group: "app-db",
+    appScoped: true,
+  },
 ];
 
 // ---------------------------------------------------------------------------

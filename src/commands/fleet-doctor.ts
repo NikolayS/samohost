@@ -24,6 +24,7 @@ import {
   type FleetRemediationResult,
 } from "../remediate/firewall-lock.ts";
 import { checkDblabNotOversized } from "../doctor/dblab-sizing.ts";
+import { checkStaticDbDrift } from "../doctor/static-db-drift.ts";
 import { checkBackupEnabled } from "../doctor/backup-enabled.ts";
 import type { ProviderPortWithBackup } from "../providers/types.ts";
 
@@ -230,6 +231,32 @@ export async function runFleetDoctor(
         allApps.filter((a) => a.vmId === record.id),
       );
       checks.push(thisDblabCheck as DoctorResult);
+
+      // static-db-drift: LOCAL-ONLY, no SSH. Detects kind=static apps that
+      // carry DB fields (migrateCmd/dbBackend/previewDbBackend/databaseUrlEnv/
+      // envDbVars) whose migrations NEVER run in the static serve path.
+      // This is the DETECTION mirror of P1's validateStaticNoDb registration
+      // gate — it surfaces already-registered apps that drifted before P1.
+      // One result per offending app on this VM; emitted as status="pass" when
+      // all apps are clean so the check always appears in the JSON output.
+      const vmApps = allApps.filter((a) => a.vmId === record.id);
+      const driftResults = checkStaticDbDrift(vmApps);
+      if (driftResults.length > 0) {
+        // Push one result per drifted app.
+        for (const dr of driftResults) {
+          checks.push(dr as DoctorResult);
+        }
+      } else {
+        // All apps clean — emit a single pass result so the check is visible in JSON.
+        checks.push({
+          id: "static-db-drift",
+          group: "infra-sizing",
+          status: "pass",
+          description: "no static apps with undeclared DB fields on this VM",
+          stdout: "",
+          stderr: "",
+        } as DoctorResult);
+      }
 
       // backup-enabled: live hcloud probe via provider.getWithBackup(providerId).
       // Only runs when a provider is passed to runFleetDoctor (e.g. in tests and
