@@ -905,6 +905,14 @@ export function parseSamohostToml(text: string): ParseTomlResult {
     }
   }
 
+  // ---- 4c. Reject kind=static with DB fields (silent-drift guard) ----------
+  // A static app never runs migrations; DB fields are silently ignored in both
+  // env-create and prod-deploy. Catch the incoherent combo loudly here.
+  validateStaticNoDb(
+    { kind, migrateCmd, dbBackend, previewDbBackend, databaseUrlEnv, envDbVars },
+    errors,
+  );
+
   // ---- 5. Validate [provision] table (optional) ----------------------------
   let provision: ProvisionManifest | undefined;
   const rawProvision = raw["provision"];
@@ -1315,4 +1323,79 @@ export function validateServicesTopology(
       }
     }
   }
+}
+
+// ---------------------------------------------------------------------------
+// Shared static-no-DB validator
+//
+// A kind=static app NEVER runs migrations in either the env-create path
+// (buildStaticEnvCreateScript has no migrate phase) or the prod deploy path
+// (the migrate block is inside the node-only else branch). Declaring DB fields
+// on a static app produces SILENT drift — migrations are configured but never
+// run. validateStaticNoDb() catches this loudly at onboarding time, steering
+// clients to kind=node (which DOES run migrate in both paths).
+//
+// Used by both parseSamohostToml (TOML path) and runAppRegister (programmatic
+// path) so parse and register cannot drift apart. "none" is the explicit
+// declaration that an app has no database and is always valid for static.
+// ---------------------------------------------------------------------------
+
+/**
+ * Shape of the DB-related fields that validateStaticNoDb inspects.
+ * Matches both AppManifest and the relevant subset of AppRegisterInput.
+ */
+export interface StaticNoDbSpec {
+  kind?: "node" | "static";
+  migrateCmd?: string;
+  dbBackend?: string;
+  previewDbBackend?: string;
+  databaseUrlEnv?: string;
+  envDbVars?: string[];
+}
+
+/**
+ * Validate that a kind=static app does not declare any DB fields.
+ *
+ * A static app never executes migrations (neither env-create nor prod-deploy
+ * has a migrate phase for static), so declaring DB fields produces silent
+ * drift. This check rejects the incoherent combo loudly, naming every
+ * offending field. kind=node (the default) is the correct shape for a
+ * DB-backed app.
+ *
+ * Rules:
+ * - Only triggers when `spec.kind === "static"`.
+ * - Offending fields: migrateCmd, dbBackend (non-"none"), previewDbBackend
+ *   (non-"none"), databaseUrlEnv, envDbVars (non-empty).
+ * - dbBackend="none" and previewDbBackend="none" are NOT offending — they
+ *   are the explicit declaration that the app has no database and are valid
+ *   for static apps.
+ * - All offending fields are collected before returning (fail-closed,
+ *   no bail-on-first), consistent with the rest of the manifest validator.
+ *
+ * Errors are appended to `errors`; the caller decides how to surface them.
+ * Factored here so parseSamohostToml and runAppRegister apply identical rules.
+ */
+export function validateStaticNoDb(
+  spec: StaticNoDbSpec,
+  errors: string[],
+): void {
+  if (spec.kind !== "static") return; // only applies to static apps
+
+  const offending: string[] = [];
+
+  if (spec.migrateCmd !== undefined) offending.push("migrateCmd");
+  if (spec.dbBackend !== undefined && spec.dbBackend !== "none") offending.push("dbBackend");
+  if (spec.previewDbBackend !== undefined && spec.previewDbBackend !== "none") {
+    offending.push("previewDbBackend");
+  }
+  if (spec.databaseUrlEnv !== undefined) offending.push("databaseUrlEnv");
+  if (spec.envDbVars !== undefined && spec.envDbVars.length > 0) offending.push("envDbVars");
+
+  if (offending.length === 0) return;
+
+  errors.push(
+    `kind=static app declares DB field(s) that are silently ignored — ` +
+      `set kind=node (the default) for a DB-backed app. ` +
+      `Offending field(s): ${offending.join(", ")}`,
+  );
 }

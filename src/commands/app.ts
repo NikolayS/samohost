@@ -41,7 +41,7 @@ import {
   type SpawnResult,
 } from "../ssh/runner.ts";
 import type { AppRecord, AppSpec, EnvDbBackend, ServiceSpec, RouteSpec, VmRecord } from "../types.ts";
-import { parseSamohostToml, validateServicesTopology } from "../manifest/toml.ts";
+import { parseSamohostToml, validateServicesTopology, validateStaticNoDb } from "../manifest/toml.ts";
 
 // ---------------------------------------------------------------------------
 // Parsed inputs (produced by the CLI parser)
@@ -261,6 +261,30 @@ export function runAppRegister(
   } catch (error) {
     err(`error: ${error instanceof Error ? error.message : String(error)}`);
     return 1;
+  }
+
+  // Static-no-DB guard: a kind=static app never runs migrations in either path
+  // (env-create uses buildStaticEnvCreateScript which has no migrate phase;
+  // prod deploy's migrate block is inside the node-only else branch). Reject
+  // the incoherent combo loudly here so a programmatic caller cannot persist a
+  // silent-drift AppRecord. Uses the same shared predicate as parseSamohostToml.
+  {
+    const staticNoDbErrors: string[] = [];
+    validateStaticNoDb(
+      {
+        kind: input.kind,
+        migrateCmd: input.migrateCmd,
+        dbBackend: input.dbBackend,
+        previewDbBackend: input.previewDbBackend,
+        databaseUrlEnv: input.databaseUrlEnv,
+        envDbVars: input.envDbVars,
+      },
+      staticNoDbErrors,
+    );
+    if (staticNoDbErrors.length > 0) {
+      err(`error: kind=static app declares DB field(s) — ${staticNoDbErrors.join("; ")}`);
+      return 1;
+    }
   }
 
   // Fix 6a: validate service topology on the programmatic path too.
