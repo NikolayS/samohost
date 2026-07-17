@@ -12,8 +12,9 @@ import type {
   CreateServerSpec,
   ProviderError,
   ProviderErrorKind,
-  ProviderPort,
+  ProviderPortWithBackup,
   ServerInfo,
+  ServerInfoWithBackup,
   ServerStatus,
   VolumeInfo,
 } from "../src/providers/types.ts";
@@ -27,7 +28,7 @@ export class FakeProviderError extends Error {
   }
 }
 
-export class FakeProvider implements ProviderPort {
+export class FakeProvider implements ProviderPortWithBackup {
   /** Captured create specs (golden user_data assertions read these). */
   readonly createCalls: CreateServerSpec[] = [];
   /** When set (incl. null), create() and get() report this ipv4 (samorev #2). */
@@ -46,6 +47,21 @@ export class FakeProvider implements ProviderPort {
   failDestroyOnceWith?: FakeProviderError;
   /** Hook invoked DURING create (before it resolves) — crash-safety probes. */
   onCreate?: (spec: CreateServerSpec) => void;
+
+  /** Records all enableBackup(id) calls (in order). */
+  readonly enableBackupCalls: string[] = [];
+  /**
+   * When set, enableBackup() throws this error (non-fatal path test).
+   * Shape: { kind: ProviderErrorKind, message: string } — normalizeError maps it.
+   */
+  failEnableBackupWith?: { kind: ProviderErrorKind; message: string };
+
+  /**
+   * Per-server backup_window override for getWithBackup().
+   * Key = providerId. Value = backup_window string or null.
+   * Default (key absent): null (backups off).
+   */
+  backupWindowById: Map<string, string | null> = new Map();
 
   private nextId = 9001;
 
@@ -73,6 +89,37 @@ export class FakeProvider implements ProviderPort {
     this.getCount += 1;
     const ipv4 = this.forceIpv4 !== undefined ? this.forceIpv4 : info.ipv4;
     return { ...info, ipv4, status: this.statusSequence[idx]! };
+  }
+
+  async getWithBackup(id: string): Promise<ServerInfoWithBackup> {
+    const backup_window = this.backupWindowById.has(id)
+      ? this.backupWindowById.get(id)!
+      : null;
+    // If the server exists in the servers map, use it as the base.
+    // If not (e.g. in unit tests that only set backupWindowById), synthesize
+    // a minimal ServerInfo so getWithBackup can be used without create().
+    const info = this.servers.get(id);
+    const base: ServerInfo = info
+      ? { ...info, status: this.statusSequence[Math.min(this.getCount, this.statusSequence.length - 1)]! }
+      : {
+          providerId: id,
+          name: `vm-${id}`,
+          status: "running",
+          ipv4: this.forceIpv4 !== undefined ? this.forceIpv4 : "192.0.2.55",
+          labels: { "managed-by": "samohost" },
+          volumeIds: [],
+        };
+    return { ...base, backup_window };
+  }
+
+  async enableBackup(id: string): Promise<void> {
+    this.enableBackupCalls.push(id);
+    if (this.failEnableBackupWith) {
+      const { kind, message } = this.failEnableBackupWith;
+      throw new FakeProviderError(kind, message);
+    }
+    // On success, update the stored backup_window for this server.
+    this.backupWindowById.set(id, "auto-assigned");
   }
 
   async list(): Promise<ServerInfo[]> {

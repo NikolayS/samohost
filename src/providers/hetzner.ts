@@ -19,8 +19,9 @@
 import type {
   CreateServerSpec,
   ProviderError,
-  ProviderPort,
+  ProviderPortWithBackup,
   ServerInfo,
+  ServerInfoWithBackup,
   ServerStatus,
   VolumeInfo,
 } from "./types.ts";
@@ -65,9 +66,11 @@ interface HetznerServer {
   public_net?: { ipv4?: { ip?: string } | null } | null;
   labels?: Record<string, string>;
   volumes?: number[];
+  /** null when automated backups are off; a time-window string when enabled. */
+  backup_window?: string | null;
 }
 
-export class HetznerProvider implements ProviderPort {
+export class HetznerProvider implements ProviderPortWithBackup {
   private readonly fetchFn: typeof fetch;
   private readonly baseUrl: string;
 
@@ -96,6 +99,31 @@ export class HetznerProvider implements ProviderPort {
   async get(id: string): Promise<ServerInfo> {
     const body = await this.request("GET", `/servers/${id}`);
     return mapServer((body as { server: HetznerServer }).server);
+  }
+
+  /**
+   * Fetch server details including backup_window.
+   * backup_window is null when backups are disabled; a time-window string
+   * (e.g. "22-02") when Hetzner automated backups are enabled.
+   */
+  async getWithBackup(id: string): Promise<ServerInfoWithBackup> {
+    const body = await this.request("GET", `/servers/${id}`);
+    const s = (body as { server: HetznerServer }).server;
+    return {
+      ...mapServer(s),
+      backup_window: s.backup_window ?? null,
+    };
+  }
+
+  /**
+   * Enable Hetzner built-in automated backups for a server.
+   * POST /servers/{id}/actions/enable_backup — no request body needed.
+   * Hetzner assigns a daily backup window automatically.
+   * Idempotent: calling on an already-backed-up server is a no-op.
+   * 20% monthly surcharge on the server price.
+   */
+  async enableBackup(id: string): Promise<void> {
+    await this.request("POST", `/servers/${id}/actions/enable_backup`);
   }
 
   async list(): Promise<ServerInfo[]> {
