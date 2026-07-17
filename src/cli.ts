@@ -116,6 +116,7 @@ import {
 } from "./commands/domain.ts";
 import { DomainStore } from "./state/domains.ts";
 import { HetznerProvider } from "./providers/hetzner.ts";
+import type { ProviderPortWithBackup } from "./providers/types.ts";
 import { StateStore } from "./state/store.ts";
 import type { EnvDbBackend } from "./types.ts";
 import {
@@ -2312,6 +2313,20 @@ function parseDomainRm(args: string[]): ParsedDomainRm {
   return { kind: "domain-rm", input: { fqdn, yes }, json };
 }
 
+/**
+ * Construct the Hetzner provider used by the `doctor --all` CLI branch.
+ *
+ * Exported so tests can verify the CLI wiring: the doctor path MUST construct
+ * this provider and pass it to runFleetDoctor so the backup-enabled guardrail
+ * actually runs in production.
+ *
+ * The provider reads HCLOUD_TOKEN at call time (never at construction), so
+ * constructing it here is safe and doesn't expose any credentials.
+ */
+export function defaultFleetDoctorProvider(): ProviderPortWithBackup {
+  return new HetznerProvider({ fetch: globalThis.fetch });
+}
+
 /** Entry point. Returns the process exit code. */
 export async function main(
   argv: string[],
@@ -2567,6 +2582,8 @@ export async function main(
           defaultAppStore(),
           out,
           err,
+          undefined,
+          defaultFleetDoctorProvider(),
         );
       }
       return runDoctor(

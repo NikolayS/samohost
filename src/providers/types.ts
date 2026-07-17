@@ -83,8 +83,12 @@ export interface ProviderPort {
    * POST /servers/{id}/actions/enable_backup — no request body required.
    * Idempotent: calling on an already-backed-up server is a no-op.
    * 20% monthly surcharge on the server price.
+   *
+   * Optional on the interface so custom ProviderPort implementations that
+   * pre-date this method (or target clouds without an equivalent) can degrade
+   * gracefully. The typeof guard in provision.ts gates the call accordingly.
    */
-  enableBackup(id: string): Promise<void>;
+  enableBackup?(id: string): Promise<void>;
 }
 
 /**

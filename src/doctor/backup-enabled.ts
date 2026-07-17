@@ -124,7 +124,7 @@ export async function checkBackupEnabled(
         });
       }
     } catch (e) {
-      // Provider call failed — emit unknown rather than false-positive fail.
+      // Provider call failed — emit fail (fail-safe: unknown backup state = fail).
       const msg = e instanceof Error ? e.message : String(e);
       results.push({
         vmId: vm.id,
