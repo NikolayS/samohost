@@ -32,3 +32,10 @@ jobs:
           # whole rig green with zero adapt validation. Hard-fail here ensures
           # the caddy install step above is never silently bypassed.
           SAMOHOST_REQUIRE_CADDY: "1"
+      # @samo/auth package — typecheck + unit tests
+      - name: Install @samo/auth deps
+        run: cd packages/auth && bun install --frozen-lockfile
+      - name: Typecheck @samo/auth
+        run: cd packages/auth && bunx tsc --noEmit
+      - name: Test @samo/auth
+        run: cd packages/auth && bun test test/

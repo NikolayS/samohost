@@ -56,6 +56,32 @@ Supabase appears only in `SPEC.md §8 Roadmap / Deferred (post-v0.1)`.
 
 ---
 
+## Canonical client-app auth: @samo/auth
+
+For all new client apps, use **`packages/auth` (`@samo/auth`)** — the shared
+bcrypt+cookie auth module productized from field-record-1.
+
+**Location:** `packages/auth/` in this repo.
+
+**What it provides:**
+- `hashPassword` / `verifyPassword` — bcryptjs, 12 rounds, min-8 chars.
+- `createSession` / `validateSession` / `revokeSession` — raw token never
+  persisted; only its SHA-256 hash stored in `app_sessions`.
+- `buildSetCookieHeader` / `clearCookieHeader` / `parseCookieToken` — httpOnly,
+  SameSite=Lax, 7-day Max-Age.
+- `requireAuth` — framework-agnostic guard; attaches resolved user to `req.user`.
+- `SqliteThrottle` — DB-backed throttle; 5 failures / 15-min window; survives
+  restarts; case-insensitive key.
+- Migration: `packages/auth/migrations/0001_auth.sql` — creates `app_users`,
+  `app_sessions`, `login_attempts` on vanilla Postgres 16+.
+
+Apply migration: `psql "$DATABASE_URL" -f packages/auth/migrations/0001_auth.sql`
+
+**When to use GoTrue / full Supabase instead:** Only when the owner explicitly
+enables it for a specific project.
+
+---
+
 ## What agents must do
 
 - **`ANTHROPIC_API_KEY` is unconditionally banned** in all samohost code and
@@ -67,8 +93,8 @@ Supabase appears only in `SPEC.md §8 Roadmap / Deferred (post-v0.1)`.
   `refresh_tokens`, `audit_log_entries`, `schema_migrations`, `mfa_factors`,
   `flow_state`) in new client app migrations. GoTrue is not running on project
   VMs.
-- For new client apps: default to **plain bcrypt + cookie sessions** (the
-  pattern from field-record-1) unless the owner specifies otherwise.
+- For new client apps: use **`@samo/auth`** (`packages/auth/`) as the default.
+  Do not copy-paste field-record-1 auth code into new apps; depend on the module.
 - The samo.team UI's `/auth/*` endpoint is powered by standalone GoTrue — this
   is correct and intentional. Do not "upgrade" it to a full Supabase stack
   without an explicit owner decision.

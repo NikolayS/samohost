@@ -62,6 +62,7 @@ import {
 
 import {
   requireAuth,
+  type AuthRequest,
 } from '../src/middleware.ts'
 
 import {
@@ -93,8 +94,10 @@ function makeTestDb(): Database {
     CREATE TABLE app_sessions (
       id          TEXT        PRIMARY KEY,
       app_user_id TEXT        NOT NULL REFERENCES app_users(id) ON DELETE CASCADE,
+      -- SQLite: enforce length=64 and all-hex via GLOB repeating pattern.
+      -- Postgres equivalent: CHECK (token ~ '^[0-9a-f]{64}$')
       token       TEXT        NOT NULL UNIQUE
-                              CHECK (length(token) = 64 AND token GLOB '*[!0-9A-Fa-f]*' = 0),
+                              CHECK (length(token) = 64 AND lower(token) GLOB '[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]'),
       expires_at  TEXT        NOT NULL,
       created_at  TEXT        NOT NULL DEFAULT (datetime('now'))
     );
@@ -282,7 +285,6 @@ describe('cookie helpers', () => {
   })
 
   test('parseCookieToken extracts token from Cookie header', () => {
-    const raw = 'other=x; samo_session=deadbeef; more=y'
     // SESSION_COOKIE_NAME may or may not be samo_session; test with the actual name.
     const cookieHeader = `other=x; ${SESSION_COOKIE_NAME}=deadbeef; more=y`
     const token = parseCookieToken(cookieHeader)
@@ -304,10 +306,8 @@ describe('cookie helpers', () => {
 // 4. requireAuth middleware
 // ---------------------------------------------------------------------------
 
-/** Minimal fake request shim for middleware testing. */
-interface FakeReq {
-  headers: Record<string, string>
-}
+/** Minimal fake request shim for middleware testing — structurally identical to AuthRequest. */
+type FakeReq = AuthRequest
 
 /** Minimal fake response shim. */
 interface FakeRes {
@@ -391,14 +391,14 @@ describe('requireAuth middleware', () => {
 
   test('accepts valid session — calls next and attaches user', async () => {
     const token = await createSession(db, userId)
-    const req: FakeReq & { user?: unknown } = {
+    const req: AuthRequest = {
       headers: { cookie: `${SESSION_COOKIE_NAME}=${token}` },
     }
     const res = makeRes()
     let nextCalled = false
     await requireAuth(db, req, res, () => { nextCalled = true })
     expect(nextCalled).toBe(true)
-    expect((req as { user?: { id: string } }).user?.id).toBe(userId)
+    expect(req.user?.id).toBe(userId)
   })
 })
 
