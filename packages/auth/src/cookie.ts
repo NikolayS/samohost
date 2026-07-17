@@ -6,8 +6,7 @@
  *   - SameSite=Lax (CSRF protection for most flows)
  *   - Max-Age set to SESSION_TTL_MS / 1000
  *   - Path=/
- *   - Secure omitted here — callers running behind HTTPS terminate at the
- *     reverse proxy; add Secure in the caller if needed.
+ *   - Secure by default — omit only in local/dev via { insecure: true }.
  *
  * Cookie name: samo_session (generic, not tied to field-record's fr_session).
  *
@@ -20,32 +19,46 @@ export const SESSION_COOKIE_NAME = 'samo_session'
 
 const SESSION_TTL_SEC = Math.floor(SESSION_TTL_MS / 1000)  // 604800 (7 days)
 
+export interface CookieOptions {
+  /** Set to true only for local/dev environments — omits the Secure flag. */
+  insecure?: boolean
+}
+
 /**
  * Build a Set-Cookie header value for a new session.
  *
+ * Includes Secure by default. Pass { insecure: true } only for local/dev.
+ *
  * @param rawToken - The raw session token (not the hash — that lives in the DB).
+ * @param opts     - Optional cookie flags override.
  */
-export function buildSetCookieHeader(rawToken: string): string {
-  return [
+export function buildSetCookieHeader(rawToken: string, opts?: CookieOptions): string {
+  const parts = [
     `${SESSION_COOKIE_NAME}=${rawToken}`,
     `Max-Age=${SESSION_TTL_SEC}`,
     'Path=/',
     'HttpOnly',
     'SameSite=Lax',
-  ].join('; ')
+  ]
+  if (!opts?.insecure) parts.push('Secure')
+  return parts.join('; ')
 }
 
 /**
  * Build a Set-Cookie header that clears the session cookie.
+ *
+ * Includes Secure by default. Pass { insecure: true } only for local/dev.
  */
-export function clearCookieHeader(): string {
-  return [
+export function clearCookieHeader(opts?: CookieOptions): string {
+  const parts = [
     `${SESSION_COOKIE_NAME}=`,
     'Max-Age=0',
     'Path=/',
     'HttpOnly',
     'SameSite=Lax',
-  ].join('; ')
+  ]
+  if (!opts?.insecure) parts.push('Secure')
+  return parts.join('; ')
 }
 
 /**

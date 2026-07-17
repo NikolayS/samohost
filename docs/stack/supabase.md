@@ -63,15 +63,43 @@ bcrypt+cookie auth module productized from field-record-1.
 
 **Location:** `packages/auth/` in this repo.
 
+**Production consumption (vanilla Postgres):**
+
+```ts
+import postgres from 'postgres'
+import { PgSessionStore, PgThrottle, requireAuthPg, buildSetCookieHeader } from '@samo/auth'
+
+const sql = postgres(process.env.DATABASE_URL!)
+const sessions = new PgSessionStore(sql)   // production session store
+const throttle = new PgThrottle(sql)       // production throttle
+
+// In a sign-in route:
+if (await throttle.isThrottled(login)) { /* 429 */ }
+const token = await sessions.createSession(userId)
+res.setHeader('Set-Cookie', buildSetCookieHeader(token))  // Secure by default
+
+// In a protected route:
+await requireAuthPg(sessions, req, res, next)  // 401 on missing/invalid/expired/revoked
+```
+
+**SQLite double (test/dev only):** `createSession` / `validateSession` / `revokeSession`
+(Bun SQLite-backed) + `SqliteThrottle` are test doubles. Do NOT use as the production
+session store in a server that runs against real Postgres.
+
 **What it provides:**
+- `PgSessionStore` — postgres.js-backed session store (PRODUCTION default).
+  Raw token returned to caller; only SHA-256 hash stored in `app_sessions`.
+  `validateSession` enforces: `expires_at > NOW()`, `status = 'active'`, `archived_at IS NULL`.
+- `PgThrottle` — postgres.js-backed throttle (PRODUCTION default).
+  5 failures / 15-min window; DB-backed so survives restarts; case-insensitive key.
+- `requireAuthPg` — middleware guard backed by `PgSessionStore`. 401 on
+  missing/invalid/expired/revoked session; attaches user to `req.user` on success.
 - `hashPassword` / `verifyPassword` — bcryptjs, 12 rounds, min-8 chars.
-- `createSession` / `validateSession` / `revokeSession` — raw token never
-  persisted; only its SHA-256 hash stored in `app_sessions`.
 - `buildSetCookieHeader` / `clearCookieHeader` / `parseCookieToken` — httpOnly,
-  SameSite=Lax, 7-day Max-Age.
-- `requireAuth` — framework-agnostic guard; attaches resolved user to `req.user`.
-- `SqliteThrottle` — DB-backed throttle; 5 failures / 15-min window; survives
-  restarts; case-insensitive key.
+  SameSite=Lax, Secure by default, 7-day Max-Age. Pass `{ insecure: true }` only
+  for local/dev to omit the Secure flag.
+- `requireAuth` — same guard but backed by Bun SQLite (test/dev only).
+- `SqliteThrottle` — SQLite-backed throttle (test/dev only).
 - Migration: `packages/auth/migrations/0001_auth.sql` — creates `app_users`,
   `app_sessions`, `login_attempts` on vanilla Postgres 16+.
 

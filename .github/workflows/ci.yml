@@ -9,6 +9,20 @@ permissions:
 jobs:
   test:
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: authtest
+          POSTGRES_PASSWORD: authtest
+          POSTGRES_DB: authtest
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
     steps:
       - uses: actions/checkout@v4
       - uses: oven-sh/setup-bun@v2
@@ -32,10 +46,17 @@ jobs:
           # whole rig green with zero adapt validation. Hard-fail here ensures
           # the caddy install step above is never silently bypassed.
           SAMOHOST_REQUIRE_CADDY: "1"
-      # @samo/auth package — typecheck + unit tests
+      # @samo/auth package — typecheck + unit tests (SQLite) + real-Postgres integration tests
       - name: Install @samo/auth deps
         run: cd packages/auth && bun install --frozen-lockfile
       - name: Typecheck @samo/auth
         run: cd packages/auth && bunx tsc --noEmit
-      - name: Test @samo/auth
-        run: cd packages/auth && bun test test/
+      - name: Test @samo/auth (SQLite unit tests)
+        run: cd packages/auth && bun test test/auth.test.ts
+      - name: Test @samo/auth (real-Postgres integration tests)
+        run: cd packages/auth && bun test test/pg.test.ts
+        env:
+          # Real Postgres service container — pg.test.ts FAILS FAST if this is unset.
+          # DO NOT REMOVE — the tests throw (not skip) on missing PG_TEST_URL so CI
+          # catches any misconfigured workflow immediately.
+          PG_TEST_URL: postgres://authtest:authtest@localhost:5432/authtest
