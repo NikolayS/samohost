@@ -44,8 +44,7 @@ import type { ProviderPortWithBackup } from "../src/providers/types.ts";
 import { FakeProvider } from "./fake-provider.ts";
 import { makeSpec, SAMPLE_PUBKEY } from "./helpers.ts";
 import { runProvision, type ProvisionDeps } from "../src/commands/provision.ts";
-import { PROVISION_SENTINEL_PATH } from "../src/cloudinit/hardening.ts";
-import { knownHostsPathFor } from "../src/ssh/runner.ts";
+import { writeFileSync, mkdirSync } from "node:fs";
 
 // ---------------------------------------------------------------------------
 // Fixtures
@@ -314,106 +313,77 @@ describe("2. Fleet-doctor integration", () => {
 // 3. Provision-time: enableBackup called after VM creation
 // ===========================================================================
 describe("3. Provision-time enableBackup", () => {
-  const ED_LINE =
-    "[192.0.2.55]:2223 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAISAMOHOSTtestkeyFIXEDvalueFORsnapshot01";
+  const SCAN_OUTPUT =
+    "[192.0.2.55]:2223 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAISAMOHOSTtestkeyFIXEDvalueFORsnapshot01\n";
 
-  function makeDeps(
-    dir: string,
-    fake: FakeProvider,
-  ): ProvisionDeps {
-    const privKeyPath = join(dir, "id_ed25519");
-    const pubKeyPath = join(dir, "id_ed25519.pub");
-    const { writeFileSync } = require("node:fs");
-    writeFileSync(privKeyPath, "FAKE_PRIVATE_KEY\n", { mode: 0o600 });
+  function makeProvisionEnv(baseDir: string, fake: FakeProvider) {
+    const privKeyPath = join(baseDir, "id_ed25519");
+    const pubKeyPath = join(baseDir, "id_ed25519.pub");
+    writeFileSync(privKeyPath, "FIXTURE PRIVATE KEY\n");
     writeFileSync(pubKeyPath, SAMPLE_PUBKEY + "\n");
-    const knownHostsDir = join(dir, "known_hosts");
-    require("node:fs").mkdirSync(knownHostsDir, { recursive: true });
+    const knownHostsDir = join(baseDir, "known_hosts.d");
+    mkdirSync(knownHostsDir, { recursive: true });
+    const controlDir = join(baseDir, "cm");
 
-    let keyscanDone = false;
-    let sshDone = false;
+    fake.statusSequence = ["initializing", "running"];
 
-    const spawnFn = async (
-      file: string,
-      args: string[],
-    ): Promise<{ code: number; stdout: string; stderr: string }> => {
-      if (file === "ssh-keyscan") {
-        if (!keyscanDone) {
-          keyscanDone = true;
-          return { code: 0, stdout: `# banner\n${ED_LINE}\n`, stderr: "" };
-        }
-        return { code: 0, stdout: `# banner\n${ED_LINE}\n`, stderr: "" };
-      }
-      if (file === "ssh") {
-        if (!sshDone) {
-          sshDone = true;
-          return {
-            code: 0,
-            stdout: "SAMOHOST_PROVISION_COMPLETE",
-            stderr: "",
-          };
-        }
-        return { code: 0, stdout: "SAMOHOST_PROVISION_COMPLETE", stderr: "" };
-      }
-      return { code: 0, stdout: "", stderr: "" };
-    };
-
-    fake.statusSequence = ["running"];
-
-    return {
+    let nowMs = 1_000_000;
+    const deps: ProvisionDeps = {
       provider: fake,
-      store: new StateStore(join(dir, "state.json")),
-      spawn: spawnFn,
-      now: (() => {
-        const start = Date.now();
-        return () => start + 5000; // always within deadline
-      })(),
-      sleep: async () => {},
+      store: new StateStore(join(baseDir, "state2.json")),
+      spawn: async (file, _args) => {
+        if (file === "ssh-keyscan") {
+          return { code: 0, stdout: `# banner\n${SCAN_OUTPUT}`, stderr: "" };
+        }
+        if (file === "ssh") {
+          return { code: 0, stdout: "SAMOHOST_PROVISION_COMPLETE\n", stderr: "" };
+        }
+        return { code: 0, stdout: "", stderr: "" };
+      },
+      now: () => nowMs,
+      sleep: async (ms: number) => { nowMs += ms; },
       knownHostsDir,
+      controlDir,
+      pollIntervalMs: 1000,
       detectEgressIp: async () => null,
     };
+    return { deps, privKeyPath };
   }
 
   test("3a. runProvision calls enableBackup on the new server's providerId", async () => {
     const fake = new FakeProvider();
-    const deps = makeDeps(dir, fake);
+    const { deps, privKeyPath } = makeProvisionEnv(dir, fake);
 
-    const spec = makeSpec({
-      name: "test-backup-client",
-      type: "cx23",
-    });
+    const spec = makeSpec({ name: "test-backup-client", type: "cx23" });
 
-    const outLines: string[] = [];
     const errLines: string[] = [];
     const code = await runProvision(
+      { spec, sshKey: privKeyPath },
       { json: false },
-      spec,
       deps,
-      (s) => outLines.push(s),
+      () => {},
       (s) => errLines.push(s),
     );
 
     expect(code).toBe(0);
-    // RED: enableBackupCalls does not exist on FakeProvider yet.
+    // enableBackup must have been called with the server's providerId.
     expect(fake.enableBackupCalls).toHaveLength(1);
-    // The id that was enabled must be the provider id returned by create().
-    const createdId = fake.createCalls[0] ? String(9001) : undefined;
-    expect(fake.enableBackupCalls[0]).toBe(createdId ?? fake.enableBackupCalls[0]);
+    expect(fake.enableBackupCalls[0]).toBe("9001");
   });
 
   test("3b. enableBackup failure is non-fatal — provision still succeeds", async () => {
     // If Hetzner returns a transient error on enable_backup, the VM is still
-    // provisioned (backups can be enabled later by fleet-doctor remediation).
+    // provisioned; fleet-doctor backup-enabled check surfaces the gap later.
     const fake = new FakeProvider();
-    // RED: failEnableBackupWith not on FakeProvider yet.
     fake.failEnableBackupWith = { kind: "transient", message: "backup-enable failed" };
 
-    const deps = makeDeps(dir, fake);
+    const { deps, privKeyPath } = makeProvisionEnv(dir, fake);
     const spec = makeSpec({ name: "test-backup-resilient", type: "cx23" });
 
     const errLines: string[] = [];
     const code = await runProvision(
+      { spec, sshKey: privKeyPath },
       { json: false },
-      spec,
       deps,
       () => {},
       (s) => errLines.push(s),
@@ -421,7 +391,7 @@ describe("3. Provision-time enableBackup", () => {
 
     // Provision must succeed even if enable_backup fails.
     expect(code).toBe(0);
-    // A warning must be emitted (non-fatal).
+    // A warning about backup failure must be emitted.
     expect(errLines.some((l) => l.includes("backup"))).toBe(true);
   });
 });

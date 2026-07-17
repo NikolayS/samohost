@@ -24,6 +24,8 @@ import {
   type FleetRemediationResult,
 } from "../remediate/firewall-lock.ts";
 import { checkDblabNotOversized } from "../doctor/dblab-sizing.ts";
+import { checkBackupEnabled } from "../doctor/backup-enabled.ts";
+import type { ProviderPortWithBackup } from "../providers/types.ts";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -192,6 +194,8 @@ export async function runFleetDoctor(
   out: (s: string) => void,
   err: (s: string) => void,
   remote?: RemoteRunner,
+  /** Optional provider for live checks (e.g. backup-enabled). When absent, live checks are skipped. */
+  provider?: ProviderPortWithBackup,
 ): Promise<number> {
   const runner = remote ?? defaultRemoteRunner();
 
@@ -226,6 +230,17 @@ export async function runFleetDoctor(
         allApps.filter((a) => a.vmId === record.id),
       );
       checks.push(thisDblabCheck as DoctorResult);
+
+      // backup-enabled: live hcloud probe via provider.getWithBackup(providerId).
+      // Only runs when a provider is passed to runFleetDoctor (e.g. in tests and
+      // the CLI entry point). Skipped when provider is absent to keep existing
+      // tests that don't pass a provider working unchanged.
+      if (provider !== undefined) {
+        const backupResults = await checkBackupEnabled([record], provider);
+        for (const br of backupResults) {
+          checks.push(br as DoctorResult);
+        }
+      }
 
       results.push({ vmId: record.id, vmName: record.name, checks });
     } catch (e) {

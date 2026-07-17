@@ -492,6 +492,8 @@ describe("integration: HetznerProvider end-to-end — secrets never leak", () =>
     const env = makeEnv();
     const queue = [
       { status: 201, body: fixture("create-server.json") },
+      // enable_backup action (POST /servers/{id}/actions/enable_backup)
+      { status: 201, body: { action: { id: 1, status: "running" } } },
       { status: 200, body: fixture("get-server-running.json") },
     ];
     const fetchMock = (async () => {
