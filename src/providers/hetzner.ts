@@ -19,7 +19,6 @@
 import type {
   CreateServerSpec,
   ProviderError,
-  ProviderPort,
   ProviderPortWithBackup,
   ServerInfo,
   ServerInfoWithBackup,

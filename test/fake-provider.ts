@@ -12,7 +12,6 @@ import type {
   CreateServerSpec,
   ProviderError,
   ProviderErrorKind,
-  ProviderPort,
   ProviderPortWithBackup,
   ServerInfo,
   ServerInfoWithBackup,
@@ -93,10 +92,23 @@ export class FakeProvider implements ProviderPortWithBackup {
   }
 
   async getWithBackup(id: string): Promise<ServerInfoWithBackup> {
-    const base = await this.get(id);
     const backup_window = this.backupWindowById.has(id)
       ? this.backupWindowById.get(id)!
       : null;
+    // If the server exists in the servers map, use it as the base.
+    // If not (e.g. in unit tests that only set backupWindowById), synthesize
+    // a minimal ServerInfo so getWithBackup can be used without create().
+    const info = this.servers.get(id);
+    const base: ServerInfo = info
+      ? { ...info, status: this.statusSequence[Math.min(this.getCount, this.statusSequence.length - 1)]! }
+      : {
+          providerId: id,
+          name: `vm-${id}`,
+          status: "running",
+          ipv4: this.forceIpv4 !== undefined ? this.forceIpv4 : "192.0.2.55",
+          labels: { "managed-by": "samohost" },
+          volumeIds: [],
+        };
     return { ...base, backup_window };
   }
 

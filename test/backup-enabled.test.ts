@@ -32,13 +32,10 @@ import { StateStore } from "../src/state/store.ts";
 import { AppStore } from "../src/state/apps.ts";
 import type { VmRecord } from "../src/types.ts";
 
-// RED: this module does not exist yet.
 import {
   checkBackupEnabled,
-  type BackupEnabledResult,
 } from "../src/doctor/backup-enabled.ts";
 
-// RED: ProviderPort does not have enableBackup or getWithBackup yet.
 import type { ProviderPortWithBackup } from "../src/providers/types.ts";
 
 import { FakeProvider } from "./fake-provider.ts";
@@ -91,29 +88,16 @@ afterEach(() => {
 
 /**
  * Minimal provider stub that returns backup_window per server id.
- * Implements ProviderPortWithBackup (extends ProviderPort + enableBackup +
- * getWithBackup).
+ * Extends FakeProvider and overrides getWithBackup.
  */
 function makeBackupProvider(
   backupWindowById: Record<string, string | null>,
 ): ProviderPortWithBackup {
-  const base = new FakeProvider();
-  return {
-    ...base,
-    enableBackup: async (_id: string) => { /* no-op */ },
-    getWithBackup: async (id: string) => {
-      const info = {
-        providerId: id,
-        name: `vm-${id}`,
-        status: "running" as const,
-        ipv4: "1.2.3.4",
-        labels: { "managed-by": "samohost" },
-        volumeIds: [],
-        backup_window: backupWindowById[id] ?? null,
-      };
-      return info;
-    },
-  };
+  const fake = new FakeProvider();
+  for (const [id, window] of Object.entries(backupWindowById)) {
+    fake.backupWindowById.set(id, window);
+  }
+  return fake;
 }
 
 // ===========================================================================
@@ -192,9 +176,6 @@ describe("1. checkBackupEnabled — core scenarios", () => {
 // 2. Fleet-doctor integration — backup-enabled appears in JSON output
 // ===========================================================================
 describe("2. Fleet-doctor integration", () => {
-  const ED_LINE =
-    "[10.0.0.1]:2223 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAISAMOHOSTtestkeyFIXEDvalueFORsnapshot01";
-
   function makePassRunner() {
     return (_vm: VmRecord, script: string) => {
       const ids: string[] = [];
