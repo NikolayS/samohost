@@ -3950,6 +3950,29 @@ describe("buildCustomDomainVhostScript", () => {
     expect(s).toContain("systemctl reload caddy");
     expect(s).not.toContain("caddy validate");
   });
+
+  test("regression #ownershipfix: static vhost git rev-parse uses safe.directory scoping so samo-owned process can read app-user-owned checkout (dubious-ownership guard)", () => {
+    // The custom-domain vhost script runs as the SSH admin user 'samo', but
+    // static release checkouts are owned by the app user.  Without
+    // -c safe.directory=<path>, git aborts with "detected dubious ownership"
+    // and the guard captures an empty HEAD, producing a false
+    // "does not match its recorded sha" failure that blocks 'domain add' for
+    // every static app.
+    //
+    // Fix: scope git trust to the already-realpath-validated $SAMOHOST_CHECKOUT_REAL
+    // via -c safe.directory="$SAMOHOST_CHECKOUT_REAL" (per-invocation, non-persistent).
+    // Drop the 2>/dev/null so the real git error is visible on actual failure.
+    const s = buildCustomDomainVhostScript(staticApp(), "myapp.com");
+    // Must contain the scoped safe.directory form (ownership-safe, non-persistent).
+    expect(s).toContain(
+      'git -C "$SAMOHOST_CHECKOUT_REAL" -c safe.directory="$SAMOHOST_CHECKOUT_REAL" rev-parse HEAD',
+    );
+    // Must NOT suppress stderr — the true git error must reach the operator.
+    expect(s).not.toContain(
+      'git -C "$SAMOHOST_CHECKOUT_REAL" rev-parse HEAD 2>/dev/null',
+    );
+    expect(bashSyntaxOk(s)).toBe(true);
+  });
 });
 
 describe("buildCustomDomainVhostRemoveScript", () => {

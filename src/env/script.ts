@@ -2843,7 +2843,7 @@ export function buildCustomDomainVhostScript(
                 'SAMOHOST_CHECKOUT_REAL=$(realpath -e "$SAMOHOST_ACTIVE_RELEASE_RAW") || { echo "active static release directory is missing" >&2; exit 1; }',
                 '[[ "$SAMOHOST_ACTIVE_RELEASE_RAW" == "$SAMOHOST_CHECKOUT_REAL" ]] || { echo "active static release path is not canonical" >&2; exit 1; }',
                 'case "$SAMOHOST_CHECKOUT_REAL" in "$SAMOHOST_RELEASES_REAL"/*) ;; *) echo "active static release escapes the releases directory" >&2; exit 1 ;; esac',
-                '[[ "$(git -C "$SAMOHOST_CHECKOUT_REAL" rev-parse HEAD 2>/dev/null)" == "$SAMOHOST_ACTIVE_SHA" ]] || { echo "active static release checkout does not match its recorded sha" >&2; exit 1; }',
+                '[[ "$(git -C "$SAMOHOST_CHECKOUT_REAL" -c safe.directory="$SAMOHOST_CHECKOUT_REAL" rev-parse HEAD)" == "$SAMOHOST_ACTIVE_SHA" ]] || { echo "active static release checkout does not match its recorded sha" >&2; exit 1; }',
                 'if [[ -n "$SAMOHOST_STATIC_ROOT" ]]; then SAMOHOST_STATIC_CANDIDATE="$SAMOHOST_CHECKOUT_REAL/$SAMOHOST_STATIC_ROOT"; else SAMOHOST_STATIC_CANDIDATE="$SAMOHOST_CHECKOUT_REAL"; fi',
                 'SAMOHOST_STATIC_DIR=$(realpath -e "$SAMOHOST_STATIC_CANDIDATE") || { echo "active staticRoot does not exist" >&2; exit 1; }',
                 'case "$SAMOHOST_STATIC_DIR" in "$SAMOHOST_CHECKOUT_REAL"|"$SAMOHOST_CHECKOUT_REAL"/*) ;; *) echo "active staticRoot escapes the release checkout" >&2; exit 1 ;; esac',
