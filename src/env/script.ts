@@ -3021,8 +3021,12 @@ export function buildControlPlaneCustomDomainVhostScript(
     `printf '%s\\n' ${sq(vhostBlock)} | sudo /usr/bin/tee "$SNIPPET" >/dev/null`,
     "",
     "# 4. Reload Caddy — reload fails on bad config (no separate validate needed).",
-    "#    systemctl reload caddy is always available on the control plane.",
-    `sudo /usr/bin/systemctl reload caddy`,
+    "#    Primary: systemctl reload caddy (keeps systemd state authoritative).",
+    "#    Fallback: caddy reload --config ... --force (admin API, zero-downtime) for",
+    "#    the verified CP failure: PrivateTmp namespace stale after long uptime",
+    "#    (systemd status=226/NAMESPACE). The || chain preserves fail-closed on",
+    "#    genuinely invalid config because caddy reload validates before applying.",
+    `sudo /usr/bin/systemctl reload caddy || sudo /usr/bin/caddy reload --config /etc/caddy/Caddyfile --force`,
     "",
     `echo "control-plane vhost ready: ${fqdn} → ${vmIp}:80 (Host: ${httpHost})"`,
   ].join("\n");
@@ -3056,7 +3060,7 @@ export function buildControlPlaneCustomDomainVhostRemoveScript(
     "set -euo pipefail",
     "",
     `sudo /usr/bin/rm -f ${sq(snippetPath)}`,
-    `sudo /usr/bin/systemctl reload caddy`,
+    `sudo /usr/bin/systemctl reload caddy || sudo /usr/bin/caddy reload --config /etc/caddy/Caddyfile --force`,
     "",
     `echo "control-plane vhost removed: ${fqdn}"`,
   ].join("\n");
