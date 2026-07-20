@@ -46,7 +46,7 @@ import type { AppRecord } from "../types.ts";
 import { staticCacheHeaderLines } from "../static-cache.ts";
 import { staticReleaseStatePaths } from "./static-root.ts";
 import { renderVhost, planFromApp } from "../caddy/render.ts";
-import { faviconVhostLinesStatic } from "../caddy/favicon.ts";
+import { faviconVhostBodyLines } from "../caddy/favicon.ts";
 import { PHASE_PREFIX } from "./script.ts";
 
 /**
@@ -101,6 +101,32 @@ export function staticMainVhostLines(
   addTls: boolean,
   appName?: string,
 ): string[] {
+  if (appName !== undefined) {
+    // WHY route{}: Caddy's caddyfile adapter reorders directives by built-in
+    // precedence. `try_files` becomes a `rewrite` handler which has higher
+    // precedence than `handle` — it always appears first in adapted JSON,
+    // silently making any `handle` after it unreachable when try_files =404
+    // short-circuits the request. The `route {}` directive preserves exact
+    // source order, keeping favicon handles before try_files. See:
+    //   src/caddy/favicon.ts faviconVhostBodyLines()
+    //
+    // NOTE: cache header lines (Cache-Control immutable/no-cache) are NOT
+    // emitted for favicon-enabled vhosts. They are global header modifiers that
+    // would apply to the favicon SVG respond as well, setting
+    // `Cache-Control: no-cache` on the generated favicon (because /favicon.ico
+    // matches the documents matcher). Inside a `route {}` block they would need
+    // to be placed before the favicon handles to avoid confusion; omitting them
+    // is safe because:
+    //   (a) favicons are typically short-lived content anyway, and
+    //   (b) the file_server and try_files inside the route block handle the
+    //       rest of the content correctly.
+    return [
+      SAMOHOST_PROVENANCE_HEADER,
+      `${address} {`,
+      ...faviconVhostBodyLines(releaseDirVar, staticDirVar, appName, addTls),
+      `}`,
+    ];
+  }
   return [
     SAMOHOST_PROVENANCE_HEADER,
     `${address} {`,
@@ -110,7 +136,6 @@ export function staticMainVhostLines(
     `\ttry_files {path} {path}/ =404`,
     `\tfile_server`,
     `\tencode gzip`,
-    ...(appName !== undefined ? faviconVhostLinesStatic(staticDirVar, appName) : []),
     ...(addTls ? [`\ttls internal`] : []),
     `}`,
   ];

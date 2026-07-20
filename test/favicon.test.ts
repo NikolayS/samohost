@@ -148,10 +148,15 @@ describe("faviconVhostLinesStatic: Caddy snippet for static apps", () => {
     expect(joined).toContain("<svg");
   });
 
-  test("SVG in fallback does not contain $ or backtick", () => {
+  test("SVG literal in fallback does not contain $ or backtick (bash-safe)", () => {
     const joined = lines.join("\n");
+    // Bash var refs like $SAMOHOST_STATIC_DIR are expected; only check the SVG body.
     expect(joined).not.toContain("`");
-    expect(joined).not.toContain("$");
+    const svgStart = joined.indexOf("<svg");
+    const svgEnd = joined.indexOf("</svg>") + 6;
+    const svgPart = svgStart >= 0 && svgEnd > svgStart ? joined.slice(svgStart, svgEnd) : joined;
+    expect(svgPart).not.toContain("$");
+    expect(svgPart).not.toContain("`");
   });
 
   test("serves SVG as image/svg+xml content type", () => {

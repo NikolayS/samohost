@@ -114,36 +114,75 @@ export function faviconSvg(appName: string): string {
 // ---------------------------------------------------------------------------
 
 /**
- * Caddy vhost lines for the favicon fallback in a STATIC app vhost.
+ * Caddy vhost body lines for a STATIC app vhost with favicon fallback.
  *
- * Inserts BEFORE the closing `}` of the site block. The static dir variable
- * expression (e.g. `$SAMOHOST_STATIC_DIR`) is used to check for a real
- * /favicon.ico file; if present, file_server serves it; otherwise the
- * inline letter-mark SVG is returned with Content-Type image/svg+xml.
+ * Returns the COMPLETE site-block body (everything between the `{address} {`
+ * opener and the closing `}`). The caller (staticMainVhostLines) splices these
+ * lines in place of the normal flat body when `appName` is provided.
+ *
+ * WHY `route {}` is required:
+ *   Caddy's caddyfile adapter reorders directives inside a site block by its
+ *   built-in directive precedence table. The `rewrite` handler produced by
+ *   `try_files` has higher precedence than `handle` — so the adapter always
+ *   places the try_files rewrite BEFORE any `handle` blocks, regardless of the
+ *   order they appear in the source Caddyfile. `try_files =404` causes Caddy to
+ *   short-circuit with a 404 response before later routes can fire, so a plain
+ *   `handle @samohost_favicon` after `try_files` is silently dead code.
+ *   The `route {}` directive opts out of the reordering: its contents are kept
+ *   in EXACT source order, making the favicon handles fire before try_files.
  *
  * Indented with a single tab (matches staticMainVhostLines convention).
  */
-export function faviconVhostLinesStatic(_staticDirVar: string, appName: string): string[] {
+export function faviconVhostBodyLines(
+  releaseDirVar: string,
+  staticDirVar: string,
+  appName: string,
+  addTls: boolean,
+): string[] {
   const svg = faviconSvg(appName);
   // The `root` directive is already set in the site block to $SAMOHOST_STATIC_DIR.
-  // Caddy's `file` matcher resolves paths against the site root by default,
-  // so `file /favicon.ico` checks <root>/favicon.ico without needing $ in the matcher.
+  // Caddy's `file` matcher resolves against the site root — no $ needed.
   //
-  // Caddy `handle` accepts only ONE inline path argument; for multiple paths use
-  // a named path matcher declared at block scope before the handle.
+  // `/favicon.svg` is always served as the generated letter-mark (apps don't
+  // ship a .svg favicon to their static dir).
+  //
+  // `/favicon.ico` is served from disk when the app ships one; otherwise falls
+  // back to the same generated SVG (browsers accept SVG for the favicon.ico URL).
+  const tlsLine = addTls ? [`\t\ttls internal`] : [];
   return [
-    `\t@samohost_has_favicon file /favicon.ico`,
-    `\t@samohost_favicon path /favicon.ico /favicon.svg`,
-    `\thandle @samohost_favicon {`,
-    `\t\thandle @samohost_has_favicon {`,
-    `\t\t\tfile_server`,
-    `\t\t}`,
-    `\t\thandle {`,
+    `\t# samohost-worktree "${releaseDirVar}"`,
+    `\troot * "${staticDirVar}"`,
+    `\troute {`,
+    `\t\t@samohost_has_favicon file /favicon.ico`,
+    `\t\thandle /favicon.svg {`,
     `\t\t\theader Content-Type image/svg+xml`,
     `\t\t\trespond "${svg}" 200`,
     `\t\t}`,
+    `\t\thandle /favicon.ico {`,
+    `\t\t\thandle @samohost_has_favicon {`,
+    `\t\t\t\tfile_server`,
+    `\t\t\t}`,
+    `\t\t\thandle {`,
+    `\t\t\t\theader Content-Type image/svg+xml`,
+    `\t\t\t\trespond "${svg}" 200`,
+    `\t\t\t}`,
+    `\t\t}`,
+    `\t\ttry_files {path} {path}/ =404`,
+    `\t\tfile_server`,
+    `\t\tencode gzip`,
     `\t}`,
+    ...tlsLine,
   ];
+}
+
+/**
+ * @deprecated Use faviconVhostBodyLines instead.
+ * Kept for backward compat with existing tests; delegates to faviconVhostBodyLines.
+ */
+export function faviconVhostLinesStatic(staticDirVar: string, appName: string): string[] {
+  // Provide empty releaseDirVar and no TLS — used only in unit tests
+  // that check for /favicon.ico and <svg presence in the output.
+  return faviconVhostBodyLines("$SAMOHOST_RELEASE_DIR", staticDirVar, appName, false);
 }
 
 /**
