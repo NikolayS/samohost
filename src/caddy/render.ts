@@ -27,6 +27,7 @@
 
 import type { AppSpec, EnvRecord, RouteSpec } from "../types.ts";
 import { servicesOf } from "../app/services.ts";
+import { faviconVhostLinesNode } from "./favicon.ts";
 
 // ---------------------------------------------------------------------------
 // VhostPlan — the pure-data input to renderVhost
@@ -79,6 +80,12 @@ export interface VhostPlan {
   defaultPort: number;
   /** Absolute path for the JSON access log (idle-GC contract). */
   logFile: string;
+  /**
+   * App name used to generate the per-app favicon letter-mark fallback.
+   * Optional: when absent no favicon block is emitted (back-compat for
+   * hand-constructed plans in tests / older call sites).
+   */
+  appName?: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -173,6 +180,18 @@ export function renderVhost(plan: VhostPlan): string {
   }
 
   // Default reverse_proxy.
+  // Favicon fallback block — emitted when plan.appName is set.
+  // Inserted BEFORE the catch-all handle so Caddy's first-match order is:
+  //   1. Named matcher routes (stream, transcript, webhook, etc.)
+  //   2. Favicon fallback (proxies to upstream; letter-mark on upstream 404)
+  //   3. Catch-all default handle
+  if (plan.appName !== undefined) {
+    for (const line of faviconVhostLinesNode(plan.appName, plan.defaultPort)) {
+      lines.push(line);
+    }
+  }
+
+  // Default reverse_proxy.
   // Zero routes (legacy single-service): emit the BARE directive with no
   // `handle {}` wrapper — matches buildEnvCreateScript's printf template
   // (src/env/script.ts vhost phase) exactly. The `handle {}` wrapper creates
@@ -258,6 +277,7 @@ export function planFromApp(app: AppSpec): VhostPlan {
     routes: planRoutes,
     defaultPort,
     logFile: `/var/log/caddy/${app.name}-prod.log`,
+    appName: app.name,
   };
 }
 

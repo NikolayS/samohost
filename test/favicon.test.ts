@@ -170,7 +170,7 @@ describe("faviconVhostLinesStatic: Caddy snippet for static apps", () => {
 // ---------------------------------------------------------------------------
 
 describe("faviconVhostLinesNode: Caddy snippet for node apps", () => {
-  const lines = faviconVhostLinesNode("samograph");
+  const lines = faviconVhostLinesNode("samograph", 3000);
 
   test("returns an array of strings", () => {
     expect(Array.isArray(lines)).toBe(true);
@@ -323,12 +323,33 @@ describe("renderVhost: includes favicon fallback for node apps", () => {
     expect(out).toContain("<svg");
   });
 
+<<<<<<< HEAD
   test("favicon block appears BEFORE the catch-all handle", () => {
     const out = renderVhost(makePlan());
     const faviconPos = out.indexOf("/favicon.ico");
     const catchAllPos = out.lastIndexOf("\thandle {");
     // favicon handle must appear before the final catch-all
     expect(faviconPos).toBeLessThan(catchAllPos);
+=======
+  test("favicon block appears BEFORE the catch-all handle (multi-route plan)", () => {
+    // Use a plan with routes so renderVhost emits a `handle {}` catch-all wrapper.
+    const planWithRoutes = makePlan({
+      routes: [
+        {
+          name: "stream",
+          matcher: { regexp: "^/stream$" },
+          target: { port: 8888 },
+        },
+      ],
+    });
+    const out = renderVhost(planWithRoutes);
+    const faviconPos = out.indexOf("/favicon.ico");
+    // The catch-all `handle {` is the last one (after the favicon block)
+    const catchAllPos = out.lastIndexOf("\thandle {");
+    // favicon handle must appear before the final catch-all
+    expect(faviconPos).toBeGreaterThan(0);
+    expect(catchAllPos).toBeGreaterThan(faviconPos);
+>>>>>>> df3a601 (feat(favicon): per-app SVG letter-mark fallback in every samohost-generated vhost)
   });
 
   test("favicon letter correct for samograph (S)", () => {
