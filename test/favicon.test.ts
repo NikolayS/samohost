@@ -24,6 +24,7 @@
 import { describe, expect, test } from "bun:test";
 import {
   faviconSvg,
+  faviconVhostBodyLines,
   faviconVhostLinesStatic,
   faviconVhostLinesNode,
 } from "../src/caddy/favicon.ts";
@@ -399,6 +400,139 @@ describe("renderVhost: includes favicon fallback for node apps", () => {
 // ---------------------------------------------------------------------------
 // 6. No SAMO platform branding on client sites
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// REGRESSION: cache headers must be present when appName is provided
+// samorev finding: faviconVhostBodyLines() omitted staticCacheHeaderLines()
+// causing ALL static apps (game-changers, samorev, friends-of-twin-peaks,
+// gregg-brandalise) to lose Cache-Control headers after the favicon PR.
+// ---------------------------------------------------------------------------
+
+describe("REGRESSION: cache headers preserved on favicon-enabled static vhost", () => {
+  // Test against staticMainVhostLines WITH appName — the NEW code path that
+  // was regressing.  The OLD path (no appName) already had coverage.
+  const apps = ["samorev", "game-changers", "friends-of-twin-peaks", "gregg-brandalise"];
+
+  for (const name of apps) {
+    test(`${name}: Cache-Control immutable header present in staticMainVhostLines output`, () => {
+      const joined = staticMainVhostLines(
+        `http://${name}.samo.team`,
+        "$SAMOHOST_RELEASE_DIR",
+        "$SAMOHOST_STATIC_DIR",
+        false,
+        name,
+      ).join("\n");
+      // Must have the immutable matcher for fingerprinted assets
+      expect(joined).toContain("@samohost_immutable");
+      expect(joined).toContain("max-age=31536000, immutable");
+    });
+
+    test(`${name}: Cache-Control no-cache header present in staticMainVhostLines output`, () => {
+      const joined = staticMainVhostLines(
+        `http://${name}.samo.team`,
+        "$SAMOHOST_RELEASE_DIR",
+        "$SAMOHOST_STATIC_DIR",
+        false,
+        name,
+      ).join("\n");
+      expect(joined).toContain("@samohost_documents");
+      expect(joined).toContain('Cache-Control "no-cache"');
+    });
+
+    test(`${name}: favicon route{} block present alongside cache headers`, () => {
+      const joined = staticMainVhostLines(
+        `http://${name}.samo.team`,
+        "$SAMOHOST_RELEASE_DIR",
+        "$SAMOHOST_STATIC_DIR",
+        false,
+        name,
+      ).join("\n");
+      // Both cache headers AND favicon must coexist
+      expect(joined).toContain("route {");
+      expect(joined).toContain("/favicon.ico");
+      expect(joined).toContain("max-age=31536000, immutable");
+    });
+  }
+
+  test("CRITICAL — buildConfigHealScript static output has both cache headers and favicon block", () => {
+    // Call buildConfigHealScript for a static app and verify the embedded
+    // heredoc content has BOTH cache-control lines AND the favicon route block.
+    // This test exercises the full production code path — the same code that
+    // determines what runs on the actual VMs.
+    const app = {
+      id: "cache-regression-test",
+      vmId: "vm-cache-reg",
+      name: "game-changers",
+      repo: "Tanya301/game-changers",
+      branch: "main",
+      kind: "static" as const,
+      appDir: "/opt/game-changers/app",
+      buildCmd: "npm run build",
+      healthUrl: "https://game-changers.samo.team/",
+      serviceUnit: "game-changers",
+      mainHost: "game-changers.samo.team",
+      mainListen: "cp-http80" as const,
+      deployedSha: "abc1234abc1234abc1234abc1234abc1234abc12",
+      generatorSha: "oldsha111oldsha111oldsha111oldsha111oldsh1",
+    };
+    // Import buildConfigHealScript dynamically in the test
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const { buildConfigHealScript } = require("../src/app/heal-script.ts");
+    const script = buildConfigHealScript(app);
+    // Must have immutable cache header
+    expect(script).toContain("max-age=31536000, immutable");
+    // Must have no-cache header for documents
+    expect(script).toContain('Cache-Control "no-cache"');
+    // Must have the favicon route block
+    expect(script).toContain("route {");
+    expect(script).toContain("/favicon.ico");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// NAME GUARD: hostile app.name must not break Caddy config or SVG
+// ---------------------------------------------------------------------------
+
+describe("name guard: hostile appName rejected by faviconVhostBodyLines and faviconVhostLinesNode", () => {
+  test('faviconVhostBodyLines throws on appName containing double-quote', () => {
+    expect(() => {
+      faviconVhostBodyLines("$REL", "$STAT", 'bad"name', false);
+    }).toThrow();
+  });
+
+  test('faviconVhostBodyLines throws on appName containing < (SVG injection)', () => {
+    expect(() => {
+      faviconVhostBodyLines("$REL", "$STAT", "<script>", false);
+    }).toThrow();
+  });
+
+  test('faviconVhostBodyLines throws on appName containing & (XML entity injection)', () => {
+    expect(() => {
+      faviconVhostBodyLines("$REL", "$STAT", "a&b", false);
+    }).toThrow();
+  });
+
+  test('faviconVhostBodyLines accepts safe alphanumeric-dash-underscore names', () => {
+    // Must NOT throw for real production names
+    for (const name of ["samorev", "game-changers", "friends-of-twin-peaks", "gregg-brandalise", "field-record-1"]) {
+      expect(() => {
+        faviconVhostBodyLines("$REL", "$STAT", name, false);
+      }).not.toThrow();
+    }
+  });
+
+  test('faviconVhostLinesNode throws on appName containing double-quote', () => {
+    expect(() => {
+      faviconVhostLinesNode('bad"name', 3000);
+    }).toThrow();
+  });
+
+  test('faviconVhostLinesNode accepts safe names', () => {
+    expect(() => {
+      faviconVhostLinesNode("samograph", 3000);
+    }).not.toThrow();
+  });
+});
 
 describe("favicon: no SAMO platform branding on any client app", () => {
   const clientApps = [
