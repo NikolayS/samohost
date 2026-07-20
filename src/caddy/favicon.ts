@@ -16,8 +16,8 @@
  *
  * Caddy vhost integration:
  *   faviconVhostLinesStatic(staticDirVar, appName) — for file_server apps
- *     Caddy file matcher checks the app's own /favicon.ico first;
- *     falls back to inline SVG respond only when the file is absent.
+ *     Caddy file matchers check the app's own /favicon.svg and /favicon.ico
+ *     first; falls back to inline SVG respond only when the file is absent.
  *
  *   faviconVhostLinesNode(appName) — for reverse_proxy apps
  *     Returns a handle block for favicon paths; the caller is responsible
@@ -175,8 +175,10 @@ export function faviconVhostBodyLines(
   // The `root` directive is already set in the site block to $SAMOHOST_STATIC_DIR.
   // Caddy's `file` matcher resolves against the site root — no $ needed.
   //
-  // `/favicon.svg` is always served as the generated letter-mark (apps don't
-  // ship a .svg favicon to their static dir).
+  // `/favicon.svg` — served from disk when the app ships one (Astro sites like
+  // friends-of-twin-peaks and gregg-brandalise ship their own designed svg);
+  // falls back to the generated letter-mark only when the file is absent.
+  // Uses @samohost_has_favicon_svg file matcher — mirrors the /favicon.ico pattern.
   //
   // `/favicon.ico` is served from disk when the app ships one; otherwise falls
   // back to the same generated SVG (browsers accept SVG for the favicon.ico URL).
@@ -197,9 +199,15 @@ export function faviconVhostBodyLines(
     `\troot * "${staticDirVar}"`,
     `\troute {`,
     `\t\t@samohost_has_favicon file /favicon.ico`,
+    `\t\t@samohost_has_favicon_svg file /favicon.svg`,
     `\t\thandle /favicon.svg {`,
-    `\t\t\theader Content-Type image/svg+xml`,
-    `\t\t\trespond "${svg}" 200`,
+    `\t\t\thandle @samohost_has_favicon_svg {`,
+    `\t\t\t\tfile_server`,
+    `\t\t\t}`,
+    `\t\t\thandle {`,
+    `\t\t\t\theader Content-Type image/svg+xml`,
+    `\t\t\t\trespond "${svg}" 200`,
+    `\t\t\t}`,
     `\t\t}`,
     `\t\thandle /favicon.ico {`,
     `\t\t\thandle @samohost_has_favicon {`,

@@ -556,3 +556,81 @@ describe("favicon: no SAMO platform branding on any client app", () => {
     });
   }
 });
+
+// ---------------------------------------------------------------------------
+// REGRESSION: /favicon.svg must NOT unconditionally override an app's own file
+//
+// Bug introduced in commit 472f8e8: faviconVhostBodyLines() emits /favicon.svg
+// as an unconditional `respond` with the generated mark — no file matcher.
+// Astro sites friends-of-twin-peaks and gregg-brandalise both ship their own
+// /favicon.svg and would have it clobbered by the platform letter-mark on the
+// next heal cycle.
+//
+// The fix mirrors what /favicon.ico already does: add @samohost_has_favicon_svg
+// file matcher, serve app's own file if present, else fall back to the
+// generated mark respond.
+// ---------------------------------------------------------------------------
+
+describe("REGRESSION: /favicon.svg for static apps — own file must not be overridden", () => {
+  test("faviconVhostBodyLines: /favicon.svg uses a file matcher (not unconditional respond)", () => {
+    const lines = faviconVhostBodyLines("$REL", "$STAT", "friends-of-twin-peaks", false);
+    const joined = lines.join("\n");
+    // The /favicon.svg block must have a Caddy file matcher so the app's own
+    // favicon.svg is served when present — same pattern as /favicon.ico.
+    // If there is NO file matcher for /favicon.svg, this regex won't match.
+    expect(joined).toMatch(/@\w+\s+file\s+\/favicon\.svg/);
+  });
+
+  test("faviconVhostBodyLines: /favicon.svg block has a file_server branch (serves own file)", () => {
+    // The block for /favicon.svg must have a nested file_server branch so an
+    // app that ships its own /favicon.svg gets it served — not the letter-mark.
+    const lines = faviconVhostBodyLines("$REL", "$STAT", "gregg-brandalise", false);
+    const joined = lines.join("\n");
+    // Locate the favicon.svg section and verify file_server appears in it.
+    const svgHandleIdx = joined.indexOf("handle /favicon.svg");
+    expect(svgHandleIdx).toBeGreaterThanOrEqual(0);
+    // There must be a file_server after the /favicon.svg handle opener (before
+    // the /favicon.ico handle starts — use the substring between the two).
+    const icoHandleIdx = joined.indexOf("handle /favicon.ico");
+    const svgSection = joined.slice(svgHandleIdx, icoHandleIdx > svgHandleIdx ? icoHandleIdx : undefined);
+    expect(svgSection).toContain("file_server");
+  });
+
+  test("faviconVhostBodyLines: /favicon.svg still has generated-mark fallback respond (for apps without own svg)", () => {
+    // Apps without a /favicon.svg must still get the letter-mark.
+    const lines = faviconVhostBodyLines("$REL", "$STAT", "samograph", false);
+    const joined = lines.join("\n");
+    const svgHandleIdx = joined.indexOf("handle /favicon.svg");
+    const icoHandleIdx = joined.indexOf("handle /favicon.ico");
+    const svgSection = joined.slice(svgHandleIdx, icoHandleIdx > svgHandleIdx ? icoHandleIdx : undefined);
+    // Must contain a `respond` with the generated mark for apps without own svg.
+    expect(svgSection).toContain("respond");
+    expect(svgSection).toContain("<svg");
+  });
+
+  test("faviconVhostLinesNode: /favicon.svg proxied to upstream (app's own svg preserved on 200)", () => {
+    // Node path already proxies upstream and only falls back on 404.
+    // Verify /favicon.svg is included in the upstream proxy matcher
+    // (so the app's own /favicon.svg is served when upstream returns 200).
+    const lines = faviconVhostLinesNode("friends-of-twin-peaks", 3000);
+    const joined = lines.join("\n");
+    // The matcher must cover both /favicon.ico AND /favicon.svg
+    expect(joined).toContain("/favicon.svg");
+    // Must use handle_response for 404 — proxy first, generate only on miss
+    expect(joined).toContain("handle_response");
+  });
+
+  test("/favicon.ico behavior unchanged: file matcher present, file_server for own ico, respond fallback", () => {
+    // Regression guard: fixing svg must not break the ico logic.
+    const lines = faviconVhostBodyLines("$REL", "$STAT", "samograph", false);
+    const joined = lines.join("\n");
+    // file matcher for ico
+    expect(joined).toMatch(/@\w+\s+file\s+\/favicon\.ico/);
+    // file_server in the ico block
+    const icoHandleIdx = joined.indexOf("handle /favicon.ico");
+    expect(icoHandleIdx).toBeGreaterThanOrEqual(0);
+    const icoSection = joined.slice(icoHandleIdx);
+    expect(icoSection).toContain("file_server");
+    expect(icoSection).toContain("respond");
+  });
+});
