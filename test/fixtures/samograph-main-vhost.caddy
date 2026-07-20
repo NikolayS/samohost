@@ -7,6 +7,7 @@
 #   fce6b0f1be2103c9e8d09068c08f86831d30170993866531e174c2ebd4cfc4fe
 # This file is the live-serving prod vhost for samograph.samo.team.
 # caddy-a1 proves planFromApp(samographApp) is Caddy-semantically identical.
+# Updated to include the samohost favicon fallback block (feat/favicon-fallback).
 http://samograph.samo.team:80 {
 	@stream path_regexp ^/calls/[^/]+/stream$
 	@transcript path_regexp ^/calls/[^/]+/transcript
@@ -21,6 +22,16 @@ http://samograph.samo.team:80 {
 	}
 	handle /__dev* {
 		respond "not found" 404
+	}
+	@samohost_favicon path /favicon.ico /favicon.svg
+	handle @samohost_favicon {
+		reverse_proxy localhost:3000 {
+			@fav404 status 404
+			handle_response @fav404 {
+				header Content-Type image/svg+xml
+				respond "<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32' width='32' height='32'><rect width='32' height='32' rx='6' fill='#7130a6'/><text x='16' y='22' font-family='Arial,sans-serif' font-size='18' font-weight='bold' text-anchor='middle' fill='white'>S</text></svg>" 200
+			}
+		}
 	}
 	handle {
 		reverse_proxy localhost:3000

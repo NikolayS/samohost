@@ -786,6 +786,7 @@ export function buildHostBootstrapScript(
         "${SAMOHOST_CHECKOUT_REAL}",
         "${SAMOHOST_STATIC_DIR}",
         app.mainListen !== "cp-http80",
+        app.name,
       ),
       'CADDY_SITE',
       '  [[ -f "$SAMOHOST_MAIN_VHOST" && ! -L "$SAMOHOST_MAIN_VHOST" ]] || { echo "active static main vhost is missing or unsafe; refusing bootstrap route change" >&2; exit 1; }',
