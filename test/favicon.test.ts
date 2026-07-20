@@ -323,14 +323,6 @@ describe("renderVhost: includes favicon fallback for node apps", () => {
     expect(out).toContain("<svg");
   });
 
-<<<<<<< HEAD
-  test("favicon block appears BEFORE the catch-all handle", () => {
-    const out = renderVhost(makePlan());
-    const faviconPos = out.indexOf("/favicon.ico");
-    const catchAllPos = out.lastIndexOf("\thandle {");
-    // favicon handle must appear before the final catch-all
-    expect(faviconPos).toBeLessThan(catchAllPos);
-=======
   test("favicon block appears BEFORE the catch-all handle (multi-route plan)", () => {
     // Use a plan with routes so renderVhost emits a `handle {}` catch-all wrapper.
     const planWithRoutes = makePlan({
@@ -349,7 +341,6 @@ describe("renderVhost: includes favicon fallback for node apps", () => {
     // favicon handle must appear before the final catch-all
     expect(faviconPos).toBeGreaterThan(0);
     expect(catchAllPos).toBeGreaterThan(faviconPos);
->>>>>>> df3a601 (feat(favicon): per-app SVG letter-mark fallback in every samohost-generated vhost)
   });
 
   test("favicon letter correct for samograph (S)", () => {
