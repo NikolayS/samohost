@@ -110,16 +110,11 @@ export function staticMainVhostLines(
     // source order, keeping favicon handles before try_files. See:
     //   src/caddy/favicon.ts faviconVhostBodyLines()
     //
-    // NOTE: cache header lines (Cache-Control immutable/no-cache) are NOT
-    // emitted for favicon-enabled vhosts. They are global header modifiers that
-    // would apply to the favicon SVG respond as well, setting
-    // `Cache-Control: no-cache` on the generated favicon (because /favicon.ico
-    // matches the documents matcher). Inside a `route {}` block they would need
-    // to be placed before the favicon handles to avoid confusion; omitting them
-    // is safe because:
-    //   (a) favicons are typically short-lived content anyway, and
-    //   (b) the file_server and try_files inside the route block handle the
-    //       rest of the content correctly.
+    // Cache headers: staticCacheHeaderLines() is emitted INSIDE the route{}
+    // block by faviconVhostBodyLines(), before try_files. The matchers
+    // (@samohost_immutable regexp, @samohost_documents path) do not match
+    // /favicon.ico or /favicon.svg — they are fully compatible with the
+    // route{} block and restore byte-identical Cache-Control behavior.
     return [
       SAMOHOST_PROVENANCE_HEADER,
       `${address} {`,

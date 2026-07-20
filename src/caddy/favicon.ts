@@ -35,6 +35,37 @@
  *     handle block + `expression {http.error.status_code} == 404`.
  */
 
+import { staticCacheHeaderLines } from "../static-cache.ts";
+
+// ---------------------------------------------------------------------------
+// Name guard — defensive charset validation
+// ---------------------------------------------------------------------------
+
+/**
+ * Safe charset for app names embedded in Caddy config and SVG strings.
+ * Current production names are all [a-z0-9-] (operator-controlled), so
+ * this guard is defence-in-depth rather than live risk mitigation.
+ *
+ * Rejects any character that could break:
+ *   - Caddy respond body: double-quote (")
+ *   - SVG text element:   less-than (<), ampersand (&)
+ *   - Caddy/SVG safety:  backtick (`), dollar ($)
+ *
+ * Allows: a-z A-Z 0-9 hyphen underscore period (covers all real names plus
+ * reasonable variants like "field-record-1", "samorev2").
+ */
+const SAFE_APP_NAME_RE = /^[a-zA-Z0-9_.-]+$/;
+
+function assertSafeAppName(appName: string): void {
+  if (!SAFE_APP_NAME_RE.test(appName)) {
+    throw new Error(
+      `faviconVhost: appName "${appName}" contains characters that are unsafe ` +
+        `in Caddy respond strings or SVG text (allowed: [a-zA-Z0-9_.-]). ` +
+        `Rename the app or sanitize before calling favicon helpers.`,
+    );
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Color palette — deterministic, excludes SAMO brand colors
 // ---------------------------------------------------------------------------
@@ -139,6 +170,7 @@ export function faviconVhostBodyLines(
   appName: string,
   addTls: boolean,
 ): string[] {
+  assertSafeAppName(appName);
   const svg = faviconSvg(appName);
   // The `root` directive is already set in the site block to $SAMOHOST_STATIC_DIR.
   // Caddy's `file` matcher resolves against the site root — no $ needed.
@@ -148,7 +180,18 @@ export function faviconVhostBodyLines(
   //
   // `/favicon.ico` is served from disk when the app ships one; otherwise falls
   // back to the same generated SVG (browsers accept SVG for the favicon.ico URL).
-  const tlsLine = addTls ? [`\t\ttls internal`] : [];
+  //
+  // Cache headers: staticCacheHeaderLines() is emitted INSIDE the route{} block,
+  // before try_files. The @samohost_immutable regexp matches fingerprinted asset
+  // URLs (hash suffix) and the @samohost_documents path matcher covers HTML/config
+  // documents. Neither matcher matches /favicon.ico or /favicon.svg (no hash
+  // suffix on favicon.ico; not an HTML document), so the favicon handles fire
+  // first and the cache matchers apply to all other content exactly as before.
+  // WHY inside route{}: route{} preserves source order (Caddy would otherwise
+  // reorder header directives relative to handle blocks by its built-in precedence
+  // table). Placing cache headers before try_files inside route{} mirrors the
+  // pre-favicon vhost layout and restores byte-identical Cache-Control behavior.
+  const tlsLine = addTls ? [`\ttls internal`] : [];
   return [
     `\t# samohost-worktree "${releaseDirVar}"`,
     `\troot * "${staticDirVar}"`,
@@ -167,6 +210,7 @@ export function faviconVhostBodyLines(
     `\t\t\t\trespond "${svg}" 200`,
     `\t\t\t}`,
     `\t\t}`,
+    ...staticCacheHeaderLines("\t\t"),
     `\t\ttry_files {path} {path}/ =404`,
     `\t\tfile_server`,
     `\t\tencode gzip`,
@@ -196,6 +240,7 @@ export function faviconVhostLinesStatic(staticDirVar: string, appName: string): 
  * Indented with a single tab.
  */
 export function faviconVhostLinesNode(appName: string, defaultPort: number): string[] {
+  assertSafeAppName(appName);
   const svg = faviconSvg(appName);
   // Caddy `handle` accepts only ONE inline path argument; for multiple paths use
   // a named path matcher declared at block scope before the handle.
