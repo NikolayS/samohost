@@ -163,25 +163,26 @@ describe("Fix 1 — no sudo tee to mktemp comparison file", () => {
 
   test("node heal script: comparison temp file is written with plain cat redirection (no sudo)", () => {
     const script = buildConfigHealScript(nodeApp());
-    // The temp file must be written without sudo. Either:
-    //   cat > "$_new_main_vhost" <<'HEREDOC'   OR
-    //   tee "$_new_main_vhost" (non-sudo, writing to stdin/heredoc)
-    // The key assertion is no sudo before the variable path.
-    // Positive assertion: the script writes to _new_main_vhost somehow (not just staged path).
-    expect(script).toContain("_new_main_vhost");
-    // And the write to the comparison file must NOT have sudo before tee + the var
-    const allSudoTeeLinesWithVar = script
+    // The temp file must be written without sudo.
+    // The write-to-temp pattern: cat > "$_new_main_vhost" <<'HEREDOC'
+    // The read-from-temp pattern (for staged write): < "$_new_main_vhost"
+    // We check that no line has `sudo ... > "$_new_main_vhost"` (writing to the var)
+    // A line with `< "$_new_main_vhost"` (reading from it for the staged sudo tee) is fine.
+    const allSudoWritesToVar = script
       .split("\n")
-      .filter((l) => /sudo/.test(l) && /_new_main_vhost/.test(l));
-    expect(allSudoTeeLinesWithVar).toHaveLength(0);
+      .filter((l) => /sudo/.test(l) && />\s+"\$_new_main_vhost"/.test(l));
+    expect(allSudoWritesToVar).toHaveLength(0);
+    // Positive: the comparison file IS written (cat > pattern)
+    expect(script).toMatch(/cat > "\$_new_main_vhost"/);
   });
 
   test("static heal script: comparison temp file is written with plain cat redirection (no sudo)", () => {
     const script = buildConfigHealScript(staticApp());
-    const allSudoTeeLinesWithVar = script
+    const allSudoWritesToVar = script
       .split("\n")
-      .filter((l) => /sudo/.test(l) && /_new_main_vhost/.test(l));
-    expect(allSudoTeeLinesWithVar).toHaveLength(0);
+      .filter((l) => /sudo/.test(l) && />\s+"\$_new_main_vhost"/.test(l));
+    expect(allSudoWritesToVar).toHaveLength(0);
+    expect(script).toMatch(/cat > "\$_new_main_vhost"/);
   });
 
   test("heredoc delimiters are preserved: node uses quoted SAMOHOST_MAIN_VHOST_CONTENT", () => {
@@ -271,13 +272,25 @@ describe("Fix 3 — inline-Caddyfile pre-flight guard in generated heal script",
 
   test("generated script does NOT write sites.d file when running the inline-caddyfile exit path", () => {
     const script = buildConfigHealScript(nodeApp());
-    // The inline-caddyfile exit must occur BEFORE the tee/mv to sites.d
-    const inlineCaddyfileIdx = script.indexOf("inline-caddyfile");
-    const firstSitesTeeIdx = script.indexOf("/etc/caddy/sites.d/");
-    // Pre-flight must appear before the sites.d writes
+    // The inline-caddyfile guard must appear BEFORE the actual vhost write block
+    // (after the rollback function definition which also contains sites.d references).
+    // We find the end of the rollback() function definition and look from there.
+    const rollbackEndIdx = script.indexOf("\n}\n");
+    expect(rollbackEndIdx).toBeGreaterThanOrEqual(0);
+    const bodyScript = script.slice(rollbackEndIdx);
+
+    // In the body (outside rollback), inline-caddyfile guard must appear before
+    // the first sudo tee/mv to sites.d
+    const inlineCaddyfileIdx = bodyScript.indexOf("inline-caddyfile");
+    const bodyLines = bodyScript.split("\n");
+    const firstSudoSitesTeeBodyIdx = bodyLines
+      .findIndex((l) => /sudo.*tee.*\/etc\/caddy\/sites\.d\/|sudo.*mv.*\/etc\/caddy\/sites\.d\//.test(l));
+
     expect(inlineCaddyfileIdx).toBeGreaterThanOrEqual(0);
-    expect(firstSitesTeeIdx).toBeGreaterThanOrEqual(0);
-    expect(inlineCaddyfileIdx).toBeLessThan(firstSitesTeeIdx);
+    expect(firstSudoSitesTeeBodyIdx).toBeGreaterThanOrEqual(0);
+
+    const inlineCaddyfileBodyLineIdx = bodyLines.findIndex((l) => l.includes("inline-caddyfile"));
+    expect(inlineCaddyfileBodyLineIdx).toBeLessThan(firstSudoSitesTeeBodyIdx);
   });
 
   test("static heal script also includes the inline-Caddyfile pre-flight guard", () => {
@@ -382,7 +395,9 @@ describe("Fix 5 — HEAL_VM_CAP is env-overridable via SAMOHOST_HEAL_VM_CAP", ()
       healthUrl: `https://${appName}.samo.team/`,
       serviceUnit: appName,
       mainHost: `${appName}.samo.team`,
-      deployedSha: "deployed1111111111111111111111111111111",
+      // deployedSha matches resolveRef output so trigger classifies the app as up-to-date
+      // (not needing a deploy), making it eligible for the heal pass.
+      deployedSha: CURRENT_SHA,
       generatorSha: OLD_GEN_SHA,
       lastDeployAt: new Date(Date.now() - 700_000).toISOString(), // past 10-min grace
     };
@@ -411,7 +426,12 @@ describe("Fix 5 — HEAL_VM_CAP is env-overridable via SAMOHOST_HEAL_VM_CAP", ()
 
   function makeDeps(healed: string[]): TriggerDeps {
     return {
-      deploy: async () => ({ action: "up-to-date" }),
+      resolveRef: () => Promise.resolve(CURRENT_SHA),
+      deploy: async () => 0,
+      fetch: (async () => ({
+        ok: true,
+        json: async () => ({ workflow_runs: [] }),
+      })) as unknown as typeof globalThis.fetch,
       now: () => new Date(),
       appHeal: async (app) => {
         healed.push(app.name);

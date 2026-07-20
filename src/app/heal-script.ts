@@ -162,7 +162,17 @@ function marker(phase: HealPhaseName, status: "start" | "ok" | "fail"): string {
  * Throws if:
  *   - app.mainHost is undefined (no main vhost to regenerate)
  */
-export function buildConfigHealScript(app: AppRecord): string {
+export interface BuildConfigHealScriptOptions {
+  /**
+   * When true, emit adoption logic for vhosts that lack the samohost
+   * provenance header but whose content (minus the header) is byte-identical
+   * to the regenerated content.  Only prepends the header — never overwrites
+   * divergent content.  Default: false (drift-foreign skip preserved).
+   */
+  adoptProvenance?: boolean;
+}
+
+export function buildConfigHealScript(app: AppRecord, opts: BuildConfigHealScriptOptions = {}): string {
   if (app.mainHost === undefined) {
     throw new Error(
       `buildConfigHealScript: app "${app.name}" has no mainHost — ` +
@@ -276,6 +286,32 @@ export function buildConfigHealScript(app: AppRecord): string {
     "",
   );
 
+  // ---- Pre-flight: inline-Caddyfile guard -----------------------------------
+  // If /etc/caddy/Caddyfile does NOT have `import sites.d/*.caddy`, writing
+  // to sites.d would either be silently ignored or create a duplicate-site
+  // conflict (e.g. field-record inline-block coexisting with the sites.d file).
+  // Bail out immediately with outcome inline-caddyfile (exit 0 — not a failure,
+  // just a structural incompatibility that requires a one-time operator migration
+  // documented in samohost/docs/runbooks/migrate-inline-caddyfile.md).
+  push(
+    "# --- pre-flight: verify /etc/caddy/Caddyfile uses import sites.d/*.caddy ---",
+    "# If the Caddyfile has inline site blocks instead of an import directive,",
+    "# writing to sites.d would create a duplicate-site conflict. Bail out.",
+    `if ! grep -qE 'import\\s+sites\\.d/\\*\\.caddy' /etc/caddy/Caddyfile 2>/dev/null; then`,
+    `  echo "inline-caddyfile: /etc/caddy/Caddyfile does not contain 'import sites.d/*.caddy' — heal skipped (operator migration required)"`,
+    `  ${marker("heal", "ok")}`,
+    "  exit 0",
+    "fi",
+    `# Also guard against the app's mainHost appearing as an inline site block`,
+    `# in the Caddyfile even when the import line exists (transitional state).`,
+    `if grep -qF ${sq(app.mainHost)} /etc/caddy/Caddyfile 2>/dev/null; then`,
+    `  echo "inline-caddyfile: ${app.mainHost} is declared as an inline site block in /etc/caddy/Caddyfile — heal skipped (remove inline block first)"`,
+    `  ${marker("heal", "ok")}`,
+    "  exit 0",
+    "fi",
+    "",
+  );
+
   // ---- Track whether any artifact was actually changed ----------------------
   push(
     "SAMOHOST_HEAL_ANY_CHANGED=0",
@@ -356,14 +392,51 @@ export function buildConfigHealScript(app: AppRecord): string {
       "  # A hand-edited file → drift-foreign finding; NEVER overwritten.",
       `  _provenance=$(head -1 ${sq(mainVhostPath)} 2>/dev/null || true)`,
       `  if [[ "$_provenance" != ${sq(SAMOHOST_PROVENANCE_HEADER)} ]]; then`,
-      `    echo "drift-foreign: ${mainVhostPath} lacks samohost provenance header"`,
-      "    SAMOHOST_HEAL_DRIFT_FOREIGN=1",
+      ...(opts.adoptProvenance
+        ? [
+            // Adoption path: file lacks the provenance header, but if the content
+            // minus the header is byte-identical to the regenerated content, we can
+            // safely prepend the header and adopt the file.
+            `    # adopt-provenance: check if file content matches regenerated (minus header)`,
+            `    _new_main_vhost=$(mktemp)`,
+            `    cat > "$_new_main_vhost" <<'SAMOHOST_MAIN_VHOST_CONTENT'`,
+            ...regeneratedMainVhost!.split("\n"),
+            "SAMOHOST_MAIN_VHOST_CONTENT",
+            // Compare file content against regenerated (both files; cmp is byte-exact).
+            // If they differ, fall through to drift-foreign.
+            // The live file lacks the header so we compare the regenerated WITH the header
+            // against the live file. They differ by definition (live lacks header).
+            // Instead compare regenerated-without-header vs live:
+            `    _new_no_header=$(mktemp)`,
+            `    tail -n +2 "$_new_main_vhost" > "$_new_no_header"`,
+            `    if cmp -s ${sq(mainVhostPath)} "$_new_no_header"; then`,
+            // Content matches (modulo missing header). Safe to adopt.
+            `      # Content is byte-identical minus header — adopt by prepending provenance header`,
+            `      if sudo /usr/bin/tee ${sq(stagedMainVhost)} >/dev/null < "$_new_main_vhost"; then`,
+            `        sudo /usr/bin/mv -- ${sq(stagedMainVhost)} ${sq(mainVhostPath)} || rollback`,
+            `        echo "main vhost: adopted (provenance header prepended)"`,
+            `        SAMOHOST_HEAL_ANY_CHANGED=1`,
+            `      else`,
+            `        rollback`,
+            `      fi`,
+            `    else`,
+            `      echo "drift-foreign: ${mainVhostPath} lacks samohost provenance header and content differs from regenerated"`,
+            `      SAMOHOST_HEAL_DRIFT_FOREIGN=1`,
+            `    fi`,
+            `    rm -f "$_new_main_vhost" "$_new_no_header"`,
+          ]
+        : [
+            `    echo "drift-foreign: ${mainVhostPath} lacks samohost provenance header"`,
+            "    SAMOHOST_HEAL_DRIFT_FOREIGN=1",
+          ]),
       "  else",
       "    # Write regenerated content to temp, compare with live",
       `    _new_main_vhost=$(mktemp)`,
       // Write the regenerated vhost (rendered at build time in TypeScript) to the temp file.
+      // Plain cat redirect (no sudo) — the temp file is user-writable; only the
+      // final staged sites.d path requires privilege.
       // Single-quoted heredoc delimiter → no shell expansion of vhost content.
-      `    sudo /usr/bin/tee "$_new_main_vhost" >/dev/null <<'SAMOHOST_MAIN_VHOST_CONTENT'`,
+      `    cat > "$_new_main_vhost" <<'SAMOHOST_MAIN_VHOST_CONTENT'`,
       ...regeneratedMainVhost!.split("\n"),
       "SAMOHOST_MAIN_VHOST_CONTENT",
       `    if cmp -s ${sq(mainVhostPath)} "$_new_main_vhost"; then`,
@@ -412,15 +485,42 @@ export function buildConfigHealScript(app: AppRecord): string {
       "    # A hand-edited file → drift-foreign finding; NEVER overwritten.",
       `    _provenance=$(head -1 ${sq(mainVhostPath)} 2>/dev/null || true)`,
       `    if [[ "$_provenance" != ${sq(SAMOHOST_PROVENANCE_HEADER)} ]]; then`,
-      `      echo "drift-foreign: ${mainVhostPath} lacks samohost provenance header"`,
-      "      SAMOHOST_HEAL_DRIFT_FOREIGN=1",
+      ...(opts.adoptProvenance
+        ? [
+            `      # adopt-provenance: generate runtime content to compare`,
+            `      _new_main_vhost=$(mktemp)`,
+            `      cat > "$_new_main_vhost" <<SAMOHOST_STATIC_VHOST_CONTENT`,
+            ...staticMainVhostLines(address!, "$SAMOHOST_RELEASE_DIR", "$SAMOHOST_STATIC_DIR", tlsLine !== undefined, app.name),
+            `SAMOHOST_STATIC_VHOST_CONTENT`,
+            `      _new_no_header=$(mktemp)`,
+            `      tail -n +2 "$_new_main_vhost" > "$_new_no_header"`,
+            `      if cmp -s ${sq(mainVhostPath)} "$_new_no_header"; then`,
+            `        if sudo /usr/bin/tee ${sq(stagedMainVhost)} >/dev/null < "$_new_main_vhost"; then`,
+            `          sudo /usr/bin/mv -- ${sq(stagedMainVhost)} ${sq(mainVhostPath)} || rollback`,
+            `          echo "main vhost: adopted (provenance header prepended)"`,
+            `          SAMOHOST_HEAL_ANY_CHANGED=1`,
+            `        else`,
+            `          rollback`,
+            `        fi`,
+            `      else`,
+            `        echo "drift-foreign: ${mainVhostPath} lacks samohost provenance header and content differs from regenerated"`,
+            `        SAMOHOST_HEAL_DRIFT_FOREIGN=1`,
+            `      fi`,
+            `      rm -f "$_new_main_vhost" "$_new_no_header"`,
+          ]
+        : [
+            `      echo "drift-foreign: ${mainVhostPath} lacks samohost provenance header"`,
+            "      SAMOHOST_HEAL_DRIFT_FOREIGN=1",
+          ]),
       "    else",
       "      # Write regenerated static vhost content to temp file (runtime expansion)",
       `      _new_main_vhost=$(mktemp)`,
       // Unquoted heredoc delimiter → $SAMOHOST_STATIC_DIR and $SAMOHOST_RELEASE_DIR
       // are expanded by bash at runtime.  Content generated by staticMainVhostLines()
       // — the shared three-way contract (deploy == heal == bootstrap).
-      `      sudo /usr/bin/tee "$_new_main_vhost" >/dev/null <<SAMOHOST_STATIC_VHOST_CONTENT`,
+      // Plain cat redirect (no sudo) — the temp file is user-writable; only the
+      // final staged sites.d path requires privilege.
+      `      cat > "$_new_main_vhost" <<SAMOHOST_STATIC_VHOST_CONTENT`,
       ...staticMainVhostLines(address!, "$SAMOHOST_RELEASE_DIR", "$SAMOHOST_STATIC_DIR", tlsLine !== undefined, app.name),
       "SAMOHOST_STATIC_VHOST_CONTENT",
       `      if cmp -s ${sq(mainVhostPath)} "$_new_main_vhost"; then`,
