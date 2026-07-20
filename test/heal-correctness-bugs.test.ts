@@ -26,10 +26,7 @@
  */
 
 import { describe, expect, test } from "bun:test";
-import {
-  buildConfigHealScript,
-  SAMOHOST_PROVENANCE_HEADER,
-} from "../src/app/heal-script.ts";
+import { buildConfigHealScript } from "../src/app/heal-script.ts";
 import { renderVhost, planFromApp } from "../src/caddy/render.ts";
 import type { AppRecord } from "../src/types.ts";
 
@@ -50,13 +47,8 @@ function nodeApp(overrides: Partial<AppRecord> = {}): AppRecord {
     healthUrl: "https://samograph.samo.team/api/version",
     serviceUnit: "samograph",
     mainHost: "samograph.samo.team",
-    mainPort: 3000,
     ...overrides,
   };
-}
-
-function renderVhostSplitLines(app: AppRecord): string[] {
-  return renderVhost(planFromApp(app)).split("\n");
 }
 
 // ---------------------------------------------------------------------------
@@ -97,9 +89,9 @@ describe("BUG-1: inline-Caddyfile guard excludes comment lines", () => {
     // The exact implementation can vary, but the generated script must have
     // some form of comment exclusion piped into (or preceding) the mainHost check.
     // We verify by looking for grep -v with a hash-comment pattern.
-    expect(script).toMatch(/grep\s+-v\s+['"][^^#].*#/m);
-    // More specifically: must strip lines starting with optional whitespace + '#'
-    // Common patterns: grep -v '^\s*#', grep -v '^[[:space:]]*#', etc.
+    // Acceptable patterns: grep -v '^\s*#', grep -v '^[[:space:]]*#', etc.
+    // The pattern matches: grep -v '<something>#'
+    expect(script).toMatch(/grep\s+-v\s+['"].+#/m);
   });
 
   test("BUG-1c: a comment line containing the mainHost does NOT trigger the guard", () => {
