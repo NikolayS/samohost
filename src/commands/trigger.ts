@@ -906,7 +906,10 @@ export async function runTriggerRun(
   // Alert: when healFailCount reaches HEAL_FAIL_ALERT_THRESHOLD, calls
   //   deps.fileHealAlert (injectable; production wires upsertGhIssue).
   //
-  const HEAL_VM_CAP = 2;
+  // HEAL_VM_CAP: configurable via SAMOHOST_HEAL_VM_CAP env var (default 2).
+  // The default (2) keeps blast radius small during initial enable. Operators
+  // can raise it (e.g. SAMOHOST_HEAL_VM_CAP=10) once confidence exists.
+  const HEAL_VM_CAP = Number(process.env["SAMOHOST_HEAL_VM_CAP"] ?? 2);
   const HEAL_FAIL_ALERT_THRESHOLD = 3;
 
   let appHealSummaries: AppHealPassSummary[] | undefined;
