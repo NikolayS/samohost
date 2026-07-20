@@ -39,7 +39,6 @@ import {
   runTriggerRun,
   type TriggerRunInput,
   type TriggerDeps,
-  type AppHealResult,
 } from "../src/commands/trigger.ts";
 import { AppStore } from "../src/state/apps.ts";
 import { StateStore } from "../src/state/store.ts";
@@ -435,7 +434,7 @@ describe("Fix 5 — HEAL_VM_CAP is env-overridable via SAMOHOST_HEAL_VM_CAP", ()
       now: () => new Date(),
       appHeal: async (app) => {
         healed.push(app.name);
-        return { outcome: "no-drift", exitCode: 0 };
+        return { outcome: "no-drift", app: app.name };
       },
     };
   }
