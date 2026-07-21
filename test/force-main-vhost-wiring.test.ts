@@ -42,7 +42,7 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
-import { parseArgs, UsageError } from "../src/cli.ts";
+import { parseArgs } from "../src/cli.ts";
 import { runEnvPlan, type EnvPlanInput } from "../src/commands/env.ts";
 import { buildHostPrepScript } from "../src/env/script.ts";
 import { AppStore } from "../src/state/apps.ts";

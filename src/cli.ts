@@ -328,6 +328,13 @@ env options (per-branch preview environments — SOLO plan, one shared VM):
                              vhost = <app>-<branch-label>.<domain>)
   --destroy                  (plan) print the destroy script instead of create
   --host-prep                (plan) print the ONE-TIME root host-prep script
+  --force-main-vhost         (plan --host-prep) allow the emitted host-prep
+                             script to overwrite a differing live main vhost
+                             (timestamped backup + caddy validate + rollback
+                             on validate failure). Default OFF — the guard
+                             refuses to overwrite a drifted/hand-authored
+                             vhost unless this flag is explicitly set.
+                             Use for a deliberate static→node conversion.
   --app <name>               (list) narrow to one app
   --json                     emit JSON instead of text
 
@@ -1908,6 +1915,7 @@ function parseEnvPlan(args: string[]): ParsedEnvPlan {
   let templateDb: string | undefined;
   let destroy = false;
   let hostPrep = false;
+  let forceMainVhost = false;
   let json = false;
   const { vm, app } = takeVmApp(args, (a, i) => {
     if (a === "--branch") { branch = takeValue(args, i, a); return i + 1; }
@@ -1916,6 +1924,7 @@ function parseEnvPlan(args: string[]): ParsedEnvPlan {
     if (a === "--template-db") { templateDb = takeValue(args, i, a); return i + 1; }
     if (a === "--destroy") { destroy = true; return i; }
     if (a === "--host-prep") { hostPrep = true; return i; }
+    if (a === "--force-main-vhost") { forceMainVhost = true; return i; }
     if (a === "--json") { json = true; return i; }
     return undefined;
   });
@@ -1934,6 +1943,7 @@ function parseEnvPlan(args: string[]): ParsedEnvPlan {
     hostPrep,
     ...(branch !== undefined ? { branch } : {}),
     ...(templateDb !== undefined ? { templateDb } : {}),
+    ...(forceMainVhost ? { forceMainVhost } : {}),
   };
   return { kind: "env-plan", input, json };
 }

@@ -79,6 +79,23 @@ export interface EnvPlanInput {
   destroy: boolean;
   /** Print the one-time root host-prep script instead. */
   hostPrep: boolean;
+  /**
+   * When `true`, threads `forceMainVhost: true` into `buildHostPrepScript` so
+   * the emitted `samohost_apply_main_vhost` call carries `force=true`.
+   *
+   * This unlocks a deliberate static→node vhost swap: the generated host-prep
+   * script will overwrite the differing live main vhost (with a timestamped
+   * backup + caddy validate + rollback-on-failure) instead of refusing.
+   *
+   * Default `false`: the guard refuses to overwrite a differing live file.
+   * The flag is an explicit opt-in for a deliberate conversion — the safe
+   * default-refuse posture is never changed implicitly.
+   *
+   * Set via `--force-main-vhost` on the `env plan --host-prep` command.
+   *
+   * @default false
+   */
+  forceMainVhost?: boolean;
 }
 
 export interface EnvCreateInput {
@@ -337,7 +354,11 @@ export function runEnvPlan(
   if (r === undefined) return 1;
 
   if (input.hostPrep) {
-    out(buildHostPrepScript(r.app, r.vm.sshUser));
+    out(buildHostPrepScript(
+      r.app,
+      r.vm.sshUser,
+      input.forceMainVhost === true ? { forceMainVhost: true } : undefined,
+    ));
     return 0;
   }
 
