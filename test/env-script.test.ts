@@ -3950,6 +3950,29 @@ describe("buildCustomDomainVhostScript", () => {
     expect(s).toContain("systemctl reload caddy");
     expect(s).not.toContain("caddy validate");
   });
+
+  test("regression #ownershipfix: static vhost git rev-parse uses safe.directory scoping so samo-owned process can read app-user-owned checkout (dubious-ownership guard)", () => {
+    // The custom-domain vhost script runs as the SSH admin user 'samo', but
+    // static release checkouts are owned by the app user.  Without
+    // -c safe.directory=<path>, git aborts with "detected dubious ownership"
+    // and the guard captures an empty HEAD, producing a false
+    // "does not match its recorded sha" failure that blocks 'domain add' for
+    // every static app.
+    //
+    // Fix: scope git trust to the already-realpath-validated $SAMOHOST_CHECKOUT_REAL
+    // via -c safe.directory="$SAMOHOST_CHECKOUT_REAL" (per-invocation, non-persistent).
+    // Drop the 2>/dev/null so the real git error is visible on actual failure.
+    const s = buildCustomDomainVhostScript(staticApp(), "myapp.com");
+    // Must contain the scoped safe.directory form (ownership-safe, non-persistent).
+    expect(s).toContain(
+      'git -C "$SAMOHOST_CHECKOUT_REAL" -c safe.directory="$SAMOHOST_CHECKOUT_REAL" rev-parse HEAD',
+    );
+    // Must NOT suppress stderr — the true git error must reach the operator.
+    expect(s).not.toContain(
+      'git -C "$SAMOHOST_CHECKOUT_REAL" rev-parse HEAD 2>/dev/null',
+    );
+    expect(bashSyntaxOk(s)).toBe(true);
+  });
 });
 
 describe("buildCustomDomainVhostRemoveScript", () => {
@@ -4042,14 +4065,21 @@ describe("buildControlPlaneCustomDomainVhostScript", () => {
     expect(s).toContain("Caddyfile");
   });
 
-  test("reloads Caddy via systemctl (not 'caddy validate')", () => {
+  test("reloads Caddy via resilient systemctl-then-admin-API fallback (not 'caddy validate')", () => {
     const s = buildControlPlaneCustomDomainVhostScript(
       "myapp.com",
       "1.2.3.4",
       "field-record-1.samo.team",
     );
-    expect(s).toContain("systemctl reload caddy");
+    // Must use the resilient fallback line so a stale PrivateTmp namespace
+    // (systemd status=226/NAMESPACE) does not block 'domain add'.
+    expect(s).toContain(
+      "sudo /usr/bin/systemctl reload caddy || sudo /usr/bin/caddy reload --config /etc/caddy/Caddyfile --force",
+    );
     expect(s).not.toContain("caddy validate");
+    // Fail-closed lock: must NOT swallow failures with || true
+    expect(s).not.toContain("reload caddy || true");
+    expect(bashSyntaxOk(s)).toBe(true);
   });
 });
 
@@ -4058,7 +4088,13 @@ describe("buildControlPlaneCustomDomainVhostRemoveScript", () => {
     const s = buildControlPlaneCustomDomainVhostRemoveScript("myapp.com");
     expect(s).toContain("10-domain-myapp-com.caddy");
     expect(s).toContain("sites.d");
-    expect(s).toContain("systemctl reload caddy");
+    // Must use the resilient fallback line so a stale PrivateTmp namespace
+    // (systemd status=226/NAMESPACE) does not block 'domain rm'.
+    expect(s).toContain(
+      "sudo /usr/bin/systemctl reload caddy || sudo /usr/bin/caddy reload --config /etc/caddy/Caddyfile --force",
+    );
+    // Fail-closed lock: must NOT swallow failures with || true
+    expect(s).not.toContain("reload caddy || true");
     expect(bashSyntaxOk(s)).toBe(true);
   });
 
@@ -4067,6 +4103,31 @@ describe("buildControlPlaneCustomDomainVhostRemoveScript", () => {
     // import line is NOT removed — it's persistent infrastructure
     expect(s).not.toContain("sed");
     expect(s).not.toContain("grep -v");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Scope guard: app-VM custom-domain vhost script must NOT adopt the admin-API
+// fallback. App-VM sudoers only grant /usr/bin/systemctl reload caddy; adding
+// the 'caddy reload --config' path there would prompt for a password.
+// ---------------------------------------------------------------------------
+describe("buildCustomDomainVhostScript (app-VM) — NO admin-API fallback", () => {
+  const appVmNodeApp = (): AppRecord => ({
+    id: "app-1",
+    vmId: "vm-1",
+    name: "field-record",
+    repo: "Tanya301/field-record-1",
+    branch: "main",
+    appDir: "/opt/field-record/app",
+    buildCmd: "npm run build",
+    healthUrl: "http://localhost:3000/api/version",
+    serviceUnit: "field-record",
+  });
+
+  test("app-VM script uses plain systemctl reload only (no caddy reload --config)", () => {
+    const s = buildCustomDomainVhostScript(appVmNodeApp(), "myapp.com");
+    expect(s).toContain("systemctl reload caddy");
+    expect(s).not.toContain("caddy reload --config");
   });
 });
 

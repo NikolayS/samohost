@@ -469,6 +469,111 @@ describe("runDomainAdd", () => {
     // Routing CNAME must still be emitted
     expect(allOut).toContain("cname.samo.team");
   });
+
+  test("mainListen=cp-http80: skips remote vhost script, still calls controlPlane and CF", async () => {
+    // Legacy / cp-http80 apps: all traffic reaches the app VM via the control-
+    // plane reverse_proxy with `header_up Host <mainHost>`, so the app VM
+    // already routes the custom domain via its existing mainHost vhost.
+    // Adding a second app-VM vhost is both redundant and impossible for legacy
+    // apps that pre-date the releases-based deployment.  The fix: skip the
+    // remote SSH step when mainListen === "cp-http80".
+    const { vmStore, appStore, domainStore } = makeStores();
+
+    const cpApp: AppRecord = {
+      ...APP,
+      mainListen: "cp-http80",
+    };
+    appStore.upsert(cpApp);
+
+    const { errLines, out, err } = makeOutput();
+
+    let remoteCalled = false;
+    let cpCalled = false;
+    let cfCalled = false;
+
+    const cfMock = {
+      createCustomHostname: async () => {
+        cfCalled = true;
+        return CH_PENDING_TXT;
+      },
+      getCustomHostname: async (_id: string) => CH_PENDING_TXT,
+      listCustomHostnames: async () => [] as CustomHostname[],
+      deleteCustomHostname: async (_id: string) => ({ id: "ch-abc123" }),
+    };
+
+    const code = await runDomainAdd(
+      { app: "field-record", fqdn: "myapp.com", dcv: "txt" },
+      { json: false },
+      vmStore,
+      appStore,
+      domainStore,
+      makeDeps({
+        cf: cfMock,
+        remote: async (_vm, _script) => {
+          remoteCalled = true;
+          return { code: 0, stdout: "ok", stderr: "" };
+        },
+        controlPlane: async (_script) => {
+          cpCalled = true;
+          return { code: 0, stdout: "ok", stderr: "" };
+        },
+      }),
+      out,
+      err,
+    );
+
+    expect(code).toBe(0);
+    expect(errLines).toHaveLength(0);
+    expect(cfCalled).toBe(true);
+    expect(cpCalled).toBe(true);
+    // Remote SSH must NOT be called for cp-http80 apps
+    expect(remoteCalled).toBe(false);
+
+    const stored = domainStore.get("myapp.com");
+    expect(stored).toBeDefined();
+    expect(stored!.customHostnameId).toBe("ch-abc123");
+  });
+
+  test("409 duplicate: falls back to listCustomHostnames and recovers the existing record", async () => {
+    // When domain add is re-run after a partial failure (CF hostname already
+    // registered), createCustomHostname returns 409. The command must recover
+    // the existing hostname via listCustomHostnames instead of aborting.
+    const { vmStore, appStore, domainStore } = makeStores();
+    const { errLines, outLines, out, err } = makeOutput();
+
+    const cfMock = {
+      createCustomHostname: async (_hostname: string) => {
+        const { CloudflareError } = await import("../src/dns/cloudflare.ts");
+        throw new CloudflareError(409, "1406 Duplicate custom hostname found.");
+      },
+      getCustomHostname: async (_id: string) => CH_PENDING_TXT,
+      listCustomHostnames: async (_hostname?: string) => [CH_PENDING_TXT],
+      deleteCustomHostname: async (_id: string) => ({ id: "ch-abc123" }),
+    };
+
+    const code = await runDomainAdd(
+      { app: "field-record", fqdn: "myapp.com", dcv: "txt" },
+      { json: false },
+      vmStore,
+      appStore,
+      domainStore,
+      makeDeps({ cf: cfMock }),
+      out,
+      err,
+    );
+
+    expect(code).toBe(0);
+    expect(errLines).toHaveLength(0);
+
+    // Should have recovered the existing hostname id
+    const stored = domainStore.get("myapp.com");
+    expect(stored).toBeDefined();
+    expect(stored!.customHostnameId).toBe("ch-abc123");
+
+    // DNS instructions should still be printed
+    const allOut = outLines.join("\n");
+    expect(allOut).toContain("cname.samo.team");
+  });
 });
 
 // ---------------------------------------------------------------------------

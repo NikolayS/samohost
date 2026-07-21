@@ -73,6 +73,35 @@ IP.
 
 Source: `samo.team/SPEC.md` (line 522 diagram), memory `project_samo_mvp_no_cloudflare_token.md`.
 
+## Control-plane Caddy reload — resilient to a broken `systemctl reload`
+
+`domain add`/`domain rm` write a `sites.d` snippet on the control plane and then
+reload Caddy. The reload is **resilient**:
+
+```
+sudo /usr/bin/systemctl reload caddy || sudo /usr/bin/caddy reload --config /etc/caddy/Caddyfile --force
+```
+
+Why the fallback exists: the control-plane `caddy.service` has `PrivateTmp=true`.
+On a long-running instance the systemd-private `/tmp` staging dir can be evicted
+by the `D /tmp … 30d` tmpfiles cleaner, after which **`systemctl reload caddy`
+fails with `status=226/NAMESPACE`** ("Failed to set up mount namespacing:
+/tmp: No such file or directory"). The running Caddy is unaffected and keeps
+serving, but any config change (routing, custom domains) silently fails to apply.
+The admin-API fallback (`caddy reload`, localhost:2019) is zero-downtime and
+immune to the namespace issue; it fails **closed** if the config is invalid.
+
+This affects **every** long-running `PrivateTmp=true` service on the host, not
+just Caddy. Host-side remedy (needs a maintenance window; NOT required for
+`domain add`): `systemctl restart caddy` to recreate the namespace dir, and fix
+the `/tmp` tmpfiles rule so it stops evicting live `systemd-private-*` dirs.
+
+Only the two **control-plane** reload sites use the fallback
+(`buildControlPlaneCustomDomainVhostScript` / `…RemoveScript`). App-VM reloads
+stay `systemctl`-only — the app-VM `samo` sudoers grant covers only
+`/usr/bin/systemctl reload caddy`, so a `caddy reload` fallback there would
+password-prompt.
+
 ## Manual runbook: adding an additional *.samo.team host to a client app
 
 `AppRecord.mainHost` is a single scalar — samohost has no first-class
