@@ -1438,4 +1438,38 @@ describe("buildHostBootstrapScript — static path (kind='static')", () => {
     expect(script).toContain("PG_SUPER_PW");
     expect(script).toContain("DATABASE_URL=");
   });
+
+  test("regression #ownershipfix: static bootstrap git rev-parse uses -c safe.directory scoping so the samo-owned process can read an app-user-owned checkout (dubious-ownership guard, bootstrap.ts:762)", () => {
+    // ROOT CAUSE (same as env-script.test.ts #ownershipfix): the bootstrap script
+    // runs as the SSH admin user ('samo' / 'agent'), but static release checkouts
+    // are owned by the app user.  Without -c safe.directory=<path>, git >=2.35
+    // aborts with "detected dubious ownership in repository" before emitting HEAD.
+    // The guard then captures an empty string and unconditionally fails with
+    // "active static deployment checkout does not match recorded sha" — blocking
+    // every bootstrap execution on a correctly-deployed static app.
+    //
+    // FIX (bootstrap.ts:762): use per-invocation trust scoping
+    //   git -C "$SAMOHOST_CHECKOUT_REAL" -c safe.directory="$SAMOHOST_CHECKOUT_REAL" rev-parse HEAD
+    // This is non-persistent (does not mutate ~/.gitconfig), bounded to the
+    // already realpath-validated path, and mirrors the identical fix in
+    // env/script.ts:2846 (custom-domain vhost guard).
+    //
+    // Also: 2>/dev/null was removed from the call so the real git error is
+    // visible to the operator on actual failure.
+    const script = buildHostBootstrapScript(staticRecord(), staticOpts());
+    // 1. Must use the scoped safe.directory form (ownership-safe, non-persistent).
+    expect(script).toContain(
+      'git -C "$SAMOHOST_CHECKOUT_REAL" -c safe.directory="$SAMOHOST_CHECKOUT_REAL" rev-parse HEAD',
+    );
+    // 2. Must NOT suppress stderr — the real git error must reach the operator.
+    expect(script).not.toContain(
+      'git -C "$SAMOHOST_CHECKOUT_REAL" rev-parse HEAD 2>/dev/null',
+    );
+    // 3. Must NOT use the bare (non-scoped) rev-parse form.
+    expect(script).not.toMatch(
+      /git -C "\$SAMOHOST_CHECKOUT_REAL" rev-parse HEAD(?! 2>\/dev\/null)/,
+    );
+    // 4. Script must remain valid bash.
+    expect(bashSyntaxOk(script)).toBe(true);
+  });
 });
