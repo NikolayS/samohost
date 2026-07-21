@@ -30,6 +30,7 @@
 import { spawnSync } from "node:child_process";
 import {
   CloudflareDns,
+  CloudflareError,
   type CustomHostname,
   type CustomHostnameClient,
 } from "../dns/cloudflare.ts";
@@ -296,11 +297,36 @@ export async function runDomainAdd(
     try {
       ch = await deps.cf.createCustomHostname(input.fqdn, input.dcv);
     } catch (e) {
-      err(
-        `error: Cloudflare custom hostname creation failed for ${input.fqdn}: ` +
-          `${e instanceof Error ? e.message : String(e)}`,
-      );
-      return 1;
+      // 409 = hostname already registered (idempotent re-run): fetch existing
+      // record instead of failing.  Any other status remains fatal.
+      if (e instanceof CloudflareError && e.status === 409) {
+        try {
+          const existing = await deps.cf.listCustomHostnames(input.fqdn);
+          const found = existing.find((h) => h.hostname === input.fqdn);
+          if (found !== undefined) {
+            ch = found;
+          } else {
+            err(
+              `error: Cloudflare returned 409 (duplicate) for ${input.fqdn} ` +
+                `but listCustomHostnames returned no match — manual cleanup needed`,
+            );
+            return 1;
+          }
+        } catch (le) {
+          err(
+            `error: Cloudflare custom hostname creation failed (409) and ` +
+              `list fallback also failed for ${input.fqdn}: ` +
+              `${le instanceof Error ? le.message : String(le)}`,
+          );
+          return 1;
+        }
+      } else {
+        err(
+          `error: Cloudflare custom hostname creation failed for ${input.fqdn}: ` +
+            `${e instanceof Error ? e.message : String(e)}`,
+        );
+        return 1;
+      }
     }
   } else {
     err(CF_DEGRADE_WARNING);
@@ -309,22 +335,31 @@ export async function runDomainAdd(
   // ---- push Caddy vhost snippet over SSH to the app VM --------------------
   // The app VM vhost uses http:// (plain HTTP) so the control-plane hop on
   // :80 is accepted without a TLS redirect.
-  try {
-    const script = buildCustomDomainVhostScript(app, input.fqdn);
-    const result = await deps.remote(vm, script);
-    if (result.code !== 0) {
+  //
+  // Skip for mainListen === "cp-http80" apps: all traffic reaches the app VM
+  // via the control-plane reverse_proxy with `header_up Host <app.mainHost>`,
+  // so the app VM already routes the custom domain via its existing mainHost
+  // vhost. Adding a second vhost for the custom FQDN would be redundant AND
+  // impossible for legacy apps that pre-date the releases-based deployment
+  // (no .samohost-active-static.json → guard rejects the script).
+  if (app.mainListen !== "cp-http80") {
+    try {
+      const script = buildCustomDomainVhostScript(app, input.fqdn);
+      const result = await deps.remote(vm, script);
+      if (result.code !== 0) {
+        err(
+          `error: remote vhost script failed (exit ${result.code}): ` +
+            result.stderr,
+        );
+        return 1;
+      }
+    } catch (e) {
       err(
-        `error: remote vhost script failed (exit ${result.code}): ` +
-          result.stderr,
+        `error: remote vhost script connection failed: ` +
+          `${e instanceof Error ? e.message : String(e)}`,
       );
       return 1;
     }
-  } catch (e) {
-    err(
-      `error: remote vhost script connection failed: ` +
-        `${e instanceof Error ? e.message : String(e)}`,
-    );
-    return 1;
   }
 
   // ---- write control-plane routing snippet (root-cause fix) ----------------
