@@ -273,6 +273,142 @@ export function parseWebPortsNotWorldOpenOutput(
 }
 
 // ---------------------------------------------------------------------------
+// dark-db parser — exposed for direct unit testing.
+// ---------------------------------------------------------------------------
+
+/**
+ * Parse the output of the dark-db probe (sudo -u postgres psql listing of
+ * non-system databases and roles) to determine whether any undeclared
+ * (hand-installed) Postgres databases or roles exist on this VM.
+ *
+ * The probe output has the structure:
+ *
+ *   DATABASES:
+ *   <db1>
+ *   <db2>
+ *   ROLES:
+ *   <role1>
+ *   <role2>
+ *
+ * System databases excluded at query time: postgres, template0, template1.
+ * System roles excluded at query time: pg_* prefix + postgres.
+ *
+ * Pass: no non-system databases AND no non-system roles, OR the AppRecord
+ *       declares a real dbBackend ("dblab" or "template") so the DB presence
+ *       is expected and managed.
+ *
+ * Fail: non-system databases or roles exist AND the AppRecord does NOT declare
+ *       a DB backend (dbBackend absent or "none") — indicating a hand-installed
+ *       DB that lives outside the managed dblab flow.
+ *
+ * Unknown (fail-safe): probe output is empty or contains an error string
+ *       (psql absent, socket unreachable, sudo denied). The sweep continues.
+ *
+ * @param stdout      Raw output from the dark-db probe section.
+ * @param dbBackend   AppRecord.dbBackend (may be undefined = absent).
+ * @param databaseUrlEnv AppRecord.databaseUrlEnv (informational; absent = no declared DB).
+ */
+export function parseDarkDbOutput(
+  stdout: string,
+  dbBackend: string | undefined,
+  databaseUrlEnv: string | undefined,
+): Pick<DoctorResult, "status" | "stdout" | "stderr"> & { description?: string } {
+  const out = stdout.trim();
+
+  // Empty output = probe failed (psql absent or socket unreachable) → unknown.
+  if (out === "") {
+    return { status: "unknown", stdout: out, stderr: "" };
+  }
+
+  // If the output does not contain our structural markers AND does not look
+  // like a clean DB/role name (i.e. looks like an error message), treat as
+  // unknown (fail-safe).
+  const hasStructure = out.includes("DATABASES:") || out.includes("ROLES:");
+  const looksLikeError =
+    /could not connect|error:|fatal:|permission denied|psql:|command not found/i.test(out);
+  if (!hasStructure && looksLikeError) {
+    return { status: "unknown", stdout: out, stderr: "" };
+  }
+
+  // When the AppRecord declares a real DB backend, the presence of databases
+  // is expected — do NOT flag as dark.
+  const isDeclared =
+    dbBackend !== undefined &&
+    dbBackend !== "none" &&
+    dbBackend !== "";
+  if (isDeclared) {
+    return { status: "pass", stdout: out, stderr: "" };
+  }
+
+  // Parse the structured output to find non-system DB names and role names.
+  // The probe already filters out system names at the SQL level, but we parse
+  // defensively to handle both the structured (DATABASES:/ROLES:) form and the
+  // simple newline-delimited form (plain db names, no headers).
+  const lines = out.split("\n").map((l) => l.trim()).filter(Boolean);
+
+  let inRolesSection = false;
+  const appDatabases: string[] = [];
+  const appRoles: string[] = [];
+
+  for (const line of lines) {
+    if (line === "DATABASES:") {
+      inRolesSection = false;
+      continue;
+    }
+    if (line === "ROLES:") {
+      inRolesSection = true;
+      continue;
+    }
+    // Skip system names defensively (belt-and-suspenders beyond the SQL filter).
+    const SYSTEM_DB_NAMES = new Set(["postgres", "template0", "template1"]);
+    const SYSTEM_ROLE_PREFIX = "pg_";
+    if (!hasStructure) {
+      // No structural headers — treat all lines as DB names (simple probe output).
+      if (!SYSTEM_DB_NAMES.has(line)) {
+        appDatabases.push(line);
+      }
+    } else if (!inRolesSection) {
+      if (!SYSTEM_DB_NAMES.has(line)) {
+        appDatabases.push(line);
+      }
+    } else {
+      // Roles section.
+      if (line !== "postgres" && !line.startsWith(SYSTEM_ROLE_PREFIX)) {
+        appRoles.push(line);
+      }
+    }
+  }
+
+  const hasAppDatabases = appDatabases.length > 0;
+  const hasAppRoles = appRoles.length > 0;
+
+  if (!hasAppDatabases && !hasAppRoles) {
+    return { status: "pass", stdout: out, stderr: "" };
+  }
+
+  // Undeclared DB/role exists — FAIL (dark database detected).
+  const found: string[] = [];
+  if (hasAppDatabases) found.push(`databases: ${appDatabases.join(", ")}`);
+  if (hasAppRoles) found.push(`roles: ${appRoles.join(", ")}`);
+
+  // Include the expected env var name in the recommendation when the record
+  // has a databaseUrlEnv hint (helps the operator know which var to set).
+  const urlHint = databaseUrlEnv
+    ? ` Set databaseUrlEnv="${databaseUrlEnv}" when re-registering.`
+    : "";
+
+  return {
+    status: "fail",
+    stdout: out,
+    stderr: "",
+    description:
+      `dark (undeclared) Postgres ${found.join("; ")} found on VM ` +
+      `but AppRecord declares no DB backend (dbBackend absent/none). ` +
+      `Fold into managed flow: re-register with dbBackend=dblab and run migrations.${urlHint}`,
+  };
+}
+
+// ---------------------------------------------------------------------------
 // Evaluate a single DoctorCheck against its observed output.
 // ---------------------------------------------------------------------------
 
@@ -283,6 +419,8 @@ function evaluateDoctorCheck(
   sshPort: number,
   skip: boolean,
   serveKind?: "node" | "static",
+  /** AppRecord passed through for app-aware parsers (dark-db). Optional for back-compat. */
+  app?: AppRecord,
 ): DoctorResult {
   if (skip) {
     return {
@@ -383,6 +521,19 @@ function evaluateDoctorCheck(
       description: check.description,
       group: check.group,
       ...parsed,
+    };
+  }
+
+  // dark-db: custom parser — FAIL when undeclared app DBs/roles exist on VM.
+  if (check.id === "dark-db") {
+    const parsed = parseDarkDbOutput(observed, app?.dbBackend, app?.databaseUrlEnv);
+    return {
+      id: check.id,
+      description: parsed.description ?? check.description,
+      group: check.group,
+      status: parsed.status,
+      stdout: parsed.stdout,
+      stderr: parsed.stderr,
     };
   }
 
@@ -534,6 +685,10 @@ export async function auditVm(
   // The fix is to skip these three checks when app.kind === "static".
   // git-remote-no-token and app-health remain evaluated (git remote exists;
   // Caddy can still serve a 200 on the healthUrl).
+  //
+  // NOTE: dark-db is intentionally NOT in STATIC_APP_SKIP_IDS. Detecting a
+  // hand-installed Postgres on a static app VM is precisely the gamechangers
+  // scenario this check exists to surface. We still want to run it.
   const STATIC_APP_SKIP_IDS = new Set([
     "env-file-perms",
     "rls-nonsuperuser",
@@ -564,7 +719,7 @@ export async function auditVm(
       observed = ssListenersOutput;
     }
 
-    return evaluateDoctorCheck(check, observed, sshResult.stderr, record.sshPort, skip, serveKind);
+    return evaluateDoctorCheck(check, observed, sshResult.stderr, record.sshPort, skip, serveKind, app);
   });
 
   return results;

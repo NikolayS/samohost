@@ -8,9 +8,13 @@
   },
   "scripts": {
     "test": "bun test",
-    "typecheck": "bunx tsc --noEmit",
+    "test:all": "bun test && cd packages/auth && bun test test/",
+    "typecheck": "bunx tsc --noEmit && cd packages/auth && bunx tsc --noEmit",
     "samohost": "bun run src/cli.ts"
   },
+  "workspaces": [
+    "packages/*"
+  ],
   "devDependencies": {
     "@types/bun": "^1.3.14",
     "typescript": "^6.0.3"

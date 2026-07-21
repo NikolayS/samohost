@@ -555,6 +555,7 @@ export function buildDeployScript(app: AppRecord, target: DeployTarget): string 
         "${SAMOHOST_CANDIDATE_DIR}",
         "${SAMOHOST_STATIC_DIR}",
         app.mainListen !== "cp-http80",
+        app.name,
       ),
       `CADDY`,
       'samohost_assert_static_tree_safe "$SAMOHOST_CANDIDATE_REAL" "$SAMOHOST_STATIC_DIR" "$SAMOHOST_STATIC_ROOT" || rollback',

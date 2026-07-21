@@ -348,14 +348,21 @@ describe("buildHostBootstrapScript — Caddy config", () => {
 
   test("script runs `caddy validate` before reload", () => {
     const script = buildHostBootstrapScript(fieldRecord(), defaultOpts());
-    const scriptLower = script;
-    expect(scriptLower).toContain("caddy validate");
-    // validate must appear before reload
-    const validateIdx = scriptLower.indexOf("caddy validate");
-    const reloadIdx = scriptLower.indexOf("caddy reload") !== -1
-      ? scriptLower.indexOf("caddy reload")
-      : scriptLower.indexOf("systemctl reload caddy");
-    expect(validateIdx).toBeLessThan(reloadIdx);
+    expect(script).toContain("caddy validate");
+    // validate must appear before the EXECUTABLE reload line.
+    // Find the first reload that is an actual command (not a sudoers NOPASSWD grant).
+    // Executable reloads: lines containing "systemctl reload caddy" but NOT "NOPASSWD:"
+    const validateIdx = script.indexOf("caddy validate");
+    const lines = script.split("\n");
+    const reloadLineIdx = lines.findIndex(
+      (l) => (l.includes("caddy reload") || l.includes("systemctl reload caddy")) &&
+              !l.includes("NOPASSWD:")
+    );
+    // Convert line index to character offset for comparison
+    const reloadCharIdx = lines.slice(0, reloadLineIdx).join("\n").length;
+    expect(validateIdx).toBeGreaterThanOrEqual(0);
+    expect(reloadLineIdx).toBeGreaterThanOrEqual(0);
+    expect(validateIdx).toBeLessThan(reloadCharIdx);
   });
 
   test("tlsMode:local => `local_certs` global is present", () => {

@@ -67,6 +67,35 @@ export const DBLAB_PROBES: AuditCheck[] = [
     probeCommand: "pg_isready -h 127.0.0.1 -p 5432 2>&1 || true",
     expect: "",
   },
+  {
+    // Bug C (2026-07-16 samograph): postgres started BEFORE docker0 was
+    // assigned its IP → postgres never bound 172.17.0.1 even though
+    // listen_addresses included it. logicalDump runs pg_dump from a
+    // temporary `postgresai/extended-postgres` container using the source
+    // connection host in server.yml. When that host is unreachable the
+    // scheduled refresh (weekly: `timetable: "0 3 * * 0"`) marks the pool
+    // "empty" and DROPS ALL LIVE CLONES. This probe catches the condition
+    // BEFORE the Sunday refresh runs.
+    //
+    // The probe runs `nc` from INSIDE the dblab_server container so it
+    // tests the exact same network path that logicalDump uses. It requires
+    // the container to have `--add-host=host.docker.internal:host-gateway`
+    // (the durable fix; see docs/dblab-install-runbook.md "Bug C").
+    //
+    // The container must also have postgresql@16-main.service starting
+    // AFTER docker.service so postgres binds the docker0 address on every
+    // boot (see the postgresql ordering drop-in in the runbook).
+    id: "dblab-source-reachable",
+    description:
+      "logicalDump source reachable: nc host.docker.internal:5432 from dblab container",
+    probeCommand:
+      "docker exec dblab_server sh -c " +
+      "'nc -w2 -z host.docker.internal 5432 2>&1 && " +
+      "echo \"host.docker.internal ($(getent hosts host.docker.internal | awk \"{print \\$1}\"):5432) open\" " +
+      "|| echo \"NO_SOURCE: $(nc -w2 host.docker.internal 5432 2>&1 || true)\"' " +
+      "2>/dev/null || echo NO_SOURCE_PROBE",
+    expect: "",
+  },
 ];
 
 export type PreflightStatus = "READY" | "BLOCKED" | "UNKNOWN";
@@ -82,6 +111,19 @@ export interface DblabPreflightReport {
   engine: PreflightStatus;
   /** Readiness of the `--db template` fallback (local Postgres up). */
   templateFallback: PreflightStatus;
+  /**
+   * Reachability of the logicalDump source from inside the dblab container.
+   *
+   * READY   : nc succeeded — the scheduled refresh will find the source.
+   * BLOCKED : nc refused/failed — the Sunday refresh WILL DROP ALL CLONES
+   *           unless fixed (Bug C: postgres not bound on docker0 address).
+   * UNKNOWN : probe missing or container not running (install --add-host).
+   *
+   * This is SEPARATE from the `engine` verdict: the engine (clones) can
+   * be up even when the source is broken — it only matters for the next
+   * scheduled refresh. Do NOT downgrade `engine` based on this verdict.
+   */
+  source: PreflightStatus;
   checks: DblabCheckResult[];
   reasons: string[];
 }
@@ -235,5 +277,78 @@ export function evaluateDblabPreflight(
     );
   }
 
-  return { engine, templateFallback, checks, reasons };
+  // ---- source reachability verdict (Bug C — 2026-07-16 time bomb) ----------
+  //
+  // The logicalDump job runs pg_dump from a temporary container using the
+  // source.connection host configured in server.yml. If that host is
+  // unreachable (e.g. postgres bound only on 127.0.0.1 but not the docker0
+  // address 172.17.0.1 because postgres started before dockerd assigned it),
+  // the scheduled refresh marks the pool "empty" and DROPS ALL LIVE CLONES.
+  //
+  // This verdict is intentionally separate from `engine`: the engine and
+  // clones may be healthy while the source is broken (current clones still
+  // work; only the NEXT REFRESH bombs). Callers that gate only on
+  // `engine === "READY"` remain unaffected; callers that want to surface the
+  // time-bomb warning should also check `source`.
+  const srcRaw = get("dblab-source-reachable");
+  let source: PreflightStatus;
+
+  if (srcRaw === undefined) {
+    // Section absent — old probe set (no dblab-source-reachable in DBLAB_PROBES
+    // OR connection died before reaching this probe).
+    source = "UNKNOWN";
+    checks.push({
+      id: "dblab-source-reachable",
+      status: "unknown",
+      detail: "no probe output",
+    });
+    reasons.push(
+      "source: dblab-source-reachable probe section absent — " +
+        "recreate the dblab container with " +
+        "--add-host=host.docker.internal:host-gateway per docs/dblab-install-runbook.md",
+    );
+  } else if (srcRaw.includes("NO_SOURCE_PROBE")) {
+    // Probe ran but the container was not running OR no exec permission.
+    source = "UNKNOWN";
+    checks.push({
+      id: "dblab-source-reachable",
+      status: "unknown",
+      detail: srcRaw.trim(),
+    });
+    reasons.push(
+      "source: could not exec into dblab_server container — " +
+        "ensure the container is running and recreate it with " +
+        "--add-host=host.docker.internal:host-gateway",
+    );
+  } else if (srcRaw.includes("NO_SOURCE:")) {
+    // nc from the container failed — source unreachable. Time-bomb state.
+    source = "BLOCKED";
+    checks.push({
+      id: "dblab-source-reachable",
+      status: "fail",
+      detail: srcRaw.trim(),
+    });
+    reasons.push(
+      "source: logicalDump source unreachable from dblab container — " +
+        "host postgres is not bound on the docker0 address (172.17.0.1:5432). " +
+        "This is the Bug C time bomb: the next scheduled refresh will run " +
+        "pg_dump → Connection refused → mark pool 'empty' → DROP ALL LIVE CLONES. " +
+        "Fix NOW (in order): " +
+        "(1) restart postgresql@16-main so it binds 172.17.0.1 per listen_addresses; " +
+        "(2) add a drop-in After=docker.service to postgresql@16-main.service " +
+        "    so the bind survives reboots (see docs/dblab-install-runbook.md Bug C); " +
+        "(3) recreate the dblab container with --add-host=host.docker.internal:host-gateway " +
+        "    so host.docker.internal resolves to the gateway IP at runtime.",
+    );
+  } else {
+    // nc succeeded — source is reachable.
+    source = "READY";
+    checks.push({
+      id: "dblab-source-reachable",
+      status: "pass",
+      detail: srcRaw.trim(),
+    });
+  }
+
+  return { engine, templateFallback, source, checks, reasons };
 }

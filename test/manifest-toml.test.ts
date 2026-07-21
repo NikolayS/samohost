@@ -2251,3 +2251,353 @@ describe("runAppRegisterFromToml — secrets + databaseUrlEnv threaded to AppRec
     expect(rec?.secrets).toBeUndefined();
   });
 });
+
+// ---------------------------------------------------------------------------
+// static-db-drift: kind=static MUST NOT declare any DB fields
+//
+// A kind=static app NEVER runs migrations in either path:
+//   - env-create branches to buildStaticEnvCreateScript (no migrate phase)
+//   - prod deploy's migrate block is inside the node-only else branch
+// Declaring DB fields on a static app produces silent drift — migrations
+// are configured but never run. validateStaticNoDb() catches this loudly.
+//
+// RED: these tests fail until validateStaticNoDb() is implemented and wired
+// into parseSamohostToml() and runAppRegister().
+// ---------------------------------------------------------------------------
+
+describe("parseSamohostToml — kind=static with DB fields is rejected (validateStaticNoDb)", () => {
+  /** Minimal valid static manifest, with optional extra fields appended. */
+  function minimalStatic(extra: string = ""): string {
+    return [
+      'name        = "static-app"',
+      'repo        = "owner/static-app"',
+      'branch      = "main"',
+      'appDir      = "/opt/static-app/app"',
+      'buildCmd    = "npm run build"',
+      'healthUrl   = "http://localhost:8080/index.html"',
+      'serviceUnit = "static-app"',
+      'kind        = "static"',
+      'staticRoot  = "dist"',
+      extra,
+    ].filter(Boolean).join("\n");
+  }
+
+  /** Minimal valid node manifest, with optional extra fields appended. */
+  function minimalNode(extra: string = ""): string {
+    return [
+      'name        = "node-app"',
+      'repo        = "owner/node-app"',
+      'branch      = "main"',
+      'appDir      = "/opt/node-app/app"',
+      'buildCmd    = "npm run build"',
+      'healthUrl   = "http://localhost:3000/health"',
+      'serviceUnit = "node-app"',
+      extra,
+    ].filter(Boolean).join("\n");
+  }
+
+  // static-db-1: kind=static + migrateCmd → error names the field
+  test("static-db-1: kind=static + migrateCmd → error names migrateCmd", () => {
+    const result = parseSamohostToml(minimalStatic('migrateCmd = "npm run migrate"'));
+    expect(result.ok).toBe(false);
+    if (result.ok) throw new Error("expected ok=false");
+    const joined = result.errors.join("\n");
+    expect(joined).toContain("migrateCmd");
+    expect(joined).toContain("kind=node");
+  });
+
+  // static-db-2: kind=static + dbBackend=dblab → error names dbBackend
+  test("static-db-2: kind=static + dbBackend=dblab → error names dbBackend", () => {
+    const result = parseSamohostToml(
+      minimalStatic('dbBackend = "dblab"\ndatabaseUrlEnv = "DATABASE_URL"'),
+    );
+    expect(result.ok).toBe(false);
+    if (result.ok) throw new Error("expected ok=false");
+    const joined = result.errors.join("\n");
+    expect(joined).toContain("dbBackend");
+    expect(joined).toContain("kind=node");
+  });
+
+  // static-db-3: kind=static + dbBackend=template → error names dbBackend
+  test("static-db-3: kind=static + dbBackend=template → error names dbBackend", () => {
+    const result = parseSamohostToml(
+      minimalStatic('dbBackend = "template"\ndatabaseUrlEnv = "DATABASE_URL"'),
+    );
+    expect(result.ok).toBe(false);
+    if (result.ok) throw new Error("expected ok=false");
+    const joined = result.errors.join("\n");
+    expect(joined).toContain("dbBackend");
+    expect(joined).toContain("kind=node");
+  });
+
+  // static-db-4: kind=static + databaseUrlEnv → error names databaseUrlEnv
+  test("static-db-4: kind=static + databaseUrlEnv → error names databaseUrlEnv", () => {
+    const result = parseSamohostToml(minimalStatic('databaseUrlEnv = "DATABASE_URL"'));
+    expect(result.ok).toBe(false);
+    if (result.ok) throw new Error("expected ok=false");
+    const joined = result.errors.join("\n");
+    expect(joined).toContain("databaseUrlEnv");
+    expect(joined).toContain("kind=node");
+  });
+
+  // static-db-5: kind=static + envDbVars non-empty → error names envDbVars
+  test("static-db-5: kind=static + envDbVars non-empty → error names envDbVars", () => {
+    const result = parseSamohostToml(
+      minimalStatic('envDbVars = ["DATABASE_URL"]'),
+    );
+    expect(result.ok).toBe(false);
+    if (result.ok) throw new Error("expected ok=false");
+    const joined = result.errors.join("\n");
+    expect(joined).toContain("envDbVars");
+    expect(joined).toContain("kind=node");
+  });
+
+  // static-db-6: kind=static + previewDbBackend=dblab → error names previewDbBackend
+  test("static-db-6: kind=static + previewDbBackend=dblab → error names previewDbBackend", () => {
+    const result = parseSamohostToml(
+      minimalStatic('previewDbBackend = "dblab"\ndatabaseUrlEnv = "DATABASE_URL"'),
+    );
+    expect(result.ok).toBe(false);
+    if (result.ok) throw new Error("expected ok=false");
+    const joined = result.errors.join("\n");
+    expect(joined).toContain("previewDbBackend");
+    expect(joined).toContain("kind=node");
+  });
+
+  // static-db-7: multiple DB fields set → ALL named in errors (all-errors-collected)
+  test("static-db-7: kind=static + migrateCmd + databaseUrlEnv + envDbVars → all three named in errors", () => {
+    const result = parseSamohostToml(
+      minimalStatic([
+        'migrateCmd     = "npm run migrate"',
+        'databaseUrlEnv = "DATABASE_URL"',
+        'envDbVars      = ["DATABASE_URL", "APP_DATABASE_URL"]',
+      ].join("\n")),
+    );
+    expect(result.ok).toBe(false);
+    if (result.ok) throw new Error("expected ok=false");
+    const joined = result.errors.join("\n");
+    expect(joined).toContain("migrateCmd");
+    expect(joined).toContain("databaseUrlEnv");
+    expect(joined).toContain("envDbVars");
+    expect(joined).toContain("kind=node");
+  });
+
+  // static-db-8: kind=static + dbBackend="none" (explicit) → OK (plain static with no DB)
+  test("static-db-8: kind=static + dbBackend=none → ok (plain static with explicit no-DB declaration)", () => {
+    const result = parseSamohostToml(minimalStatic('dbBackend = "none"'));
+    if (!result.ok) {
+      throw new Error("expected ok=true; errors: " + result.errors.join(", "));
+    }
+    expect(result.ok).toBe(true);
+  });
+
+  // static-db-9: kind=static with no DB fields → OK (plain static)
+  test("static-db-9: kind=static with no DB fields → ok (plain static manifest unchanged)", () => {
+    const result = parseSamohostToml(minimalStatic());
+    if (!result.ok) {
+      throw new Error("expected ok=true; errors: " + result.errors.join(", "));
+    }
+    expect(result.ok).toBe(true);
+  });
+
+  // static-db-10: kind=node + DB fields → OK (coherent DB-backed node app, no false positive)
+  test("static-db-10: kind=node + migrateCmd + dbBackend + databaseUrlEnv + envDbVars → ok (coherent node app)", () => {
+    const result = parseSamohostToml(
+      minimalNode([
+        'migrateCmd     = "npm run migrate"',
+        'dbBackend      = "dblab"',
+        'databaseUrlEnv = "DATABASE_URL"',
+        'envDbVars      = ["DATABASE_URL"]',
+      ].join("\n")),
+    );
+    if (!result.ok) {
+      throw new Error("expected ok=true; errors: " + result.errors.join(", "));
+    }
+    expect(result.ok).toBe(true);
+  });
+
+  // static-db-11: kind absent (defaults to node) + DB fields → OK (legacy/node apps unchanged)
+  test("static-db-11: kind absent (implicit node) + DB fields → ok (legacy apps unchanged)", () => {
+    const result = parseSamohostToml(
+      minimalNode([
+        'migrateCmd     = "npm run migrate"',
+        'dbBackend      = "dblab"',
+        'databaseUrlEnv = "DATABASE_URL"',
+      ].join("\n")),
+    );
+    if (!result.ok) {
+      throw new Error("expected ok=true; errors: " + result.errors.join(", "));
+    }
+    expect(result.ok).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// static-db-reg: runAppRegister rejects kind=static + DB fields programmatically
+//
+// The TOML parse path catches these at manifest-parse time.
+// The register path must also catch them so a programmatic caller (not using
+// --from-toml) cannot persist an incoherent AppRecord.
+// ---------------------------------------------------------------------------
+
+describe("runAppRegister — kind=static with DB fields rejected (validateStaticNoDb)", () => {
+  let dir: string;
+  let vmStore: StateStore;
+  let appStore: AppStore;
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), "samohost-static-db-reg-"));
+    vmStore = new StateStore(join(dir, "state.json"));
+    appStore = new AppStore(join(dir, "apps.json"));
+    vmStore.upsert(vm());
+  });
+
+  afterEach(() => rmSync(dir, { recursive: true, force: true }));
+
+  /** Shared minimal static register input (no DB fields). */
+  function staticBase(): Parameters<typeof runAppRegister>[0] {
+    return {
+      vm: "samo-we-field-record",
+      name: "static-app",
+      repo: "owner/static-app",
+      branch: "main",
+      appDir: "/opt/static-app/app",
+      buildCmd: "npm run build",
+      serviceUnit: "static-app",
+      healthUrl: "http://localhost:8080/index.html",
+      rlsNonSuperuser: false,
+      kind: "static" as const,
+      staticRoot: "dist",
+    };
+  }
+
+  // reg-sdb-1: kind=static + migrateCmd → exit 1, error names migrateCmd
+  test("reg-sdb-1: kind=static + migrateCmd → exit 1, error names migrateCmd", () => {
+    const c = capture();
+    const code = runAppRegister(
+      { ...staticBase(), migrateCmd: "npm run migrate" },
+      { json: false },
+      vmStore,
+      appStore,
+      c.out,
+      c.err,
+    );
+    expect(code).toBe(1);
+    expect(c.e).toContain("migrateCmd");
+    expect(c.e).toContain("kind=node");
+    // Must not have persisted the app
+    expect(appStore.get("vm-1111", "static-app")).toBeUndefined();
+  });
+
+  // reg-sdb-2: kind=static + dbBackend=dblab → exit 1, error names dbBackend
+  test("reg-sdb-2: kind=static + dbBackend=dblab → exit 1, error names dbBackend", () => {
+    const c = capture();
+    const code = runAppRegister(
+      { ...staticBase(), dbBackend: "dblab" as const, databaseUrlEnv: "DATABASE_URL" },
+      { json: false },
+      vmStore,
+      appStore,
+      c.out,
+      c.err,
+    );
+    expect(code).toBe(1);
+    expect(c.e).toContain("dbBackend");
+    expect(c.e).toContain("kind=node");
+    expect(appStore.get("vm-1111", "static-app")).toBeUndefined();
+  });
+
+  // reg-sdb-3: kind=static + databaseUrlEnv → exit 1, error names databaseUrlEnv
+  test("reg-sdb-3: kind=static + databaseUrlEnv → exit 1, error names databaseUrlEnv", () => {
+    const c = capture();
+    const code = runAppRegister(
+      { ...staticBase(), databaseUrlEnv: "DATABASE_URL" },
+      { json: false },
+      vmStore,
+      appStore,
+      c.out,
+      c.err,
+    );
+    expect(code).toBe(1);
+    expect(c.e).toContain("databaseUrlEnv");
+    expect(c.e).toContain("kind=node");
+    expect(appStore.get("vm-1111", "static-app")).toBeUndefined();
+  });
+
+  // reg-sdb-4: kind=static + envDbVars non-empty → exit 1, error names envDbVars
+  test("reg-sdb-4: kind=static + envDbVars non-empty → exit 1, error names envDbVars", () => {
+    const c = capture();
+    const code = runAppRegister(
+      { ...staticBase(), envDbVars: ["DATABASE_URL"] },
+      { json: false },
+      vmStore,
+      appStore,
+      c.out,
+      c.err,
+    );
+    expect(code).toBe(1);
+    expect(c.e).toContain("envDbVars");
+    expect(c.e).toContain("kind=node");
+    expect(appStore.get("vm-1111", "static-app")).toBeUndefined();
+  });
+
+  // reg-sdb-5: kind=static with no DB fields → exit 0 (plain static unchanged)
+  test("reg-sdb-5: kind=static with no DB fields → exit 0, app persisted (plain static unchanged)", () => {
+    const c = capture();
+    const code = runAppRegister(
+      staticBase(),
+      { json: false },
+      vmStore,
+      appStore,
+      c.out,
+      c.err,
+    );
+    expect(code).toBe(0);
+    expect(appStore.get("vm-1111", "static-app")).toBeDefined();
+  });
+
+  // reg-sdb-6: kind=static + dbBackend=none → exit 0 (explicit no-DB is valid)
+  test("reg-sdb-6: kind=static + dbBackend=none → exit 0 (explicit no-DB declaration)", () => {
+    const c = capture();
+    const code = runAppRegister(
+      { ...staticBase(), dbBackend: "none" as const },
+      { json: false },
+      vmStore,
+      appStore,
+      c.out,
+      c.err,
+    );
+    expect(code).toBe(0);
+    const rec = appStore.get("vm-1111", "static-app");
+    expect(rec).toBeDefined();
+    expect(rec?.dbBackend).toBe("none");
+  });
+
+  // reg-sdb-7: kind=node + DB fields → exit 0 (coherent, no false positive)
+  test("reg-sdb-7: kind=node + DB fields → exit 0 (coherent node app, no false positive)", () => {
+    const c = capture();
+    const code = runAppRegister(
+      {
+        vm: "samo-we-field-record",
+        name: "node-app",
+        repo: "owner/node-app",
+        branch: "main",
+        appDir: "/opt/node-app/app",
+        buildCmd: "npm run build",
+        serviceUnit: "node-app",
+        healthUrl: "http://localhost:3000/health",
+        rlsNonSuperuser: false,
+        migrateCmd: "npm run migrate",
+        dbBackend: "dblab" as const,
+        databaseUrlEnv: "DATABASE_URL",
+        envDbVars: ["DATABASE_URL"],
+      },
+      { json: false },
+      vmStore,
+      appStore,
+      c.out,
+      c.err,
+    );
+    expect(code).toBe(0);
+    expect(appStore.get("vm-1111", "node-app")).toBeDefined();
+  });
+});

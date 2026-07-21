@@ -78,4 +78,32 @@ export interface ProviderPort {
   /** Volumes attached to a server — reported by destroy, NEVER auto-deleted. */
   listVolumes(serverId: string): Promise<VolumeInfo[]>;
   normalizeError(e: unknown): ProviderError;
+  /**
+   * Enable Hetzner built-in automated backups for a server.
+   * POST /servers/{id}/actions/enable_backup — no request body required.
+   * Idempotent: calling on an already-backed-up server is a no-op.
+   * 20% monthly surcharge on the server price.
+   *
+   * Optional on the interface so custom ProviderPort implementations that
+   * pre-date this method (or target clouds without an equivalent) can degrade
+   * gracefully. The typeof guard in provision.ts gates the call accordingly.
+   */
+  enableBackup?(id: string): Promise<void>;
+}
+
+/**
+ * ServerInfo extended with backup state, returned by getWithBackup().
+ * backup_window is null when backups are disabled, or a time-window string
+ * (e.g. "22-02") when enabled.
+ */
+export interface ServerInfoWithBackup extends ServerInfo {
+  backup_window: string | null;
+}
+
+/**
+ * Extension of ProviderPort that can read backup_window per server.
+ * Used by the fleet-doctor backup-enabled guardrail.
+ */
+export interface ProviderPortWithBackup extends ProviderPort {
+  getWithBackup(id: string): Promise<ServerInfoWithBackup>;
 }

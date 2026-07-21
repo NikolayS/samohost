@@ -303,6 +303,23 @@ export async function runProvision(
       providerId: info.providerId,
       ip: info.ipv4 ?? "",
     });
+
+    // ---- enable Hetzner automated backups (non-fatal if it fails) ----
+    // POST /servers/{id}/actions/enable_backup — no body, 20% surcharge.
+    // Idempotent: calling on an already-backed-up server is a no-op.
+    // Failure is logged as a warning but does NOT abort provisioning; the
+    // fleet-doctor backup-enabled check will surface missed servers.
+    if (typeof deps.provider.enableBackup === "function") {
+      try {
+        await deps.provider.enableBackup(info.providerId);
+      } catch (backupErr) {
+        const norm = deps.provider.normalizeError(backupErr);
+        err(
+          `warning: backup enable failed for ${info.providerId} [${norm.kind}]: ` +
+            `${norm.message} — run fleet-doctor to surface and remediate.`,
+        );
+      }
+    }
   } catch (e) {
     const norm = deps.provider.normalizeError(e);
     persist({ lifecycleState: "failed" });
