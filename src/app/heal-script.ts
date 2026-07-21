@@ -304,7 +304,10 @@ export function buildConfigHealScript(app: AppRecord, opts: BuildConfigHealScrip
     "fi",
     `# Also guard against the app's mainHost appearing as an inline site block`,
     `# in the Caddyfile even when the import line exists (transitional state).`,
-    `if grep -qF ${sq(app.mainHost)} /etc/caddy/Caddyfile 2>/dev/null; then`,
+    `# Strip comment lines (lines whose first non-whitespace char is '#') before`,
+    `# checking — a comment mentioning the host (e.g. historical note) must NOT`,
+    `# trigger the guard; only a real structural site-block line should fire.`,
+    `if grep -v '^[[:space:]]*#' /etc/caddy/Caddyfile 2>/dev/null | grep -qF ${sq(app.mainHost)}; then`,
     `  echo "inline-caddyfile: ${app.mainHost} is declared as an inline site block in /etc/caddy/Caddyfile — heal skipped (remove inline block first)"`,
     `  ${marker("heal", "ok")}`,
     "  exit 0",
@@ -400,7 +403,7 @@ export function buildConfigHealScript(app: AppRecord, opts: BuildConfigHealScrip
             `    # adopt-provenance: check if file content matches regenerated (minus header)`,
             `    _new_main_vhost=$(mktemp)`,
             `    cat > "$_new_main_vhost" <<'SAMOHOST_MAIN_VHOST_CONTENT'`,
-            ...regeneratedMainVhost!.split("\n"),
+            ...regeneratedMainVhost!.replace(/\n$/, "").split("\n"),
             "SAMOHOST_MAIN_VHOST_CONTENT",
             // Compare file content against regenerated (both files; cmp is byte-exact).
             // If they differ, fall through to drift-foreign.
@@ -437,7 +440,7 @@ export function buildConfigHealScript(app: AppRecord, opts: BuildConfigHealScrip
       // final staged sites.d path requires privilege.
       // Single-quoted heredoc delimiter → no shell expansion of vhost content.
       `    cat > "$_new_main_vhost" <<'SAMOHOST_MAIN_VHOST_CONTENT'`,
-      ...regeneratedMainVhost!.split("\n"),
+      ...regeneratedMainVhost!.replace(/\n$/, "").split("\n"),
       "SAMOHOST_MAIN_VHOST_CONTENT",
       `    if cmp -s ${sq(mainVhostPath)} "$_new_main_vhost"; then`,
       `      rm -f "$_new_main_vhost"`,
@@ -457,7 +460,7 @@ export function buildConfigHealScript(app: AppRecord, opts: BuildConfigHealScrip
       'elif [[ "${SAMOHOST_MAIN_VHOST_BACKUP:-}" != "" ]]; then',
       "  # File did not exist — no provenance check needed, write fresh",
       `  if sudo /usr/bin/tee ${sq(mainVhostPath)} >/dev/null <<'SAMOHOST_MAIN_VHOST_CONTENT'`,
-      ...regeneratedMainVhost!.split("\n"),
+      ...regeneratedMainVhost!.replace(/\n$/, "").split("\n"),
       "SAMOHOST_MAIN_VHOST_CONTENT",
       "  then",
       "    echo \"main vhost: created\"",
