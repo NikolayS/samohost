@@ -1,0 +1,48 @@
+# umami-site.samohost.toml.tmpl — samohost manifest template for a per-site
+# Umami analytics instance.
+#
+# Rendered by: samohost recipe umami-site --vm <vm> --site <slug> \
+#                --host <fqdn> --port <n> --umami-repo <owner/name> \
+#                [--umami-ref v3]
+#
+# Umami is onboarded as a NODE APP: one AppRecord per site, its own managed
+# Postgres DB (via `samohost app bootstrap --db-name umami_<slug>`), and its
+# own Caddy mainHost vhost.  Everything (app + data) lives on the client VM.
+#
+# BUILD NOTE: Umami's Next.js build MUST NOT run on the VM (OOMs cx23).
+# buildCmd is /usr/bin/true — the app repo must contain a pre-built Umami
+# standalone artifact (server.js + public/) committed under .next/standalone/.
+# See docs/recipes/umami-per-site.md for the off-VM artifact build runbook.
+#
+# RELEASE NOTE: upstream Umami uses v2.x/v3.x semver tags which do NOT match
+# samohost's date grammar (vYYYYMMDD.N).  The release-tag fields are
+# intentionally absent.  Pin via branch/ref (--umami-ref default: v3).
+
+# ---- required fields -------------------------------------------------------
+name        = "{{name}}"
+repo        = "{{repo}}"
+branch      = "{{ref}}"
+appDir      = "/opt/{{name}}/app"
+buildCmd    = "/usr/bin/true"
+healthUrl   = "http://127.0.0.1:{{port}}/api/heartbeat"
+serviceUnit = "{{name}}"
+
+# ---- app user --------------------------------------------------------------
+appUser     = "{{appUser}}"
+
+# ---- public vhost ----------------------------------------------------------
+mainHost    = "{{host}}"
+mainListen  = "cp-http80"
+
+# ---- database (managed by samohost app bootstrap; Umami owns its own DB) ---
+# dbBackend="none" tells samohost that preview environments do not need a
+# DBLab thin-clone: Umami manages its own Postgres separately from the
+# samohost preview pipeline.  The production DB is bootstrapped once by the
+# operator using `samohost app bootstrap --db-name umami_<slug>`.
+dbBackend        = "none"
+previewDbBackend = "none"
+
+# databaseUrlEnv + envDbVars are declared so that if a DB-backed preview is
+# ever wired up in future, samohost knows which var holds the DB URL.
+databaseUrlEnv   = "DATABASE_URL"
+envDbVars        = ["DATABASE_URL"]

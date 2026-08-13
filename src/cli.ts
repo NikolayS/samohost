@@ -125,6 +125,10 @@ import {
   type OnboardInput,
   type OnboardReport,
 } from "./commands/onboard.ts";
+import {
+  runRecipeUmamiSite,
+  type UmamiSiteInput,
+} from "./commands/recipe-umami.ts";
 
 /**
  * Compute the CLI exit code for an onboard run.
@@ -640,6 +644,11 @@ export interface ParsedOnboard {
   input: OnboardInput;
 }
 
+export interface ParsedRecipeUmamiSite {
+  kind: "recipe-umami-site";
+  input: UmamiSiteInput;
+}
+
 export type ParsedCommand =
   | ParsedPreview
   | ParsedPreviewRebuild
@@ -674,6 +683,7 @@ export type ParsedCommand =
   | ParsedDomainRm
   | ParsedDomainSearch
   | ParsedOnboard
+  | ParsedRecipeUmamiSite
   | { kind: "help" }
   | { kind: "version" };
 
@@ -745,6 +755,9 @@ export function parseArgs(
   }
   if (first === "onboard") {
     return parseOnboard(argv.slice(1));
+  }
+  if (first === "recipe") {
+    return parseRecipe(argv.slice(1));
   }
 
   // A bare --help/--version may also appear after an (absent) command.
@@ -2128,6 +2141,88 @@ function parseTriggerRun(args: string[]): ParsedTriggerRun {
 // ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
+// recipe
+// ---------------------------------------------------------------------------
+
+type RecipeSub = "umami-site";
+
+const RECIPE_SUBS: readonly RecipeSub[] = ["umami-site"];
+
+/** Default Umami ref: current stable release line. */
+const DEFAULT_UMAMI_REF = "v3";
+
+function parseRecipe(args: string[]): ParsedCommand {
+  const sub = args[0];
+  if (sub === undefined) {
+    throw new UsageError(
+      `recipe requires a subcommand: ${RECIPE_SUBS.join(" | ")}`,
+    );
+  }
+  if (!(RECIPE_SUBS as readonly string[]).includes(sub)) {
+    throw new UsageError(`unknown recipe subcommand: ${sub}`);
+  }
+  const rest = args.slice(1);
+  switch (sub as RecipeSub) {
+    case "umami-site":
+      return parseRecipeUmamiSite(rest);
+  }
+}
+
+function parseRecipeUmamiSite(args: string[]): ParsedRecipeUmamiSite {
+  let vm: string | undefined;
+  let slug: string | undefined;
+  let host: string | undefined;
+  let port: number | undefined;
+  let umamiRepo: string | undefined;
+  let umamiRef: string = DEFAULT_UMAMI_REF;
+
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i]!;
+    switch (a) {
+      case "--vm":
+        vm = takeValue(args, i, a);
+        i++;
+        break;
+      case "--site":
+        slug = takeValue(args, i, a);
+        i++;
+        break;
+      case "--host":
+        host = takeValue(args, i, a);
+        i++;
+        break;
+      case "--port":
+        port = parseIntFlag(takeValue(args, i, a), a);
+        i++;
+        break;
+      case "--umami-repo":
+        umamiRepo = takeValue(args, i, a);
+        i++;
+        break;
+      case "--umami-ref":
+        umamiRef = takeValue(args, i, a);
+        i++;
+        break;
+      default:
+        if (a.startsWith("-")) {
+          throw new UsageError(`recipe umami-site: unknown flag: ${a}`);
+        }
+        throw new UsageError(`recipe umami-site: unexpected argument: ${a}`);
+    }
+  }
+
+  if (vm === undefined) throw new UsageError("recipe umami-site: --vm is required");
+  if (slug === undefined) throw new UsageError("recipe umami-site: --site is required");
+  if (host === undefined) throw new UsageError("recipe umami-site: --host is required");
+  if (port === undefined) throw new UsageError("recipe umami-site: --port is required");
+  if (umamiRepo === undefined) throw new UsageError("recipe umami-site: --umami-repo is required");
+
+  return {
+    kind: "recipe-umami-site",
+    input: { vm, slug, host, port, umamiRepo, umamiRef },
+  };
+}
+
 // onboard
 // ---------------------------------------------------------------------------
 
@@ -2700,6 +2795,14 @@ export async function main(
       );
       return computeOnboardExitCode(report);
     }
+    case "recipe-umami-site":
+      return runRecipeUmamiSite(
+        cmd.input,
+        new StateStore(),
+        defaultAppStore(),
+        out,
+        err,
+      );
   }
 }
 
