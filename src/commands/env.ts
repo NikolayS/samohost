@@ -337,6 +337,55 @@ export function deriveTarget(
   };
 }
 
+/** Complete an older env record without moving its already assigned listeners. */
+function completeRecordedTarget(
+  app: AppRecord,
+  env: EnvRecord,
+  existingOnVm: readonly EnvRecord[],
+  extraUsedPorts: readonly number[] = [],
+): EnvScriptTarget | { error: string } {
+  const target = targetFromRecord(env);
+  const { services, defaultListener } = servicesOf(app);
+  const listeners = services.flatMap(s => s.listeners);
+  if (listeners.length <= 1) return target;
+
+  // The scalar field has always identified the default listener. Keep it even
+  // when that listener is not first in declaration order, or is already bound.
+  const ports = { ...env.ports };
+  if (Object.hasOwn(ports, defaultListener) && ports[defaultListener] !== env.port) {
+    return { error: `listener port map for '${env.name}' disagrees with its recorded primary port` };
+  }
+  ports[defaultListener] = env.port;
+  const recorded = Object.values(ports);
+  if (recorded.some(p => !Number.isInteger(p) || p < 1 || p > 65535) ||
+      new Set(recorded).size !== recorded.length) {
+    return { error: `listener port map for '${env.name}' contains invalid or duplicate ports` };
+  }
+  const others = existingOnVm.filter(e => e.id !== env.id);
+  const otherPorts = others.flatMap(e => [e.port, ...Object.values(e.ports ?? {})]);
+  if (recorded.some(p => otherPorts.includes(p))) {
+    return { error: `listener port map for '${env.name}' conflicts with another recorded environment` };
+  }
+  const used = new Set([...recorded, ...otherPorts, ...extraUsedPorts]);
+  for (const listener of listeners) {
+    if (Object.hasOwn(ports, listener.name)) continue;
+    let port = DEFAULT_POOL.base;
+    while (port < DEFAULT_POOL.base + DEFAULT_POOL.size && used.has(port)) port++;
+    if (port === DEFAULT_POOL.base + DEFAULT_POOL.size) {
+      return { error: `port pool exhausted (${DEFAULT_POOL.size} ports from ${DEFAULT_POOL.base}) — destroy stale envs before adding listeners` };
+    }
+    ports[listener.name] = port;
+    used.add(port);
+  }
+  return { ...target, ports };
+}
+
+function needsListenerAllocation(app: AppRecord, env: EnvRecord): boolean {
+  const { services } = servicesOf(app);
+  const listeners = services.flatMap(s => s.listeners);
+  return listeners.length > 1 && listeners.some(l => !Object.hasOwn(env.ports ?? {}, l.name));
+}
+
 // ---------------------------------------------------------------------------
 // plan (offline)
 // ---------------------------------------------------------------------------
@@ -370,7 +419,9 @@ export function runEnvPlan(
   // Prefer the persisted record (stable name/port) when the env exists.
   const existing = envStore.get(r.vm.id, r.app.name, input.branch);
   const target = existing
-    ? targetFromRecord(existing)
+    ? input.destroy
+      ? targetFromRecord(existing)
+      : completeRecordedTarget(r.app, existing, envStore.listFor(r.vm.id))
     : deriveTarget(
         r.app,
         input.branch,
@@ -529,8 +580,8 @@ export interface EnvExecDeps {
    * record) and feeds the live-bound ports into allocation alongside the
    * store-recorded ones, so the preview lands on the lowest pool port that is
    * neither store-recorded NOR live-bound. A re-create reuses its OWN recorded
-   * port and never consults the probe (idempotent — its own port shows as bound
-   * but is legitimately ours, exactly #71's is-active case).
+   * ports. A re-create probes only when its recorded map needs additional
+   * listeners; existing assignments remain pinned even when live-bound.
    *
    * Production impl runs `ss -ltnH` over the pinned SSH runner and parses the
    * output with {@link parseListeningPorts}. THROWS on probe failure so the
@@ -709,12 +760,8 @@ export async function runEnvCreate(
 
   const existing = envStore.get(r.vm.id, r.app.name, input.branch);
   let target: EnvScriptTarget | { error: string };
-  if (existing) {
-    // Re-create reuses the recorded name/port (idempotent re-run after a failed
-    // create). It keeps its OWN port even when that port shows as live-bound —
-    // the bound listener IS our own unit (#71's is-active case), not a squatter.
-    target = targetFromRecord(existing);
-  } else {
+  let liveBound: readonly number[] = [];
+  if (!existing || needsListenerAllocation(r.app, existing)) {
     // Fresh env: probe the host for ports ACTUALLY bound (squatter robustness,
     // complement to #71). Allocation then skips any pool port that is either
     // store-recorded OR live-bound, so the preview never lands on a squatted
@@ -722,7 +769,6 @@ export async function runEnvCreate(
     // CLOSED rather than risk allocating onto a squatter — re-run after the
     // host is reachable. When no probe is wired, fall back to store-only and
     // let #71 guard the bind.
-    let liveBound: readonly number[] = [];
     if (deps.inUsePorts !== undefined) {
       try {
         liveBound = await deps.inUsePorts(r.vm);
@@ -735,6 +781,12 @@ export async function runEnvCreate(
         return 1;
       }
     }
+  }
+  if (existing) {
+    // Older records can predate the app's multi-listener topology. Allocate
+    // only missing listeners; never map them all onto the old scalar port.
+    target = completeRecordedTarget(r.app, existing, envStore.listFor(r.vm.id), liveBound);
+  } else {
     target = deriveTarget(
       r.app,
       input.branch,

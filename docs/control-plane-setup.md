@@ -119,6 +119,15 @@ ExecStart=/usr/bin/bun run src/cli.ts trigger run --gc --pr-previews
 Previews still need the same CF DNS + origin-TLS setup as any `env create`
 (`docs/preview-reachability.md`).
 
+### Recreating previews after adding listeners
+
+When an app gains additional listeners, an older environment record may carry
+only its primary port or a partial listener map. Re-create keeps its existing
+assignments and allocates missing listeners around recorded and live-bound
+ports. Invalid maps, failed port probes, and exhausted pools stop before the
+create script is sent. Offline plans cannot probe live ports; their allocation
+can differ from the subsequent create. Destroy continues to use recorded state.
+
 ### Required env vars for `--pr-previews` / `--heal`
 
 The trigger service **requires** the following variable when `--pr-previews` or
