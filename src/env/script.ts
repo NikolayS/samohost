@@ -617,10 +617,13 @@ const PARITY_CHECK_FN_LINES: string[] = [
  *   2./3. Table ownership + grants: idempotent DDL applied under
  *      ON_ERROR_STOP; failures are COUNTED via exit codes (never echoed —
  *      error text can quote DDL) and fail the phase (finding 3).
- *   4. RLS policies: duplicates fail on engines whose retrieval carries
- *      policies, so errors stay ignored — the parity gate is the authority.
- *   5./6. Fail-closed gates: apply-failure count, then policy/grant/ownership
- *      parity via samohost_parity_check (finding 1).
+ *   4. RLS policies: replay only onto snapshot-present tables. Duplicate
+ *      policy errors are tolerated; exact protection verification below is
+ *      authoritative (a count alone cannot detect a changed permissive policy).
+ *   5./6. Fail-closed gates: apply-failure count, scoped policy/grant/ownership
+ *      counts, then exact policies + enabled/forced RLS on snapshot tables.
+ *      Branch migrations own tables absent from the snapshot; deployments must
+ *      validate their expected protections after migration, before startup.
  * (Closing brace at column 0 — tests extract this function.)
  */
 const SYNC_CLONE_GLOBALS_FN_LINES: string[] = [
@@ -792,10 +795,10 @@ const SYNC_CLONE_GLOBALS_FN_LINES: string[] = [
   "  # 3. Table grants — scoped to tables that exist on the clone.",
   '  sudo -u postgres /usr/bin/psql -At -d "$prod_db" -c "SELECT \'GRANT \'||privilege_type||\' ON \'||quote_ident(table_schema)||\'.\'||quote_ident(table_name)||\' TO \'||quote_ident(grantee)||\';\' FROM information_schema.table_privileges WHERE grantee NOT IN (\'postgres\',\'PUBLIC\') AND table_schema NOT IN (\'pg_catalog\',\'information_schema\') AND (table_schema||\'.\' ||table_name) IN ($_clone_tab_in)" \\',
   '    | PGPASSWORD="$SAMOHOST_DB_PASSWORD" psql -v ON_ERROR_STOP=1 -h 127.0.0.1 -p "$SAMOHOST_DB_PORT" -U samohost_env -d "$prod_db" -f - >/dev/null 2>&1 || apply_failures=$((apply_failures+1))',
-  "  # 4. RLS policies (deparsed; restore dropped them with the roles missing).",
+  "  # 4. RLS policies on snapshot-present tables only (same scope as grants).",
   "  #    CREATE POLICY duplicates FAIL on engines whose retrieval already",
   "  #    carries policies, so errors stay ignored — parity below is the gate.",
-  '  sudo -u postgres /usr/bin/psql -At -d "$prod_db" -c "SELECT \'CREATE POLICY \'||quote_ident(policyname)||\' ON \'||quote_ident(schemaname)||\'.\'||quote_ident(tablename)||\' AS \'||permissive||\' FOR \'||cmd||\' TO \'||(SELECT string_agg(CASE WHEN r=\'public\' THEN \'PUBLIC\' ELSE quote_ident(r) END, \', \') FROM unnest(roles) AS r)||COALESCE(\' USING (\'||qual||\')\',\'\')||COALESCE(\' WITH CHECK (\'||with_check||\')\',\'\')||\';\' FROM pg_policies" \\',
+  '  sudo -u postgres /usr/bin/psql -At -d "$prod_db" -c "SELECT \'CREATE POLICY \'||quote_ident(policyname)||\' ON \'||quote_ident(schemaname)||\'.\'||quote_ident(tablename)||\' AS \'||permissive||\' FOR \'||cmd||\' TO \'||(SELECT string_agg(CASE WHEN r=\'public\' THEN \'PUBLIC\' ELSE quote_ident(r) END, \', \') FROM unnest(roles) AS r)||COALESCE(\' USING (\'||qual||\')\',\'\')||COALESCE(\' WITH CHECK (\'||with_check||\')\',\'\')||\';\' FROM pg_policies WHERE (schemaname||\'.\'||tablename) IN ($_clone_tab_in)" \\',
   '    | PGPASSWORD="$SAMOHOST_DB_PASSWORD" psql -h 127.0.0.1 -p "$SAMOHOST_DB_PORT" -U samohost_env -d "$prod_db" -f - >/dev/null 2>&1 || true',
   "  # 5. Apply-failure gate: failures are counted, never echoed.",
   '  if [[ "$apply_failures" -gt 0 ]]; then',
@@ -810,9 +813,24 @@ const SYNC_CLONE_GLOBALS_FN_LINES: string[] = [
   "  #    even when membership is implied) and (b) brick-prone when unrelated",
   "  #    apps/roles on the same cluster inflate the prod count above the clone's",
   "  #    scoped count. The scoped gate at 1.5 is authoritative.",
-  '  samohost_parity_check "RLS policies" "SELECT count(*) FROM pg_policies" \\',
+  '  samohost_parity_check "RLS policies" "SELECT count(*) FROM pg_policies WHERE (schemaname||\'.\'||tablename) IN ($_clone_tab_in)" \\',
   '    && samohost_parity_check "table grants" "SELECT count(*) FROM information_schema.table_privileges WHERE grantee NOT IN (\'postgres\',\'PUBLIC\') AND table_schema NOT IN (\'pg_catalog\',\'information_schema\') AND (table_schema||\'.\' ||table_name) IN ($_clone_tab_in)" \\',
-  '    && samohost_parity_check "table ownership" "SELECT count(*) FROM pg_tables WHERE schemaname NOT IN (\'pg_catalog\',\'information_schema\') AND tableowner <> \'postgres\' AND (schemaname||\'.\'||tablename) IN ($_clone_tab_in)"',
+  '    && samohost_parity_check "table ownership" "SELECT count(*) FROM pg_tables WHERE schemaname NOT IN (\'pg_catalog\',\'information_schema\') AND tableowner <> \'postgres\' AND (schemaname||\'.\'||tablename) IN ($_clone_tab_in)" || return 1',
+  "  # Counts do not prove isolation: changed/extra permissive policies, role",
+  "  # subjects, USING/WITH CHECK, or disabled/FORCE RLS must all fail closed.",
+  "  # Canonical ordered JSON keeps policy text inside captured variables;",
+  "  # never echo it (expressions may contain application-sensitive literals).",
+  '  local _rls_sql _prod_rls _clone_rls',
+  '  _rls_sql="SELECT COALESCE(jsonb_agg(jsonb_build_object(\'schema\',n.nspname,\'table\',c.relname,\'enabled\',c.relrowsecurity,\'forced\',c.relforcerowsecurity,\'policies\',COALESCE((SELECT jsonb_agg(jsonb_build_object(\'name\',p.policyname,\'permissive\',p.permissive,\'command\',p.cmd,\'roles\',(SELECT jsonb_agg(r ORDER BY r) FROM unnest(p.roles) AS r),\'using\',p.qual,\'check\',p.with_check) ORDER BY p.policyname) FROM pg_catalog.pg_policies p WHERE p.schemaname=n.nspname AND p.tablename=c.relname),\'[]\'::jsonb)) ORDER BY n.nspname,c.relname),\'[]\'::jsonb)::text FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace WHERE c.relkind IN (\'r\',\'p\') AND (n.nspname||\'.\'||c.relname) IN ($_clone_tab_in)"',
+  '  _prod_rls="$(sudo -u postgres /usr/bin/psql -XAt -d "$prod_db" -c "$_rls_sql" 2>/dev/null)" \\',
+  '    || { echo "samohost: RLS protection metadata PRODUCTION read failed — failing CLOSED" >&2; return 1; }',
+  '  _clone_rls="$(PGPASSWORD="$SAMOHOST_DB_PASSWORD" psql -XAt -h 127.0.0.1 -p "$SAMOHOST_DB_PORT" -U samohost_env -d "$prod_db" -c "$_rls_sql" 2>/dev/null)" \\',
+  '    || { echo "samohost: RLS protection metadata CLONE read failed — failing CLOSED" >&2; return 1; }',
+  '  if [[ -z "$_prod_rls" || -z "$_clone_rls" || "$_prod_rls" != "$_clone_rls" ]]; then',
+  '    echo "samohost: RLS protection mismatch on snapshot-present tables — failing CLOSED" >&2',
+  '    return 1',
+  '  fi',
+  '  return 0',
   "}",
 ];
 
