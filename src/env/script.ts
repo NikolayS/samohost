@@ -1260,7 +1260,7 @@ export function buildEnvCreateScript(
   // apps and multi-service apps share one code path. For a legacy app (no
   // services field), servicesOf() synthesizes the single "web" service from
   // healthUrl, keeping the external behaviour identical.
-  const { services } = servicesOf(app);
+  const { services, defaultListener } = servicesOf(app);
 
   // Flat list of (listener, owning service) pairs in declaration order.
   // Declaration order is preserved throughout: port-check, envfile, health.
@@ -1268,8 +1268,18 @@ export function buildEnvCreateScript(
     svc.listeners.map((l) => ({ listener: l, unit: svc.unit })),
   );
 
+  // Commands complete legacy records before rendering. Refuse unsafe direct
+  // callers too: a scalar fallback would bind every service to the same port.
+  if (allListeners.length > 1) {
+    const ports = allListeners.map(({ listener }) => t.ports?.[listener.name]);
+    if (ports.some(p => p === undefined || !Number.isInteger(p) || p < 1 || p > 65535) ||
+        new Set(ports).size !== ports.length || t.ports?.[defaultListener] !== t.port) {
+      throw new Error("listener port assignments must be complete, distinct, and match the primary port");
+    }
+  }
+
   // Listener-name → allocated preview port.
-  // Multi-service: read from target.ports; legacy: all listeners share target.port.
+  // Multi-listener: read from target.ports; legacy: one listener uses target.port.
   const portMap = new Map<string, number>();
   if (t.ports !== undefined) {
     for (const [name, port] of Object.entries(t.ports)) {
