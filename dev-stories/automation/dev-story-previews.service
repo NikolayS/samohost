@@ -1,0 +1,9 @@
+[Unit]
+Description=dev-story: open-PR previews reachable (live E2E health check)
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=testuser
+Environment=HOME=/home/testuser
+ExecStart=/home/testuser/bin/dev-story-previews.sh
