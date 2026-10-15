@@ -40,6 +40,7 @@ import {
   type RunDeps,
   type SpawnResult,
 } from "../ssh/runner.ts";
+import { REMOTE_STAGED_SCRIPT_COMMAND } from "../ssh/script-command.ts";
 import type { AppRecord, AppSpec, EnvDbBackend, ServiceSpec, RouteSpec, VmRecord } from "../types.ts";
 import { parseSamohostToml, validateServicesTopology, validateStaticNoDb } from "../manifest/toml.ts";
 
@@ -972,16 +973,16 @@ export async function runAppDeploy(
 // Production dependency wiring (not exercised by unit tests)
 // ---------------------------------------------------------------------------
 
-/** Run ssh with the deploy script on stdin (`bash -s`) over the pinned runner. */
+/** Stage the deploy script from stdin, then execute it over the pinned runner. */
 function defaultRemoteScriptRunner(): RemoteScriptRunner {
   const deps: RunDeps = {
     clock: () => Date.now(),
     knownHostsDir:
       process.env["SAMOHOST_KNOWN_HOSTS_DIR"] ?? defaultKnownHostsDir(),
     spawn: (file: string, args: string[]): Promise<SpawnResult> => {
-      // The runner appends the remote command as the final argv element; we use
-      // `bash -s` so the script body is read from stdin (never argv, never a
-      // file on the remote) — secrets-safe and splice-safe.
+      // The runner appends the remote command as the final argv element. The
+      // command stages stdin before execution so build tools cannot consume
+      // the unread tail of the deployment program.
       const res = spawnSync(file, args, {
         encoding: "utf8",
         maxBuffer: 16 * 1024 * 1024,
@@ -1010,7 +1011,7 @@ function defaultRemoteScriptRunner(): RemoteScriptRunner {
         });
       },
     };
-    return runRemote(vm, "bash -s", piping);
+    return runRemote(vm, REMOTE_STAGED_SCRIPT_COMMAND, piping);
   };
 }
 

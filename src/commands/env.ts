@@ -50,6 +50,7 @@ import {
   type RunDeps,
   type SpawnResult,
 } from "../ssh/runner.ts";
+import { REMOTE_STAGED_SCRIPT_COMMAND } from "../ssh/script-command.ts";
 import type {
   AppRecord,
   EnvDbBackend,
@@ -1043,7 +1044,7 @@ export async function runEnvPreflight(
 // Production dependency wiring (not exercised by unit tests)
 // ---------------------------------------------------------------------------
 
-/** Run ssh with the env script on stdin (`bash -s`) over the pinned runner. */
+/** Stage the env script from stdin, then execute it over the pinned runner. */
 function defaultRemoteScriptRunner(timeoutMs?: number): RemoteScriptRunner {
   return (vm, script) => {
     const deps: RunDeps = {
@@ -1066,7 +1067,7 @@ function defaultRemoteScriptRunner(timeoutMs?: number): RemoteScriptRunner {
         });
       },
     };
-    return runRemote(vm, "bash -s", deps);
+    return runRemote(vm, REMOTE_STAGED_SCRIPT_COMMAND, deps);
   };
 }
 
