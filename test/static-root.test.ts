@@ -7,6 +7,7 @@ import {
   readdirSync,
   readFileSync,
   rmSync,
+  statSync,
   symlinkSync,
   writeFileSync,
 } from "node:fs";
@@ -205,10 +206,14 @@ describe("staticRoot schema and path security", () => {
 
 type PreviewFixture = "clean" | "root-symlink" | "nested-file-symlink" | "nested-dir-symlink";
 
-function runPreviewSandbox(fixture: PreviewFixture): {
+function runPreviewSandbox(
+  fixture: PreviewFixture,
+  options: { umask?: string; preexistingOwnerOnlyEnv?: boolean } = {},
+): {
   status: number | null;
   stderr: string;
   dir: string;
+  envsRoot: string;
   envDir: string;
   snippet: string;
 } {
@@ -218,7 +223,8 @@ function runPreviewSandbox(fixture: PreviewFixture): {
   const appDir = join(dir, "site", "app");
   const caddyDir = join(dir, "caddy");
   const binDir = join(dir, "bin");
-  const envDir = join(dir, "site", "envs", "astro-site-pr-1");
+  const envsRoot = join(dir, "site", "envs");
+  const envDir = join(envsRoot, "astro-site-pr-1");
   const snippet = join(caddyDir, "sites.d", "astro-site-pr-1.caddy");
 
   const git = (args: string[], cwd = dir): void => {
@@ -256,6 +262,26 @@ function runPreviewSandbox(fixture: PreviewFixture): {
   mkdirSync(join(dir, "site"));
   git(["clone", origin, appDir]);
 
+  if (options.preexistingOwnerOnlyEnv) {
+    mkdirSync(envsRoot, { recursive: true });
+    git(["clone", "--branch", "main", origin, envDir]);
+    const makeOwnerOnly = (path: string): void => {
+      for (const entry of readdirSync(path, { withFileTypes: true })) {
+        const entryPath = join(path, entry.name);
+        if (entry.isSymbolicLink()) continue;
+        if (entry.isDirectory()) {
+          makeOwnerOnly(entryPath);
+          chmodSync(entryPath, 0o700);
+        } else {
+          chmodSync(entryPath, 0o600);
+        }
+      }
+      chmodSync(path, 0o700);
+    };
+    makeOwnerOnly(envDir);
+    chmodSync(envsRoot, 0o700);
+  }
+
   mkdirSync(join(caddyDir, "sites.d"), { recursive: true });
   mkdirSync(binDir);
   writeFileSync(join(binDir, "sudo"), [
@@ -277,12 +303,43 @@ function runPreviewSandbox(fixture: PreviewFixture): {
     vhost: "astro-site-pr-1.samo.cat",
     dbBackend: "none",
   }).replaceAll("/etc/caddy", caddyDir);
-  const result = spawnSync("bash", ["-s"], {
+  const bashArgs = options.umask === undefined
+    ? ["-s"]
+    : ["-c", `umask ${options.umask}; exec bash -s`];
+  const result = spawnSync("bash", bashArgs, {
     input: script,
     encoding: "utf8",
     env: { ...process.env, PATH: `${binDir}:${process.env["PATH"] ?? ""}` },
   });
-  return { status: result.status, stderr: result.stderr, dir, envDir, snippet };
+  return {
+    status: result.status,
+    stderr: result.stderr,
+    dir,
+    envsRoot,
+    envDir,
+    snippet,
+  };
+}
+
+function expectPreviewTreeWorldReadable(result: {
+  envsRoot: string;
+  envDir: string;
+}): void {
+  for (const path of [
+    result.envsRoot,
+    result.envDir,
+    join(result.envDir, "dist"),
+  ]) {
+    const stat = statSync(path);
+    expect(stat.isDirectory(), path).toBe(true);
+    expect(stat.mode & 0o055, path).toBe(0o055);
+  }
+  for (const path of [
+    join(result.envDir, "dist", "index.html"),
+    join(result.envDir, "dist", "config.js"),
+  ]) {
+    expect(statSync(path).mode & 0o044, path).toBe(0o044);
+  }
 }
 
 describe("staticRoot preview sandbox", () => {
@@ -300,6 +357,29 @@ describe("staticRoot preview sandbox", () => {
       expect(readFileSync(result.snippet, "utf8")).toContain(
         `root * ${join(result.envDir, "dist")}`,
       );
+    } finally {
+      rmSync(result.dir, { recursive: true, force: true });
+    }
+  });
+
+  test("executed preview leaves the served tree world-readable even under a leaked umask 077", () => {
+    const result = runPreviewSandbox("clean", { umask: "077" });
+    try {
+      expect(result.status, result.stderr).toBe(0);
+      expectPreviewTreeWorldReadable(result);
+    } finally {
+      rmSync(result.dir, { recursive: true, force: true });
+    }
+  });
+
+  test("re-running preview create self-heals an owner-only env dir from the umask leak", () => {
+    const result = runPreviewSandbox("clean", {
+      preexistingOwnerOnlyEnv: true,
+      umask: "022",
+    });
+    try {
+      expect(result.status, result.stderr).toBe(0);
+      expectPreviewTreeWorldReadable(result);
     } finally {
       rmSync(result.dir, { recursive: true, force: true });
     }
