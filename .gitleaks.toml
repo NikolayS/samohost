@@ -1,0 +1,41 @@
+# .gitleaks.toml — custom gitleaks rules for samohost
+#
+# The built-in gitleaks ruleset covers GitHub PATs, AWS keys, GitLab tokens,
+# OpenAI keys, and Cloudflare API tokens.  The rules below add coverage for
+# formats not yet in the default ruleset and serve as a template for client
+# repos.
+#
+# Extend (do not replace) built-in rules:
+[extend]
+useDefault = true
+
+[[rules]]
+id          = "cloudflare-user-api-token"
+description = "Cloudflare user-scoped API token (cfut_ prefix)"
+regex       = '''cfut_[A-Za-z0-9\-_]{8,}'''
+tags        = ["cloudflare", "api-token"]
+
+[[rules]]
+id          = "samo-agent-token"
+description = "SAMO agent bearer token prefix"
+regex       = '''samo_[A-Za-z0-9\-_]{16,}'''
+tags        = ["samo", "api-token"]
+
+# ---------------------------------------------------------------------------
+# Allowlist: paths and patterns that should not trigger findings
+# ---------------------------------------------------------------------------
+[allowlist]
+description = "Known-safe test fixtures and documentation examples"
+
+# test/secret-deny-hook.test.ts passes obviously-fake token strings INTO the
+# hook subprocess as payload content.  Those strings exist only as TypeScript
+# string literals in the test; they are never real credentials.  Excluding the
+# file by path is the standard gitleaks pattern for test fixtures.
+paths = [
+  '''test/secret-deny-hook\.test\.ts''',
+]
+
+# The sample SSH public key in test/helpers.ts is public material — safe.
+regexes = [
+  '''ssh-ed25519 AAAAC3NzaC1lZDI1NTE5''',
+]

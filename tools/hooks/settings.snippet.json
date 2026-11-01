@@ -1,0 +1,16 @@
+{
+  "_comment": "Paste the 'hooks' block into ~/.claude/settings.json — do NOT auto-apply. Update the path to match where secret-deny.py is installed on the target machine.",
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Write|Edit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 /path/to/samohost/tools/hooks/secret-deny.py"
+          }
+        ]
+      }
+    ]
+  }
+}
