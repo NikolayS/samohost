@@ -184,7 +184,7 @@ describe("BLOCKER 1(b): buildEnvCreateScript — secrets-preflight phase", () =>
       ],
       defaultListener: "web",
     });
-    const s = buildEnvCreateScript(multiApp, target());
+    const s = buildEnvCreateScript(multiApp, target({ ports: { web: 3100, worker: 3102 } }));
     // Both unit template paths must appear in the preflight check
     expect(s).toContain("acme-web@.service");
     expect(s).toContain("acme-worker@.service");
