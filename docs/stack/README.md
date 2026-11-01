@@ -42,6 +42,7 @@ Project VM (cx23, one per client project)
 | 5 | [zfs.md](zfs.md) | Pool naming, shapes, and constraints |
 | 6 | [routing.md](routing.md) | Caddy, Cloudflare tokens, domain map |
 | 7 | [deploy.md](deploy.md) | Trigger poller, CI gate, PR previews |
+| 8 | [custom-domains.md](custom-domains.md) | Add a client custom domain via Cloudflare-for-SaaS |
 
 Also read before any PR/MR:
 - [`docs/setup-checklist.md`](../setup-checklist.md) — env vars + token scopes
