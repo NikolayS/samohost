@@ -1,0 +1,10 @@
+[Unit]
+Description=run dev-story preview-comment-current every 15 min
+
+[Timer]
+OnBootSec=3min
+OnUnitActiveSec=15min
+AccuracySec=30s
+
+[Install]
+WantedBy=timers.target

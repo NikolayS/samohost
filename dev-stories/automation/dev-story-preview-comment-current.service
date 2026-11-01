@@ -1,0 +1,9 @@
+[Unit]
+Description=dev-story: every open PR has a current preview-link comment
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=testuser
+Environment=HOME=/home/testuser
+ExecStart=/home/testuser/bin/dev-story-preview-comment-current.sh

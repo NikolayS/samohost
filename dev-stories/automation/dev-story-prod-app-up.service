@@ -1,0 +1,9 @@
+[Unit]
+Description=dev-story: every non-static app's production site is up (live E2E health check)
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=testuser
+Environment=HOME=/home/testuser
+ExecStart=/home/testuser/bin/dev-story-prod-app-up.sh
