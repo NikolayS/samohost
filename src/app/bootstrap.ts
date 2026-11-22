@@ -48,9 +48,14 @@
  *     CRITICAL for non-static apps: dbName is REQUIRED and EXPLICIT — never
  *     derived from app.name. Static apps skip the DB and base-env sections.
  *
+ *     Then the app's own login role (`<dbName>_app` by default): created
+ *     NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS with a
+ *     password generated on the host; CONNECT on the app's database is
+ *     revoked from PUBLIC and granted to that role.
+ *
  *  e. Base env file seeding (600, appUser-owned): DATABASE_URL (superuser),
- *     APP_DATABASE_URL placeholder (app role + 'app_password' — rotated by
- *     deploy.sh on first deploy), NODE_ENV, PORT (from healthUrl), HOST,
+ *     APP_DATABASE_URL (the app role and its generated password), NODE_ENV,
+ *     PORT (from healthUrl), HOST,
  *     COOKIE_SECRET (on-host openssl rand), SEED_OWNER_LOGIN/PASSWORD.
  *     PG_BACKEND is intentionally NOT written here (lives in unit Environment=).
  *     Idempotent: reuses existing pw/secret/DEPLOYED_SHA values.
@@ -158,9 +163,10 @@ export interface HostBootstrapOptions {
   tlsMode?: "acme" | "local";
 
   /**
-   * PR-A2 — The app (non-superuser, RLS) database role name written into the
-   * APP_DATABASE_URL placeholder. Default "app_user". The placeholder password
-   * is the literal 'app_password' — deploy.sh rotates it on first deploy.
+   * The app's own non-superuser login role (the user in APP_DATABASE_URL).
+   * Default `<dbName>_app`. The bootstrap creates it with a password
+   * generated on the server (openssl rand) and writes that password into the
+   * env file. A re-run keeps the password already in the env file.
    */
   appDbRole?: string;
 
@@ -257,9 +263,27 @@ export function buildHostBootstrapScript(
   const gitSafeConf = `${appBase}/git-safe.conf`;
   const repoUrl = `https://github.com/${app.repo}.git`;
   const appPort = bootstrapPort(app);
-  const appDbRole = opts.appDbRole ?? "app_user";
-  const seedOwnerLogin = opts.seedOwnerLogin ?? "owner";
+  // dbName and the role names are embedded in SQL and in the root-run shell
+  // script. Accept only lowercase PostgreSQL identifiers that need no quoting,
+  // short enough that "<dbName>_owner" still fits in 63 bytes.
+  if (dbName !== undefined && !/^[a-z_][a-z0-9_]{0,47}$/.test(dbName)) {
+    throw new Error(
+      `buildHostBootstrapScript: invalid dbName ${JSON.stringify(dbName)}: ` +
+        "expected ^[a-z_][a-z0-9_]{0,47}$ (a lowercase PostgreSQL identifier)",
+    );
+  }
   const rlsUrlVar = app.rlsUrlVar ?? "APP_DATABASE_URL";
+  if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(rlsUrlVar)) {
+    throw new Error(`buildHostBootstrapScript: invalid rlsUrlVar ${JSON.stringify(rlsUrlVar)}`);
+  }
+  const appDbRole = opts.appDbRole ?? `${dbName ?? app.name}_app`;
+  if (!isStatic && !/^[a-z_][a-z0-9_]{0,62}$/.test(appDbRole)) {
+    throw new Error(
+      `buildHostBootstrapScript: invalid appDbRole ${JSON.stringify(appDbRole)}: ` +
+        "expected ^[a-z_][a-z0-9_]{0,62}$",
+    );
+  }
+  const seedOwnerLogin = opts.seedOwnerLogin ?? "owner";
   const staticReleaseState = staticReleaseStatePaths(app.appDir);
   const staticReleaseTagFormat = app.releaseTagFormat ?? "";
 
@@ -929,6 +953,42 @@ export function buildHostBootstrapScript(
     `  echo "postgres: database ${dbName} already exists"`,
     `fi`,
     "",
+    `# App role ${appDbRole}: the non-superuser login role the running app uses`,
+    `# (${rlsUrlVar}). Its password is generated here once and kept in the env`,
+    `# file; a re-run reuses that password, so a working password is never`,
+    `# rotated. A ${rlsUrlVar} that names a different role was set up by hand`,
+    `# or by an older tool: that line and that role are left unchanged.`,
+    `# The SQL, including the password, reaches psql on stdin only.`,
+    `APP_DB_ROLE=${sq(appDbRole)}`,
+    `APP_DB_LINE=""`,
+    `APP_DB_PW=""`,
+    `if [[ -f "$ENV_FILE" ]] && grep -q '^${rlsUrlVar}=' "$ENV_FILE" \\`,
+    `   && ! grep -q '^${rlsUrlVar}=postgresql://[^:@/]*:app_password@' "$ENV_FILE"; then`,
+    `  APP_DB_LINE="$(grep '^${rlsUrlVar}=' "$ENV_FILE" | head -1)"`,
+    `fi`,
+    `if [[ -n "$APP_DB_LINE" ]]; then`,
+    `  APP_DB_PW="$(printf '%s' "$APP_DB_LINE" | sed -E 's#^[^=]*=postgresql://[^:]*:([^@]*)@.*#\\1#')"`,
+    `fi`,
+    `if [[ -n "$APP_DB_LINE" && ( "$APP_DB_LINE" != "${rlsUrlVar}=postgresql://\${APP_DB_ROLE}:"* || ! "$APP_DB_PW" =~ ^[0-9a-f]+$ ) ]]; then`,
+    `  echo "postgres: ${rlsUrlVar} in $ENV_FILE was not written by samohost; leaving it and its role unchanged"`,
+    `else`,
+    `  if [[ -n "$APP_DB_LINE" ]]; then`,
+    `    echo "postgres: reusing the existing password of role $APP_DB_ROLE from $ENV_FILE"`,
+    `  else`,
+    `    APP_DB_PW="$(openssl rand -hex 24)"`,
+    `    echo "postgres: generated a new password for role $APP_DB_ROLE (value only in $ENV_FILE)"`,
+    `  fi`,
+    "  printf '%s\\n' \\",
+    "    \"DO \\$samohost\\$ BEGIN IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = '${APP_DB_ROLE}') THEN EXECUTE format('CREATE ROLE %I', '${APP_DB_ROLE}'); END IF; END \\$samohost\\$;\" \\",
+    "    \"ALTER ROLE ${APP_DB_ROLE} WITH LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS PASSWORD \\$pgpw\\$${APP_DB_PW}\\$pgpw\\$;\" \\",
+    `    "SELECT format('REVOKE CONNECT, TEMPORARY ON DATABASE %I FROM PUBLIC', '${dbName}') \\\\gexec" \\`,
+    `    "SELECT format('GRANT CONNECT, TEMPORARY ON DATABASE %I TO %I', '${dbName}', '\${APP_DB_ROLE}') \\\\gexec" \\`,
+    `    | sudo -u postgres psql -p 5432 -q -v ON_ERROR_STOP=1 >/dev/null`,
+    `  APP_DB_LINE="${rlsUrlVar}=postgresql://\${APP_DB_ROLE}:\${APP_DB_PW}@127.0.0.1:5432/${dbName}"`,
+    `  echo "postgres: role $APP_DB_ROLE ready (login, no superuser, CONNECT on ${dbName} only) [password not logged]"`,
+    `fi`,
+    `unset APP_DB_PW`,
+    "",
   );
 
   // ---- section 11 (PR-A2-e): base env file seeding -------------------------
@@ -936,8 +996,7 @@ export function buildHostBootstrapScript(
     `# ---------------------------------------------------------------------------`,
     `# §11. Base env file seeding (PR-A2-e): ${envFile}`,
     `#      600, ${appUser}-owned. DATABASE_URL = superuser (migrations/seed only).`,
-    `#      ${rlsUrlVar} = ${appDbRole}:app_password placeholder`,
-    `#        (deploy.sh rotates the password on the first deploy).`,
+    `#      ${rlsUrlVar} = role ${appDbRole} with the password generated in §10.`,
     `#      PG_BACKEND is intentionally NOT set here — it lives in the unit's`,
     `#      Environment= directive (stack-prep.sh invariant).`,
     `#      Idempotent: reuses existing secrets across re-runs.`,
@@ -957,14 +1016,7 @@ export function buildHostBootstrapScript(
     `  COOKIE_SECRET="$(openssl rand -hex 32)"`,
     `fi`,
     "",
-    `# Preserve an already-rotated ${rlsUrlVar} across re-runs.`,
-    `# The placeholder (${appDbRole}:app_password) is only valid before the first deploy.`,
-    `APP_DB_LINE="${rlsUrlVar}=postgresql://${appDbRole}:app_password@127.0.0.1:5432/${dbName}"`,
-    `if [[ -f "$ENV_FILE" ]] && grep -q '^${rlsUrlVar}=postgresql://${appDbRole}:' "$ENV_FILE" \\`,
-    `   && ! grep -q '^${rlsUrlVar}=postgresql://${appDbRole}:app_password@' "$ENV_FILE"; then`,
-    `  APP_DB_LINE="$(grep '^${rlsUrlVar}=' "$ENV_FILE" | head -1)"`,
-    `  echo "$ENV_FILE: preserving already-rotated ${rlsUrlVar}"`,
-    `fi`,
+    `# ${rlsUrlVar}: APP_DB_LINE was set in §10 (the app role and its password).`,
     "",
     `# Preserve deploy bookkeeping vars (DEPLOYED_SHA, DEPLOY_FAILED_SHA) if present.`,
     `PRESERVE=""`,
@@ -978,7 +1030,7 @@ export function buildHostBootstrapScript(
     `cat > "$ENV_FILE" <<ENVEOF`,
     `# ${app.name} env file — generated by samohost host-bootstrap. chmod 600, ${appUser}-owned.`,
     `# NEVER commit. DATABASE_URL is the superuser (migrations/seed only).`,
-    `# ${rlsUrlVar} placeholder is rotated by deploy.sh on the first deploy.`,
+    `# ${rlsUrlVar} is the app's own non-superuser role.`,
     `# PG_BACKEND is intentionally NOT set here — it is set in ${unit}.service Environment=.`,
     `DATABASE_URL=postgresql://postgres:\${PG_SUPER_PW}@127.0.0.1:5432/${dbName}`,
     `\${APP_DB_LINE}`,

@@ -784,20 +784,22 @@ describe("buildHostBootstrapScript (A2) — base env file content", () => {
     expect(script).toContain("APP_DATABASE_URL=");
   });
 
-  test("custom appDbRole option used in RLS URL placeholder (default: app_user)", () => {
+  test("default app role is <dbName>_app, written with the generated password", () => {
     const script = buildHostBootstrapScript(fieldRecord(), frOpts());
-    // Default role is app_user
-    expect(script).toMatch(/APP_DATABASE_URL=postgresql:\/\/app_user:/);
+    expect(script).toContain("APP_DB_ROLE='field_record_app'");
+    expect(script).toContain(
+      'APP_DB_LINE="APP_DATABASE_URL=postgresql://${APP_DB_ROLE}:${APP_DB_PW}@127.0.0.1:5432/field_record"',
+    );
   });
 
-  test("custom appDbRole option (svc_user) appears in RLS URL placeholder", () => {
+  test("custom appDbRole option (svc_user) is the role in the URL", () => {
     const script = buildHostBootstrapScript(demoApp(), demoOptsA2({ appDbRole: "svc_user" }));
-    expect(script).toMatch(/[A-Z_]*DATABASE_URL=postgresql:\/\/svc_user:/);
+    expect(script).toContain("APP_DB_ROLE='svc_user'");
   });
 
-  test("RLS URL placeholder uses literal 'app_password' (deploy.sh rotates on first deploy)", () => {
+  test("the literal 'app_password' placeholder is never written (only detected for replacement)", () => {
     const script = buildHostBootstrapScript(fieldRecord(), frOpts());
-    expect(script).toMatch(/APP_DATABASE_URL=postgresql:\/\/app_user:app_password@/);
+    expect(script).not.toMatch(/APP_DATABASE_URL=postgresql:\/\/app_user:app_password@127/);
   });
 
   test("env file preserves idempotency: reuse existing COOKIE_SECRET if present", () => {
