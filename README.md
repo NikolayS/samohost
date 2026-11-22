@@ -215,9 +215,11 @@ tables in it (PostgreSQL 15 and later give CREATE on `public` only to its
 owner). `<db>_app` gets USAGE on schema `public`, SELECT, INSERT, UPDATE and
 DELETE on tables, and USAGE, SELECT and UPDATE on sequences: as default
 privileges for objects that `<db>_owner` creates later, and as grants on the
-objects that exist when bootstrap runs. A bootstrap re-run grants these
-rights again on all existing tables, including tables from which a migration
-revoked them; the next migrate run revokes them again. If
+objects that exist when bootstrap runs. After those grants bootstrap revokes
+INSERT, UPDATE and DELETE on `public.schema_migrations` from `<db>_app`, so
+a re-run does not let the app change the migration record. A re-run still
+grants the rights again on other tables from which a migration revoked
+them; the next migrate run revokes them again. If
 `APP_DATABASE_URL` names a role that samohost did not create, that role and
 the line are left unchanged, and the role gets CONNECT on `<db>` and the
 same rights.

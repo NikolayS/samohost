@@ -1334,6 +1334,7 @@ export function buildHostBootstrapScript(
     `    "SELECT format('ALTER DEFAULT PRIVILEGES FOR ROLE %I IN SCHEMA public GRANT USAGE, SELECT, UPDATE ON SEQUENCES TO %I', '\${OWNER_DB_ROLE}', rolname) FROM pg_catalog.pg_roles WHERE rolname = '\${APP_DB_GRANTEE}' \\\\gexec" \\`,
     `    "SELECT format('GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO %I', rolname) FROM pg_catalog.pg_roles WHERE rolname = '\${APP_DB_GRANTEE}' \\\\gexec" \\`,
     `    "SELECT format('GRANT USAGE, SELECT, UPDATE ON ALL SEQUENCES IN SCHEMA public TO %I', rolname) FROM pg_catalog.pg_roles WHERE rolname = '\${APP_DB_GRANTEE}' \\\\gexec" \\`,
+    `    "SELECT format('REVOKE INSERT, UPDATE, DELETE ON TABLE public.schema_migrations FROM %I', rolname) FROM pg_catalog.pg_roles WHERE rolname = '\${APP_DB_GRANTEE}' AND pg_catalog.to_regclass('public.schema_migrations') IS NOT NULL \\\\gexec" \\`,
     `    | ${psqlInAppDb(dbName)} -q -v ON_ERROR_STOP=1 >/dev/null`,
     `  echo "postgres: schema public of ${dbName} owned by $OWNER_DB_ROLE; data rights for \${APP_DB_GRANTEE:-no app role}"`,
     `fi`,

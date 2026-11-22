@@ -50,6 +50,8 @@ describe("split layout: schema owner and data rights of the app role", () => {
         `SELECT format('ALTER DEFAULT PRIVILEGES FOR ROLE %I IN SCHEMA public GRANT USAGE, SELECT, UPDATE ON SEQUENCES TO %I', 'shop_owner', rolname) ${where}`,
         `SELECT format('GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO %I', rolname) ${where}`,
         `SELECT format('GRANT USAGE, SELECT, UPDATE ON ALL SEQUENCES IN SCHEMA public TO %I', rolname) ${where}`,
+        // The grant on all tables must not reopen the migration bookkeeping table.
+        "SELECT format('REVOKE INSERT, UPDATE, DELETE ON TABLE public.schema_migrations FROM %I', rolname) FROM pg_catalog.pg_roles WHERE rolname = 'shop_app' AND pg_catalog.to_regclass('public.schema_migrations') IS NOT NULL \\gexec",
       ]);
       const argv = readOr(sb.argvLog).split("\n");
       expect(argv).toContain("-u postgres env PGOPTIONS=-c search_path=pg_catalog psql -p 5432 -d shop -q -v ON_ERROR_STOP=1");
