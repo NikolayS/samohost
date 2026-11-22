@@ -934,16 +934,34 @@ export function buildHostBootstrapScript(
   const caddyfileHeader = tlsMode === "local"
     ? ["# Caddy global options (local TLS — no ACME).", "{", "  local_certs", "}"]
     : ["# Caddy global options (ACME TLS — default)."];
-  // Split layout: Caddy's admin API on a unix socket in the caddy user's home.
-  // Connecting to a unix socket needs write permission on it, which only the
-  // caddy user (its owner) and root have. The default is TCP
-  // localhost:2019, which every local process, the app included, can use to
-  // load a new Caddy config. `systemctl reload caddy` runs `caddy reload` as
-  // caddy, which sends the config to the admin address the config names.
+  // Caddy's admin API on a unix socket in the caddy user's home, for servers
+  // where a new-layout bootstrap ran. Caddy creates the socket with mode 0200
+  // by default, and connecting needs write permission on it, so only the
+  // caddy user and root can use it. The default is TCP localhost:2019, which
+  // every local process, the app included, can use to load a new Caddy
+  // config. `systemctl reload caddy` runs `caddy reload` as caddy, which
+  // sends the config to the admin address the config names.
   const caddyAdminSocket = "/var/lib/caddy/admin.sock";
-  const caddyfileHeaderSplit = tlsMode === "local"
+  const caddyAdminRe = `^[[:space:]]*admin[[:space:]]+unix/${caddyAdminSocket.replaceAll(".", "[.]")}([[:space:]]|$)`;
+  const caddyfileHeaderSocket = tlsMode === "local"
     ? ["# Caddy global options (local TLS — no ACME).", "{", "  local_certs", `  admin unix/${caddyAdminSocket}`, "}"]
     : ["# Caddy global options (ACME TLS — default).", "{", `  admin unix/${caddyAdminSocket}`, "}"];
+  // Write the canonical base file, with the admin socket line when chosen.
+  const writeBaseCaddyfile = (indent: string): string[] => [
+    `${indent}if [[ "$SAMOHOST_CADDY_ADMIN_SOCKET" == 1 ]]; then`,
+    `${indent}cat > /etc/caddy/Caddyfile <<'CADDYFILE'`,
+    ...caddyfileHeaderSocket,
+    "",
+    "import sites.d/*.caddy",
+    "CADDYFILE",
+    `${indent}else`,
+    `${indent}cat > /etc/caddy/Caddyfile <<'CADDYFILE'`,
+    ...caddyfileHeader,
+    "",
+    "import sites.d/*.caddy",
+    "CADDYFILE",
+    `${indent}fi`,
+  ];
 
   push(
     `# ---------------------------------------------------------------------------`,
@@ -952,6 +970,15 @@ export function buildHostBootstrapScript(
     `# ---------------------------------------------------------------------------`,
     "",
     `mkdir -p /etc/caddy/sites.d`,
+    "",
+    `# Admin API: a server where a new-layout bootstrap ran keeps it on`,
+    `# ${caddyAdminSocket}, so no bootstrap of any app moves it back to TCP.`,
+    `SAMOHOST_CADDY_ADMIN_SOCKET=0`,
+    `if ${!isStatic ? `[[ "\${SAMOHOST_DB_LAYOUT:-}" == split ]] || ` : ""}grep -Eq '${caddyAdminRe}' /etc/caddy/Caddyfile 2>/dev/null || grep -qsx split /var/lib/samohost/db-layout/*; then`,
+    `  SAMOHOST_CADDY_ADMIN_SOCKET=1`,
+    `fi`,
+    `SAMOHOST_CADDYFILE_PREV="$(mktemp)"`,
+    `if [[ -f /etc/caddy/Caddyfile ]]; then cp /etc/caddy/Caddyfile "$SAMOHOST_CADDYFILE_PREV"; fi`,
     "",
   );
   if (isStaticReleaseChannel) {
@@ -962,11 +989,7 @@ export function buildHostBootstrapScript(
       `if [[ "\${SAMOHOST_CADDY_INSTALLED_NOW:-0}" == "1" || ! -f /etc/caddy/Caddyfile ]]; then`,
       `  # A just-installed package Caddyfile is vendor sample content, not a`,
       `  # legacy production route. Start fresh hosts from the canonical base.`,
-      `  cat > /etc/caddy/Caddyfile <<'CADDYFILE'`,
-      ...caddyfileHeader,
-      "",
-      "import sites.d/*.caddy",
-      "CADDYFILE",
+      ...writeBaseCaddyfile("  "),
       `elif grep -Eq '^[[:space:]]*import[[:space:]]+(/etc/caddy/)?sites\\.d/\\*\\.caddy([[:space:]]*(#.*)?)?$' /etc/caddy/Caddyfile; then`,
       `  echo "Caddy: existing sites.d import preserved."`,
       `else`,
@@ -979,52 +1002,33 @@ export function buildHostBootstrapScript(
     push(
       `# Write a minimal-but-valid Caddyfile. Idempotent: overwrite with the`,
       `# deterministic content — no append-drift.`,
-      ...(runtimeUserUsable
-        ? [
-            `if [[ "$SAMOHOST_DB_LAYOUT" == split ]]; then`,
-            `# split layout: admin API on ${caddyAdminSocket} (only the caddy user can open it).`,
-            `# The first switch from TCP needs the restart below: the running Caddy`,
-            `# does not listen on the new admin address yet, so reload fails.`,
-            `SAMOHOST_CADDYFILE_PREV="$(mktemp)"`,
-            `if [[ -f /etc/caddy/Caddyfile ]]; then cp /etc/caddy/Caddyfile "$SAMOHOST_CADDYFILE_PREV"; fi`,
-            `cat > /etc/caddy/Caddyfile <<'CADDYFILE'`,
-            ...caddyfileHeaderSplit,
-            "",
-            "import sites.d/*.caddy",
-            "CADDYFILE",
-            `else`,
-          ]
-        : []),
-      `cat > /etc/caddy/Caddyfile <<'CADDYFILE'`,
-      ...caddyfileHeader,
-      "",
-      "import sites.d/*.caddy",
-      "CADDYFILE",
-      ...(runtimeUserUsable ? [`fi`] : []),
+      ...writeBaseCaddyfile(""),
       "",
     );
   }
   push(
+    `# The switch from TCP to the socket: the running Caddy does not listen on`,
+    `# the new address yet, so reload fails and Caddy is restarted.`,
+    `SAMOHOST_CADDY_ADMIN_SWITCH=0`,
+    `if grep -Eq '${caddyAdminRe}' /etc/caddy/Caddyfile && ! grep -Eq '${caddyAdminRe}' "$SAMOHOST_CADDYFILE_PREV"; then`,
+    `  SAMOHOST_CADDY_ADMIN_SWITCH=1`,
+    `fi`,
     `caddy validate --config /etc/caddy/Caddyfile`,
     `/usr/bin/systemctl enable caddy`,
-    ...(runtimeUserUsable && !isStaticReleaseChannel
-      ? [
-          `if [[ "$SAMOHOST_DB_LAYOUT" == split ]]; then`,
-          `  # A failed restart must reach the restore below, not stop the script.`,
-          `  /usr/bin/systemctl reload caddy || /usr/bin/systemctl restart caddy || true`,
-          `  if ! /usr/bin/systemctl is-active --quiet caddy; then`,
-          `    echo "ERROR: caddy is not running after the admin socket change; restoring the previous Caddyfile" >&2`,
-          `    if [[ -s "$SAMOHOST_CADDYFILE_PREV" ]]; then cp "$SAMOHOST_CADDYFILE_PREV" /etc/caddy/Caddyfile; fi`,
-          `    /usr/bin/systemctl restart caddy || true`,
-          `    rm -f "$SAMOHOST_CADDYFILE_PREV"`,
-          `    exit 1`,
-          `  fi`,
-          `  rm -f "$SAMOHOST_CADDYFILE_PREV"`,
-          `else`,
-          `  /usr/bin/systemctl reload caddy || /usr/bin/systemctl restart caddy`,
-          `fi`,
-        ]
-      : [`/usr/bin/systemctl reload caddy || /usr/bin/systemctl restart caddy`]),
+    `if [[ "$SAMOHOST_CADDY_ADMIN_SWITCH" == 1 ]]; then`,
+    `  # A failed restart must reach the restore below, not stop the script.`,
+    `  /usr/bin/systemctl reload caddy || /usr/bin/systemctl restart caddy || true`,
+    `  if ! /usr/bin/systemctl is-active --quiet caddy; then`,
+    `    echo "ERROR: caddy is not running after the admin socket change; restoring the previous Caddyfile" >&2`,
+    `    if [[ -s "$SAMOHOST_CADDYFILE_PREV" ]]; then cp "$SAMOHOST_CADDYFILE_PREV" /etc/caddy/Caddyfile; fi`,
+    `    /usr/bin/systemctl restart caddy || true`,
+    `    rm -f "$SAMOHOST_CADDYFILE_PREV"`,
+    `    exit 1`,
+    `  fi`,
+    `else`,
+    `  /usr/bin/systemctl reload caddy || /usr/bin/systemctl restart caddy`,
+    `fi`,
+    `rm -f "$SAMOHOST_CADDYFILE_PREV"`,
     `echo "Caddy: Caddyfile ${isStaticReleaseChannel ? "ready" : "written"} (tls=${tlsMode}), validated, reloaded."`,
     "",
   );

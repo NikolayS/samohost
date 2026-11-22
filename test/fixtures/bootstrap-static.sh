@@ -169,17 +169,56 @@ fi
 
 mkdir -p /etc/caddy/sites.d
 
+# Admin API: a server where a new-layout bootstrap ran keeps it on
+# /var/lib/caddy/admin.sock, so no bootstrap of any app moves it back to TCP.
+SAMOHOST_CADDY_ADMIN_SOCKET=0
+if grep -Eq '^[[:space:]]*admin[[:space:]]+unix//var/lib/caddy/admin[.]sock([[:space:]]|$)' /etc/caddy/Caddyfile 2>/dev/null || grep -qsx split /var/lib/samohost/db-layout/*; then
+  SAMOHOST_CADDY_ADMIN_SOCKET=1
+fi
+SAMOHOST_CADDYFILE_PREV="$(mktemp)"
+if [[ -f /etc/caddy/Caddyfile ]]; then cp /etc/caddy/Caddyfile "$SAMOHOST_CADDYFILE_PREV"; fi
+
 # Write a minimal-but-valid Caddyfile. Idempotent: overwrite with the
 # deterministic content — no append-drift.
+if [[ "$SAMOHOST_CADDY_ADMIN_SOCKET" == 1 ]]; then
+cat > /etc/caddy/Caddyfile <<'CADDYFILE'
+# Caddy global options (ACME TLS — default).
+{
+  admin unix//var/lib/caddy/admin.sock
+}
+
+import sites.d/*.caddy
+CADDYFILE
+else
 cat > /etc/caddy/Caddyfile <<'CADDYFILE'
 # Caddy global options (ACME TLS — default).
 
 import sites.d/*.caddy
 CADDYFILE
+fi
 
+# The switch from TCP to the socket: the running Caddy does not listen on
+# the new address yet, so reload fails and Caddy is restarted.
+SAMOHOST_CADDY_ADMIN_SWITCH=0
+if grep -Eq '^[[:space:]]*admin[[:space:]]+unix//var/lib/caddy/admin[.]sock([[:space:]]|$)' /etc/caddy/Caddyfile && ! grep -Eq '^[[:space:]]*admin[[:space:]]+unix//var/lib/caddy/admin[.]sock([[:space:]]|$)' "$SAMOHOST_CADDYFILE_PREV"; then
+  SAMOHOST_CADDY_ADMIN_SWITCH=1
+fi
 caddy validate --config /etc/caddy/Caddyfile
 /usr/bin/systemctl enable caddy
-/usr/bin/systemctl reload caddy || /usr/bin/systemctl restart caddy
+if [[ "$SAMOHOST_CADDY_ADMIN_SWITCH" == 1 ]]; then
+  # A failed restart must reach the restore below, not stop the script.
+  /usr/bin/systemctl reload caddy || /usr/bin/systemctl restart caddy || true
+  if ! /usr/bin/systemctl is-active --quiet caddy; then
+    echo "ERROR: caddy is not running after the admin socket change; restoring the previous Caddyfile" >&2
+    if [[ -s "$SAMOHOST_CADDYFILE_PREV" ]]; then cp "$SAMOHOST_CADDYFILE_PREV" /etc/caddy/Caddyfile; fi
+    /usr/bin/systemctl restart caddy || true
+    rm -f "$SAMOHOST_CADDYFILE_PREV"
+    exit 1
+  fi
+else
+  /usr/bin/systemctl reload caddy || /usr/bin/systemctl restart caddy
+fi
+rm -f "$SAMOHOST_CADDYFILE_PREV"
 echo "Caddy: Caddyfile written (tls=acme), validated, reloaded."
 
 # ---------------------------------------------------------------------------
