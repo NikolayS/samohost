@@ -81,8 +81,6 @@ const SPLIT_SUDOERS = [
   "shop ALL=(root) NOPASSWD: /usr/bin/mv -- /etc/caddy/sites.d/.samohost-heal-next-00-main-shop.caddy /etc/caddy/sites.d/00-main-shop.caddy",
   "shop ALL=(root) NOPASSWD: /usr/bin/rm -f /etc/caddy/sites.d/.samohost-heal-next-00-main-shop.caddy",
   "shop ALL=(root) NOPASSWD: /usr/bin/tee /opt/shop/release.env",
-  "shop ALL=(root) NOPASSWD: /usr/bin/tee ^/etc/caddy/sites[.]d/shop-[a-z0-9-]+[.]caddy$",
-  "shop ALL=(root) NOPASSWD: /usr/bin/rm ^-f /etc/caddy/sites[.]d/shop-[a-z0-9-]+[.]caddy$",
 ].join("\n") + "\n";
 
 const SPLIT_UNIT = [
@@ -277,35 +275,12 @@ describe("new layout: deploy user's sudo rules", () => {
     expect(rules).not.toContain("(postgres)");
   });
 
-  test("preview patterns: sudo regular expressions without characters sudoers would need escaped", () => {
-    const regexRules = SPLIT_SUDOERS.trim().split("\n").filter((l) => l.includes(" ^"));
-    expect(regexRules.length).toBe(2);
-    for (const rule of regexRules) {
-      const args = rule.slice(rule.indexOf(" ^") + 1);
-      expect(args.startsWith("^") && args.endsWith("$")).toBe(true);
-      expect(args).not.toMatch(/[\\,:=*?]/);
-    }
-  });
-
-  test("preview patterns match only one preview vhost file of this app", () => {
+  test("no rule for preview vhost files: <app>-<label> overlaps between apps whose names share a prefix", () => {
+    const rules = writtenSudoersAndUnit("split").sudoers;
+    expect(rules).not.toContain("^");
     const allowed = sudoMatcher(SPLIT_SUDOERS);
-    expect(allowed("/usr/bin/tee", "/etc/caddy/sites.d/shop-feat-x.caddy")).toBe(true);
-    expect(allowed("/usr/bin/rm", "-f /etc/caddy/sites.d/shop-feat-x-1a2b3c.caddy")).toBe(true);
-    for (const args of [
-      "/etc/caddy/sites.d/shop-a.caddy /etc/sudoers.d/x",
-      "/etc/caddy/sites.d/shop-../../sudoers.d/x.caddy",
-      "/etc/caddy/sites.d/shop-a b.caddy",
-      "/etc/caddy/sites.d/shop-A.caddy",
-      "/etc/caddy/sites.d/other-a.caddy",
-      "/etc/caddy/sites.d/00-main-other.caddy",
-      "/etc/caddy/sitesXd/shop-a.caddy",
-      "-a /etc/caddy/sites.d/shop-a.caddy",
-      "/etc/caddy/Caddyfile",
-    ]) {
-      expect(allowed("/usr/bin/tee", args), args).toBe(false);
-      expect(allowed("/usr/bin/rm", `-f ${args}`), args).toBe(false);
-    }
-    expect(allowed("/usr/bin/rm", "-rf /etc/caddy/sites.d/shop-a.caddy")).toBe(false);
+    expect(allowed("/usr/bin/tee", "/etc/caddy/sites.d/shop-feat-x.caddy")).toBe(false);
+    expect(allowed("/usr/bin/rm", "-f /etc/caddy/sites.d/shop-feat-x.caddy")).toBe(false);
   });
 
   test("every sudo command of the node deploy and heal scripts is allowed by the new rules", () => {

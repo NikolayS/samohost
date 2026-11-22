@@ -327,10 +327,9 @@ export function buildHostBootstrapScript(
   const mainVhostFile = `/etc/caddy/sites.d/00-main-${app.name}.caddy`;
   // Same name as the heal script's staging file (src/app/heal-script.ts).
   const healStagedVhostFile = `/etc/caddy/sites.d/.samohost-heal-next-00-main-${app.name}.caddy`;
-  // Preview vhost files are /etc/caddy/sites.d/<app>-<label>.caddy with the
-  // label in [a-z0-9-] (src/env/name.ts). sudo 1.9.10+ matches a ^...$
-  // argument pattern against the whole argument string.
-  const previewVhostPattern = `/etc/caddy/sites[.]d/${app.name.replaceAll(".", "[.]")}-[a-z0-9-]+[.]caddy`;
+  // No sudo rule for preview vhost files (/etc/caddy/sites.d/<app>-<label>.caddy):
+  // that name pattern overlaps between apps whose names share a prefix, and
+  // previews of new-layout apps are not designed yet (host-prep refuses them).
   const seedOwnerLogin = opts.seedOwnerLogin ?? "owner";
   // cp-http80: the control plane is the only proxy in front of this server's
   // Caddy (the firewall opens :80 to it alone). The app trusts its
@@ -744,10 +743,10 @@ export function buildHostBootstrapScript(
       "",
       ...(runtimeUserUsable
         ? [
-            `# split layout: exact file names for the main vhost and the heal staging`,
-            `# file; sudo regular expressions for this app's preview vhost files. No`,
-            `# wildcard, journalctl, daemon-reload or psql grant: the deploy and heal`,
-            `# scripts do not use them (logs and doctor run as the operator user).`,
+            `# split layout: exact file names for the main vhost, the heal staging file`,
+            `# and release.env. No wildcard, preview, journalctl, daemon-reload or psql`,
+            `# grant: the deploy and heal scripts do not use them (logs and doctor run`,
+            `# as the operator user; previews of these apps are not designed yet).`,
             `if [[ "$SAMOHOST_DB_LAYOUT" == split ]]; then`,
             `cat > ${sq(sudoersFile)} <<'SAMOHOST_SPLIT_SUDOERS'`,
             `${appUser} ALL=(root) NOPASSWD: /usr/bin/systemctl enable ${unit}`,
@@ -760,8 +759,6 @@ export function buildHostBootstrapScript(
             `${appUser} ALL=(root) NOPASSWD: /usr/bin/mv -- ${healStagedVhostFile} ${mainVhostFile}`,
             `${appUser} ALL=(root) NOPASSWD: /usr/bin/rm -f ${healStagedVhostFile}`,
             `${appUser} ALL=(root) NOPASSWD: /usr/bin/tee ${releaseEnvFile}`,
-            `${appUser} ALL=(root) NOPASSWD: /usr/bin/tee ^${previewVhostPattern}$`,
-            `${appUser} ALL=(root) NOPASSWD: /usr/bin/rm ^-f ${previewVhostPattern}$`,
             "SAMOHOST_SPLIT_SUDOERS",
             "else",
           ]

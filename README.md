@@ -323,15 +323,18 @@ keep the legacy layout get the same sudo rules and unit as before.
   through an exact `sudo /usr/bin/tee /opt/<app>/release.env` rule. Its
   other sudo rules name exact files: `00-main-<app>.caddy` and the heal
   staging file
-  `.samohost-heal-next-00-main-<app>.caddy`. For preview vhost files it gets
-  sudo regular expressions (sudo 1.9.10 or later) that match only
-  `/etc/caddy/sites.d/<app>-<label>.caddy` with the label in `[a-z0-9-]`.
-  It has no `journalctl`, `daemon-reload` or `psql` rule: `samohost logs`
+  `.samohost-heal-next-00-main-<app>.caddy`. It has no rule for preview
+  vhost files: their name `<app>-<label>.caddy` would also match previews of
+  another app whose name starts with `<app>-`. It has no `journalctl`,
+  `daemon-reload` or `psql` rule: `samohost logs`
   and `samohost doctor` connect as the operator user, and the deploy and
   heal scripts of these apps do not use the other two.
 - The deploy sets `umask 022` so the runtime user can read what it builds.
 
-Previews of these apps are not built yet. They will need rules for
+Previews of these apps are not built yet, and host-prep refuses them. They
+will need a preview vhost file name that cannot match another app's files
+(for example `<app>--<label>.caddy` with labels that do not contain `--`),
+rules for writing and removing those files, rules for
 `systemctl enable --now`, `disable --now` and `reset-failed` of the preview
 instance `<app>@<label>`, and a way to create and drop the preview database
 that is not `psql` as `postgres`. The preview unit should use the same
