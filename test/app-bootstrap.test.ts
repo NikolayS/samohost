@@ -567,7 +567,7 @@ function demoOptsA2(overrides: Partial<HostBootstrapOptions> = {}): HostBootstra
   return {
     appUser: "deployer",
     dbName: "demo_db",
-    appDbRole: "svc_user",
+    appDbRole: "demo_db_svc",
     seedOwnerLogin: "admin_owner",
     ...overrides,
   };
@@ -647,7 +647,8 @@ describe("buildHostBootstrapScript (A2) — DB superuser password handling", () 
     expect(script).toContain("ALTER ROLE postgres PASSWORD");
     // The psql invocation that carries the ALTER must use stdin piping, not -c with password
     // Pattern: something | ... psql  (the pipe feeds the SQL)
-    expect(script).toMatch(/printf[^\n]*\|\s*(sudo[^\n]*)?\s*.*psql|printf[^\n]*ALTER ROLE/);
+    // printf '%s\n' <no-log settings> \ / "ALTER ROLE postgres PASSWORD ..." \ / | sudo -u postgres psql
+    expect(script).toMatch(/printf '%s\\n'[^\n]*\\\n\s*"ALTER ROLE postgres PASSWORD[^\n]*\\\n\s*\|\s*sudo -u postgres psql/);
   });
 
   test("no PGPASSWORD= in a command line (password must not be in argv)", () => {
@@ -792,9 +793,9 @@ describe("buildHostBootstrapScript (A2) — base env file content", () => {
     );
   });
 
-  test("custom appDbRole option (svc_user) is the role in the URL", () => {
-    const script = buildHostBootstrapScript(demoApp(), demoOptsA2({ appDbRole: "svc_user" }));
-    expect(script).toContain("APP_DB_ROLE='svc_user'");
+  test("custom appDbRole option (demo_db_svc) is the role in the URL", () => {
+    const script = buildHostBootstrapScript(demoApp(), demoOptsA2({ appDbRole: "demo_db_svc" }));
+    expect(script).toContain("APP_DB_ROLE='demo_db_svc'");
   });
 
   test("the literal 'app_password' placeholder is never written (only detected for replacement)", () => {
@@ -1043,9 +1044,9 @@ describe("buildHostBootstrapScript (A2) — no hardcoding with demo-app fixture"
     expect(script).toContain("demo_db");
   });
 
-  test("demo-app script contains custom appDbRole 'svc_user'", () => {
-    const script = buildHostBootstrapScript(demoApp(), demoOptsA2({ appDbRole: "svc_user" }));
-    expect(script).toContain("svc_user");
+  test("demo-app script contains custom appDbRole 'demo_db_svc'", () => {
+    const script = buildHostBootstrapScript(demoApp(), demoOptsA2({ appDbRole: "demo_db_svc" }));
+    expect(script).toContain("demo_db_svc");
   });
 
   test("demo-app script contains custom seedOwnerLogin 'admin_owner'", () => {

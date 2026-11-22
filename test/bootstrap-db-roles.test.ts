@@ -154,7 +154,11 @@ describe("bootstrap — app database role (executed with stubs)", () => {
       expect(res.status).toBe(0);
       const env = readFileSync(join(sb.dir, "staging.env"), "utf8");
       expect(env).toContain(line);
-      expect(readOr(sb.sqlLog)).not.toContain("legacy_role");
+      // The role is not created or altered; it only keeps CONNECT on the database.
+      expect(readOr(sb.sqlLog)).not.toMatch(/(CREATE|ALTER) ROLE[^\n]*legacy_role|rolname = 'legacy_role'\) THEN/);
+      expect(readOr(sb.sqlLog)).toContain(
+        "SELECT format('GRANT CONNECT, TEMPORARY ON DATABASE %I TO %I', 'shop', rolname) FROM pg_catalog.pg_roles WHERE rolname = 'legacy_role' \\gexec",
+      );
       expect(readOr(sb.sqlLog)).not.toContain("shop_app");
     } finally {
       sb.cleanup();

@@ -286,6 +286,27 @@ export function buildHostBootstrapScript(
         "expected ^[a-z_][a-z0-9_]{0,62}$",
     );
   }
+  if (
+    !isStatic &&
+    (!appDbRole.startsWith(`${dbName}_`) ||
+      appDbRole === `${dbName}_owner` ||
+      appDbRole === "postgres" ||
+      appDbRole.startsWith("pg_"))
+  ) {
+    throw new Error(
+      `buildHostBootstrapScript: invalid appDbRole ${JSON.stringify(appDbRole)}: ` +
+        `it must start with "${dbName}_" and must not be "${dbName}_owner", "postgres" or a pg_ name`,
+    );
+  }
+  // Session settings fed to psql before any statement that carries a
+  // password, so the statement text never reaches the PostgreSQL log (same
+  // lines as src/env/script.ts uses for preview roles).
+  const noLogSqlArgs =
+    `"SET log_statement TO 'none';" "SET log_min_duration_statement TO -1;" "SET log_min_error_statement TO 'panic';"`;
+  // psql as postgres inside the app's database: the database owner role can
+  // set the database's search_path, so pin it to pg_catalog.
+  const psqlInAppDb = (db: string): string =>
+    `sudo -u postgres env PGOPTIONS='-c search_path=pg_catalog' psql -p 5432 -d ${sq(db)}`;
   // Split layout (src/app/db-layout.ts): the migration role owns the app's
   // database; the migrate env file sits next to the runtime env file.
   const ownerDbRole = `${dbName ?? app.name}_owner`;
@@ -1098,8 +1119,8 @@ export function buildHostBootstrapScript(
     // Dollar-quoting: \$pgpw\$...\$pgpw\$ — fed via STDIN so cleartext never lands in argv.
     // \$pgpw\$ in the generated bash script: backslash-escaped so bash treats $ as literal.
     // Use string concatenation + explicit escapes to prevent TS template-literal expansion.
-    "printf 'ALTER ROLE postgres PASSWORD %s;\\n'" +
-      " \"\\$pgpw\\$${PG_SUPER_PW}\\$pgpw\\$\" \\",
+    `printf '%s\\n' ${noLogSqlArgs} \\`,
+    "  \"ALTER ROLE postgres PASSWORD \\$pgpw\\$${PG_SUPER_PW}\\$pgpw\\$;\" \\",
     `  | sudo -u postgres psql -p 5432 -q >/dev/null`,
     `echo "postgres: superuser password set (value not logged)"`,
     `fi`,
@@ -1120,7 +1141,7 @@ export function buildHostBootstrapScript(
     `    OWNER_DB_PW="$(openssl rand -hex 24)"`,
     `    echo "postgres: generated a new password for role $OWNER_DB_ROLE (value only in $MIGRATE_ENV_FILE)"`,
     `  fi`,
-    "  printf '%s\\n' \\",
+    `  printf '%s\\n' ${noLogSqlArgs} \\`,
     "    \"DO \\$samohost\\$ BEGIN IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = '${OWNER_DB_ROLE}') THEN EXECUTE format('CREATE ROLE %I', '${OWNER_DB_ROLE}'); END IF; END \\$samohost\\$;\" \\",
     "    \"ALTER ROLE ${OWNER_DB_ROLE} WITH LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS PASSWORD \\$pgpw\\$${OWNER_DB_PW}\\$pgpw\\$;\" \\",
     `    | sudo -u postgres psql -p 5432 -q -v ON_ERROR_STOP=1 >/dev/null`,
@@ -1148,7 +1169,7 @@ export function buildHostBootstrapScript(
     `  # Tables created earlier by another role (for example by the superuser in`,
     `  # the legacy layout) stay owned by that role; migrations as $OWNER_DB_ROLE`,
     `  # cannot alter them until an operator changes their owner.`,
-    `  SAMOHOST_FOREIGN_OWNED="$(sudo -u postgres psql -p 5432 -d ${sq(dbName)} -qAtc "SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = 'public' AND c.relowner <> (SELECT oid FROM pg_roles WHERE rolname = '\${OWNER_DB_ROLE}')" 2>/dev/null || echo 0)"`,
+    `  SAMOHOST_FOREIGN_OWNED="$(${psqlInAppDb(dbName)} -qAtc "SELECT pg_catalog.count(*) FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid OPERATOR(pg_catalog.=) c.relnamespace WHERE n.nspname OPERATOR(pg_catalog.=) 'public' AND c.relowner OPERATOR(pg_catalog.<>) (SELECT oid FROM pg_catalog.pg_roles WHERE rolname OPERATOR(pg_catalog.=) '\${OWNER_DB_ROLE}')" 2>/dev/null || echo 0)"`,
     `  if [[ "\${SAMOHOST_FOREIGN_OWNED:-0}" =~ ^[1-9] ]]; then`,
     `    echo "WARNING: \${SAMOHOST_FOREIGN_OWNED} object(s) in schema public of ${dbName} are not owned by $OWNER_DB_ROLE; migrations cannot alter them" >&2`,
     `  fi`,
@@ -1179,7 +1200,7 @@ export function buildHostBootstrapScript(
     `    APP_DB_PW="$(openssl rand -hex 24)"`,
     `    echo "postgres: generated a new password for role $APP_DB_ROLE (value only in $ENV_FILE)"`,
     `  fi`,
-    "  printf '%s\\n' \\",
+    `  printf '%s\\n' ${noLogSqlArgs} \\`,
     "    \"DO \\$samohost\\$ BEGIN IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = '${APP_DB_ROLE}') THEN EXECUTE format('CREATE ROLE %I', '${APP_DB_ROLE}'); END IF; END \\$samohost\\$;\" \\",
     "    \"ALTER ROLE ${APP_DB_ROLE} WITH LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS PASSWORD \\$pgpw\\$${APP_DB_PW}\\$pgpw\\$;\" \\",
     `    "SELECT format('REVOKE CONNECT, TEMPORARY ON DATABASE %I FROM PUBLIC', '${dbName}') \\\\gexec" \\`,
@@ -1189,6 +1210,34 @@ export function buildHostBootstrapScript(
     `  echo "postgres: role $APP_DB_ROLE ready (login, no superuser, CONNECT on ${dbName} only) [password not logged]"`,
     `fi`,
     `unset APP_DB_PW`,
+    "",
+    `# Rights of the role in ${rlsUrlVar} (the samohost app role or a role set up`,
+    `# by hand): CONNECT on ${dbName} in both layouts, so the REVOKE from PUBLIC`,
+    `# above does not lock out a preserved role. Split layout only: the migration`,
+    `# role owns schema public (PostgreSQL 15+ gives CREATE on it only to its`,
+    `# owner), and the app role gets data rights on the tables and sequences`,
+    `# that the migration role creates now (default privileges) and that exist.`,
+    `APP_DB_GRANTEE="$(printf '%s' "$APP_DB_LINE" | sed -E 's#^[^=]*=postgresql://([^:@/?]*).*#\\1#')"`,
+    `if [[ ! "$APP_DB_GRANTEE" =~ ^[a-z_][a-z0-9_]{0,62}$ ]]; then`,
+    `  echo "WARNING: the role in ${rlsUrlVar} is not a plain lowercase name; it gets no grants" >&2`,
+    `  APP_DB_GRANTEE=""`,
+    `fi`,
+    `if [[ -n "$APP_DB_GRANTEE" ]]; then`,
+    `  printf '%s\\n' \\`,
+    `    "SELECT format('GRANT CONNECT, TEMPORARY ON DATABASE %I TO %I', '${dbName}', rolname) FROM pg_catalog.pg_roles WHERE rolname = '\${APP_DB_GRANTEE}' \\\\gexec" \\`,
+    `    | sudo -u postgres psql -p 5432 -q -v ON_ERROR_STOP=1 >/dev/null`,
+    `fi`,
+    `if [[ "$SAMOHOST_DB_LAYOUT" == split ]]; then`,
+    `  printf '%s\\n' \\`,
+    `    "SELECT format('ALTER SCHEMA public OWNER TO %I', '\${OWNER_DB_ROLE}') \\\\gexec" \\`,
+    `    "SELECT format('GRANT USAGE ON SCHEMA public TO %I', rolname) FROM pg_catalog.pg_roles WHERE rolname = '\${APP_DB_GRANTEE}' \\\\gexec" \\`,
+    `    "SELECT format('ALTER DEFAULT PRIVILEGES FOR ROLE %I IN SCHEMA public GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO %I', '\${OWNER_DB_ROLE}', rolname) FROM pg_catalog.pg_roles WHERE rolname = '\${APP_DB_GRANTEE}' \\\\gexec" \\`,
+    `    "SELECT format('ALTER DEFAULT PRIVILEGES FOR ROLE %I IN SCHEMA public GRANT USAGE, SELECT, UPDATE ON SEQUENCES TO %I', '\${OWNER_DB_ROLE}', rolname) FROM pg_catalog.pg_roles WHERE rolname = '\${APP_DB_GRANTEE}' \\\\gexec" \\`,
+    `    "SELECT format('GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO %I', rolname) FROM pg_catalog.pg_roles WHERE rolname = '\${APP_DB_GRANTEE}' \\\\gexec" \\`,
+    `    "SELECT format('GRANT USAGE, SELECT, UPDATE ON ALL SEQUENCES IN SCHEMA public TO %I', rolname) FROM pg_catalog.pg_roles WHERE rolname = '\${APP_DB_GRANTEE}' \\\\gexec" \\`,
+    `    | ${psqlInAppDb(dbName)} -q -v ON_ERROR_STOP=1 >/dev/null`,
+    `  echo "postgres: schema public of ${dbName} owned by $OWNER_DB_ROLE; data rights for \${APP_DB_GRANTEE:-no app role}"`,
+    `fi`,
     "",
   );
 

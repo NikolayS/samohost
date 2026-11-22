@@ -82,7 +82,8 @@ export function makeSandbox(): Sandbox {
     "#!/usr/bin/env bash",
     `printf '%s\\n' "$*" >> ${JSON.stringify(argvLog)}`,
     'args="$*"',
-    'if [[ "$args" == *"-c "* || "$args" == *"-qAtc"* ]]; then',
+    // A -c after psql is a probe; PGOPTIONS='-c ...' before psql is not.
+    'if [[ "$args" == *psql*" -c "* || "$args" == *"-qAtc"* ]]; then',
     '  if [[ "$args" == *"pg_roles"* ]]; then',
     `    role=$(printf '%s' "$args" | sed -E "s/.*rolname='([^']*)'.*/\\1/")`,
     `    grep -qx "$role" ${JSON.stringify(rolesFile)} && echo 1`,

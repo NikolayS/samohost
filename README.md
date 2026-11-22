@@ -210,6 +210,26 @@ both without superuser, CREATEDB, CREATEROLE, REPLICATION or BYPASSRLS:
 CONNECT on `<db>` is revoked from PUBLIC and granted to these two roles.
 Passwords are generated on the server and kept on re-runs.
 
+`<db>_owner` owns schema `public` of `<db>`, so migrations can create
+tables in it (PostgreSQL 15 and later give CREATE on `public` only to its
+owner). `<db>_app` gets USAGE on schema `public`, SELECT, INSERT, UPDATE and
+DELETE on tables, and USAGE, SELECT and UPDATE on sequences: as default
+privileges for objects that `<db>_owner` creates later, and as grants on the
+objects that exist when bootstrap runs. A bootstrap re-run grants these
+rights again on all existing tables, including tables from which a migration
+revoked them; the next migrate run revokes them again. If
+`APP_DATABASE_URL` names a role that samohost did not create, that role and
+the line are left unchanged, and the role gets CONNECT on `<db>` and the
+same rights.
+
+What the app sees:
+
+- new layout: the running app has `APP_DATABASE_URL` and no
+  `DATABASE_URL`. `DATABASE_URL` (the owner role) and `APP_DATABASE_URL`
+  are both set only for `migrateCmd` and `seedCmd`.
+- old layout (bootstrapped by an older samohost): the running app keeps
+  `DATABASE_URL` (the superuser) and `APP_DATABASE_URL`.
+
 Two env files sit next to each other on the server:
 
 - the runtime env file (`envFile`, loaded by the systemd unit): the app's
@@ -229,8 +249,12 @@ and keep it as it is. To move such an app to the new layout:
    `<db>_owner`, makes it the owner of `<db>`, writes `migrate.env`, and prints
    a warning when objects in schema `public` are owned by another role.
 3. As root, give those objects to `<db>_owner`
-   (`sudo -u postgres psql -d <db>`, then `ALTER TABLE ... OWNER TO <db>_owner;`
-   for each table, view and unowned sequence), so migrations can alter them.
+   (`sudo -u postgres env PGOPTIONS='-c search_path=pg_catalog' psql -d <db>`,
+   then `ALTER TABLE public.<name> OWNER TO <db>_owner;` for each table, view
+   and unowned sequence), so migrations can alter them. Keep the
+   `search_path` setting: the owner of `<db>` can set the database's
+   `search_path`, and a superuser session that resolves names through
+   `public` could run functions that role wrote.
 4. Deploy. The next deploy finds `migrate.env` and uses the new layout.
 
 ### Rollback of a node deploy
