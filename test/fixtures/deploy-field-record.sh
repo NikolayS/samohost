@@ -122,6 +122,13 @@ else
   if [[ "$SAMOHOST_HAS_PREVIOUS_RELEASE" == "1" ]]; then rollback before-restart; fi
   exit 1
 fi
+# split layout: the service's runtime user reads the release through the
+# world-read bit; umask 022 covers new files, this covers files an earlier
+# clone or deploy left owner-only. Skips .git; does not follow links.
+if [[ -f "$SAMOHOST_MIGRATE_ENV_FILE" ]]; then
+  find "$SAMOHOST_APP_DIR" -path "$SAMOHOST_APP_DIR/.git" -prune -o ! -type l -exec chmod go+rX {} + \
+    || echo "WARNING: could not make every file in $SAMOHOST_APP_DIR readable for the runtime user" >&2
+fi
 
 # --- migrate: apply DB migrations before the new code boots ---
 # subshell + cd: always runs from the app dir, whatever buildCmd cd'd into (issue #122).

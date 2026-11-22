@@ -1393,6 +1393,13 @@ export function buildHostBootstrapScript(
     `chown ${sq(appUser)}:${sq(appUser)} "$GIT_SAFE_CONF"`,
     `chmod 644 "$GIT_SAFE_CONF"`,
     "",
+    ...(runtimeUserUsable
+      ? [
+          `# split layout: the service runs as ${runtimeUser}, which reads the checkout`,
+          `# through the world-read bit. §11 left umask 077 for the env files.`,
+          `if [[ "$SAMOHOST_DB_LAYOUT" == split ]]; then umask 022; fi`,
+        ]
+      : []),
     `if [[ -d "$APP_DIR/.git" ]]; then`,
     `  echo "clone: $APP_DIR already a git checkout — leaving in place."`,
     `elif [[ -s "$TOKEN_FILE" ]]; then`,
@@ -1425,6 +1432,15 @@ export function buildHostBootstrapScript(
     `else`,
     `  echo "clone: SKIPPED (no token). Place a 600 token at $TOKEN_FILE and re-run."`,
     `fi`,
+    ...(runtimeUserUsable
+      ? [
+          `# split layout: open up files an earlier clone left owner-only. Runs as the`,
+          `# deploy user, who owns them; skips .git and does not follow links.`,
+          `if [[ "$SAMOHOST_DB_LAYOUT" == split && -d "$APP_DIR" && ! -L "$APP_DIR" ]]; then`,
+          `  sudo -u ${sq(appUser)} find "$APP_DIR" -path "$APP_DIR/.git" -prune -o ! -type l -exec chmod go+rX {} +`,
+          `fi`,
+        ]
+      : []),
     "",
   );
 
