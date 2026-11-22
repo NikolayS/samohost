@@ -20,7 +20,7 @@ function section9(text: string): string {
   return lines.slice(start, end - 1).join("\n");
 }
 
-function run9(layout: "split" | "legacy", isActive: "0" | "3", tlsMode?: "local") {
+function run9(layout: "split" | "legacy", isActive: "0" | "3", tlsMode?: "local", restartFails = false) {
   const dir = mkdtempSync(join(tmpdir(), "samohost-caddy-"));
   const bin = join(dir, "bin");
   mkdirSync(bin);
@@ -30,7 +30,16 @@ function run9(layout: "split" | "legacy", isActive: "0" | "3", tlsMode?: "local"
     chmodSync(join(bin, name), 0o755);
   };
   stub("caddy", "exit 0");
-  stub("systemctl", `if [[ "$1" == reload ]]; then exit 1; fi\nif [[ "$1" == is-active ]]; then exit ${isActive}; fi\nexit 0`);
+  stub(
+    "systemctl",
+    [
+      `if [[ "$1" == reload ]]; then exit 1; fi`,
+      `if [[ "$1" == is-active ]]; then exit ${isActive}; fi`,
+      // The first restart fails when asked to; the one after the restore works.
+      `if [[ "$1" == restart && ${restartFails ? 1 : 0} == 1 && ! -e ${JSON.stringify(join(dir, "restarted-once"))} ]]; then touch ${JSON.stringify(join(dir, "restarted-once"))}; exit 1; fi`,
+      "exit 0",
+    ].join("\n"),
+  );
   const etc = join(dir, "etc-caddy");
   mkdirSync(etc);
   writeFileSync(join(etc, "Caddyfile"), "# previous\nimport sites.d/*.caddy\n");
@@ -79,6 +88,18 @@ describe("Caddy admin API (split layout)", () => {
       expect(r.res.status).toBe(1);
       expect(r.res.stderr).toContain("restoring the previous Caddyfile");
       expect(r.caddyfile).toBe("# previous\nimport sites.d/*.caddy\n");
+    } finally {
+      r.cleanup();
+    }
+  });
+
+  test("restart fails with the new Caddyfile: the previous one is restored and Caddy restarted", () => {
+    const r = run9("split", "3", undefined, true);
+    try {
+      expect(r.res.status).toBe(1);
+      expect(r.res.stderr).toContain("restoring the previous Caddyfile");
+      expect(r.caddyfile).toBe("# previous\nimport sites.d/*.caddy\n");
+      expect(r.calls.split("\n").filter((l) => l === "systemctl restart caddy").length).toBe(2);
     } finally {
       r.cleanup();
     }

@@ -911,8 +911,9 @@ export function buildHostBootstrapScript(
   const caddyfileHeader = tlsMode === "local"
     ? ["# Caddy global options (local TLS — no ACME).", "{", "  local_certs", "}"]
     : ["# Caddy global options (ACME TLS — default)."];
-  // Split layout: Caddy's admin API on a unix socket in the caddy user's home
-  // (Caddy creates it 755, so only caddy can connect). The default is TCP
+  // Split layout: Caddy's admin API on a unix socket in the caddy user's home.
+  // Connecting to a unix socket needs write permission on it, which only the
+  // caddy user (its owner) and root have. The default is TCP
   // localhost:2019, which every local process, the app included, can use to
   // load a new Caddy config. `systemctl reload caddy` runs `caddy reload` as
   // caddy, which sends the config to the admin address the config names.
@@ -983,10 +984,11 @@ export function buildHostBootstrapScript(
   push(
     `caddy validate --config /etc/caddy/Caddyfile`,
     `/usr/bin/systemctl enable caddy`,
-    `/usr/bin/systemctl reload caddy || /usr/bin/systemctl restart caddy`,
     ...(runtimeUserUsable && !isStaticReleaseChannel
       ? [
           `if [[ "$SAMOHOST_DB_LAYOUT" == split ]]; then`,
+          `  # A failed restart must reach the restore below, not stop the script.`,
+          `  /usr/bin/systemctl reload caddy || /usr/bin/systemctl restart caddy || true`,
           `  if ! /usr/bin/systemctl is-active --quiet caddy; then`,
           `    echo "ERROR: caddy is not running after the admin socket change; restoring the previous Caddyfile" >&2`,
           `    if [[ -s "$SAMOHOST_CADDYFILE_PREV" ]]; then cp "$SAMOHOST_CADDYFILE_PREV" /etc/caddy/Caddyfile; fi`,
@@ -995,9 +997,11 @@ export function buildHostBootstrapScript(
           `    exit 1`,
           `  fi`,
           `  rm -f "$SAMOHOST_CADDYFILE_PREV"`,
+          `else`,
+          `  /usr/bin/systemctl reload caddy || /usr/bin/systemctl restart caddy`,
           `fi`,
         ]
-      : []),
+      : [`/usr/bin/systemctl reload caddy || /usr/bin/systemctl restart caddy`]),
     `echo "Caddy: Caddyfile ${isStaticReleaseChannel ? "ready" : "written"} (tls=${tlsMode}), validated, reloaded."`,
     "",
   );
