@@ -67,7 +67,7 @@ describe("§5 directory layout", () => {
         `install -d -m 755 -o root -g root ${r.base}`,
         `chown -h root:root ${r.base}`,
         `chmod 755 ${r.base}`,
-        `install -d -m 755 -o shop -g shop ${r.base}/uploads`,
+        // uploads is created in §5c for the runtime user, never for the deploy user.
         `install -d -m 755 -o shop -g shop ${r.base}/app`,
       ]);
     } finally {

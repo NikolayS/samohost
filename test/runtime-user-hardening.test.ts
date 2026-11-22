@@ -10,7 +10,7 @@
 
 import { describe, expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
-import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, linkSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { buildHostBootstrapScript } from "../src/app/bootstrap.ts";
@@ -195,7 +195,7 @@ describe("env layout is decided before the sudo rules and the unit", () => {
 
 describe("new layout: runtime user '<app>-run'", () => {
   test("created as a system user with no login shell, its own group only, owning only the uploads folder", () => {
-    const sb = stubDir({ id: "exit 1", useradd: "", usermod: "", gpasswd: "", chown: "", chmod: "" });
+    const sb = stubDir({ id: "exit 1", useradd: "", usermod: "", gpasswd: "", chown: "", chmod: "", install: "" });
     try {
       const res = runBash(section(script(), "5c", "6"), sb.dir, { SAMOHOST_DB_LAYOUT: "split" });
       expect(res.status, res.stderr).toBe(0);
@@ -205,8 +205,7 @@ describe("new layout: runtime user '<app>-run'", () => {
         "useradd --system --user-group --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin shop-run",
         "usermod --shell /usr/sbin/nologin shop-run",
         "gpasswd -d shop-run shop",
-        "chown -hR shop-run:shop-run /opt/shop/uploads",
-        "chmod 750 /opt/shop/uploads",
+        "install -d -m 750 -o shop-run -g shop-run /opt/shop/uploads",
       ]);
     } finally {
       sb.cleanup();
@@ -228,8 +227,35 @@ describe("new layout: runtime user '<app>-run'", () => {
     }
   });
 
+  test("an existing uploads folder: owner changed without following links; files with more than one hard link skipped", () => {
+    const sb = stubDir({ id: "exit 0", useradd: "", usermod: "", gpasswd: "", chown: "", chmod: "", install: "" });
+    try {
+      const uploads = join(sb.dir, "uploads");
+      mkdirSync(join(uploads, "sub"), { recursive: true });
+      writeFileSync(join(uploads, "photo.jpg"), "x");
+      writeFileSync(join(sb.dir, "outside"), "secret");
+      linkSync(join(sb.dir, "outside"), join(uploads, "linked"));
+      symlinkSync("/etc/hosts", join(uploads, "sub", "link"));
+      const text = section(script(), "5c", "6").replaceAll("/opt/shop/uploads", uploads);
+      const res = runBash(text, sb.dir, { SAMOHOST_DB_LAYOUT: "split" });
+      expect(res.status, res.stderr).toBe(0);
+      const calls = readFileSync(sb.log, "utf8");
+      const chowned = calls.split("\n").filter((l) => l.startsWith("chown ")).join(" ");
+      expect(chowned).toContain(`-h shop-run:shop-run`);
+      expect(chowned).toContain(join(uploads, "photo.jpg"));
+      expect(chowned).toContain(join(uploads, "sub", "link"));
+      expect(chowned).not.toContain(join(uploads, "linked"));
+      expect(calls).not.toMatch(/^chown -hR/m);
+      expect(calls).not.toMatch(/^install /m);
+      expect(calls).toContain(`chmod 750 ${uploads}`);
+      expect(res.stderr).toContain("more than one hard link");
+    } finally {
+      sb.cleanup();
+    }
+  });
+
   test("an existing runtime user is kept (no second useradd)", () => {
-    const sb = stubDir({ id: "exit 0", useradd: "", usermod: "", gpasswd: "", chown: "", chmod: "" });
+    const sb = stubDir({ id: "exit 0", useradd: "", usermod: "", gpasswd: "", chown: "", chmod: "", install: "" });
     try {
       const res = runBash(section(script(), "5c", "6"), sb.dir, { SAMOHOST_DB_LAYOUT: "split" });
       expect(res.status, res.stderr).toBe(0);

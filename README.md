@@ -315,7 +315,8 @@ keep the legacy layout get the same sudo rules and unit as before.
   checkout's `.git` and `.npmrc`. `MemoryDenyWriteExecute` is not set
   because Node's JIT needs it off.
 - `/opt/<app>` is root-owned (755). The deploy user owns only the checkout
-  `/opt/<app>/app`, and the runtime user owns `/opt/<app>/uploads`. Nobody
+  `/opt/<app>/app`, and the runtime user owns `/opt/<app>/uploads` (on a
+  fresh server bootstrap creates it for the runtime user directly). Nobody
   but root can create, rename or replace entries next to the files that
   root writes and systemd reads (the env file, `migrate.env`,
   `release.env`, `git-safe.conf`, the token file), so a symbolic link
@@ -364,7 +365,9 @@ runtime user and hardening.
 To move an existing server that already has `migrate.env`:
 
 1. Run `samohost app bootstrap` again. It creates `<app>-run`, gives it
-   `/opt/<app>/uploads`, rewrites the sudo rules and the unit, and runs
+   `/opt/<app>/uploads` (the owner of each entry is changed without
+   following links; files with more than one hard link are skipped with a
+   warning), rewrites the sudo rules and the unit, and runs
    `systemctl daemon-reload`. The running service keeps its old user until
    it restarts.
 2. Deploy, or restart the service. It then runs as `<app>-run`.
