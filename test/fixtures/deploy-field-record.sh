@@ -26,6 +26,9 @@ SAMOHOST_MIGRATE_ENV_FILE='/opt/field-record/migrate.env'
 if [[ -f "$SAMOHOST_MIGRATE_ENV_FILE" ]]; then
   export -n DATABASE_URL APP_DATABASE_URL
 fi
+# split layout: the service runs as a separate runtime user, which reads
+# the checkout, node_modules and dist/ through their world-read bit.
+if [[ -f "$SAMOHOST_MIGRATE_ENV_FILE" ]]; then umask 022; fi
 
 # --- fetch: bring the target SHA into the local object store ---
 echo "<<<SAMOHOST_PHASE:fetch:start>>>"

@@ -35,17 +35,22 @@ export function nodeOpts(overrides: Partial<HostBootstrapOptions> = {}): HostBoo
 }
 
 /**
- * The part of the script from the §10 heading to the line before the §12
- * heading: database bootstrap and env files.
+ * The env layout section (§5b) and the part of the script from the §10
+ * heading to the line before the §12 heading: database bootstrap and env files.
  */
 export function dbSection(script: string): string {
   const lines = script.split("\n");
+  // §5b sets ENV_FILE, MIGRATE_ENV_FILE and SAMOHOST_DB_LAYOUT for §10 and §11.
+  const layoutStart = lines.findIndex((l) => l.startsWith("# §5b."));
+  const layoutEnd = lines.findIndex((l) => l.startsWith("# §5c."));
   const start = lines.findIndex((l) => l.startsWith("# §10."));
   const end = lines.findIndex((l) => l.startsWith("# §12."));
-  expect(start, "§10 heading").toBeGreaterThan(0);
+  expect(layoutStart, "§5b heading").toBeGreaterThan(0);
+  expect(layoutEnd, "§5c heading").toBeGreaterThan(layoutStart);
+  expect(start, "§10 heading").toBeGreaterThan(layoutEnd);
   expect(end, "§12 heading").toBeGreaterThan(start);
   // Include the dashes line above each heading only for the start.
-  return lines.slice(start - 1, end - 1).join("\n");
+  return [...lines.slice(layoutStart - 1, layoutEnd - 1), ...lines.slice(start - 1, end - 1)].join("\n");
 }
 
 export interface Sandbox {

@@ -254,6 +254,51 @@ in a release after the code stopped using it. samohost records the commit as
 failed (`failedSha`) after a rollback and does not deploy it again until
 `app clear-failed`.
 
+### Runtime user and service hardening of a node app
+
+This applies to node apps with the split env layout (a `migrate.env` next to
+the runtime env file; every new node app). Static apps and node apps that
+keep the legacy layout get the same sudo rules and unit as before.
+
+- The service runs as `<app>-run`: a system user with no login shell, no
+  sudo rules and its own group only. It reads the release through the
+  world-read bit of the checkout, `node_modules` and `dist/`, and writes only
+  `/opt/<app>/uploads`. systemd reads `EnvironmentFile=` files before it
+  drops to this user, so the runtime env file stays mode 600.
+- The unit sets `NoNewPrivileges`, `ProtectSystem=strict`, `ProtectHome`,
+  `PrivateTmp`, `PrivateDevices`, the kernel and cgroup protections,
+  `RestrictSUIDSGID`, `RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX`, an
+  empty `CapabilityBoundingSet`, `LockPersonality`, `MemoryMax=50%`,
+  `TasksMax=256`, `ReadWritePaths=/opt/<app>/uploads`, and
+  `InaccessiblePaths=` for `migrate.env`, `.gh-token`, `git-safe.conf`, the
+  checkout's `.git` and `.npmrc`. `MemoryDenyWriteExecute` is not set
+  because Node's JIT needs it off.
+- The deploy user keeps building and deploying. Its sudo rules name exact
+  files: `00-main-<app>.caddy` and the heal staging file
+  `.samohost-heal-next-00-main-<app>.caddy`. For preview vhost files it gets
+  sudo regular expressions (sudo 1.9.10 or later) that match only
+  `/etc/caddy/sites.d/<app>-<label>.caddy` with the label in `[a-z0-9-]`.
+  It has no `journalctl`, `daemon-reload` or `psql` rule: `samohost logs`
+  and `samohost doctor` connect as the operator user, and the deploy and
+  heal scripts of these apps do not use the other two.
+- The deploy sets `umask 022` so the runtime user can read what it builds.
+
+Previews of these apps are not built yet. They will need rules for
+`systemctl enable --now`, `disable --now` and `reset-failed` of the preview
+instance `<app>@<label>`, and a way to create and drop the preview database
+that is not `psql` as `postgres`. The preview unit should use the same
+runtime user and hardening.
+
+To move an existing server that already has `migrate.env`:
+
+1. Run `samohost app bootstrap` again. It creates `<app>-run`, gives it
+   `/opt/<app>/uploads`, rewrites the sudo rules and the unit, and runs
+   `systemctl daemon-reload`. The running service keeps its old user until
+   it restarts.
+2. Deploy, or restart the service. It then runs as `<app>-run`.
+3. If the app writes files anywhere other than `/opt/<app>/uploads`, those
+   writes now fail. Move that data under `uploads/` first.
+
 ## How it's tested
 
 - **Unit + golden/snapshot:** `bun test` (457 tests; rendered deploy/env scripts

@@ -232,6 +232,9 @@ export function buildDeployScript(app: AppRecord, target: DeployTarget): string 
             'if [[ -f "$SAMOHOST_MIGRATE_ENV_FILE" ]]; then',
             `  export -n ${splitLayout.dbVars.join(" ")}`,
             "fi",
+            "# split layout: the service runs as a separate runtime user, which reads",
+            "# the checkout, node_modules and dist/ through their world-read bit.",
+            'if [[ -f "$SAMOHOST_MIGRATE_ENV_FILE" ]]; then umask 022; fi',
           ]
         : []),
       "",

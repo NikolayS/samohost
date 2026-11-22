@@ -87,6 +87,7 @@ import {
 import {
   assertLinuxAppUser,
   assertOptionalLinuxAppUser,
+  linuxAppUserError,
 } from "./linux-user.ts";
 import { staticMainVhostLines } from "./heal-script.ts";
 import { migrateEnvFileOf, releaseEnvFileOf } from "./db-layout.ts";
@@ -290,6 +291,21 @@ export function buildHostBootstrapScript(
   const ownerDbRole = `${dbName ?? app.name}_owner`;
   const migrateEnvFile = isStatic ? "" : migrateEnvFileOf(envFile);
   const releaseEnvFile = isStatic ? "" : releaseEnvFileOf(envFile);
+  // New env layout only: the service runs as a separate runtime user under a
+  // hardened unit, and the deploy user's sudo rules name exact files. The
+  // name must be a valid Linux user name, and the app name must be plain
+  // enough to sit in a sudo rule and a sudo regular expression unescaped.
+  const runtimeUser = `${app.name}-run`;
+  const runtimeUserUsable =
+    !isStatic && linuxAppUserError(runtimeUser) === undefined && /^[a-z0-9][a-z0-9_.-]*$/.test(app.name);
+  const uploadsDir = `${appBase}/uploads`;
+  const mainVhostFile = `/etc/caddy/sites.d/00-main-${app.name}.caddy`;
+  // Same name as the heal script's staging file (src/app/heal-script.ts).
+  const healStagedVhostFile = `/etc/caddy/sites.d/.samohost-heal-next-00-main-${app.name}.caddy`;
+  // Preview vhost files are /etc/caddy/sites.d/<app>-<label>.caddy with the
+  // label in [a-z0-9-] (src/env/name.ts). sudo 1.9.10+ matches a ^...$
+  // argument pattern against the whole argument string.
+  const previewVhostPattern = `/etc/caddy/sites[.]d/${app.name.replaceAll(".", "[.]")}-[a-z0-9-]+[.]caddy`;
   const seedOwnerLogin = opts.seedOwnerLogin ?? "owner";
   // cp-http80: the control plane is the only proxy in front of this server's
   // Caddy (the firewall opens :80 to it alone). The app trusts its
@@ -558,6 +574,58 @@ export function buildHostBootstrapScript(
     "",
   );
 
+  // ---- section 5b: env layout; section 5c: runtime user (node apps) --------
+  if (!isStatic) {
+    push(
+      `# ---------------------------------------------------------------------------`,
+      `# §5b. Env layout. Decides §5c, §6, §7, §10 and §11.`,
+      `# ---------------------------------------------------------------------------`,
+      "",
+      `ENV_FILE=${sq(envFile)}`,
+      `# Env layout: see src/app/db-layout.ts. An app bootstrapped before the`,
+      `# split layout has the superuser DATABASE_URL in its runtime env file and`,
+      `# no migrate env file: it keeps that legacy layout unchanged. Every other`,
+      `# app gets the split layout: no superuser address in any env file, a`,
+      `# migration role that owns only this database, and a migrate env file`,
+      `# that only the deploy's migrate step loads.`,
+      `MIGRATE_ENV_FILE=${sq(migrateEnvFile)}`,
+      `if [[ -f "$ENV_FILE" ]] && grep -q '^DATABASE_URL=postgresql://postgres:' "$ENV_FILE" && [[ ! -e "$MIGRATE_ENV_FILE" ]]; then`,
+      `  SAMOHOST_DB_LAYOUT=legacy`,
+      `  echo "postgres: legacy env layout (superuser DATABASE_URL in $ENV_FILE) kept unchanged"`,
+      `else`,
+      `  SAMOHOST_DB_LAYOUT=split`,
+      `fi`,
+      "",
+      `# ---------------------------------------------------------------------------`,
+      `# §5c. Runtime user ${sq(runtimeUser)} (split layout only). The service runs as`,
+      `#      this user: no sudo rules, no login shell, not in the deploy user's`,
+      `#      group. It reads the release (world-readable files in the checkout);`,
+      `#      it writes only ${uploadsDir}. systemd reads the env files for it.`,
+      `# ---------------------------------------------------------------------------`,
+      "",
+      `if [[ "$SAMOHOST_DB_LAYOUT" == split ]]; then`,
+      ...(runtimeUserUsable
+        ? [
+            `  if id ${sq(runtimeUser)} >/dev/null 2>&1; then`,
+            `    echo "User ${sq(runtimeUser)} already exists — skipping useradd."`,
+            `  else`,
+            `    useradd --system --user-group --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin ${sq(runtimeUser)}`,
+            `  fi`,
+            `  usermod --shell /usr/sbin/nologin ${sq(runtimeUser)}`,
+            `  gpasswd -d ${sq(runtimeUser)} ${sq(appUser)} >/dev/null 2>&1 || true`,
+            `  chown -hR ${sq(`${runtimeUser}:${runtimeUser}`)} ${sq(uploadsDir)}`,
+            `  chmod 750 ${sq(uploadsDir)}`,
+            `  echo "Runtime user: ${runtimeUser} (writes only ${uploadsDir})"`,
+          ]
+        : [
+            `  echo "ERROR: the runtime user name ${runtimeUser} is not a valid Linux user name (^[a-z_][a-z0-9_-]{0,31}$); use a shorter app name" >&2`,
+            `  exit 1`,
+          ]),
+      `fi`,
+      "",
+    );
+  }
+
   // ---- section 6: deploy sudoers --------------------------------------------
   // Static apps get a reduced sudoers: no unit-specific grants (the main unit
   // does not exist), no psql grant (no DB). Only daemon-reload and journalctl
@@ -599,6 +667,29 @@ export function buildHostBootstrapScript(
       `#     samohost is push-based (no timer); no timer/path-deploy grants here.`,
       `# ---------------------------------------------------------------------------`,
       "",
+      ...(runtimeUserUsable
+        ? [
+            `# split layout: exact file names for the main vhost and the heal staging`,
+            `# file; sudo regular expressions for this app's preview vhost files. No`,
+            `# wildcard, journalctl, daemon-reload or psql grant: the deploy and heal`,
+            `# scripts do not use them (logs and doctor run as the operator user).`,
+            `if [[ "$SAMOHOST_DB_LAYOUT" == split ]]; then`,
+            `cat > ${sq(sudoersFile)} <<'SAMOHOST_SPLIT_SUDOERS'`,
+            `${appUser} ALL=(root) NOPASSWD: /usr/bin/systemctl enable ${unit}`,
+            `${appUser} ALL=(root) NOPASSWD: /usr/bin/systemctl start ${unit}`,
+            `${appUser} ALL=(root) NOPASSWD: /usr/bin/systemctl stop ${unit}`,
+            `${appUser} ALL=(root) NOPASSWD: /usr/bin/systemctl restart ${unit}`,
+            `${appUser} ALL=(root) NOPASSWD: /usr/bin/systemctl reload caddy`,
+            `${appUser} ALL=(root) NOPASSWD: /usr/bin/tee ${mainVhostFile}`,
+            `${appUser} ALL=(root) NOPASSWD: /usr/bin/tee ${healStagedVhostFile}`,
+            `${appUser} ALL=(root) NOPASSWD: /usr/bin/mv -- ${healStagedVhostFile} ${mainVhostFile}`,
+            `${appUser} ALL=(root) NOPASSWD: /usr/bin/rm -f ${healStagedVhostFile}`,
+            `${appUser} ALL=(root) NOPASSWD: /usr/bin/tee ^${previewVhostPattern}$`,
+            `${appUser} ALL=(root) NOPASSWD: /usr/bin/rm ^-f ${previewVhostPattern}$`,
+            "SAMOHOST_SPLIT_SUDOERS",
+            "else",
+          ]
+        : []),
       `cat > ${sq(sudoersFile)} <<SUDOERS`,
       `${appUser} ALL=(root) NOPASSWD: /usr/bin/systemctl daemon-reload`,
       `${appUser} ALL=(root) NOPASSWD: /usr/bin/systemctl enable ${unit}`,
@@ -612,6 +703,7 @@ export function buildHostBootstrapScript(
       `${appUser} ALL=(postgres) NOPASSWD: /usr/bin/psql`,
       `${appUser} ALL=(root) NOPASSWD: /usr/bin/journalctl *`,
       "SUDOERS",
+      ...(runtimeUserUsable ? ["fi"] : []),
       `chmod 440 ${sq(sudoersFile)}`,
       `visudo -cf ${sq(sudoersFile)}`,
       `echo "Sudoers: ${sudoersFile} written and validated."`,
@@ -631,6 +723,48 @@ export function buildHostBootstrapScript(
     `#     start is deferred to first deploy (daemon-reload + enable only).`,
     `# ---------------------------------------------------------------------------`,
     "",
+    ...(runtimeUserUsable
+      ? [
+          `# split layout: the service runs as ${runtimeUser} with systemd hardening.`,
+          `# systemd reads the EnvironmentFile= files before it drops to that user.`,
+          `# MemoryDenyWriteExecute is not set: Node's JIT needs writable code pages.`,
+          `if [[ "$SAMOHOST_DB_LAYOUT" == split ]]; then`,
+          `cat > /etc/systemd/system/${unit}.service <<'SAMOHOST_SPLIT_UNIT'`,
+          "[Unit]",
+          `Description=${app.name} main service`,
+          "After=network.target postgresql.service",
+          "",
+          "[Service]",
+          `User=${runtimeUser}`,
+          `Group=${runtimeUser}`,
+          `WorkingDirectory=${appDir}`,
+          `EnvironmentFile=${envFile}`,
+          `EnvironmentFile=-${releaseEnvFile}`,
+          `ExecStart=${execStart}`,
+          "Restart=always",
+          "NoNewPrivileges=yes",
+          "ProtectSystem=strict",
+          "ProtectHome=yes",
+          "PrivateTmp=yes",
+          "PrivateDevices=yes",
+          "ProtectKernelTunables=yes",
+          "ProtectKernelModules=yes",
+          "ProtectControlGroups=yes",
+          "RestrictSUIDSGID=yes",
+          "RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX",
+          "CapabilityBoundingSet=",
+          "LockPersonality=yes",
+          "MemoryMax=50%",
+          "TasksMax=256",
+          `ReadWritePaths=${uploadsDir}`,
+          `InaccessiblePaths=${[migrateEnvFile, tokenFile, gitSafeConf, `${appDir}/.git`, `${appDir}/.npmrc`].map((x) => `-${x}`).join(" ")}`,
+          "",
+          "[Install]",
+          "WantedBy=multi-user.target",
+          "SAMOHOST_SPLIT_UNIT",
+          "else",
+        ]
+      : []),
     `cat > /etc/systemd/system/${unit}.service <<'UNIT'`,
     "[Unit]",
     `Description=${app.name} main service`,
@@ -648,6 +782,7 @@ export function buildHostBootstrapScript(
     "[Install]",
     "WantedBy=multi-user.target",
     "UNIT",
+    ...(runtimeUserUsable ? ["fi"] : []),
     `/usr/bin/systemctl daemon-reload`,
     `# Enable unit so it starts on reboot; start is deferred to first deploy.`,
     `/usr/bin/systemctl enable ${unit}`,
@@ -928,7 +1063,7 @@ export function buildHostBootstrapScript(
     `#      from app.name (which could produce a different string via transforms).`,
     `# ---------------------------------------------------------------------------`,
     "",
-    `ENV_FILE=${sq(envFile)}`,
+    `# ENV_FILE, MIGRATE_ENV_FILE and SAMOHOST_DB_LAYOUT are set in §5b.`,
     "",
     `# Enable and start postgresql. Try the meta-unit first; fall back to the`,
     `# versioned cluster unit if needed.`,
@@ -944,20 +1079,6 @@ export function buildHostBootstrapScript(
     `sudo -u postgres psql -p 5432 -qAtc 'select 1' >/dev/null 2>&1 \\`,
     `  || { echo "ERROR: PostgreSQL cluster did not come up on 127.0.0.1:5432" >&2; exit 1; }`,
     `echo "postgres: cluster ready on 127.0.0.1:5432"`,
-    "",
-    `# Env layout: see src/app/db-layout.ts. An app bootstrapped before the`,
-    `# split layout has the superuser DATABASE_URL in its runtime env file and`,
-    `# no migrate env file: it keeps that legacy layout unchanged. Every other`,
-    `# app gets the split layout: no superuser address in any env file, a`,
-    `# migration role that owns only this database, and a migrate env file`,
-    `# that only the deploy's migrate step loads.`,
-    `MIGRATE_ENV_FILE=${sq(migrateEnvFile)}`,
-    `if [[ -f "$ENV_FILE" ]] && grep -q '^DATABASE_URL=postgresql://postgres:' "$ENV_FILE" && [[ ! -e "$MIGRATE_ENV_FILE" ]]; then`,
-    `  SAMOHOST_DB_LAYOUT=legacy`,
-    `  echo "postgres: legacy env layout (superuser DATABASE_URL in $ENV_FILE) kept unchanged"`,
-    `else`,
-    `  SAMOHOST_DB_LAYOUT=split`,
-    `fi`,
     "",
     `if [[ "$SAMOHOST_DB_LAYOUT" == legacy ]]; then`,
     `# Superuser password: generate ONCE; persist into the env file only.`,
