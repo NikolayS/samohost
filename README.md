@@ -309,8 +309,17 @@ keep the legacy layout get the same sudo rules and unit as before.
   `InaccessiblePaths=` for `migrate.env`, `.gh-token`, `git-safe.conf`, the
   checkout's `.git` and `.npmrc`. `MemoryDenyWriteExecute` is not set
   because Node's JIT needs it off.
-- The deploy user keeps building and deploying. Its sudo rules name exact
-  files: `00-main-<app>.caddy` and the heal staging file
+- `/opt/<app>` is root-owned (755). The deploy user owns only the checkout
+  `/opt/<app>/app`, and the runtime user owns `/opt/<app>/uploads`. Nobody
+  but root can create, rename or replace entries next to the files that
+  root writes and systemd reads (the env file, `migrate.env`,
+  `release.env`, `git-safe.conf`, the token file), so a symbolic link
+  cannot point root or systemd at another file. Bootstrap refuses symbolic
+  links that an earlier deploy user left there.
+- The deploy user keeps building and deploying. It writes `release.env`
+  through an exact `sudo /usr/bin/tee /opt/<app>/release.env` rule. Its
+  other sudo rules name exact files: `00-main-<app>.caddy` and the heal
+  staging file
   `.samohost-heal-next-00-main-<app>.caddy`. For preview vhost files it gets
   sudo regular expressions (sudo 1.9.10 or later) that match only
   `/etc/caddy/sites.d/<app>-<label>.caddy` with the label in `[a-z0-9-]`.

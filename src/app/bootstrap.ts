@@ -588,24 +588,11 @@ export function buildHostBootstrapScript(
     "",
   );
 
-  // ---- section 5: /opt/<app> layout -----------------------------------------
-  push(
-    `# ---------------------------------------------------------------------------`,
-    `# §5. /opt/${app.name} directory layout (appBase, uploads, appDir).`,
-    `# ---------------------------------------------------------------------------`,
-    "",
-    `install -d -m 755 -o ${sq(appUser)} -g ${sq(appUser)} ${sq(appBase)}`,
-    `install -d -m 755 -o ${sq(appUser)} -g ${sq(appUser)} ${sq(`${appBase}/uploads`)}`,
-    `install -d -m 755 -o ${sq(appUser)} -g ${sq(appUser)} ${sq(appDir)}`,
-    `echo "Layout: ${appBase}/ (uploads/, app checkout at ${appDir})"`,
-    "",
-  );
-
-  // ---- section 5b: env layout; section 5c: runtime user (node apps) --------
+  // ---- section 4b: env layout (node apps) -----------------------------------
   if (!isStatic) {
     push(
       `# ---------------------------------------------------------------------------`,
-      `# §5b. Env layout. Decides §5c, §6, §7, §10 and §11.`,
+      `# §4b. Env layout. Decides §5, §5c, §6, §7, §10, §11 and §12.`,
       `# ---------------------------------------------------------------------------`,
       "",
       `ENV_FILE=${sq(envFile)}`,
@@ -634,6 +621,53 @@ export function buildHostBootstrapScript(
       `  SAMOHOST_DB_LAYOUT=split`,
       `fi`,
       "",
+    );
+  }
+
+  // ---- section 5: /opt/<app> layout -----------------------------------------
+  // Split layout: appBase is root-owned, so the deploy user cannot create,
+  // rename or replace entries next to the files root writes and systemd
+  // reads (env files, migrate.env, release.env, git-safe.conf, the token
+  // file). The deploy user owns only the checkout; uploads belongs to the
+  // runtime user (§5c).
+  const oldLayoutLines = [
+    `install -d -m 755 -o ${sq(appUser)} -g ${sq(appUser)} ${sq(appBase)}`,
+    `install -d -m 755 -o ${sq(appUser)} -g ${sq(appUser)} ${sq(`${appBase}/uploads`)}`,
+    `install -d -m 755 -o ${sq(appUser)} -g ${sq(appUser)} ${sq(appDir)}`,
+  ];
+  push(
+    `# ---------------------------------------------------------------------------`,
+    `# §5. /opt/${app.name} directory layout (appBase, uploads, appDir).`,
+    `# ---------------------------------------------------------------------------`,
+    "",
+    ...(runtimeUserUsable
+      ? [
+          `if [[ "$SAMOHOST_DB_LAYOUT" == split ]]; then`,
+          `  # appBase root-owned; its parent is root-owned, so the name cannot be swapped.`,
+          `  if [[ -L ${sq(appBase)} ]]; then echo "ERROR: ${appBase} is a symbolic link" >&2; exit 1; fi`,
+          `  install -d -m 755 -o root -g root ${sq(appBase)}`,
+          `  chown -h root:root ${sq(appBase)}`,
+          `  chmod 755 ${sq(appBase)}`,
+          `  # From here only root can change entries in ${appBase}. Refuse links that`,
+          `  # an earlier deploy user may have left, before root follows any name.`,
+          `  for _p in ${sq(`${appBase}/uploads`)} ${sq(appDir)} ${sq(tokenFile)} ${sq(gitSafeConf)}; do`,
+          `    if [[ -L "$_p" ]]; then echo "ERROR: $_p is a symbolic link" >&2; exit 1; fi`,
+          `  done`,
+          `  if [[ -L ${sq(releaseEnvFile)} ]]; then rm -f ${sq(releaseEnvFile)}; fi`,
+          `  install -d -m 755 -o ${sq(appUser)} -g ${sq(appUser)} ${sq(`${appBase}/uploads`)}`,
+          `  install -d -m 755 -o ${sq(appUser)} -g ${sq(appUser)} ${sq(appDir)}`,
+          `else`,
+          ...oldLayoutLines.map((l) => `  ${l}`),
+          `fi`,
+        ]
+      : oldLayoutLines),
+    `echo "Layout: ${appBase}/ (uploads/, app checkout at ${appDir})"`,
+    "",
+  );
+
+  // ---- section 5c: runtime user (node apps) ---------------------------------
+  if (!isStatic) {
+    push(
       `# ---------------------------------------------------------------------------`,
       `# §5c. Runtime user ${sq(runtimeUser)} (split layout only). The service runs as`,
       `#      this user: no sudo rules, no login shell, not in the deploy user's`,
@@ -724,6 +758,7 @@ export function buildHostBootstrapScript(
             `${appUser} ALL=(root) NOPASSWD: /usr/bin/tee ${healStagedVhostFile}`,
             `${appUser} ALL=(root) NOPASSWD: /usr/bin/mv -- ${healStagedVhostFile} ${mainVhostFile}`,
             `${appUser} ALL=(root) NOPASSWD: /usr/bin/rm -f ${healStagedVhostFile}`,
+            `${appUser} ALL=(root) NOPASSWD: /usr/bin/tee ${releaseEnvFile}`,
             `${appUser} ALL=(root) NOPASSWD: /usr/bin/tee ^${previewVhostPattern}$`,
             `${appUser} ALL=(root) NOPASSWD: /usr/bin/rm ^-f ${previewVhostPattern}$`,
             "SAMOHOST_SPLIT_SUDOERS",
@@ -1103,7 +1138,7 @@ export function buildHostBootstrapScript(
     `#      from app.name (which could produce a different string via transforms).`,
     `# ---------------------------------------------------------------------------`,
     "",
-    `# ENV_FILE, MIGRATE_ENV_FILE and SAMOHOST_DB_LAYOUT are set in §5b.`,
+    `# ENV_FILE, MIGRATE_ENV_FILE and SAMOHOST_DB_LAYOUT are set in §4b.`,
     "",
     `# Enable and start postgresql. Try the meta-unit first; fall back to the`,
     `# versioned cluster unit if needed.`,

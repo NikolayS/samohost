@@ -66,7 +66,14 @@ rollback() {
   git reset --hard "${PRE_DEPLOY_SHA}" || true
   # Restore the previous release env file (or remove the one this deploy created).
   if [[ "${SAMOHOST_RELEASE_ENV_WRITTEN:-0}" == "1" ]]; then
-    if [[ "${SAMOHOST_RELEASE_ENV_HAD_PREVIOUS:-0}" == "1" ]]; then
+    if [[ -f "$SAMOHOST_MIGRATE_ENV_FILE" ]]; then
+      # split layout: root-owned directory; the exact sudo tee rule writes the file (empty on a first deploy).
+      if [[ "${SAMOHOST_RELEASE_ENV_HAD_PREVIOUS:-0}" == "1" ]]; then
+        printf '%s\n' "$SAMOHOST_RELEASE_ENV_PREVIOUS" | sudo /usr/bin/tee "$SAMOHOST_RELEASE_ENV_FILE" >/dev/null || true
+      else
+        printf '' | sudo /usr/bin/tee "$SAMOHOST_RELEASE_ENV_FILE" >/dev/null || true
+      fi
+    elif [[ "${SAMOHOST_RELEASE_ENV_HAD_PREVIOUS:-0}" == "1" ]]; then
       printf '%s\n' "$SAMOHOST_RELEASE_ENV_PREVIOUS" > "$SAMOHOST_RELEASE_ENV_FILE" || true
     else
       rm -f "$SAMOHOST_RELEASE_ENV_FILE" || true
@@ -150,9 +157,14 @@ SAMOHOST_RELEASE_ENV_FILE='/opt/field-record/release.env'
 SAMOHOST_RELEASE_ENV_HAD_PREVIOUS=0
 SAMOHOST_RELEASE_ENV_PREVIOUS=""
 if [[ -f "$SAMOHOST_RELEASE_ENV_FILE" ]] && SAMOHOST_RELEASE_ENV_PREVIOUS="$(cat "$SAMOHOST_RELEASE_ENV_FILE")"; then SAMOHOST_RELEASE_ENV_HAD_PREVIOUS=1; fi
-if printf 'SAMO_RELEASE_TAG=%s\nSAMO_RELEASE_SHA=%s\n' "$SAMO_RELEASE_TAG" "$SAMO_RELEASE_SHA" 2>/dev/null > "${SAMOHOST_RELEASE_ENV_FILE}.next" && chmod 0644 "${SAMOHOST_RELEASE_ENV_FILE}.next" && mv -f "${SAMOHOST_RELEASE_ENV_FILE}.next" "$SAMOHOST_RELEASE_ENV_FILE"; then
+SAMOHOST_RELEASE_ENV_WRITTEN=0
+# split layout: the env file's directory is root-owned; the exact sudo tee rule writes the file.
+if [[ -f "$SAMOHOST_MIGRATE_ENV_FILE" ]]; then
+  if printf 'SAMO_RELEASE_TAG=%s\nSAMO_RELEASE_SHA=%s\n' "$SAMO_RELEASE_TAG" "$SAMO_RELEASE_SHA" | sudo /usr/bin/tee "$SAMOHOST_RELEASE_ENV_FILE" >/dev/null; then SAMOHOST_RELEASE_ENV_WRITTEN=1; fi
+elif printf 'SAMO_RELEASE_TAG=%s\nSAMO_RELEASE_SHA=%s\n' "$SAMO_RELEASE_TAG" "$SAMO_RELEASE_SHA" 2>/dev/null > "${SAMOHOST_RELEASE_ENV_FILE}.next" && chmod 0644 "${SAMOHOST_RELEASE_ENV_FILE}.next" && mv -f "${SAMOHOST_RELEASE_ENV_FILE}.next" "$SAMOHOST_RELEASE_ENV_FILE"; then
   SAMOHOST_RELEASE_ENV_WRITTEN=1
-else
+fi
+if [[ "$SAMOHOST_RELEASE_ENV_WRITTEN" != "1" ]]; then
   rm -f "${SAMOHOST_RELEASE_ENV_FILE}.next" 2>/dev/null || true
   echo "WARNING: could not write the release env file $SAMOHOST_RELEASE_ENV_FILE; the service starts without SAMO_RELEASE_TAG and SAMO_RELEASE_SHA" >&2
 fi

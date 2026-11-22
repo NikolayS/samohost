@@ -80,6 +80,7 @@ const SPLIT_SUDOERS = [
   "shop ALL=(root) NOPASSWD: /usr/bin/tee /etc/caddy/sites.d/.samohost-heal-next-00-main-shop.caddy",
   "shop ALL=(root) NOPASSWD: /usr/bin/mv -- /etc/caddy/sites.d/.samohost-heal-next-00-main-shop.caddy /etc/caddy/sites.d/00-main-shop.caddy",
   "shop ALL=(root) NOPASSWD: /usr/bin/rm -f /etc/caddy/sites.d/.samohost-heal-next-00-main-shop.caddy",
+  "shop ALL=(root) NOPASSWD: /usr/bin/tee /opt/shop/release.env",
   "shop ALL=(root) NOPASSWD: /usr/bin/tee ^/etc/caddy/sites[.]d/shop-[a-z0-9-]+[.]caddy$",
   "shop ALL=(root) NOPASSWD: /usr/bin/rm ^-f /etc/caddy/sites[.]d/shop-[a-z0-9-]+[.]caddy$",
 ].join("\n") + "\n";
@@ -166,7 +167,7 @@ describe("env layout is decided before the sudo rules and the unit", () => {
       if (envBody !== undefined) writeFileSync(envFile, envBody);
       if (withMigrateEnv) writeFileSync(join(dir, "migrate.env"), "DATABASE_URL=x\n");
       const text = buildHostBootstrapScript({ ...goldenNodeApp(), envFile }, goldenNodeOpts());
-      const res = runBash(`${section(text, "5b", "5c")}\necho "LAYOUT=$SAMOHOST_DB_LAYOUT"`, "/usr/bin");
+      const res = runBash(`${section(text, "4b", "5")}\necho "LAYOUT=$SAMOHOST_DB_LAYOUT"`, "/usr/bin");
       expect(res.status, res.stderr).toBe(0);
       return /LAYOUT=(\w+)/.exec(res.stdout)?.[1] ?? "";
     } finally {
@@ -320,6 +321,7 @@ describe("new layout: deploy user's sudo rules", () => {
         const args = m[2]!
           .trim()
           .replaceAll('"${SAMOHOST_UNIT}"', "shop")
+          .replaceAll('"$SAMOHOST_RELEASE_ENV_FILE"', "/opt/shop/release.env")
           .replace(/'([^']*)'/g, "$1");
         if (args.includes("$")) throw new Error(`unresolved argument in: sudo ${cmd} ${args}`);
         seen.push(`${cmd} ${args}`);
@@ -331,6 +333,7 @@ describe("new layout: deploy user's sudo rules", () => {
       "/usr/bin/mv -- /etc/caddy/sites.d/.samohost-heal-next-00-main-shop.caddy /etc/caddy/sites.d/00-main-shop.caddy",
     );
     expect(seen).toContain("/usr/bin/systemctl restart shop");
+    expect(seen).toContain("/usr/bin/tee /opt/shop/release.env");
   });
 
   test("the sudo grant self-check still passes with the new rule count", () => {

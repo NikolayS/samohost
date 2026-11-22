@@ -75,7 +75,11 @@ export function makeDeploySandbox(opts: { headSha?: string; healthCode?: string;
     'if [[ "$*" == "run build" ]]; then mkdir -p dist && echo new > dist/release.txt; fi',
   ]);
   stub(bin, "curl", [`echo ${opts.healthCode ?? "200"}`]);
-  stub(bin, "sudo", [`printf '%s\\n' "$*" >> ${JSON.stringify(sudoLog)}`]);
+  // Records every call; runs `sudo /usr/bin/tee <file>` so the file is written.
+  stub(bin, "sudo", [
+    `printf '%s\\n' "$*" >> ${JSON.stringify(sudoLog)}`,
+    'if [[ "$1" == /usr/bin/tee ]]; then shift; exec tee "$@"; fi',
+  ]);
   stub(bin, "psql", [
     `{ printf 'ARGS %s\\n' "$*"; printf 'ENV PGHOST=%s PGPORT=%s PGUSER=%s PGPASSWORD=%s PGDATABASE=%s\\n' "\${PGHOST:-}" "\${PGPORT:-}" "\${PGUSER:-}" "\${PGPASSWORD:-}" "\${PGDATABASE:-}"; } >> ${JSON.stringify(psqlLog)}`,
     "echo f",
