@@ -264,8 +264,9 @@ proxies to the app on `localhost:<port>`. Caddy's main vhost, including the
 favicon route, keeps the X-Forwarded-For entries of the control-plane
 address only (`trusted_proxies`). The runtime env file gets
 `TRUSTED_PROXIES=127.0.0.1,<control plane address>`: the app's TCP peer is
-Caddy on 127.0.0.1 (the app listens on `HOST=0.0.0.0`), then the control
-plane. Bootstrap, heal and host-prep use the control-plane address
+Caddy on 127.0.0.1, then the control plane. In the new layout the env file
+has `HOST=127.0.0.1`, so the app accepts connections from this server only;
+the legacy layout keeps `HOST=0.0.0.0`. Bootstrap, heal and host-prep use the control-plane address
 recorded for the VM; `app bootstrap --control-plane-ip` with a different
 address is refused.
 
@@ -303,7 +304,9 @@ keep the legacy layout get the same sudo rules and unit as before.
   drops to this user, so the runtime env file stays mode 600.
 - The unit sets `NoNewPrivileges`, `ProtectSystem=strict`, `ProtectHome`,
   `PrivateTmp`, `PrivateDevices`, the kernel and cgroup protections,
-  `RestrictSUIDSGID`, `RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX`, an
+  `ProtectProc=invisible`, `RestrictSUIDSGID`,
+  `RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK` (Node's
+  `os.networkInterfaces()` needs `AF_NETLINK`), an
   empty `CapabilityBoundingSet`, `LockPersonality`, `MemoryMax=50%`,
   `TasksMax=256`, `ReadWritePaths=/opt/<app>/uploads`, and
   `InaccessiblePaths=` for `migrate.env`, `.gh-token`, `git-safe.conf`, the

@@ -47,6 +47,9 @@ describe("bootstrap — split env layout (executed with stubs)", () => {
       expect(runtime).not.toMatch(/^SEED_OWNER_/m);
       expect(runtime).toMatch(/^APP_DATABASE_URL=postgresql:\/\/shop_app:[0-9a-f]{48}@127\.0\.0\.1:5432\/shop$/m);
       expect(runtime).toMatch(/^COOKIE_SECRET=[0-9a-f]+$/m);
+      // The app listens on loopback only: Caddy on this server is its only client.
+      expect(runtime).toMatch(/^HOST=127\.0\.0\.1$/m);
+      expect(runtime).not.toContain("HOST=0.0.0.0");
       const owner = migrate.match(/^DATABASE_URL=postgresql:\/\/shop_owner:([0-9a-f]{48})@127\.0\.0\.1:5432\/shop$/m);
       expect(owner, migrate).not.toBeNull();
       expect(migrate).toMatch(/^SEED_OWNER_LOGIN=owner$/m);
