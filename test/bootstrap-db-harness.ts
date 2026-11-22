@@ -7,8 +7,8 @@ import { expect } from "bun:test";
 import { spawnSync } from "node:child_process";
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
-import type { HostBootstrapOptions } from "../src/app/bootstrap.ts";
+import { dirname, join } from "node:path";
+import { buildHostBootstrapScript, type HostBootstrapOptions } from "../src/app/bootstrap.ts";
 import type { AppRecord } from "../src/types.ts";
 
 export function nodeApp(overrides: Partial<AppRecord> = {}): AppRecord {
@@ -32,6 +32,24 @@ export function nodeApp(overrides: Partial<AppRecord> = {}): AppRecord {
 
 export function nodeOpts(overrides: Partial<HostBootstrapOptions> = {}): HostBootstrapOptions {
   return { appUser: "shop", dbName: "shop", ...overrides };
+}
+
+/**
+ * Bootstrap script for an executed run with the env file in a sandbox
+ * folder. That folder is also the app base directory and holds the
+ * checkout, because the split layout refuses an env file or checkout that
+ * is not directly in the app base directory.
+ */
+export function sandboxScript(
+  envFile: string,
+  app: Partial<AppRecord> = {},
+  opts: Partial<HostBootstrapOptions> = {},
+): string {
+  const base = dirname(envFile);
+  return buildHostBootstrapScript(
+    nodeApp({ ...app, envFile, appDir: join(base, "app") }),
+    nodeOpts({ ...opts, appBase: base }),
+  );
 }
 
 /**

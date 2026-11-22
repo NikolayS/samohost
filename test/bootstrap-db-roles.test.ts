@@ -17,8 +17,7 @@ import { describe, expect, test } from "bun:test";
 import { readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { buildHostBootstrapScript } from "../src/app/bootstrap.ts";
-import type { AppRecord } from "../src/types.ts";
-import { dbSection, makeSandbox, nodeApp, nodeOpts, readOr, runSection, type Sandbox } from "./bootstrap-db-harness.ts";
+import { dbSection, makeSandbox, nodeApp, nodeOpts, readOr, runSection, sandboxScript } from "./bootstrap-db-harness.ts";
 
 /** Lines of the script that are not comments. */
 function codeLines(script: string): string[] {
@@ -73,14 +72,10 @@ describe("bootstrap — app database role (rendered text)", () => {
 });
 
 describe("bootstrap — app database role (executed with stubs)", () => {
-  function envFileApp(sb: Sandbox): AppRecord {
-    return nodeApp({ envFile: join(sb.dir, "staging.env") });
-  }
-
   test("first run creates the role and writes its real password into APP_DATABASE_URL", () => {
     const sb = makeSandbox();
     try {
-      const script = buildHostBootstrapScript(envFileApp(sb), nodeOpts());
+      const script = sandboxScript(join(sb.dir, "staging.env"));
       const res = runSection(sb, dbSection(script));
       expect(res.stderr).toBe("");
       expect(res.status).toBe(0);
@@ -102,7 +97,7 @@ describe("bootstrap — app database role (executed with stubs)", () => {
   test("re-run keeps the working password (no silent rotation)", () => {
     const sb = makeSandbox();
     try {
-      const script = buildHostBootstrapScript(envFileApp(sb), nodeOpts());
+      const script = sandboxScript(join(sb.dir, "staging.env"));
       expect(runSection(sb, dbSection(script)).status).toBe(0);
       const first = readFileSync(join(sb.dir, "staging.env"), "utf8").match(/^APP_DATABASE_URL=.*$/m)![0];
       writeFileSync(sb.rolesFile, "shop_app\n");
@@ -130,7 +125,7 @@ describe("bootstrap — app database role (executed with stubs)", () => {
         "DATABASE_URL=postgresql://postgres:abc@127.0.0.1:5432/shop\n" +
           "APP_DATABASE_URL=postgresql://app_user:app_password@127.0.0.1:5432/shop\n",
       );
-      const script = buildHostBootstrapScript(envFileApp(sb), nodeOpts());
+      const script = sandboxScript(join(sb.dir, "staging.env"));
       const res = runSection(sb, dbSection(script));
       expect(res.status).toBe(0);
       const env = readFileSync(join(sb.dir, "staging.env"), "utf8");
@@ -149,7 +144,7 @@ describe("bootstrap — app database role (executed with stubs)", () => {
         join(sb.dir, "staging.env"),
         `DATABASE_URL=postgresql://postgres:abc@127.0.0.1:5432/shop\n${line}\n`,
       );
-      const script = buildHostBootstrapScript(envFileApp(sb), nodeOpts());
+      const script = sandboxScript(join(sb.dir, "staging.env"));
       const res = runSection(sb, dbSection(script));
       expect(res.status).toBe(0);
       const env = readFileSync(join(sb.dir, "staging.env"), "utf8");

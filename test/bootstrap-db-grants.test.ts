@@ -13,7 +13,7 @@ import { describe, expect, test } from "bun:test";
 import { readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { buildHostBootstrapScript } from "../src/app/bootstrap.ts";
-import { dbSection, makeSandbox, nodeApp, nodeOpts, readOr, runSection } from "./bootstrap-db-harness.ts";
+import { dbSection, makeSandbox, nodeApp, nodeOpts, readOr, runSection, sandboxScript } from "./bootstrap-db-harness.ts";
 
 const NO_LOG = [
   "SET log_statement TO 'none';",
@@ -30,7 +30,7 @@ function runFresh(envBody?: string) {
   const sb = makeSandbox();
   const envFile = join(sb.dir, "staging.env");
   if (envBody !== undefined) writeFileSync(envFile, envBody);
-  const res = runSection(sb, dbSection(buildHostBootstrapScript(nodeApp({ envFile }), nodeOpts())));
+  const res = runSection(sb, dbSection(sandboxScript(envFile)));
   return { sb, res, envFile };
 }
 

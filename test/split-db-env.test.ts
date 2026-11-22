@@ -15,10 +15,9 @@
 import { describe, expect, test } from "bun:test";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { buildHostBootstrapScript } from "../src/app/bootstrap.ts";
 import { buildDeployScript } from "../src/app/script.ts";
 import { migrateEnvFileOf } from "../src/app/db-layout.ts";
-import { dbSection, makeSandbox, nodeApp, nodeOpts, readOr, runSection } from "./bootstrap-db-harness.ts";
+import { dbSection, makeSandbox, nodeApp, readOr, runSection, sandboxScript } from "./bootstrap-db-harness.ts";
 import { makeDeploySandbox } from "./node-deploy-harness.ts";
 
 const SHA = "2222222222222222222222222222222222222222";
@@ -37,7 +36,7 @@ describe("bootstrap — split env layout (executed with stubs)", () => {
     const sb = makeSandbox();
     try {
       const app = nodeApp({ envFile: join(sb.dir, "staging.env") });
-      const res = runSection(sb, dbSection(buildHostBootstrapScript(app, nodeOpts())));
+      const res = runSection(sb, dbSection(sandboxScript(app.envFile!)));
       expect(res.stderr).toBe("");
       expect(res.status).toBe(0);
       const runtime = readFileSync(join(sb.dir, "staging.env"), "utf8");
@@ -75,7 +74,7 @@ describe("bootstrap — split env layout (executed with stubs)", () => {
     const sb = makeSandbox();
     try {
       const app = nodeApp({ envFile: join(sb.dir, "staging.env") });
-      const section = dbSection(buildHostBootstrapScript(app, nodeOpts()));
+      const section = dbSection(sandboxScript(app.envFile!));
       expect(runSection(sb, section).status).toBe(0);
       const first = readFileSync(join(sb.dir, "migrate.env"), "utf8");
       const firstRuntime = readFileSync(join(sb.dir, "staging.env"), "utf8");
@@ -97,7 +96,7 @@ describe("bootstrap — split env layout (executed with stubs)", () => {
           "APP_DATABASE_URL=postgresql://legacy_role:s3cret@127.0.0.1:5432/shop\n" +
           "SEED_OWNER_PASSWORD=0011223344556677\n",
       );
-      const res = runSection(sb, dbSection(buildHostBootstrapScript(nodeApp({ envFile }), nodeOpts())));
+      const res = runSection(sb, dbSection(sandboxScript(envFile)));
       expect(res.status).toBe(0);
       const env = readFileSync(envFile, "utf8");
       expect(env).toContain("DATABASE_URL=postgresql://postgres:abc123@127.0.0.1:5432/shop");

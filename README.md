@@ -321,6 +321,11 @@ keep the legacy layout get the same sudo rules and unit as before.
   `release.env`, `git-safe.conf`, the token file), so a symbolic link
   cannot point root or systemd at another file. Bootstrap refuses symbolic
   links that an earlier deploy user left there.
+- The env file and the checkout must be entries directly in `/opt/<app>/`
+  (for example `/opt/<app>/staging.env` and `/opt/<app>/app`), not named
+  `uploads`, `migrate.env`, `release.env`, `git-safe.conf` or `.gh-token`.
+  Bootstrap stops with an error for other paths when it finds the new
+  layout. `migrate.env` and `release.env` are then always this app's files.
 - The deploy user keeps building and deploying. It writes `release.env`
   through an exact `sudo /usr/bin/tee /opt/<app>/release.env` rule. Its
   other sudo rules name exact files: `00-main-<app>.caddy` and the heal

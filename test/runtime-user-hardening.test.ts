@@ -165,7 +165,10 @@ describe("env layout is decided before the sudo rules and the unit", () => {
       const envFile = join(dir, "staging.env");
       if (envBody !== undefined) writeFileSync(envFile, envBody);
       if (withMigrateEnv) writeFileSync(join(dir, "migrate.env"), "DATABASE_URL=x\n");
-      const text = buildHostBootstrapScript({ ...goldenNodeApp(), envFile }, goldenNodeOpts());
+      const text = buildHostBootstrapScript(
+        { ...goldenNodeApp(), envFile, appDir: join(dir, "app") },
+        { ...goldenNodeOpts(), appBase: dir },
+      );
       const res = runBash(`${section(text, "4b", "5")}\necho "LAYOUT=$SAMOHOST_DB_LAYOUT"`, "/usr/bin");
       expect(res.status, res.stderr).toBe(0);
       return /LAYOUT=(\w+)/.exec(res.stdout)?.[1] ?? "";

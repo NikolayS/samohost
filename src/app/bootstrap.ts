@@ -93,7 +93,7 @@ import {
   linuxAppUserError,
 } from "./linux-user.ts";
 import { staticMainVhostLines } from "./heal-script.ts";
-import { migrateEnvFileOf, releaseEnvFileOf } from "./db-layout.ts";
+import { migrateEnvFileOf, releaseEnvFileOf, splitLayoutPathError } from "./db-layout.ts";
 import { isIP } from "node:net";
 import { dirname } from "node:path";
 
@@ -622,6 +622,18 @@ export function buildHostBootstrapScript(
       `fi`,
       "",
     );
+    // §5 makes appBase root-owned and the env files sit next to the env file:
+    // other paths are refused in the split layout (the legacy layout continues).
+    const pathError = splitLayoutPathError(appBase, envFile, appDir);
+    if (pathError !== undefined) {
+      push(
+        `if [[ "$SAMOHOST_DB_LAYOUT" == split ]]; then`,
+        `  echo ${sq(`ERROR: ${pathError}`)} >&2`,
+        `  exit 1`,
+        `fi`,
+        "",
+      );
+    }
   }
 
   // ---- section 5: /opt/<app> layout -----------------------------------------

@@ -11,12 +11,11 @@
 import { describe, expect, test } from "bun:test";
 import { existsSync, lstatSync, readdirSync, readFileSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
-import { buildHostBootstrapScript } from "../src/app/bootstrap.ts";
-import { dbSection, makeSandbox, nodeApp, nodeOpts, readOr, runSection, stateDirOf } from "./bootstrap-db-harness.ts";
+import { dbSection, makeSandbox, readOr, runSection, sandboxScript, stateDirOf } from "./bootstrap-db-harness.ts";
 
 function bootstrap(sb: ReturnType<typeof makeSandbox>) {
   const envFile = join(sb.dir, "staging.env");
-  return { envFile, run: () => runSection(sb, dbSection(buildHostBootstrapScript(nodeApp({ envFile }), nodeOpts()))) };
+  return { envFile, run: () => runSection(sb, dbSection(sandboxScript(envFile))) };
 }
 
 describe("symbolic links in the app user's directory", () => {
@@ -42,7 +41,7 @@ describe("symbolic links in the app user's directory", () => {
     const sb = makeSandbox();
     try {
       const { run } = bootstrap(sb);
-      const script = buildHostBootstrapScript(nodeApp({ envFile: join(sb.dir, "staging.env") }), nodeOpts());
+      const script = sandboxScript(join(sb.dir, "staging.env"));
       const section = dbSection(script);
       expect(section).not.toMatch(/cat > "\$ENV_FILE"|cat > "\$MIGRATE_ENV_FILE"/);
       expect(section).not.toMatch(/(chown|chmod)[^\n]*"\$(MIGRATE_)?ENV_FILE"/);

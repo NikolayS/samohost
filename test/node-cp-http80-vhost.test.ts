@@ -16,7 +16,7 @@ import { buildHostPrepScript } from "../src/env/script.ts";
 import { buildConfigHealScript } from "../src/app/heal-script.ts";
 import { buildHostBootstrapScript } from "../src/app/bootstrap.ts";
 import { planFromApp, renderVhost } from "../src/caddy/render.ts";
-import { dbSection, makeSandbox, nodeApp, nodeOpts, runSection } from "./bootstrap-db-harness.ts";
+import { dbSection, makeSandbox, nodeApp, nodeOpts, runSection, sandboxScript } from "./bootstrap-db-harness.ts";
 
 const CP = "192.0.2.10";
 
@@ -87,8 +87,7 @@ describe("bootstrap — TRUSTED_PROXIES in the runtime env file", () => {
   test("cp-http80 node app: runtime env file trusts the control-plane address", () => {
     const sb = makeSandbox();
     try {
-      const app = { ...cpApp(), envFile: join(sb.dir, "staging.env") };
-      const script = buildHostBootstrapScript(app, nodeOpts({ firewallOpts: { controlPlaneIp: CP } }));
+      const script = sandboxScript(join(sb.dir, "staging.env"), cpApp(), { firewallOpts: { controlPlaneIp: CP } });
       expect(runSection(sb, dbSection(script)).status).toBe(0);
       // The app's TCP peer is Caddy on loopback (it dials localhost and the app
       // listens on 0.0.0.0), then the control plane.
