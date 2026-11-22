@@ -29,6 +29,7 @@ import type { AppRecord, EnvDbBackend, EnvRecord } from "../types.ts";
 import { staticCacheHeaderLines } from "../static-cache.ts";
 import { servicesOf } from "../app/services.ts";
 import { assertOptionalLinuxAppUser } from "../app/linux-user.ts";
+import { migrateEnvFileOf } from "../app/db-layout.ts";
 import {
   staticReleaseStatePaths,
   staticRootOf,
@@ -2696,12 +2697,41 @@ export function buildHostPrepScript(
     "visudo -cf /etc/sudoers.d/samohost-env-" + app.name,
   );
 
+  // Node apps: stop before any change on a server that shows the new layout
+  // of src/app/bootstrap.ts (separate database roles, runtime user
+  // <app>-run). Previews of those apps are not designed yet, and the rules
+  // below give the operator user wildcard sudo rights for previews.
+  const newLayoutCheckLines: string[] = [];
+  if (!isStatic) {
+    const envFile = app.envFile ?? `/opt/${app.name}/staging.env`;
+    let migrateEnvFile: string | undefined;
+    try {
+      migrateEnvFile = migrateEnvFileOf(envFile);
+    } catch {
+      migrateEnvFile = undefined;
+    }
+    const signs = [
+      `[[ "$(cat ${sq(`/var/lib/samohost/db-layout/${app.name}`)} 2>/dev/null)" == split ]]`,
+      ...(migrateEnvFile !== undefined ? [`[[ -e ${sq(migrateEnvFile)} ]]`] : []),
+      `id -u ${sq(`${app.name}-run`)} >/dev/null 2>&1`,
+    ];
+    newLayoutCheckLines.push(
+      "# 0. New-layout node apps: no previews yet.",
+      `if ${signs.join(" || ")}; then`,
+      `  echo ${sq(`ERROR: app '${app.name}' uses the new layout (separate database roles, runtime user ${app.name}-run). Host-prep sets up previews, which such apps do not support yet, so it stops here and changes nothing.`)} >&2`,
+      "  exit 1",
+      "fi",
+      "",
+    );
+  }
+
   return [
     "#!/usr/bin/env bash",
     `# samohost host-prep for app '${app.name}' — ONE-TIME, run by an operator with root.`,
     "# Review before applying. Nothing here is executed by samohost itself.",
     "set -euo pipefail",
     "",
+    ...newLayoutCheckLines,
     ...(isStatic && managesMainVhost ? [...staticTreeGuardFnLines(), ""] : []),
     // Guard function definition (only when mainHost is set); placed early so
     // it is in scope before the Caddy step that calls it.

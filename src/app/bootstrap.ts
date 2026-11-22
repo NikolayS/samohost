@@ -622,6 +622,16 @@ export function buildHostBootstrapScript(
       `fi`,
       "",
     );
+    // Host-prep (src/env/script.ts) gives the operator user wildcard sudo
+    // rules for previews, which new-layout apps do not support yet. It refuses
+    // such servers; this covers host-prep that ran before the first bootstrap.
+    push(
+      `if [[ "$SAMOHOST_DB_LAYOUT" == split && -e ${sq(`/etc/sudoers.d/samohost-env-${app.name}`)} ]]; then`,
+      `  echo ${sq(`ERROR: /etc/sudoers.d/samohost-env-${app.name} (preview rules from host-prep) exists; the new layout does not support previews yet. Remove that file after checking that no preview of ${app.name} is in use, then run bootstrap again.`)} >&2`,
+      `  exit 1`,
+      `fi`,
+      "",
+    );
     // §5 makes appBase root-owned and the env files sit next to the env file:
     // other paths are refused in the split layout (the legacy layout continues).
     const pathError = splitLayoutPathError(appBase, envFile, appDir);

@@ -338,10 +338,15 @@ keep the legacy layout get the same sudo rules and unit as before.
   heal scripts of these apps do not use the other two.
 - The deploy sets `umask 022` so the runtime user can read what it builds.
 
-Previews of these apps are not built yet, and host-prep refuses them. They
-will need a preview vhost file name that cannot match another app's files
-(for example `<app>--<label>.caddy` with labels that do not contain `--`),
-rules for writing and removing those files, rules for
+Previews of these apps are not built yet. Host-prep stops before any change
+when the server has the layout marker `/var/lib/samohost/db-layout/<app>`
+with `split`, the app's `migrate.env`, or the user `<app>-run`. Bootstrap
+stops in the new layout when `/etc/sudoers.d/samohost-env-<app>` (host-prep
+rules) exists, which happens when host-prep ran before the first bootstrap.
+Previews of these apps will need a preview vhost file name that cannot
+match another app's files (for example `<app>--<label>.caddy` with labels
+that do not contain `--`), rules for writing and removing those files,
+rules for
 `systemctl enable --now`, `disable --now` and `reset-failed` of the preview
 instance `<app>@<label>`, and a way to create and drop the preview database
 that is not `psql` as `postgres`. The preview unit should use the same
