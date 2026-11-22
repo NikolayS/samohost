@@ -42,7 +42,11 @@ samohost_assert_static_tree_safe() {
 # ---------------------------------------------------------------------------
 
 TOKEN_FILE='/opt/my-static-site/.gh-token'
+# Root writes and chmods the token file in a folder the deploy user may own:
+# refuse symbolic links at the folder and at the file.
+if [[ -L '/opt/my-static-site' ]]; then echo 'ERROR: /opt/my-static-site is a symbolic link; refusing to write the token file through it' >&2; exit 1; fi
 mkdir -p '/opt/my-static-site'
+if [[ -L "$TOKEN_FILE" ]]; then echo "ERROR: $TOKEN_FILE is a symbolic link; refusing to write or chmod it as root" >&2; exit 1; fi
 if [[ ! -s "$TOKEN_FILE" ]]; then
   # No token file yet: try FD 3 (a dedicated channel — never the FD 0 the
   # script itself is being read from). If FD 3 is not open the read is a
