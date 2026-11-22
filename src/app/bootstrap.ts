@@ -89,7 +89,7 @@ import {
   assertOptionalLinuxAppUser,
 } from "./linux-user.ts";
 import { staticMainVhostLines } from "./heal-script.ts";
-import { migrateEnvFileOf } from "./db-layout.ts";
+import { migrateEnvFileOf, releaseEnvFileOf } from "./db-layout.ts";
 import { isIP } from "node:net";
 
 // ---------------------------------------------------------------------------
@@ -289,6 +289,7 @@ export function buildHostBootstrapScript(
   // database; the migrate env file sits next to the runtime env file.
   const ownerDbRole = `${dbName ?? app.name}_owner`;
   const migrateEnvFile = isStatic ? "" : migrateEnvFileOf(envFile);
+  const releaseEnvFile = isStatic ? "" : releaseEnvFileOf(envFile);
   const seedOwnerLogin = opts.seedOwnerLogin ?? "owner";
   // cp-http80: the control plane is the only proxy in front of this server's
   // Caddy (the firewall opens :80 to it alone). The app trusts its
@@ -640,6 +641,7 @@ export function buildHostBootstrapScript(
     `Group=${appUser}`,
     `WorkingDirectory=${appDir}`,
     `EnvironmentFile=${envFile}`,
+    `EnvironmentFile=-${releaseEnvFile}`,
     `ExecStart=${execStart}`,
     "Restart=always",
     "",

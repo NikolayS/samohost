@@ -49,7 +49,7 @@ import {
   staticTreeGuardFnLines,
 } from "./static-root.ts";
 import { staticMainVhostLines } from "./heal-script.ts";
-import { databaseUrlVarsOf, migrateEnvFileOf } from "./db-layout.ts";
+import { databaseUrlVarsOf, migrateEnvFileOf, releaseEnvFileOf } from "./db-layout.ts";
 
 /** Marker prefix the parser keys on. */
 export const PHASE_PREFIX = "<<<SAMOHOST_PHASE:";
@@ -120,6 +120,18 @@ export function buildDeployScript(app: AppRecord, target: DeployTarget): string 
 
   const sha = target.sha;
   const releaseIdentity = target.tag ?? sha;
+  // Node apps: the tag goes into the build environment and the release env
+  // file (systemd EnvironmentFile syntax), so it must be a plain tag name.
+  const nodeReleaseTag = target.tag ?? "";
+  if (app.kind !== "static" && !/^[A-Za-z0-9._-]{0,128}$/.test(nodeReleaseTag)) {
+    throw new Error(`invalid release tag for a node deploy: ${JSON.stringify(nodeReleaseTag)}`);
+  }
+  if (app.kind !== "static" && !/^[0-9a-f]{7,64}$/.test(sha)) {
+    throw new Error(`invalid deploy sha: ${JSON.stringify(sha)}`);
+  }
+  const releaseEnvFile = app.kind !== "static" && app.envFile !== undefined
+    ? releaseEnvFileOf(app.envFile)
+    : undefined;
   const isStaticReleaseChannel =
     app.kind === "static" && app.releaseTagPattern !== undefined;
   const staticReleaseTagFormat = app.releaseTagFormat ?? "";
@@ -169,6 +181,14 @@ export function buildDeployScript(app: AppRecord, target: DeployTarget): string 
           `SAMOHOST_STATIC_ROOT=${sq(staticRoot ?? "")}`,
           `SAMOHOST_ACTIVE_STATE=${sq(staticReleaseState.activeState)}`,
           `SAMOHOST_ACTIVE_ROUTE=${sq(staticReleaseState.activeRoute)}`,
+        ]
+      : []),
+    ...(app.kind !== "static"
+      ? [
+          "# Release identity for the build (dist/build-info.json, /version.json) and,",
+          "# through the release env file, for the running service.",
+          `export SAMO_RELEASE_TAG=${sq(nodeReleaseTag)}`,
+          `export SAMO_RELEASE_SHA=${sq(sha)}`,
         ]
       : []),
     "",
@@ -362,6 +382,16 @@ export function buildDeployScript(app: AppRecord, target: DeployTarget): string 
       "# restart and re-health. Emits rollback:ok / rollback:fail and exits 1.",
       "rollback() {",
       "  git reset --hard \"${PRE_DEPLOY_SHA}\" || true",
+      ...(releaseEnvFile !== undefined
+        ? [
+            "  # Restore the previous release env file (or remove the one this deploy created).",
+            '  if [[ -n "${SAMOHOST_RELEASE_ENV_BACKUP:-}" && -f "$SAMOHOST_RELEASE_ENV_BACKUP" ]]; then',
+            '    cp "$SAMOHOST_RELEASE_ENV_BACKUP" "$SAMOHOST_RELEASE_ENV_FILE" || true',
+            '  elif [[ "${SAMOHOST_RELEASE_ENV_WRITTEN:-0}" == "1" ]]; then',
+            '    rm -f "$SAMOHOST_RELEASE_ENV_FILE" || true',
+            "  fi",
+          ]
+        : []),
       '  if [[ -d "${SAMOHOST_APP_DIR}/dist.prev" ]]; then',
       '    rm -rf "${SAMOHOST_APP_DIR}/dist"',
       '    cp -r "${SAMOHOST_APP_DIR}/dist.prev" "${SAMOHOST_APP_DIR}/dist"',
@@ -715,6 +745,22 @@ export function buildDeployScript(app: AppRecord, target: DeployTarget): string 
 
     // ----- restart -----------------------------------------------------------
     // Full-path sudo systemctl, mandatory. See header note (3).
+    if (releaseEnvFile !== undefined) {
+      push(
+        "# --- release env: tag and sha for the running service (unit EnvironmentFile=-) ---",
+        "# The previous file is kept for rollback. No secret is written here.",
+        `SAMOHOST_RELEASE_ENV_FILE=${sq(releaseEnvFile)}`,
+        'SAMOHOST_RELEASE_ENV_BACKUP=""',
+        'if [[ -f "$SAMOHOST_RELEASE_ENV_FILE" ]]; then SAMOHOST_RELEASE_ENV_BACKUP="$(mktemp)"; cp "$SAMOHOST_RELEASE_ENV_FILE" "$SAMOHOST_RELEASE_ENV_BACKUP"; fi',
+        'if printf \'SAMO_RELEASE_TAG=%s\\nSAMO_RELEASE_SHA=%s\\n\' "$SAMO_RELEASE_TAG" "$SAMO_RELEASE_SHA" > "${SAMOHOST_RELEASE_ENV_FILE}.next" && chmod 0644 "${SAMOHOST_RELEASE_ENV_FILE}.next" && mv -f "${SAMOHOST_RELEASE_ENV_FILE}.next" "$SAMOHOST_RELEASE_ENV_FILE"; then',
+        "  SAMOHOST_RELEASE_ENV_WRITTEN=1",
+        "else",
+        '  echo "could not write the release env file" >&2',
+        "  rollback",
+        "fi",
+        "",
+      );
+    }
     push(
       "# --- restart: full-path sudo systemctl (NOPASSWD exact-path + use_pty) ---",
       marker("restart", "start"),

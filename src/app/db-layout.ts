@@ -32,6 +32,25 @@ export function migrateEnvFileOf(envFile: string): string {
 }
 
 /**
+ * Path of the release env file for a runtime env file path: written by each
+ * node deploy (SAMO_RELEASE_TAG, SAMO_RELEASE_SHA) and loaded by the systemd
+ * unit as an optional second EnvironmentFile.
+ */
+export function releaseEnvFileOf(envFile: string): string {
+  const slash = envFile.lastIndexOf("/");
+  if (slash < 0) {
+    throw new Error(`env file path must be absolute: ${JSON.stringify(envFile)}`);
+  }
+  const path = `${envFile.slice(0, slash)}/release.env`;
+  if (path === envFile) {
+    throw new Error(
+      `env file ${JSON.stringify(envFile)} has the reserved name release.env; choose another envFile`,
+    );
+  }
+  return path;
+}
+
+/**
  * Names of the variables that hold database addresses for this app: they are
  * kept out of the environment of `npm ci` and the build in the split layout.
  */

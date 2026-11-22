@@ -12,6 +12,10 @@ SAMOHOST_REPO='Tanya301/field-record-1'
 SAMOHOST_BRANCH='main'
 SAMOHOST_UNIT='field-record'
 SAMOHOST_HEALTH_URL='http://localhost:3000/api/version'
+# Release identity for the build (dist/build-info.json, /version.json) and,
+# through the release env file, for the running service.
+export SAMO_RELEASE_TAG=''
+export SAMO_RELEASE_SHA='abc1234def5678901234567890abcdef12345678'
 
 cd "$SAMOHOST_APP_DIR"
 git config --global --add safe.directory "$SAMOHOST_APP_DIR"
@@ -48,6 +52,12 @@ echo "<<<SAMOHOST_PHASE:checkpoint:ok>>>"
 # restart and re-health. Emits rollback:ok / rollback:fail and exits 1.
 rollback() {
   git reset --hard "${PRE_DEPLOY_SHA}" || true
+  # Restore the previous release env file (or remove the one this deploy created).
+  if [[ -n "${SAMOHOST_RELEASE_ENV_BACKUP:-}" && -f "$SAMOHOST_RELEASE_ENV_BACKUP" ]]; then
+    cp "$SAMOHOST_RELEASE_ENV_BACKUP" "$SAMOHOST_RELEASE_ENV_FILE" || true
+  elif [[ "${SAMOHOST_RELEASE_ENV_WRITTEN:-0}" == "1" ]]; then
+    rm -f "$SAMOHOST_RELEASE_ENV_FILE" || true
+  fi
   if [[ -d "${SAMOHOST_APP_DIR}/dist.prev" ]]; then
     rm -rf "${SAMOHOST_APP_DIR}/dist"
     cp -r "${SAMOHOST_APP_DIR}/dist.prev" "${SAMOHOST_APP_DIR}/dist"
@@ -104,6 +114,18 @@ if (if [[ -f "$SAMOHOST_MIGRATE_ENV_FILE" ]]; then set -a; . "$SAMOHOST_MIGRATE_
 else
   echo "<<<SAMOHOST_PHASE:migrate:fail>>>"
   exit 1
+fi
+
+# --- release env: tag and sha for the running service (unit EnvironmentFile=-) ---
+# The previous file is kept for rollback. No secret is written here.
+SAMOHOST_RELEASE_ENV_FILE='/opt/field-record/release.env'
+SAMOHOST_RELEASE_ENV_BACKUP=""
+if [[ -f "$SAMOHOST_RELEASE_ENV_FILE" ]]; then SAMOHOST_RELEASE_ENV_BACKUP="$(mktemp)"; cp "$SAMOHOST_RELEASE_ENV_FILE" "$SAMOHOST_RELEASE_ENV_BACKUP"; fi
+if printf 'SAMO_RELEASE_TAG=%s\nSAMO_RELEASE_SHA=%s\n' "$SAMO_RELEASE_TAG" "$SAMO_RELEASE_SHA" > "${SAMOHOST_RELEASE_ENV_FILE}.next" && chmod 0644 "${SAMOHOST_RELEASE_ENV_FILE}.next" && mv -f "${SAMOHOST_RELEASE_ENV_FILE}.next" "$SAMOHOST_RELEASE_ENV_FILE"; then
+  SAMOHOST_RELEASE_ENV_WRITTEN=1
+else
+  echo "could not write the release env file" >&2
+  rollback
 fi
 
 # --- restart: full-path sudo systemctl (NOPASSWD exact-path + use_pty) ---
