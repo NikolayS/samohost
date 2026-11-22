@@ -65,10 +65,12 @@ rollback() {
   local rb_mode="${1:-}"
   git reset --hard "${PRE_DEPLOY_SHA}" || true
   # Restore the previous release env file (or remove the one this deploy created).
-  if [[ -n "${SAMOHOST_RELEASE_ENV_BACKUP:-}" && -f "$SAMOHOST_RELEASE_ENV_BACKUP" ]]; then
-    cp "$SAMOHOST_RELEASE_ENV_BACKUP" "$SAMOHOST_RELEASE_ENV_FILE" || true
-  elif [[ "${SAMOHOST_RELEASE_ENV_WRITTEN:-0}" == "1" ]]; then
-    rm -f "$SAMOHOST_RELEASE_ENV_FILE" || true
+  if [[ "${SAMOHOST_RELEASE_ENV_WRITTEN:-0}" == "1" ]]; then
+    if [[ "${SAMOHOST_RELEASE_ENV_HAD_PREVIOUS:-0}" == "1" ]]; then
+      printf '%s\n' "$SAMOHOST_RELEASE_ENV_PREVIOUS" > "$SAMOHOST_RELEASE_ENV_FILE" || true
+    else
+      rm -f "$SAMOHOST_RELEASE_ENV_FILE" || true
+    fi
   fi
   if [[ -d "${SAMOHOST_APP_DIR}/dist.prev" ]]; then
     rm -rf "${SAMOHOST_APP_DIR}/dist"
@@ -134,15 +136,18 @@ else
 fi
 
 # --- release env: tag and sha for the running service (unit EnvironmentFile=-) ---
-# The previous file is kept for rollback. No secret is written here.
+# No secret is written here. The previous content is kept in a variable for
+# rollback. A failed write is a warning, not a failure: units written before
+# this file existed do not load it, and the release runs without the values.
 SAMOHOST_RELEASE_ENV_FILE='/opt/field-record/release.env'
-SAMOHOST_RELEASE_ENV_BACKUP=""
-if [[ -f "$SAMOHOST_RELEASE_ENV_FILE" ]]; then SAMOHOST_RELEASE_ENV_BACKUP="$(mktemp)"; cp "$SAMOHOST_RELEASE_ENV_FILE" "$SAMOHOST_RELEASE_ENV_BACKUP"; fi
-if printf 'SAMO_RELEASE_TAG=%s\nSAMO_RELEASE_SHA=%s\n' "$SAMO_RELEASE_TAG" "$SAMO_RELEASE_SHA" > "${SAMOHOST_RELEASE_ENV_FILE}.next" && chmod 0644 "${SAMOHOST_RELEASE_ENV_FILE}.next" && mv -f "${SAMOHOST_RELEASE_ENV_FILE}.next" "$SAMOHOST_RELEASE_ENV_FILE"; then
+SAMOHOST_RELEASE_ENV_HAD_PREVIOUS=0
+SAMOHOST_RELEASE_ENV_PREVIOUS=""
+if [[ -f "$SAMOHOST_RELEASE_ENV_FILE" ]] && SAMOHOST_RELEASE_ENV_PREVIOUS="$(cat "$SAMOHOST_RELEASE_ENV_FILE")"; then SAMOHOST_RELEASE_ENV_HAD_PREVIOUS=1; fi
+if printf 'SAMO_RELEASE_TAG=%s\nSAMO_RELEASE_SHA=%s\n' "$SAMO_RELEASE_TAG" "$SAMO_RELEASE_SHA" 2>/dev/null > "${SAMOHOST_RELEASE_ENV_FILE}.next" && chmod 0644 "${SAMOHOST_RELEASE_ENV_FILE}.next" && mv -f "${SAMOHOST_RELEASE_ENV_FILE}.next" "$SAMOHOST_RELEASE_ENV_FILE"; then
   SAMOHOST_RELEASE_ENV_WRITTEN=1
 else
-  echo "could not write the release env file" >&2
-  rollback
+  rm -f "${SAMOHOST_RELEASE_ENV_FILE}.next" 2>/dev/null || true
+  echo "WARNING: could not write the release env file $SAMOHOST_RELEASE_ENV_FILE; the service starts without SAMO_RELEASE_TAG and SAMO_RELEASE_SHA" >&2
 fi
 
 # --- restart: full-path sudo systemctl (NOPASSWD exact-path + use_pty) ---
@@ -179,7 +184,16 @@ if [[ -z "$RLS_URL" ]]; then
   echo "assert-rls: neither RLS_DATABASE_URL nor DATABASE_URL is set in the deploy environment" >&2
   rollback
 fi
-rls_result=$(psql "$RLS_URL" -tAc "SELECT rolsuper FROM pg_roles WHERE rolname = current_user" 2>&1 || echo CONNECTION_FAILED)
+# The address is passed to psql in PG* variables, not as an argument (ps shows
+# arguments). Only postgresql://user:password@host[:port]/db URLs are accepted.
+rls_result=CONNECTION_FAILED
+if [[ "$RLS_URL" =~ ^postgres(ql)?://([^:@/?#]+)(:([^@/?#]*))?@([^:@/?#]+)(:([0-9]+))?/([^?#]+) ]]; then
+  rls_pw="$(printf '%b' "${BASH_REMATCH[4]//%/\x}")"
+  rls_result=$(PGHOST="${BASH_REMATCH[5]}" PGPORT="${BASH_REMATCH[7]:-5432}" PGUSER="${BASH_REMATCH[2]}" PGPASSWORD="$rls_pw" PGDATABASE="${BASH_REMATCH[8]}" psql -X -w -tAc "SELECT rolsuper FROM pg_catalog.pg_roles WHERE rolname = current_user" 2>&1 || echo CONNECTION_FAILED)
+  unset rls_pw
+else
+  echo "assert-rls: the database address is not a postgresql://user:password@host/db URL" >&2
+fi
 if [[ "$rls_result" == "f" ]]; then
   echo "<<<SAMOHOST_PHASE:assert-rls:ok>>>"
 else

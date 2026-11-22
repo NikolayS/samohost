@@ -30,6 +30,7 @@ export interface DeploySandbox {
   npmLog: string;
   sudoLog: string;
   gitLog: string;
+  psqlLog: string;
   run(script: string): { status: number | null; stdout: string; stderr: string };
   /** Recorded npm calls: args plus the recorded variables it saw. */
   npmCalls(): Array<{ args: string; env: Record<string, string> }>;
@@ -58,6 +59,7 @@ export function makeDeploySandbox(opts: { headSha?: string; healthCode?: string;
   const npmLog = join(dir, "npm.log");
   const sudoLog = join(dir, "sudo.log");
   const gitLog = join(dir, "git.log");
+  const psqlLog = join(dir, "psql.log");
   const headSha = opts.headSha ?? "1111111111111111111111111111111111111111";
   stub(bin, "git", [
     `printf '%s\\n' "$*" >> ${JSON.stringify(gitLog)}`,
@@ -74,7 +76,10 @@ export function makeDeploySandbox(opts: { headSha?: string; healthCode?: string;
   ]);
   stub(bin, "curl", [`echo ${opts.healthCode ?? "200"}`]);
   stub(bin, "sudo", [`printf '%s\\n' "$*" >> ${JSON.stringify(sudoLog)}`]);
-  stub(bin, "psql", ["echo f"]);
+  stub(bin, "psql", [
+    `{ printf 'ARGS %s\\n' "$*"; printf 'ENV PGHOST=%s PGPORT=%s PGUSER=%s PGPASSWORD=%s PGDATABASE=%s\\n' "\${PGHOST:-}" "\${PGPORT:-}" "\${PGUSER:-}" "\${PGPASSWORD:-}" "\${PGDATABASE:-}"; } >> ${JSON.stringify(psqlLog)}`,
+    "echo f",
+  ]);
   stub(bin, "sleep", ["exit 0"]);
   return {
     dir,
@@ -84,6 +89,7 @@ export function makeDeploySandbox(opts: { headSha?: string; healthCode?: string;
     npmLog,
     sudoLog,
     gitLog,
+    psqlLog,
     run(script: string) {
       const res = spawnSync("bash", ["-c", script], {
         encoding: "utf8",

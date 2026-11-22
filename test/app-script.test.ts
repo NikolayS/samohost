@@ -83,7 +83,9 @@ describe("buildDeployScript hard-won behaviors", () => {
     const script = buildDeployScript(fieldRecord(), TARGET);
     // The script must never assign a literal secret value.
     expect(script).not.toContain("DATABASE_URL=");
-    expect(script).not.toContain("PGPASSWORD=");
+    // The assert-rls probe passes the password to psql in PGPASSWORD, from a
+    // variable parsed out of the env file at run time; never a literal value.
+    expect(script).not.toMatch(/PGPASSWORD=(?!"\$rls_pw" )/);
     // Issue #2 (bug 1): the env file IS now sourced (read-only) so migrate/
     // seed/probes get the app environment — but it must never be WRITTEN:
     // no append-redirect, no in-place edit, no DEPLOYED_SHA bookkeeping in it.
