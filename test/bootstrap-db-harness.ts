@@ -113,6 +113,13 @@ export function makeSandbox(): Sandbox {
   chmodSync(join(bin, "openssl"), 0o755);
   writeFileSync(join(bin, "chown"), "#!/usr/bin/env bash\nexit 0\n");
   chmodSync(join(bin, "chown"), 0o755);
+  // GNU mv -T (do not treat the target as a directory) is not in macOS mv;
+  // the targets here are never directories, so plain mv -f behaves the same.
+  writeFileSync(
+    join(bin, "mv"),
+    '#!/usr/bin/env bash\nargs=()\nfor a in "$@"; do if [[ "$a" == -fT ]]; then args+=(-f); else args+=("$a"); fi; done\nexec /bin/mv "${args[@]}"\n',
+  );
+  chmodSync(join(bin, "mv"), 0o755);
   writeFileSync(join(bin, "useradd"), `#!/usr/bin/env bash\nprintf 'useradd %s\\n' "$*" >> ${JSON.stringify(argvLog)}\n`);
   chmodSync(join(bin, "useradd"), 0o755);
   return {
@@ -125,8 +132,14 @@ export function makeSandbox(): Sandbox {
   };
 }
 
+/** Where the sandbox keeps the root-owned state directory /var/lib/samohost. */
+export function stateDirOf(sb: Sandbox): string {
+  return join(sb.dir, "var-lib-samohost");
+}
+
 export function runSection(sb: Sandbox, section: string): { status: number | null; stdout: string; stderr: string } {
-  const res = spawnSync("bash", ["-c", `set -euo pipefail\n${section}`], {
+  const body = section.replaceAll("/var/lib/samohost", stateDirOf(sb));
+  const res = spawnSync("bash", ["-c", `set -euo pipefail\n${body}`], {
     encoding: "utf8",
     env: { PATH: `${sb.bin}:/usr/bin:/bin`, HOME: sb.dir },
   });

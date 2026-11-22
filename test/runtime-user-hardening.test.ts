@@ -10,7 +10,7 @@
 
 import { describe, expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
-import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { buildHostBootstrapScript } from "../src/app/bootstrap.ts";
@@ -184,7 +184,7 @@ describe("env layout is decided before the sudo rules and the unit", () => {
   test("the layout is set once, before §6, and the database section still sees it", () => {
     const text = script();
     const assignments = text.split("\n").filter((l) => /^\s*SAMOHOST_DB_LAYOUT=/.test(l));
-    expect(assignments.length).toBe(2); // legacy and split arms of one if
+    expect(assignments.length).toBe(3); // marker, legacy and split arms of one if
     expect(text.indexOf("SAMOHOST_DB_LAYOUT=legacy")).toBeLessThan(text.indexOf("# §6."));
     expect(dbSection(text)).toContain("SAMOHOST_DB_LAYOUT=legacy");
   });
@@ -205,6 +205,21 @@ describe("new layout: runtime user '<app>-run'", () => {
         "chown -hR shop-run:shop-run /opt/shop/uploads",
         "chmod 750 /opt/shop/uploads",
       ]);
+    } finally {
+      sb.cleanup();
+    }
+  });
+
+  test("a symbolic link at the uploads folder is refused before chown and chmod", () => {
+    const sb = stubDir({ id: "exit 0", useradd: "", usermod: "", gpasswd: "", chown: "", chmod: "" });
+    try {
+      const link = join(sb.dir, "uploads");
+      symlinkSync("/etc", link);
+      const text = section(script(), "5c", "6").replaceAll("/opt/shop/uploads", link);
+      const res = runBash(text, sb.dir, { SAMOHOST_DB_LAYOUT: "split" });
+      expect(res.status).toBe(1);
+      expect(res.stderr).toContain("is a symbolic link");
+      expect(readFileSync(sb.log, "utf8")).not.toMatch(/^(chown|chmod) /m);
     } finally {
       sb.cleanup();
     }

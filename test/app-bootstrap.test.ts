@@ -699,7 +699,9 @@ describe("buildHostBootstrapScript (A2) — base env file content", () => {
 
   test("env file is chowned to appUser", () => {
     const script = buildHostBootstrapScript(fieldRecord(), frOpts());
-    expect(script).toMatch(/chown.*agent.*staging\.env|chown.*agent.*ENV_FILE/);
+    // Written in a root-owned temporary directory, chowned there, then renamed.
+    expect(script).toContain(`chown 'agent':'agent' "$SAMOHOST_WRITE_DIR/env"`);
+    expect(script).toContain('mv -fT "$SAMOHOST_WRITE_DIR/env" "$ENV_FILE"');
   });
 
   test("env file contains DATABASE_URL=postgresql://postgres:", () => {

@@ -53,10 +53,13 @@
  *     password generated on the host; CONNECT on the app's database is
  *     revoked from PUBLIC and granted to that role.
  *
- *  e. Base env file seeding (600, appUser-owned): DATABASE_URL (superuser),
- *     APP_DATABASE_URL (the app role and its generated password), NODE_ENV,
- *     PORT (from healthUrl), HOST,
- *     COOKIE_SECRET (on-host openssl rand), SEED_OWNER_LOGIN/PASSWORD.
+ *  e. Env files (600, appUser-owned; see src/app/db-layout.ts). Split layout:
+ *     the runtime env file has APP_DATABASE_URL (the app role), NODE_ENV,
+ *     PORT (from healthUrl), HOST, COOKIE_SECRET and TRUSTED_PROXIES; the
+ *     migrate env file has DATABASE_URL (the owner role) and
+ *     SEED_OWNER_LOGIN/PASSWORD. Legacy layout: one env file with the
+ *     superuser DATABASE_URL and all of the above. Both are written through
+ *     a temporary file in a root-owned directory and renamed into place.
  *     PG_BACKEND is intentionally NOT written here (lives in unit Environment=).
  *     Idempotent: reuses existing pw/secret/DEPLOYED_SHA values.
  *
@@ -92,6 +95,7 @@ import {
 import { staticMainVhostLines } from "./heal-script.ts";
 import { migrateEnvFileOf, releaseEnvFileOf } from "./db-layout.ts";
 import { isIP } from "node:net";
+import { dirname } from "node:path";
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -610,7 +614,18 @@ export function buildHostBootstrapScript(
       `# migration role that owns only this database, and a migrate env file`,
       `# that only the deploy's migrate step loads.`,
       `MIGRATE_ENV_FILE=${sq(migrateEnvFile)}`,
-      `if [[ -f "$ENV_FILE" ]] && grep -q '^DATABASE_URL=postgresql://postgres:' "$ENV_FILE" && [[ ! -e "$MIGRATE_ENV_FILE" ]]; then`,
+      `# Root reads and writes these files in the app user's directory: refuse`,
+      `# symbolic links, which could point root at any file.`,
+      `for _f in "$ENV_FILE" "$MIGRATE_ENV_FILE"; do`,
+      `  if [[ -L "$_f" ]]; then echo "ERROR: $_f is a symbolic link; refusing to read or write it as root" >&2; exit 1; fi`,
+      `done`,
+      `# Root-owned marker, written once an app has the split layout: deleting the`,
+      `# migrate env file or planting a superuser address does not bring back the`,
+      `# legacy path (which sets the superuser password from the env file).`,
+      `SAMOHOST_LAYOUT_MARKER=${sq(`/var/lib/samohost/db-layout/${app.name}`)}`,
+      `if [[ -f "$SAMOHOST_LAYOUT_MARKER" ]] && [[ "$(cat "$SAMOHOST_LAYOUT_MARKER")" == split ]]; then`,
+      `  SAMOHOST_DB_LAYOUT=split`,
+      `elif [[ -f "$ENV_FILE" ]] && grep -q '^DATABASE_URL=postgresql://postgres:' "$ENV_FILE" && [[ ! -e "$MIGRATE_ENV_FILE" ]]; then`,
       `  SAMOHOST_DB_LAYOUT=legacy`,
       `  echo "postgres: legacy env layout (superuser DATABASE_URL in $ENV_FILE) kept unchanged"`,
       `else`,
@@ -633,6 +648,8 @@ export function buildHostBootstrapScript(
             `    useradd --system --user-group --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin ${sq(runtimeUser)}`,
             `  fi`,
             `  usermod --shell /usr/sbin/nologin ${sq(runtimeUser)}`,
+            `  # chmod follows symbolic links: refuse one at the uploads folder.`,
+            `  if [[ -L ${sq(uploadsDir)} ]]; then echo "ERROR: ${uploadsDir} is a symbolic link" >&2; exit 1; fi`,
             `  gpasswd -d ${sq(runtimeUser)} ${sq(appUser)} >/dev/null 2>&1 || true`,
             `  chown -hR ${sq(`${runtimeUser}:${runtimeUser}`)} ${sq(uploadsDir)}`,
             `  chmod 750 ${sq(uploadsDir)}`,
@@ -1112,6 +1129,11 @@ export function buildHostBootstrapScript(
     `  PG_SUPER_PW="$(openssl rand -hex 24)"`,
     `  echo "postgres: generated new superuser password (value only in $ENV_FILE)"`,
     `fi`,
+    `# The value goes into SQL: accept only hex, as samohost generates it.`,
+    `if [[ ! "$PG_SUPER_PW" =~ ^[0-9a-f]+$ ]]; then`,
+    `  echo "ERROR: the superuser password in $ENV_FILE is not a hex value as samohost generates it; refusing to use it" >&2`,
+    `  exit 1`,
+    `fi`,
     `# Set/rotate the postgres role password to match (idempotent).`,
     `# The whole SQL — INCLUDING the quoted literal — is fed via STDIN so the`,
     `# cleartext password never lands in argv / the process table.`,
@@ -1245,8 +1267,10 @@ export function buildHostBootstrapScript(
   push(
     `# ---------------------------------------------------------------------------`,
     `# §11. Base env file seeding (PR-A2-e): ${envFile}`,
-    `#      600, ${appUser}-owned. DATABASE_URL = superuser (migrations/seed only).`,
-    `#      ${rlsUrlVar} = role ${appDbRole} with the password generated in §10.`,
+    `#      600, ${appUser}-owned. Split layout: ${rlsUrlVar} (role ${appDbRole}) in the`,
+    `#      runtime env file; DATABASE_URL (role ${ownerDbRole}) and SEED_OWNER_* in`,
+    `#      ${migrateEnvFile}. Legacy layout: one file with the superuser DATABASE_URL.`,
+    `#      Written in a root-owned temporary directory, then renamed into place.`,
     `#      PG_BACKEND is intentionally NOT set here — it lives in the unit's`,
     `#      Environment= directive (stack-prep.sh invariant).`,
     `#      Idempotent: reuses existing secrets across re-runs.`,
@@ -1280,8 +1304,11 @@ export function buildHostBootstrapScript(
     `done`,
     "",
     `umask 077`,
+    `# Root-owned temporary directory next to the app directory (same file`,
+    `# system), so the rename below replaces the target name without following it.`,
+    `SAMOHOST_WRITE_DIR="$(mktemp -d ${sq(`${dirname(dirname(envFile))}/.samohost-bootstrap.XXXXXX`)})"`,
     `if [[ "$SAMOHOST_DB_LAYOUT" == legacy ]]; then`,
-    `cat > "$ENV_FILE" <<ENVEOF`,
+    `cat > "$SAMOHOST_WRITE_DIR/env" <<ENVEOF`,
     `# ${app.name} env file — generated by samohost host-bootstrap. chmod 600, ${appUser}-owned.`,
     `# NEVER commit. DATABASE_URL is the superuser (migrations/seed only).`,
     `# ${rlsUrlVar} is the app's own non-superuser role.`,
@@ -1297,7 +1324,7 @@ export function buildHostBootstrapScript(
     `SEED_OWNER_PASSWORD=\${SEED_PW}`,
     `ENVEOF`,
     `else`,
-    `cat > "$ENV_FILE" <<ENVEOF`,
+    `cat > "$SAMOHOST_WRITE_DIR/env" <<ENVEOF`,
     `# ${app.name} runtime env file — generated by samohost host-bootstrap. chmod 600, ${appUser}-owned.`,
     `# Loaded by ${unit}.service. NEVER commit. No superuser or migration address:`,
     `# ${rlsUrlVar} is the app's own non-superuser role.`,
@@ -1308,7 +1335,7 @@ export function buildHostBootstrapScript(
     `COOKIE_SECRET=\${COOKIE_SECRET}`,
     ...trustedProxiesEnvLines,
     `ENVEOF`,
-    `cat > "$MIGRATE_ENV_FILE" <<MIGRATEEOF`,
+    `cat > "$SAMOHOST_WRITE_DIR/migrate" <<MIGRATEEOF`,
     `# ${app.name} migrate env file — generated by samohost host-bootstrap. chmod 600, ${appUser}-owned.`,
     `# Loaded only by the deploy's migrate step. NEVER commit.`,
     `# DATABASE_URL is the migration role (owner of ${dbName} only, not a superuser).`,
@@ -1316,15 +1343,25 @@ export function buildHostBootstrapScript(
     `SEED_OWNER_LOGIN=${seedOwnerLogin}`,
     `SEED_OWNER_PASSWORD=\${SEED_PW}`,
     `MIGRATEEOF`,
-    `chown ${sq(appUser)}:${sq(appUser)} "$MIGRATE_ENV_FILE"`,
-    `chmod 600 "$MIGRATE_ENV_FILE"`,
+    `chown ${sq(appUser)}:${sq(appUser)} "$SAMOHOST_WRITE_DIR/migrate"`,
+    `chmod 600 "$SAMOHOST_WRITE_DIR/migrate"`,
     `unset OWNER_DB_PW`,
-    `echo "$MIGRATE_ENV_FILE: written (600, ${appUser}). [secret values not logged]"`,
     `fi`,
-    `[[ -n "\${PRESERVE}" ]] && printf '%s' "\${PRESERVE}" >> "$ENV_FILE"`,
-    `chown ${sq(appUser)}:${sq(appUser)} "$ENV_FILE"`,
-    `chmod 600 "$ENV_FILE"`,
+    `[[ -n "\${PRESERVE}" ]] && printf '%s' "\${PRESERVE}" >> "$SAMOHOST_WRITE_DIR/env"`,
+    `chown ${sq(appUser)}:${sq(appUser)} "$SAMOHOST_WRITE_DIR/env"`,
+    `chmod 600 "$SAMOHOST_WRITE_DIR/env"`,
+    `for _f in "$ENV_FILE" "$MIGRATE_ENV_FILE"; do`,
+    `  if [[ -L "$_f" ]]; then echo "ERROR: $_f is a symbolic link; refusing to replace it" >&2; rm -rf "$SAMOHOST_WRITE_DIR"; exit 1; fi`,
+    `done`,
+    `mv -fT "$SAMOHOST_WRITE_DIR/env" "$ENV_FILE"`,
     `echo "$ENV_FILE: written (600, ${appUser}). [secret values not logged]"`,
+    `if [[ "$SAMOHOST_DB_LAYOUT" == split ]]; then`,
+    `  mv -fT "$SAMOHOST_WRITE_DIR/migrate" "$MIGRATE_ENV_FILE"`,
+    `  echo "$MIGRATE_ENV_FILE: written (600, ${appUser}). [secret values not logged]"`,
+    `  mkdir -p /var/lib/samohost/db-layout`,
+    `  printf 'split\\n' > "$SAMOHOST_LAYOUT_MARKER"`,
+    `fi`,
+    `rmdir "$SAMOHOST_WRITE_DIR"`,
     "",
   );
   } // end if (!isStatic) for §10 + §11
