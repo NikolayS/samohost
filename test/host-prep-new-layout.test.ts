@@ -98,14 +98,14 @@ describe("host-prep: new-layout node apps", () => {
 });
 
 describe("bootstrap: host-prep rules already present", () => {
-  function run4b(layout: "split" | "legacy", withHostPrepRules: boolean) {
+  function run3b(layout: "split" | "legacy", withHostPrepRules: boolean) {
     const dir = mkdtempSync(join(tmpdir(), "samohost-prep-boot-"));
     try {
       if (withHostPrepRules) writeFileSync(join(dir, "samohost-env-shop"), "# rules\n");
       const text = buildHostBootstrapScript(nodeApp(), nodeOpts());
       const lines = text.split("\n");
-      const start = lines.findIndex((l) => l.startsWith("# §4b."));
-      const end = lines.findIndex((l, i) => i > start && l.startsWith("# §5."));
+      const start = lines.findIndex((l) => l.startsWith("# §3b."));
+      const end = lines.findIndex((l, i) => i > start && l.startsWith("# §4."));
       const body = lines
         .slice(start, end - 1)
         .join("\n")
@@ -118,13 +118,13 @@ describe("bootstrap: host-prep rules already present", () => {
   }
 
   test("split layout with host-prep rules for the app: stops", () => {
-    const res = run4b("split", true);
+    const res = run3b("split", true);
     expect(res.status).toBe(1);
     expect(res.stderr).toContain("samohost-env-shop");
   });
 
   test("split layout without host-prep rules, legacy layout with them: continues", () => {
-    expect(run4b("split", false).status).toBe(0);
-    expect(run4b("legacy", true).status).toBe(0);
+    expect(run3b("split", false).status).toBe(0);
+    expect(run3b("legacy", true).status).toBe(0);
   });
 });

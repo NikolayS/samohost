@@ -558,45 +558,11 @@ export function buildHostBootstrapScript(
     "",
   );
 
-  // ---- section 4: OS user + authorized_keys ---------------------------------
-  push(
-    `# ---------------------------------------------------------------------------`,
-    `# §4. App OS user ${sq(appUser)}.`,
-    `#     useradd --create-home (not the interactive variant whose chfn step`,
-    `#     fails on the hardened box's expired-password PAM configuration).`,
-    `# ---------------------------------------------------------------------------`,
-    "",
-    `if id ${sq(appUser)} >/dev/null 2>&1; then`,
-    `  echo "User ${sq(appUser)} already exists — skipping useradd."`,
-    "else",
-    `  useradd --create-home --shell /bin/bash ${sq(appUser)}`,
-    "fi",
-    "",
-    `# Copy the operator's authorized_keys to the app user so the same SSH key`,
-    `# that provisioned the box can also authenticate as ${sq(appUser)}.`,
-    `# Prefer SUDO_USER's key (the actual operator); fall back to root's.`,
-    `OPERATOR_KEYS=""`,
-    `if [[ -n "\${SUDO_USER:-}" ]] && [[ -f "/home/\${SUDO_USER}/.ssh/authorized_keys" ]]; then`,
-    `  OPERATOR_KEYS="/home/\${SUDO_USER}/.ssh/authorized_keys"`,
-    `elif [[ -f /root/.ssh/authorized_keys ]]; then`,
-    `  OPERATOR_KEYS="/root/.ssh/authorized_keys"`,
-    `fi`,
-    `if [[ -n "\${OPERATOR_KEYS}" ]]; then`,
-    `  install -d -m 700 -o ${sq(appUser)} -g ${sq(appUser)} "/home/${appUser}/.ssh"`,
-    `  install -m 600 -o ${sq(appUser)} -g ${sq(appUser)} "\${OPERATOR_KEYS}" \\`,
-    `    "/home/${appUser}/.ssh/authorized_keys"`,
-    `  echo "Copied \${OPERATOR_KEYS} -> /home/${appUser}/.ssh/authorized_keys"`,
-    `else`,
-    `  echo "WARNING: no operator authorized_keys found; skipping key copy." >&2`,
-    `fi`,
-    "",
-  );
-
-  // ---- section 4b: env layout (node apps) -----------------------------------
+  // ---- section 3b: env layout (node apps) -----------------------------------
   if (!isStatic) {
     push(
       `# ---------------------------------------------------------------------------`,
-      `# §4b. Env layout. Decides §5, §5c, §6, §7, §10, §11 and §12.`,
+      `# §3b. Env layout. Decides §4, §5, §5c, §6, §7, §9, §10, §11 and §12.`,
       `# ---------------------------------------------------------------------------`,
       "",
       `ENV_FILE=${sq(envFile)}`,
@@ -649,6 +615,59 @@ export function buildHostBootstrapScript(
       );
     }
   }
+
+  // ---- section 4: OS user + authorized_keys ---------------------------------
+  push(
+    `# ---------------------------------------------------------------------------`,
+    `# §4. App OS user ${sq(appUser)}.`,
+    `#     useradd --create-home (not the interactive variant whose chfn step`,
+    `#     fails on the hardened box's expired-password PAM configuration).`,
+    `# ---------------------------------------------------------------------------`,
+    "",
+    `if id ${sq(appUser)} >/dev/null 2>&1; then`,
+    `  echo "User ${sq(appUser)} already exists — skipping useradd."`,
+    "else",
+    `  useradd --create-home --shell /bin/bash ${sq(appUser)}`,
+    "fi",
+    "",
+    `# Copy the operator's authorized_keys to the app user so the same SSH key`,
+    `# that provisioned the box can also authenticate as ${sq(appUser)}.`,
+    `# Prefer SUDO_USER's key (the actual operator); fall back to root's.`,
+    `OPERATOR_KEYS=""`,
+    `if [[ -n "\${SUDO_USER:-}" ]] && [[ -f "/home/\${SUDO_USER}/.ssh/authorized_keys" ]]; then`,
+    `  OPERATOR_KEYS="/home/\${SUDO_USER}/.ssh/authorized_keys"`,
+    `elif [[ -f /root/.ssh/authorized_keys ]]; then`,
+    `  OPERATOR_KEYS="/root/.ssh/authorized_keys"`,
+    `fi`,
+    `if [[ -n "\${OPERATOR_KEYS}" ]]; then`,
+    ...(runtimeUserUsable
+      ? [
+          `if [[ "$SAMOHOST_DB_LAYOUT" == split ]]; then`,
+          `  # split layout: root does not write into the deploy user's home. Refuse`,
+          `  # links, keep an existing file, and write a missing one as the user.`,
+          `  for _p in ${sq(`/home/${appUser}/.ssh`)} ${sq(`/home/${appUser}/.ssh/authorized_keys`)}; do`,
+          `    if [[ -L "$_p" ]]; then echo "ERROR: $_p is a symbolic link" >&2; exit 1; fi`,
+          `  done`,
+          `  if [[ -e ${sq(`/home/${appUser}/.ssh/authorized_keys`)} ]]; then`,
+          `    echo "Kept the existing /home/${appUser}/.ssh/authorized_keys"`,
+          `  else`,
+          `    sudo -u ${sq(appUser)} install -d -m 700 ${sq(`/home/${appUser}/.ssh`)}`,
+          `    sudo -u ${sq(appUser)} sh -c 'umask 077 && cat > "$1"' sh ${sq(`/home/${appUser}/.ssh/authorized_keys`)} < "\${OPERATOR_KEYS}"`,
+          `    echo "Copied \${OPERATOR_KEYS} -> /home/${appUser}/.ssh/authorized_keys (as ${appUser})"`,
+          `  fi`,
+          `else`,
+        ]
+      : []),
+    `  install -d -m 700 -o ${sq(appUser)} -g ${sq(appUser)} "/home/${appUser}/.ssh"`,
+    `  install -m 600 -o ${sq(appUser)} -g ${sq(appUser)} "\${OPERATOR_KEYS}" \\`,
+    `    "/home/${appUser}/.ssh/authorized_keys"`,
+    `  echo "Copied \${OPERATOR_KEYS} -> /home/${appUser}/.ssh/authorized_keys"`,
+    ...(runtimeUserUsable ? [`fi`] : []),
+    `else`,
+    `  echo "WARNING: no operator authorized_keys found; skipping key copy." >&2`,
+    `fi`,
+    "",
+  );
 
   // ---- section 5: /opt/<app> layout -----------------------------------------
   // Split layout: appBase is root-owned, so the deploy user cannot create,
@@ -1208,7 +1227,7 @@ export function buildHostBootstrapScript(
     `#      from app.name (which could produce a different string via transforms).`,
     `# ---------------------------------------------------------------------------`,
     "",
-    `# ENV_FILE, MIGRATE_ENV_FILE and SAMOHOST_DB_LAYOUT are set in §4b.`,
+    `# ENV_FILE, MIGRATE_ENV_FILE and SAMOHOST_DB_LAYOUT are set in §3b.`,
     "",
     `# Enable and start postgresql. Try the meta-unit first; fall back to the`,
     `# versioned cluster unit if needed.`,

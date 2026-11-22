@@ -11,16 +11,16 @@ import { spawnSync } from "node:child_process";
 import { buildHostBootstrapScript } from "../src/app/bootstrap.ts";
 import { nodeApp, nodeOpts } from "./bootstrap-db-harness.ts";
 
-function section4b(text: string): string {
+function section3b(text: string): string {
   const lines = text.split("\n");
-  const start = lines.findIndex((l) => l.startsWith("# §4b."));
-  const end = lines.findIndex((l, i) => i > start && l.startsWith("# §5."));
+  const start = lines.findIndex((l) => l.startsWith("# §3b."));
+  const end = lines.findIndex((l, i) => i > start && l.startsWith("# §4."));
   return lines.slice(start, end - 1).join("\n");
 }
 
-/** Run §4b on this Mac with the layout forced through the marker check. */
-function run4b(text: string, layout: "split" | "legacy") {
-  const body = section4b(text).replace(/^(\s*)SAMOHOST_DB_LAYOUT=\w+$/gm, `$1SAMOHOST_DB_LAYOUT=${layout}`);
+/** Run §3b on this Mac with the layout forced through the marker check. */
+function run3b(text: string, layout: "split" | "legacy") {
+  const body = section3b(text).replace(/^(\s*)SAMOHOST_DB_LAYOUT=\w+$/gm, `$1SAMOHOST_DB_LAYOUT=${layout}`);
   return spawnSync("bash", ["-c", `set -euo pipefail\n${body}\necho "LAYOUT=$SAMOHOST_DB_LAYOUT"`], {
     encoding: "utf8",
     env: { PATH: "/usr/bin:/bin" },
@@ -41,10 +41,10 @@ const REFUSED: Array<[string, { envFile?: string; appDir?: string }]> = [
 ];
 
 describe("new layout: env file and checkout paths", () => {
-  test("default paths: no refusal lines, and §4b passes in both layouts", () => {
+  test("default paths: no refusal lines, and §3b passes in both layouts", () => {
     const text = buildHostBootstrapScript(nodeApp(), nodeOpts());
     expect(text).not.toContain("the new layout needs");
-    expect(run4b(text, "split").status).toBe(0);
+    expect(run3b(text, "split").status).toBe(0);
   });
 
   test("an env file with another name directly in /opt/<app> is accepted", () => {
@@ -55,10 +55,10 @@ describe("new layout: env file and checkout paths", () => {
   for (const [what, change] of REFUSED) {
     test(`refused in the new layout: ${what}; the legacy layout continues`, () => {
       const text = buildHostBootstrapScript(nodeApp(change), nodeOpts());
-      const split = run4b(text, "split");
+      const split = run3b(text, "split");
       expect(split.status).toBe(1);
       expect(split.stderr).toContain("the new layout needs");
-      const legacy = run4b(text, "legacy");
+      const legacy = run3b(text, "legacy");
       expect(legacy.status, legacy.stderr).toBe(0);
       expect(legacy.stdout).toContain("LAYOUT=legacy");
     });

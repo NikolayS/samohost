@@ -169,7 +169,7 @@ describe("env layout is decided before the sudo rules and the unit", () => {
         { ...goldenNodeApp(), envFile, appDir: join(dir, "app") },
         { ...goldenNodeOpts(), appBase: dir },
       );
-      const res = runBash(`${section(text, "4b", "5")}\necho "LAYOUT=$SAMOHOST_DB_LAYOUT"`, "/usr/bin");
+      const res = runBash(`${section(text, "3b", "4")}\necho "LAYOUT=$SAMOHOST_DB_LAYOUT"`, "/usr/bin");
       expect(res.status, res.stderr).toBe(0);
       return /LAYOUT=(\w+)/.exec(res.stdout)?.[1] ?? "";
     } finally {

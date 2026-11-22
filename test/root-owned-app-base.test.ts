@@ -52,10 +52,10 @@ function runSection5(layout: "split" | "legacy", prepare: (base: string) => void
 }
 
 describe("§5 directory layout", () => {
-  test("rendered: the env layout is decided (§4b) before §5", () => {
+  test("rendered: the env layout is decided (§3b) before §4 and §5", () => {
     const text = buildHostBootstrapScript(nodeApp(), nodeOpts());
-    expect(text.indexOf("# §4b.")).toBeGreaterThan(0);
-    expect(text.indexOf("# §4b.")).toBeLessThan(text.indexOf("# §5."));
+    expect(text.indexOf("# §3b.")).toBeGreaterThan(0);
+    expect(text.indexOf("# §3b.")).toBeLessThan(text.indexOf("# §4."));
     expect(text.indexOf("SAMOHOST_DB_LAYOUT=split")).toBeLessThan(text.indexOf("# §5."));
   });
 
