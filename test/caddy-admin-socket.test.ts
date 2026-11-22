@@ -133,6 +133,23 @@ describe("Caddy admin API: switch to the unix socket (split layout)", () => {
     });
   });
 
+  test("after the switch, one reload over the socket proves that later reloads work", () => {
+    check({ layout: "split", caddyfile: TCP_FILE, reloads: [1, 0] }, (o) => {
+      expect(o.res.status, o.res.stderr).toBe(0);
+      expect(o.calls.split("\n").filter((l) => l === "systemctl reload caddy").length).toBe(2);
+      expect(restarts(o.calls)).toBe(1);
+    });
+  });
+
+  test("reload over the socket fails: previous Caddyfile restored, Caddy restarted, message names the version", () => {
+    check({ layout: "split", caddyfile: TCP_FILE, reloads: [1, 1] }, (o) => {
+      expect(o.res.status).toBe(1);
+      expect(o.res.stderr).toContain("Caddy 2.5.1 or later");
+      expect(o.caddyfile).toBe(TCP_FILE);
+      expect(restarts(o.calls)).toBe(2);
+    });
+  });
+
   test("socket already in use: a reload, no restart", () => {
     check({ layout: "split", caddyfile: SOCKET_FILE, reloads: [0] }, (o) => {
       expect(o.res.status, o.res.stderr).toBe(0);

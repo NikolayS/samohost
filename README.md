@@ -326,6 +326,15 @@ keep the legacy layout get the same sudo rules and unit as before.
   `uploads`, `migrate.env`, `release.env`, `git-safe.conf` or `.gh-token`.
   Bootstrap stops with an error for other paths when it finds the new
   layout. `migrate.env` and `release.env` are then always this app's files.
+- Caddy's admin API listens on the unix socket `/var/lib/caddy/admin.sock`
+  instead of TCP `localhost:2019`. Caddy creates the socket with mode 0200,
+  so only the caddy user and root can use it. The first bootstrap that
+  writes the socket line restarts Caddy once, then runs one
+  `systemctl reload caddy` over the socket. If Caddy is not running or the
+  reload fails, bootstrap restores the previous Caddyfile, restarts Caddy
+  and stops. The socket needs Caddy 2.5.1 or later. Every later bootstrap
+  on the server, of any app, keeps the socket line when the Caddyfile has
+  it or a layout marker says `split`.
 - The deploy user keeps building and deploying. It writes `release.env`
   through an exact `sudo /usr/bin/tee /opt/<app>/release.env` rule. Its
   other sudo rules name exact files: `00-main-<app>.caddy` and the heal

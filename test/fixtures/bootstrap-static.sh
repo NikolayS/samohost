@@ -208,8 +208,9 @@ caddy validate --config /etc/caddy/Caddyfile
 if [[ "$SAMOHOST_CADDY_ADMIN_SWITCH" == 1 ]]; then
   # A failed restart must reach the restore below, not stop the script.
   /usr/bin/systemctl reload caddy || /usr/bin/systemctl restart caddy || true
-  if ! /usr/bin/systemctl is-active --quiet caddy; then
-    echo "ERROR: caddy is not running after the admin socket change; restoring the previous Caddyfile" >&2
+  # One reload over the socket: deploy and heal reload Caddy this way.
+  if ! /usr/bin/systemctl is-active --quiet caddy || ! /usr/bin/systemctl reload caddy; then
+    echo "ERROR: caddy is not running or does not accept a reload over the admin socket /var/lib/caddy/admin.sock after the admin socket change; restoring the previous Caddyfile. The admin socket needs Caddy 2.5.1 or later ('caddy version' shows the installed version)." >&2
     if [[ -s "$SAMOHOST_CADDYFILE_PREV" ]]; then cp "$SAMOHOST_CADDYFILE_PREV" /etc/caddy/Caddyfile; fi
     /usr/bin/systemctl restart caddy || true
     rm -f "$SAMOHOST_CADDYFILE_PREV"
