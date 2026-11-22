@@ -45,7 +45,7 @@
 import type { AppRecord } from "../types.ts";
 import { staticCacheHeaderLines } from "../static-cache.ts";
 import { staticReleaseStatePaths } from "./static-root.ts";
-import { renderVhost, planFromApp } from "../caddy/render.ts";
+import { renderVhost, planFromApp, mainVhostTrustedProxies } from "../caddy/render.ts";
 import { faviconVhostBodyLines } from "../caddy/favicon.ts";
 import { PHASE_PREFIX } from "./script.ts";
 
@@ -170,6 +170,11 @@ export interface BuildConfigHealScriptOptions {
    * divergent content.  Default: false (drift-foreign skip preserved).
    */
   adoptProvenance?: boolean;
+  /**
+   * Control-plane address of the VM. For a node `cp-http80` app it becomes
+   * the vhost's `trusted_proxies` (same render as host-prep).
+   */
+  controlPlaneIp?: string;
 }
 
 export function buildConfigHealScript(app: AppRecord, opts: BuildConfigHealScriptOptions = {}): string {
@@ -201,7 +206,9 @@ export function buildConfigHealScript(app: AppRecord, opts: BuildConfigHealScrip
   // the vhost content using a bash heredoc with variable substitution.
   // renderVhost is NOT called for static apps — it would produce a node-style
   // reverse_proxy block, which is wrong for static apps.
-  const regeneratedMainVhost = isStatic ? undefined : renderVhost(planFromApp(app));
+  const regeneratedMainVhost = isStatic
+    ? undefined
+    : renderVhost(planFromApp(app, { trustedProxies: mainVhostTrustedProxies(app, opts.controlPlaneIp) }));
 
   // ---- Script header --------------------------------------------------------
   push(

@@ -1427,7 +1427,7 @@ export async function runAppHeal(
     out(`dry-run: would heal ${apps.length} app(s) on vm ${vm.name} — pass --apply to write changes`);
     for (const app of apps) {
       try {
-        const script = buildConfigHealScript(app);
+        const script = buildConfigHealScript(app, vm.controlPlaneIp !== undefined ? { controlPlaneIp: vm.controlPlaneIp } : {});
         out(`[dry-run] heal script for ${app.name} (${script.split("\n").length} lines) — not executing`);
       } catch (e) {
         err(`error: cannot build heal script for ${app.name}: ${e instanceof Error ? e.message : String(e)}`);
@@ -1442,7 +1442,7 @@ export async function runAppHeal(
   for (const app of apps) {
     let script: string;
     try {
-      script = buildConfigHealScript(app);
+      script = buildConfigHealScript(app, vm.controlPlaneIp !== undefined ? { controlPlaneIp: vm.controlPlaneIp } : {});
     } catch (e) {
       err(`error: cannot build heal script for ${app.name}: ${e instanceof Error ? e.message : String(e)}`);
       anyFailure = true;

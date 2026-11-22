@@ -355,10 +355,19 @@ export function runEnvPlan(
   if (r === undefined) return 1;
 
   if (input.hostPrep) {
+    // A node cp-http80 main vhost trusts X-Forwarded-For from the VM's
+    // recorded control-plane address (the only source allowed on :80).
+    const trustedProxy = r.app.kind !== "static" && r.app.mainListen === "cp-http80"
+      ? r.vm.controlPlaneIp
+      : undefined;
+    const hostPrepOpts = {
+      ...(input.forceMainVhost === true ? { forceMainVhost: true } : {}),
+      ...(trustedProxy !== undefined ? { mainVhostTrustedProxy: trustedProxy } : {}),
+    };
     out(buildHostPrepScript(
       r.app,
       r.vm.sshUser,
-      input.forceMainVhost === true ? { forceMainVhost: true } : undefined,
+      Object.keys(hostPrepOpts).length > 0 ? hostPrepOpts : undefined,
     ));
     return 0;
   }

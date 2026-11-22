@@ -28,6 +28,7 @@
 import type { AppSpec, EnvRecord, RouteSpec } from "../types.ts";
 import { servicesOf } from "../app/services.ts";
 import { faviconVhostLinesNode } from "./favicon.ts";
+import { isIP } from "node:net";
 
 // ---------------------------------------------------------------------------
 // VhostPlan — the pure-data input to renderVhost
@@ -86,6 +87,26 @@ export interface VhostPlan {
    * hand-constructed plans in tests / older call sites).
    */
   appName?: string;
+  /**
+   * Addresses (IP or CIDR) of the proxy in front of this server whose
+   * X-Forwarded-For values Caddy keeps (reverse_proxy `trusted_proxies`).
+   * Set for `cp-http80` production vhosts to the control-plane address, so
+   * the app receives the visitor address the control plane forwarded.
+   * Absent or empty: the bare `reverse_proxy localhost:<port>` form.
+   */
+  trustedProxies?: string[];
+}
+
+/** One `reverse_proxy localhost:<port>` directive, with trusted proxies when set. */
+function reverseProxyLines(indent: string, port: number, trustedProxies: string[] | undefined): string[] {
+  if (trustedProxies === undefined || trustedProxies.length === 0) {
+    return [`${indent}reverse_proxy localhost:${port}`];
+  }
+  return [
+    `${indent}reverse_proxy localhost:${port} {`,
+    `${indent}\ttrusted_proxies ${trustedProxies.join(" ")}`,
+    `${indent}}`,
+  ];
 }
 
 // ---------------------------------------------------------------------------
@@ -174,7 +195,7 @@ export function renderVhost(plan: VhostPlan): string {
       } else {
         lines.push(`\thandle {`);
       }
-      lines.push(`\t\treverse_proxy localhost:${port}`);
+      lines.push(...reverseProxyLines("\t\t", port, plan.trustedProxies));
       lines.push(`\t}`);
     }
   }
@@ -202,10 +223,10 @@ export function renderVhost(plan: VhostPlan): string {
   // Routes present (multi-service): wrap in a catch-all `handle {}` so it
   // acts as Caddy's last-resort fallback after all matcher-specific handles.
   if (plan.routes.length === 0) {
-    lines.push(`\treverse_proxy localhost:${plan.defaultPort}`);
+    lines.push(...reverseProxyLines("\t", plan.defaultPort, plan.trustedProxies));
   } else {
     lines.push(`\thandle {`);
-    lines.push(`\t\treverse_proxy localhost:${plan.defaultPort}`);
+    lines.push(...reverseProxyLines("\t\t", plan.defaultPort, plan.trustedProxies));
     lines.push(`\t}`);
   }
 
@@ -238,7 +259,10 @@ export function renderVhost(plan: VhostPlan): string {
  *   - servicesOf() throws (missing defaultListener, dangling listener name)
  *   - a route references a listener that doesn't exist in the service topology
  */
-export function planFromApp(app: AppSpec): VhostPlan {
+export function planFromApp(
+  app: AppSpec,
+  opts: { trustedProxies?: string[] } = {},
+): VhostPlan {
   if (app.mainHost === undefined) {
     throw new Error(
       `planFromApp: app "${app.name}" has no mainHost — ` +
@@ -278,7 +302,32 @@ export function planFromApp(app: AppSpec): VhostPlan {
     defaultPort,
     logFile: `/var/log/caddy/${app.name}-prod.log`,
     appName: app.name,
+    ...(opts.trustedProxies !== undefined && opts.trustedProxies.length > 0
+      ? { trustedProxies: assertTrustedProxies(opts.trustedProxies) }
+      : {}),
   };
+}
+
+/** Trusted proxy entries are embedded in Caddy config: IP or CIDR only. */
+function assertTrustedProxies(entries: string[]): string[] {
+  for (const entry of entries) {
+    const [address = "", prefix, extra] = entry.split("/");
+    const family = isIP(address);
+    const max = family === 4 ? 32 : 128;
+    const prefixOk = prefix === undefined || (/^\d{1,3}$/.test(prefix) && Number(prefix) >= 1 && Number(prefix) <= max);
+    if (family === 0 || extra !== undefined || !prefixOk) {
+      throw new Error(`invalid trusted proxy ${JSON.stringify(entry)}: expected an IP address or CIDR range`);
+    }
+  }
+  return entries;
+}
+
+/**
+ * The trusted-proxy list for an app's production vhost: the control-plane
+ * address for `cp-http80` apps when it is known, otherwise none.
+ */
+export function mainVhostTrustedProxies(app: AppSpec, controlPlaneIp: string | undefined): string[] | undefined {
+  return app.mainListen === "cp-http80" && controlPlaneIp !== undefined ? [controlPlaneIp] : undefined;
 }
 
 // ---------------------------------------------------------------------------

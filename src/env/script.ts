@@ -34,7 +34,7 @@ import {
   staticRootOf,
   staticTreeGuardFnLines,
 } from "../app/static-root.ts";
-import { planFromEnv, renderVhost } from "../caddy/render.ts";
+import { mainVhostTrustedProxies, planFromApp, planFromEnv, renderVhost } from "../caddy/render.ts";
 
 /** Same marker prefix as deploy scripts — one parser convention everywhere. */
 export const ENV_PHASE_PREFIX = "<<<SAMOHOST_PHASE:";
@@ -2323,6 +2323,14 @@ export interface HostPrepFirewallOpts {
    * @default false
    */
   forceMainVhost?: boolean;
+
+  /**
+   * Control-plane address for a node app with `mainListen = "cp-http80"`.
+   * The main vhost is then rendered by renderVhost(planFromApp(...)), the same
+   * render `app heal` uses, with this address as reverse_proxy
+   * `trusted_proxies`. Does not add a firewall rule (bootstrap opens :80).
+   */
+  mainVhostTrustedProxy?: string;
 }
 
 /**
@@ -2450,7 +2458,14 @@ export function buildHostPrepScript(
           ...(app.mainListen === "cp-http80" ? [] : [`\ttls internal`]),
           `}`,
         ]
-      : [
+      : app.mainListen === "cp-http80"
+        // One render for node cp-http80 apps, shared with `app heal`
+        // (src/app/heal-script.ts): http://<host>:80, no certificate and no
+        // HTTPS redirect, visitor address kept from the control plane.
+        ? renderVhost(planFromApp(app, {
+            trustedProxies: mainVhostTrustedProxies(app, firewallOpts?.mainVhostTrustedProxy),
+          })).replace(/\n$/, "").split("\n")
+        : [
           `${mainHost} {`,
           `\treverse_proxy localhost:${port}`,
           `}`,
