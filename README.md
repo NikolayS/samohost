@@ -233,6 +233,27 @@ and keep it as it is. To move such an app to the new layout:
    for each table, view and unowned sequence), so migrations can alter them.
 4. Deploy. The next deploy finds `migrate.env` and uses the new layout.
 
+### Rollback of a node deploy
+
+A node deploy runs fetch, checkout, install, build, migrate, restart and the
+health check. `dist/` is copied to `dist.prev/` before install and build.
+
+- If install, build or migrate fails and a previous release exists (`dist/`
+  was present before the deploy), the deploy resets the checkout to the
+  previous commit and restores `dist/` from `dist.prev/`. The service was not
+  restarted and keeps running the previous release; its health is checked.
+- If the health check fails after the restart, the deploy restores the same
+  files and `release.env`, restarts the service and checks health again.
+- On a first deploy (no `dist/` before it) a failure is reported without a
+  rollback.
+
+Migrations that already ran are not undone, in either case. `node_modules`
+is not restored. The previous release must therefore work with the new
+schema: add columns as nullable or with a default, and drop a column only
+in a release after the code stopped using it. samohost records the commit as
+failed (`failedSha`) after a rollback and does not deploy it again until
+`app clear-failed`.
+
 ## How it's tested
 
 - **Unit + golden/snapshot:** `bun test` (457 tests; rendered deploy/env scripts

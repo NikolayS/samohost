@@ -42,15 +42,24 @@ fi
 echo "<<<SAMOHOST_PHASE:checkpoint:start>>>"
 PRE_DEPLOY_SHA=$(git rev-parse HEAD)
 echo "pre-deploy sha: ${PRE_DEPLOY_SHA}"
+# A previous release exists when dist/ is present before this deploy. Its copy
+# dist.prev/ is made here, before install and build (a build may delete dist/).
+SAMOHOST_HAS_PREVIOUS_RELEASE=0
 if [[ -d "${SAMOHOST_APP_DIR}/dist" ]]; then
   rm -rf "${SAMOHOST_APP_DIR}/dist.prev"
   cp -r "${SAMOHOST_APP_DIR}/dist" "${SAMOHOST_APP_DIR}/dist.prev"
+  SAMOHOST_HAS_PREVIOUS_RELEASE=1
 fi
 echo "<<<SAMOHOST_PHASE:checkpoint:ok>>>"
 
 # rollback(): restore the pre-deploy state coherently (git + dist), then
 # restart and re-health. Emits rollback:ok / rollback:fail and exits 1.
+# rollback before-restart: used when install, build or migrate failed. The
+# service was not restarted and still runs the previous release, so the
+# files are restored and its health is checked without a restart.
+# Database migrations that already ran are not undone.
 rollback() {
+  local rb_mode="${1:-}"
   git reset --hard "${PRE_DEPLOY_SHA}" || true
   # Restore the previous release env file (or remove the one this deploy created).
   if [[ -n "${SAMOHOST_RELEASE_ENV_BACKUP:-}" && -f "$SAMOHOST_RELEASE_ENV_BACKUP" ]]; then
@@ -62,8 +71,10 @@ rollback() {
     rm -rf "${SAMOHOST_APP_DIR}/dist"
     cp -r "${SAMOHOST_APP_DIR}/dist.prev" "${SAMOHOST_APP_DIR}/dist"
   fi
-  sudo /usr/bin/systemctl restart "${SAMOHOST_UNIT}" || true
-  sleep 5
+  if [[ "$rb_mode" != "before-restart" ]]; then
+    sudo /usr/bin/systemctl restart "${SAMOHOST_UNIT}" || true
+    sleep 5
+  fi
   local rb_code
   rb_code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 "${SAMOHOST_HEALTH_URL}" || echo 000)
   if [[ "$rb_code" == "200" ]]; then
@@ -92,6 +103,7 @@ if (if [ -f package-lock.json ] || [ -f npm-shrinkwrap.json ]; then npm ci --inc
   echo "<<<SAMOHOST_PHASE:install:ok>>>"
 else
   echo "<<<SAMOHOST_PHASE:install:fail>>>"
+  if [[ "$SAMOHOST_HAS_PREVIOUS_RELEASE" == "1" ]]; then rollback before-restart; fi
   exit 1
 fi
 
@@ -102,6 +114,7 @@ if (cd "$SAMOHOST_APP_DIR" && npm run build); then
   echo "<<<SAMOHOST_PHASE:build:ok>>>"
 else
   echo "<<<SAMOHOST_PHASE:build:fail>>>"
+  if [[ "$SAMOHOST_HAS_PREVIOUS_RELEASE" == "1" ]]; then rollback before-restart; fi
   exit 1
 fi
 
@@ -113,6 +126,7 @@ if (if [[ -f "$SAMOHOST_MIGRATE_ENV_FILE" ]]; then set -a; . "$SAMOHOST_MIGRATE_
   echo "<<<SAMOHOST_PHASE:migrate:ok>>>"
 else
   echo "<<<SAMOHOST_PHASE:migrate:fail>>>"
+  if [[ "$SAMOHOST_HAS_PREVIOUS_RELEASE" == "1" ]]; then rollback before-restart; fi
   exit 1
 fi
 

@@ -29,6 +29,7 @@ export interface DeploySandbox {
   migrateEnvFile: string;
   npmLog: string;
   sudoLog: string;
+  gitLog: string;
   run(script: string): { status: number | null; stdout: string; stderr: string };
   /** Recorded npm calls: args plus the recorded variables it saw. */
   npmCalls(): Array<{ args: string; env: Record<string, string> }>;
@@ -40,7 +41,14 @@ function stub(bin: string, name: string, body: string[]): void {
   chmodSync(join(bin, name), 0o755);
 }
 
-export function makeDeploySandbox(opts: { headSha?: string; healthCode?: string } = {}): DeploySandbox {
+/**
+ * Options:
+ *   failNpm     npm arguments (for example "run build") of the call that fails;
+ *   healthCode  HTTP code the curl stub prints.
+ * The npm stub's `run build` deletes dist/ first (like the client app
+ * template's build) and, unless it fails, writes dist/release.txt = "new".
+ */
+export function makeDeploySandbox(opts: { headSha?: string; healthCode?: string; failNpm?: string } = {}): DeploySandbox {
   const dir = mkdtempSync(join(tmpdir(), "samohost-deploy-"));
   const bin = join(dir, "bin");
   const appDir = join(dir, "app");
@@ -49,8 +57,10 @@ export function makeDeploySandbox(opts: { headSha?: string; healthCode?: string 
   writeFileSync(join(appDir, "package-lock.json"), "{}\n");
   const npmLog = join(dir, "npm.log");
   const sudoLog = join(dir, "sudo.log");
+  const gitLog = join(dir, "git.log");
   const headSha = opts.headSha ?? "1111111111111111111111111111111111111111";
   stub(bin, "git", [
+    `printf '%s\\n' "$*" >> ${JSON.stringify(gitLog)}`,
     'case "$1" in',
     `  rev-parse) echo ${headSha} ;;`,
     "  *) exit 0 ;;",
@@ -58,6 +68,9 @@ export function makeDeploySandbox(opts: { headSha?: string; healthCode?: string 
   ]);
   stub(bin, "npm", [
     `{ printf 'CALL %s\\n' "$*"; for v in ${RECORDED_VARS.join(" ")}; do if [[ -n "\${!v+x}" ]]; then printf 'ENV %s=%s\\n' "$v" "\${!v}"; fi; done; } >> ${JSON.stringify(npmLog)}`,
+    'if [[ "$*" == "run build" ]]; then rm -rf dist; fi',
+    `if [[ "$*" == ${JSON.stringify(opts.failNpm ?? "")} ]]; then exit 1; fi`,
+    'if [[ "$*" == "run build" ]]; then mkdir -p dist && echo new > dist/release.txt; fi',
   ]);
   stub(bin, "curl", [`echo ${opts.healthCode ?? "200"}`]);
   stub(bin, "sudo", [`printf '%s\\n' "$*" >> ${JSON.stringify(sudoLog)}`]);
@@ -70,6 +83,7 @@ export function makeDeploySandbox(opts: { headSha?: string; healthCode?: string 
     migrateEnvFile: join(dir, "migrate.env"),
     npmLog,
     sudoLog,
+    gitLog,
     run(script: string) {
       const res = spawnSync("bash", ["-c", script], {
         encoding: "utf8",
