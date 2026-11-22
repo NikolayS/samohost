@@ -90,7 +90,9 @@ describe("bootstrap — TRUSTED_PROXIES in the runtime env file", () => {
       const app = { ...cpApp(), envFile: join(sb.dir, "staging.env") };
       const script = buildHostBootstrapScript(app, nodeOpts({ firewallOpts: { controlPlaneIp: CP } }));
       expect(runSection(sb, dbSection(script)).status).toBe(0);
-      expect(readFileSync(join(sb.dir, "staging.env"), "utf8")).toMatch(new RegExp(`^TRUSTED_PROXIES=${CP.replace(/\./g, "\\.")}$`, "m"));
+      // The app's TCP peer is Caddy on loopback (it dials localhost and the app
+      // listens on 0.0.0.0), then the control plane.
+      expect(readFileSync(join(sb.dir, "staging.env"), "utf8")).toMatch(new RegExp(`^TRUSTED_PROXIES=127\\.0\\.0\\.1,${CP.replace(/\./g, "\\.")}$`, "m"));
       expect(readFileSync(join(sb.dir, "migrate.env"), "utf8")).not.toContain("TRUSTED_PROXIES");
     } finally {
       sb.cleanup();
@@ -101,5 +103,25 @@ describe("bootstrap — TRUSTED_PROXIES in the runtime env file", () => {
     expect(() =>
       buildHostBootstrapScript(cpApp(), nodeOpts({ firewallOpts: { controlPlaneIp: "192.0.2.10;id" } })),
     ).toThrow(/controlPlaneIp/);
+  });
+});
+
+describe("favicon fallback route of a cp-http80 node vhost", () => {
+  test("its reverse_proxy keeps the same trusted_proxies as the default route", async () => {
+    const { planFromApp, renderVhost, mainVhostTrustedProxies } = await import("../src/caddy/render.ts");
+    const app = nodeApp({ mainHost: "shop.example.com", mainListen: "cp-http80" });
+    const text = renderVhost(planFromApp(app, { trustedProxies: mainVhostTrustedProxies(app, CP) }));
+    const lines = text.split("\n");
+    const fav = lines.findIndex((l) => l.includes("handle @samohost_favicon"));
+    expect(fav).toBeGreaterThan(0);
+    expect(lines[fav + 1]).toBe("\t\treverse_proxy localhost:3100 {");
+    expect(lines[fav + 2]).toBe(`\t\t\ttrusted_proxies ${CP}`);
+    expect(text.split(`trusted_proxies ${CP}`).length - 1).toBe(2);
+  });
+
+  test("without trusted proxies the favicon route is unchanged", async () => {
+    const { faviconVhostLinesNode } = await import("../src/caddy/favicon.ts");
+    expect(faviconVhostLinesNode("shop", 3100)[2]).toBe("\t\treverse_proxy localhost:3100 {");
+    expect(faviconVhostLinesNode("shop", 3100)[3]).toBe("\t\t\t@fav404 status 404");
   });
 });

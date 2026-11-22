@@ -346,7 +346,9 @@ export function buildHostBootstrapScript(
       throw new Error(`buildHostBootstrapScript: invalid controlPlaneIp ${JSON.stringify(trustedProxy)}`);
     }
   }
-  const trustedProxiesEnvLines = trustedProxy !== undefined ? [`TRUSTED_PROXIES=${trustedProxy}`] : [];
+  // The app's TCP peer is Caddy on loopback (Caddy dials localhost:<port>
+  // and the app listens on 0.0.0.0), and Caddy's peer is the control plane.
+  const trustedProxiesEnvLines = trustedProxy !== undefined ? [`TRUSTED_PROXIES=127.0.0.1,${trustedProxy}`] : [];
   const staticReleaseState = staticReleaseStatePaths(app.appDir);
   const staticReleaseTagFormat = app.releaseTagFormat ?? "";
 

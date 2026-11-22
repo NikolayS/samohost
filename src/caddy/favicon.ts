@@ -247,7 +247,7 @@ export function faviconVhostLinesStatic(staticDirVar: string, appName: string): 
  * Must be inserted BEFORE the catch-all `handle {}` in renderVhost.
  * Indented with a single tab.
  */
-export function faviconVhostLinesNode(appName: string, defaultPort: number): string[] {
+export function faviconVhostLinesNode(appName: string, defaultPort: number, trustedProxies?: string[]): string[] {
   assertSafeAppName(appName);
   const svg = faviconSvg(appName);
   // Caddy `handle` accepts only ONE inline path argument; for multiple paths use
@@ -256,6 +256,10 @@ export function faviconVhostLinesNode(appName: string, defaultPort: number): str
     `\t@samohost_favicon path /favicon.ico /favicon.svg`,
     `\thandle @samohost_favicon {`,
     `\t\treverse_proxy localhost:${defaultPort} {`,
+    // Same X-Forwarded-For trust as the vhost's default route (render.ts).
+    ...(trustedProxies !== undefined && trustedProxies.length > 0
+      ? [`\t\t\ttrusted_proxies ${trustedProxies.join(" ")}`]
+      : []),
     `\t\t\t@fav404 status 404`,
     `\t\t\thandle_response @fav404 {`,
     `\t\t\t\theader Content-Type image/svg+xml`,

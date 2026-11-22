@@ -257,6 +257,18 @@ and keep it as it is. To move such an app to the new layout:
    `public` could run functions that role wrote.
 4. Deploy. The next deploy finds `migrate.env` and uses the new layout.
 
+### Client addresses behind the control plane (cp-http80 node apps)
+
+The control plane proxies to this server's Caddy on port 80, and Caddy
+proxies to the app on `localhost:<port>`. Caddy's main vhost, including the
+favicon route, keeps the X-Forwarded-For entries of the control-plane
+address only (`trusted_proxies`). The runtime env file gets
+`TRUSTED_PROXIES=127.0.0.1,<control plane address>`: the app's TCP peer is
+Caddy on 127.0.0.1 (the app listens on `HOST=0.0.0.0`), then the control
+plane. Bootstrap, heal and host-prep use the control-plane address
+recorded for the VM; `app bootstrap --control-plane-ip` with a different
+address is refused.
+
 ### Rollback of a node deploy
 
 A node deploy runs fetch, checkout, install, build, migrate, restart and the

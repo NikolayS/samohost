@@ -672,6 +672,20 @@ export function runAppBootstrap(
     err("error: --control-plane-ip is only valid for cp-http80 apps");
     return 1;
   }
+  // Heal and host-prep use the address recorded for the VM; bootstrap must
+  // render the same one into TRUSTED_PROXIES and the firewall rule.
+  if (
+    app.mainListen === "cp-http80" &&
+    input.controlPlaneIp !== undefined &&
+    vm.controlPlaneIp !== undefined &&
+    input.controlPlaneIp !== vm.controlPlaneIp
+  ) {
+    err(
+      `error: --control-plane-ip ${input.controlPlaneIp} differs from the control-plane IP recorded for vm ` +
+        `${vm.name} (${vm.controlPlaneIp}); heal and host-prep use the recorded one`,
+    );
+    return 1;
+  }
   const controlPlaneIp = app.mainListen === "cp-http80"
     ? input.controlPlaneIp ?? vm.controlPlaneIp
     : input.controlPlaneIp;

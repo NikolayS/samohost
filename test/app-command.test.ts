@@ -375,6 +375,22 @@ describe("app bootstrap uses the stored app kind for the database contract", () 
     expect(c.o).toContain("proto tcp from '91.99.233.145' to any port 80");
   });
 
+  test("cp-http80 bootstrap refuses a --control-plane-ip that differs from the one recorded for the VM", () => {
+    const existing = appStore.get("vm-1111", "site")!;
+    appStore.upsert({ ...existing, mainHost: "site.example.com", mainListen: "cp-http80" });
+    vmStore.upsert(vm({ controlPlaneIp: "192.0.2.10" } as Partial<VmRecord> & { controlPlaneIp: string }));
+    const c = capture();
+    const input = {
+      vm: "samo-we-field-record",
+      app: "site",
+      appUser: "site",
+      controlPlaneIp: "192.0.2.99",
+    } as Parameters<typeof runAppBootstrap>[0] & { controlPlaneIp: string };
+    expect(runAppBootstrap(input, vmStore, appStore, c.out, c.err)).toBe(1);
+    expect(c.o).toBe("");
+    expect(c.e).toContain("differs from the control-plane IP recorded for vm");
+  });
+
   test("persisted control-plane IP does not open :80 for a static TLS app", () => {
     vmStore.upsert(vm({
       controlPlaneIp: "91.99.233.145",

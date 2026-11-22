@@ -207,7 +207,7 @@ export function renderVhost(plan: VhostPlan): string {
   //   2. Favicon fallback (proxies to upstream; letter-mark on upstream 404)
   //   3. Catch-all default handle
   if (plan.appName !== undefined) {
-    for (const line of faviconVhostLinesNode(plan.appName, plan.defaultPort)) {
+    for (const line of faviconVhostLinesNode(plan.appName, plan.defaultPort, plan.trustedProxies)) {
       lines.push(line);
     }
   }
