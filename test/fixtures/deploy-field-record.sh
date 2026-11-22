@@ -18,6 +18,10 @@ git config --global --add safe.directory "$SAMOHOST_APP_DIR"
 
 # --- env: source the app env file (READ-ONLY; never written, never echoed) ---
 set -a; . '/opt/field-record/staging.env'; set +a
+SAMOHOST_MIGRATE_ENV_FILE='/opt/field-record/migrate.env'
+if [[ -f "$SAMOHOST_MIGRATE_ENV_FILE" ]]; then
+  export -n DATABASE_URL APP_DATABASE_URL
+fi
 
 # --- fetch: bring the target SHA into the local object store ---
 echo "<<<SAMOHOST_PHASE:fetch:start>>>"
@@ -93,8 +97,9 @@ fi
 
 # --- migrate: apply DB migrations before the new code boots ---
 # subshell + cd: always runs from the app dir, whatever buildCmd cd'd into (issue #122).
+# split layout: only this subshell exports the database addresses and loads the migrate env file.
 echo "<<<SAMOHOST_PHASE:migrate:start>>>"
-if (cd "$SAMOHOST_APP_DIR" && node --import tsx/esm src/migration-runner-cli.ts); then
+if (if [[ -f "$SAMOHOST_MIGRATE_ENV_FILE" ]]; then set -a; . "$SAMOHOST_MIGRATE_ENV_FILE"; set +a; export DATABASE_URL APP_DATABASE_URL; fi && cd "$SAMOHOST_APP_DIR" && node --import tsx/esm src/migration-runner-cli.ts); then
   echo "<<<SAMOHOST_PHASE:migrate:ok>>>"
 else
   echo "<<<SAMOHOST_PHASE:migrate:fail>>>"
@@ -147,7 +152,7 @@ fi
 # --- seed: idempotent post-deploy seed (only after healthy deploy) ---
 # subshell + cd: always runs from the app dir, whatever earlier commands cd'd into (issue #122).
 echo "<<<SAMOHOST_PHASE:seed:start>>>"
-if (cd "$SAMOHOST_APP_DIR" && npm run db:seed); then
+if (if [[ -f "$SAMOHOST_MIGRATE_ENV_FILE" ]]; then set -a; . "$SAMOHOST_MIGRATE_ENV_FILE"; set +a; export DATABASE_URL APP_DATABASE_URL; fi && cd "$SAMOHOST_APP_DIR" && npm run db:seed); then
   echo "<<<SAMOHOST_PHASE:seed:ok>>>"
 else
   echo "<<<SAMOHOST_PHASE:seed:fail>>>"

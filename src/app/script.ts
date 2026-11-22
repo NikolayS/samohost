@@ -49,6 +49,7 @@ import {
   staticTreeGuardFnLines,
 } from "./static-root.ts";
 import { staticMainVhostLines } from "./heal-script.ts";
+import { databaseUrlVarsOf, migrateEnvFileOf } from "./db-layout.ts";
 
 /** Marker prefix the parser keys on. */
 export const PHASE_PREFIX = "<<<SAMOHOST_PHASE:";
@@ -193,10 +194,26 @@ export function buildDeployScript(app: AppRecord, target: DeployTarget): string 
   // DATABASE_URL, ...). Issue #2 bug 1: without this, migrate died with
   // "DATABASE_URL environment variable is required". The file is never
   // written and its values are never echoed.
+  // Split env layout (src/app/db-layout.ts), detected on the server by the
+  // presence of the migrate env file: database addresses stay in this shell
+  // (export -n) so `npm ci`, install scripts and the build do not receive
+  // them; only the migrate subshell exports them, together with the migrate
+  // env file. Legacy apps (no migrate env file) keep the old behaviour.
+  const splitLayout = app.kind !== "static" && app.envFile !== undefined
+    ? { migrateEnvFile: migrateEnvFileOf(app.envFile), dbVars: databaseUrlVarsOf(app) }
+    : undefined;
   if (app.envFile !== undefined) {
     push(
       "# --- env: source the app env file (READ-ONLY; never written, never echoed) ---",
       `set -a; . ${sq(app.envFile)}; set +a`,
+      ...(splitLayout !== undefined
+        ? [
+            `SAMOHOST_MIGRATE_ENV_FILE=${sq(splitLayout.migrateEnvFile)}`,
+            'if [[ -f "$SAMOHOST_MIGRATE_ENV_FILE" ]]; then',
+            `  export -n ${splitLayout.dbVars.join(" ")}`,
+            "fi",
+          ]
+        : []),
       "",
     );
   }
@@ -680,8 +697,13 @@ export function buildDeployScript(app: AppRecord, target: DeployTarget): string 
       push(
         "# --- migrate: apply DB migrations before the new code boots ---",
         "# subshell + cd: always runs from the app dir, whatever buildCmd cd'd into (issue #122).",
+        ...(splitLayout !== undefined
+          ? ["# split layout: only this subshell exports the database addresses and loads the migrate env file."]
+          : []),
         marker("migrate", "start"),
-        `if (cd "$SAMOHOST_APP_DIR" && ${app.migrateCmd}); then`,
+        splitLayout !== undefined
+          ? `if (if [[ -f "$SAMOHOST_MIGRATE_ENV_FILE" ]]; then set -a; . "$SAMOHOST_MIGRATE_ENV_FILE"; set +a; export ${splitLayout.dbVars.join(" ")}; fi && cd "$SAMOHOST_APP_DIR" && ${app.migrateCmd}); then`
+          : `if (cd "$SAMOHOST_APP_DIR" && ${app.migrateCmd}); then`,
         `  ${marker("migrate", "ok")}`,
         "else",
         `  ${marker("migrate", "fail")}`,
@@ -783,7 +805,9 @@ export function buildDeployScript(app: AppRecord, target: DeployTarget): string 
         "# --- seed: idempotent post-deploy seed (only after healthy deploy) ---",
         "# subshell + cd: always runs from the app dir, whatever earlier commands cd'd into (issue #122).",
         marker("seed", "start"),
-        `if (cd "$SAMOHOST_APP_DIR" && ${app.seedCmd}); then`,
+        splitLayout !== undefined
+          ? `if (if [[ -f "$SAMOHOST_MIGRATE_ENV_FILE" ]]; then set -a; . "$SAMOHOST_MIGRATE_ENV_FILE"; set +a; export ${splitLayout.dbVars.join(" ")}; fi && cd "$SAMOHOST_APP_DIR" && ${app.seedCmd}); then`
+          : `if (cd "$SAMOHOST_APP_DIR" && ${app.seedCmd}); then`,
         `  ${marker("seed", "ok")}`,
         "else",
         `  ${marker("seed", "fail")}`,

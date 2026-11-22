@@ -198,6 +198,41 @@ serviceUnit = "field-record-1"                      # systemd unit restarted on 
 No secrets ever belong in the manifest — it lives in a (often public) client
 repo. Database URLs / tokens stay in the app's own `--env-file` on the host.
 
+### Database roles and env files of a node app
+
+`app bootstrap --db-name <db>` creates two PostgreSQL roles for a node app,
+both without superuser, CREATEDB, CREATEROLE, REPLICATION or BYPASSRLS:
+
+- `<db>_app`: the role the running app uses (`APP_DATABASE_URL`).
+- `<db>_owner`: the owner of database `<db>` and nothing else, used by
+  `migrateCmd` and `seedCmd` (`DATABASE_URL` in the migrate env file).
+
+CONNECT on `<db>` is revoked from PUBLIC and granted to these two roles.
+Passwords are generated on the server and kept on re-runs.
+
+Two env files sit next to each other on the server:
+
+- the runtime env file (`envFile`, loaded by the systemd unit): the app's
+  `APP_DATABASE_URL` and no other database address;
+- `migrate.env` in the same directory: the owner role's `DATABASE_URL` and
+  `SEED_OWNER_LOGIN` / `SEED_OWNER_PASSWORD`. Only the deploy's migrate and
+  seed steps load it. `npm ci` and the build run with no database address in
+  their environment.
+
+An app bootstrapped by an older samohost has the superuser `DATABASE_URL` in
+its runtime env file and no `migrate.env`. Bootstrap and deploy detect that
+and keep it as it is. To move such an app to the new layout:
+
+1. As root on the server, remove the `DATABASE_URL=postgresql://postgres:...`
+   and `SEED_OWNER_*` lines from the runtime env file.
+2. Run `app bootstrap` again. It now uses the new layout: it creates
+   `<db>_owner`, makes it the owner of `<db>`, writes `migrate.env`, and prints
+   a warning when objects in schema `public` are owned by another role.
+3. As root, give those objects to `<db>_owner`
+   (`sudo -u postgres psql -d <db>`, then `ALTER TABLE ... OWNER TO <db>_owner;`
+   for each table, view and unowned sequence), so migrations can alter them.
+4. Deploy. The next deploy finds `migrate.env` and uses the new layout.
+
 ## How it's tested
 
 - **Unit + golden/snapshot:** `bun test` (457 tests; rendered deploy/env scripts
