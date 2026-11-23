@@ -31,7 +31,9 @@ function setup(o: { healthCode?: string; failStep?: string; withStep?: boolean; 
       // Repository code in a step could read its stdin.
       "cat >/dev/null",
       ...(o.failStep !== undefined ? [`if [[ "$1" == ${o.failStep} ]]; then exit 1; fi`] : []),
-      `if [[ "$1" == release ]]; then mkdir -p ${JSON.stringify(join(sb.dir, "releases", "new"))}; rm -f ${JSON.stringify(join(sb.dir, "current"))}; ln -s releases/new ${JSON.stringify(join(sb.dir, "current"))}; fi`,
+      // release and rollback as the real step script does them.
+      `if [[ "$1" == release ]]; then mkdir -p ${JSON.stringify(join(sb.dir, "releases", "new"))}; if [[ -L ${JSON.stringify(join(sb.dir, "current"))} ]]; then ln -sfn "$(readlink ${JSON.stringify(join(sb.dir, "current"))})" ${JSON.stringify(join(sb.dir, "previous"))}; else rm -f ${JSON.stringify(join(sb.dir, "previous"))}; fi; rm -f ${JSON.stringify(join(sb.dir, "current"))}; ln -s releases/new ${JSON.stringify(join(sb.dir, "current"))}; fi`,
+      `if [[ "$1" == rollback ]]; then if [[ ! -L ${JSON.stringify(join(sb.dir, "previous"))} ]]; then rm -f ${JSON.stringify(join(sb.dir, "current"))}; exit 3; fi; ln -sfn "$(readlink ${JSON.stringify(join(sb.dir, "previous"))})" ${JSON.stringify(join(sb.dir, "current"))}; fi`,
       "exit 0",
     ].join("\n") + "\n");
     chmodSync(step, 0o755);
@@ -133,16 +135,19 @@ describe("deploy: build model", () => {
     }
   });
 
-  test("first deploy (no previous release) fails after the release: the service is stopped; outcome 'stopped'", () => {
+  test("first deploy (no previous release) fails after the release: current removed, the service stopped (still enabled); outcome 'stopped'", () => {
     const r = setup({ healthCode: "500" });
     try {
       expect(r.res.status).toBe(1);
-      expect(r.steps).toEqual(["install", "build", "migrate", "release", "cleanup"]);
+      expect(r.steps).toEqual(["install", "build", "migrate", "release", "rollback", "cleanup"]);
       const sudo = r.sudo.split("\n");
       expect(sudo.filter((l) => l === "/usr/bin/systemctl restart shop").length).toBe(1);
       expect(sudo).toContain("/usr/bin/systemctl stop shop");
+      expect(sudo.some((l) => l.includes("disable"))).toBe(false);
+      expect(existsSync(join(r.sb.dir, "current"))).toBe(false);
       expect(r.res.stdout).toContain("<<<SAMOHOST_PHASE:stop:ok>>>");
-      expect(r.res.stderr).toContain("no previous release to roll back to; the service shop was stopped");
+      expect(r.res.stderr).toContain("there is no previous release to roll back to; current was removed and the service shop was stopped");
+      expect(r.res.stderr).not.toContain("step rollback failed");
       expect(parseDeployOutcome(r.res.stdout + r.res.stderr).outcome).toBe("stopped");
     } finally {
       r.sb.cleanup();
@@ -155,6 +160,8 @@ describe("deploy: build model", () => {
       expect(r.res.status).toBe(1);
       expect(r.steps).toEqual(["install", "build", "migrate", "release", "rollback", "cleanup"]);
       expect(r.sudo.split("\n")).toContain("/usr/bin/systemctl stop shop");
+      expect(r.res.stderr).toContain("step rollback failed (exit 1); the service shop was stopped; current still names the failed release");
+      expect(r.res.stderr).not.toContain("no previous release");
       expect(parseDeployOutcome(r.res.stdout + r.res.stderr).outcome).toBe("stopped");
     } finally {
       r.sb.cleanup();

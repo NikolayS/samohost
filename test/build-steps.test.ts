@@ -451,10 +451,30 @@ describe("step script: executed", () => {
     }
   });
 
-  test("rollback switches current back to the previous release; without one it fails", () => {
+  test("rollback without a previous release removes current (exit 3); the next release does not keep the failed one as previous", () => {
     const s = sandbox();
     try {
-      expect(s.step("rollback").status).toBe(1);
+      expect(s.step("install").status).toBe(0);
+      expect(s.step("release").status).toBe(0);
+      const failed = readlinkSync(join(s.base, "current"));
+      const res = s.step("rollback");
+      expect(res.status).toBe(3);
+      expect(res.stderr).toContain("no previous release");
+      expect(existsSync(join(s.base, "current"))).toBe(false);
+      spawnSync("sleep", ["1"]);
+      expect(s.step("install").status).toBe(0);
+      expect(s.step("release").status).toBe(0);
+      expect(readlinkSync(join(s.base, "current"))).not.toBe(failed);
+      expect(existsSync(join(s.base, "previous"))).toBe(false);
+      expect(readdirSync(join(s.base, "releases"))).not.toContain(failed.replace("releases/", ""));
+    } finally {
+      s.cleanup();
+    }
+  }, 30000);
+
+  test("rollback switches current back to the previous release", () => {
+    const s = sandbox();
+    try {
       s.step("release");
       const first = readlinkSync(join(s.base, "current"));
       spawnSync("sleep", ["1"]);
