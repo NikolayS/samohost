@@ -524,6 +524,7 @@ Files and folders (`/opt/<app>` is root:root 755):
 | `app/` (checkout) | deploy user, readable for all | deploy user, build steps (not `.git`) | deploy user |
 | `build/` | `<app>-build`, 700 | build steps, the copy unit | install and build steps (the install unit empties it in place) |
 | `build-cache/` | `<app>-build`, 700 | install and build steps (npm cache) | install and build steps |
+| `releases/` | root:`<app>-run`, 751 | service; the copy unit reaches its destination by name | root (`step release`) |
 | `releases/<name>/` | root:`<app>-run`, 750, files 640 or 750 | service | the copy unit (as `<app>-build`, into a fresh folder), then root (owners and modes) |
 | `current`, `previous` | root, links into `releases/` | systemd, root | root (`step release`, `step rollback`) |
 | env file | deploy user, 600 | systemd for the service; the deploy (sources it) | bootstrap |
@@ -549,7 +550,8 @@ is not affected), an empty
 `TasksMax=1024`, `RuntimeMaxSec` (1800 s for install and build, 900 s for
 migrate and seed) and `KillMode=control-group`. The env file,
 `migrate.env`, `.gh-token`, `git-safe.conf`, the checkout's `.git` and
-`releases/` are inaccessible in every step unit. `HOME` is the unit's
+`releases/` are inaccessible in the install, build, migrate and seed units
+(the copy unit sees `releases/`, see below). `HOME` is the unit's
 private `/tmp`. Install and build can write `build/` and `build-cache/`
 (`npm_config_cache`) and their private `/tmp` and `/var/tmp`; migrate and
 seed can write only their private `/tmp` and `/var/tmp`. Network:
@@ -618,7 +620,9 @@ after killing every process of `<app>-build`. Root does not read or walk
 1. Root creates the destination `releases/<name>.tmp` fresh, mode 700,
    inside the root-owned `releases/`, and gives it to `<app>-build`.
    `<app>-run` cannot enter it, and only root can create entries in
-   `releases/`.
+   `releases/`. `releases/` is mode 751, so `<app>-build` can reach the
+   destination by name but cannot list `releases/` or enter a release
+   folder (750 root:`<app>-run`).
 2. A transient unit `samohost-<app>-copy` runs `cp -R -P` from `build/` to
    the destination as `<app>-build`. It has the step hardening, no network
    (`PrivateNetwork`, `IPAddressDeny=any`), no unix sockets, the env files,

@@ -118,7 +118,9 @@ describe("§5d build user and step script", () => {
       const calls = r.calls();
       expect(calls).toContain(`install -d -m 700 -o shop-build -g shop-build ${r.base}/build`);
       expect(calls).toContain(`install -d -m 700 -o shop-build -g shop-build ${r.base}/build-cache`);
-      expect(calls).toContain(`install -d -m 750 -o root -g shop-run ${r.base}/releases`);
+      // 751: the copy unit (as shop-build) must reach its destination releases/<name>.tmp
+      // by name; it cannot list releases/ or enter a release folder (750 root:shop-run).
+      expect(calls).toContain(`install -d -m 751 -o root -g shop-run ${r.base}/releases`);
     } finally {
       r.cleanup();
     }
