@@ -82,6 +82,8 @@ const SPLIT_SUDOERS = [
   "shop ALL=(root) NOPASSWD: /usr/bin/tee /etc/caddy/sites.d/.samohost-heal-next-00-main-shop.caddy",
   "shop ALL=(root) NOPASSWD: /usr/bin/mv -- /etc/caddy/sites.d/.samohost-heal-next-00-main-shop.caddy /etc/caddy/sites.d/00-main-shop.caddy",
   "shop ALL=(root) NOPASSWD: /usr/bin/rm -f /etc/caddy/sites.d/.samohost-heal-next-00-main-shop.caddy",
+  "shop ALL=(root) NOPASSWD: /usr/bin/rm -f /etc/caddy/sites.d/00-main-shop.caddy",
+  "shop ALL=(caddy) NOPASSWD: /usr/bin/caddy validate --config /etc/caddy/Caddyfile",
   "shop ALL=(root) NOPASSWD: /usr/bin/tee /opt/shop/release.env",
   ...["install", "build", "migrate", "seed", "release", "rollback", "cleanup"].map(
     (step) => `shop ALL=(root) NOPASSWD: /usr/local/lib/samohost/apps/shop/step ${step}`,
@@ -141,9 +143,9 @@ function sudoMatcher(rules: string) {
     if (m === null) throw new Error(`unparsed rule: ${line}`);
     return { runas: m[1]!, cmd: m[2]!, args: m[3] ?? "" };
   });
-  return (cmd: string, args: string): boolean =>
+  return (cmd: string, args: string, runas = "root"): boolean =>
     parsed.some((r) => {
-      if (r.runas !== "root" || r.cmd !== cmd) return false;
+      if (r.runas !== runas || r.cmd !== cmd) return false;
       if (r.args.startsWith("^") && r.args.endsWith("$")) return new RegExp(r.args).test(args);
       return r.args === args;
     });
@@ -362,16 +364,17 @@ describe("new layout: deploy user's sudo rules", () => {
     const allowed = sudoMatcher(SPLIT_SUDOERS);
     const seen: string[] = [];
     for (const text of texts) {
-      for (const m of text.matchAll(/\bsudo (\/usr\/bin\/[a-z]+)((?: (?:'[^']*'|"[^"]*"|[^\s;|&<>'"]+))*)/g)) {
-        const cmd = m[1]!;
-        const args = m[2]!
+      for (const m of text.matchAll(/\bsudo (?:-u ([a-z]+) )?(\/usr\/bin\/[a-z]+)((?: (?:'[^']*'|"[^"]*"|[^\s;|&<>'"]+))*)/g)) {
+        const runas = m[1] ?? "root";
+        const cmd = m[2]!;
+        const args = m[3]!
           .trim()
           .replaceAll('"${SAMOHOST_UNIT}"', "shop")
           .replaceAll('"$SAMOHOST_RELEASE_ENV_FILE"', "/opt/shop/release.env")
           .replace(/'([^']*)'/g, "$1");
         if (args.includes("$")) throw new Error(`unresolved argument in: sudo ${cmd} ${args}`);
-        seen.push(`${cmd} ${args}`);
-        expect(allowed(cmd, args), `sudo ${cmd} ${args}`).toBe(true);
+        seen.push(`${runas === "root" ? "" : `-u ${runas} `}${cmd} ${args}`);
+        expect(allowed(cmd, args, runas), `sudo -u ${runas} ${cmd} ${args}`).toBe(true);
       }
     }
     // The heal staging file name in the rules is the one the heal script uses.
@@ -380,6 +383,13 @@ describe("new layout: deploy user's sudo rules", () => {
     );
     expect(seen).toContain("/usr/bin/systemctl restart shop");
     expect(seen).toContain("/usr/bin/tee /opt/shop/release.env");
+    // Heal validates as the caddy user and its rollback can remove a vhost it created.
+    expect(seen).toContain("-u caddy /usr/bin/caddy validate --config /etc/caddy/Caddyfile");
+    expect(seen).toContain("/usr/bin/rm -f /etc/caddy/sites.d/00-main-shop.caddy");
+  });
+
+  test("the deploy user has 19 rules: 12 exact commands and 7 step rules", () => {
+    expect(SPLIT_SUDOERS.trim().split("\n").length).toBe(19);
   });
 
   test("the sudo grant self-check still passes with the new rule count", () => {

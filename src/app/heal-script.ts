@@ -48,6 +48,15 @@ import { staticReleaseStatePaths } from "./static-root.ts";
 import { renderVhost, planFromApp, mainVhostTrustedProxies } from "../caddy/render.ts";
 import { faviconVhostBodyLines } from "../caddy/favicon.ts";
 import { PHASE_PREFIX } from "./script.ts";
+import { buildStepScriptPath } from "./build-steps.ts";
+
+/**
+ * Caddy's validation of the whole configuration. On a split-layout server
+ * the deploy user runs it as the caddy user through an exact sudo rule
+ * (src/app/bootstrap.ts §6): validation opens each vhost's log file in
+ * /var/log/caddy, which only caddy can create.
+ */
+export const CADDY_VALIDATE_COMMAND = "/usr/bin/caddy validate --config /etc/caddy/Caddyfile";
 
 /**
  * Build the static main-vhost address expression — matches the deploy path
@@ -243,6 +252,14 @@ export function buildConfigHealScript(app: AppRecord, opts: BuildConfigHealScrip
           '  sudo /usr/bin/rm -f "${SAMOHOST_ACTIVE_ROUTE_STAGED:-}" || true',
         ]
       : []),
+    ...(!isStatic
+      ? [
+          "  # A main vhost that heal created (none existed before) is removed.",
+          '  if [[ "${SAMOHOST_MAIN_VHOST_CREATED:-0}" == "1" ]]; then',
+          `    sudo /usr/bin/rm -f ${sq(mainVhostPath)} || rb_ok=0`,
+          "  fi",
+        ]
+      : []),
     "  # Restore main vhost backup",
     '  if [[ "${SAMOHOST_MAIN_VHOST_HAD_BACKUP:-0}" == "1" && -f "${SAMOHOST_MAIN_VHOST_BACKUP:-}" ]]; then',
     `    if sudo /usr/bin/tee ${sq(stagedMainVhost)} >/dev/null < "$SAMOHOST_MAIN_VHOST_BACKUP"; then`,
@@ -261,7 +278,9 @@ export function buildConfigHealScript(app: AppRecord, opts: BuildConfigHealScrip
           "  fi",
         ]
       : []),
-    "  caddy validate --config /etc/caddy/Caddyfile >/dev/null || rb_ok=0",
+    isStatic
+      ? "  caddy validate --config /etc/caddy/Caddyfile >/dev/null || rb_ok=0"
+      : "  samohost_caddy_validate || rb_ok=0",
     '  if [[ "$rb_ok" == "1" ]]; then sudo /usr/bin/systemctl reload caddy || rb_ok=0; fi',
     `  sleep ${RESTART_SETTLE_SEC}`,
     "  local rb_code",
@@ -286,6 +305,23 @@ export function buildConfigHealScript(app: AppRecord, opts: BuildConfigHealScrip
     "}",
     "",
   );
+
+  // Defined after rollback(), which calls it at run time.
+  if (!isStatic) {
+    push(
+      "# Split layout (the step script exists): validate as the caddy user through",
+      "# the exact sudo rule; the deploy user cannot open the vhosts' log files.",
+      `SAMOHOST_STEP=${sq(buildStepScriptPath(app.name))}`,
+      "samohost_caddy_validate() {",
+      '  if [[ -x "$SAMOHOST_STEP" ]]; then',
+      `    sudo -u caddy ${CADDY_VALIDATE_COMMAND} >/dev/null`,
+      "  else",
+      "    caddy validate --config /etc/caddy/Caddyfile >/dev/null",
+      "  fi",
+      "}",
+      "",
+    );
+  }
 
   // ---- Heal start -----------------------------------------------------------
   push(
@@ -466,6 +502,8 @@ export function buildConfigHealScript(app: AppRecord, opts: BuildConfigHealScrip
       "  fi",
       'elif [[ "${SAMOHOST_MAIN_VHOST_BACKUP:-}" != "" ]]; then',
       "  # File did not exist — no provenance check needed, write fresh",
+      "  # (the rollback removes it again).",
+      "  SAMOHOST_MAIN_VHOST_CREATED=1",
       `  if sudo /usr/bin/tee ${sq(mainVhostPath)} >/dev/null <<'SAMOHOST_MAIN_VHOST_CONTENT'`,
       ...regeneratedMainVhost!.replace(/\n$/, "").split("\n"),
       "SAMOHOST_MAIN_VHOST_CONTENT",
@@ -627,7 +665,9 @@ export function buildConfigHealScript(app: AppRecord, opts: BuildConfigHealScrip
   // ---- Validate the combined Caddy config ----------------------------------
   push(
     "# --- validate: check the combined Caddy config before reload ---",
-    "caddy validate --config /etc/caddy/Caddyfile >/dev/null || rollback",
+    isStatic
+      ? "caddy validate --config /etc/caddy/Caddyfile >/dev/null || rollback"
+      : "samohost_caddy_validate || rollback",
     "",
   );
 

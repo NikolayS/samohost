@@ -344,8 +344,9 @@ keep the legacy layout get the same sudo rules and unit as before.
   root-owned release in `/opt/<app>/current` through its group; before the
   build model (servers without the step script) it read the checkout,
   `node_modules` and `dist/` through their world-read bit. It can write
-  `/opt/<app>/uploads`, its private `/tmp` and `/var/tmp` (`PrivateTmp`)
-  and its private `/dev/shm` (`TemporaryFileSystem`); `ProtectSystem=strict`
+  `/opt/<app>/uploads` and its private `/tmp` and `/var/tmp`
+  (`PrivateTmp`); its private `/dev/shm` (`TemporaryFileSystem`) is an
+  empty root-owned folder that it cannot write. `ProtectSystem=strict`
   makes every other path read-only for it, except the device nodes that
   systemd puts in its private `/dev`. No build step can hand it a
   descriptor into `build/`: the step units cannot create unix sockets.
@@ -402,7 +403,16 @@ keep the legacy layout get the same sudo rules and unit as before.
   writes `release.env` through an exact
   `sudo /usr/bin/tee /opt/<app>/release.env` rule. Its other sudo rules
   name exact files: `00-main-<app>.caddy` and the heal staging file
-  `.samohost-heal-next-00-main-<app>.caddy`. It has no rule for preview
+  `.samohost-heal-next-00-main-<app>.caddy`, and one exact command as the
+  caddy user, `sudo -u caddy /usr/bin/caddy validate --config
+  /etc/caddy/Caddyfile` (the validation opens each vhost's log file in
+  `/var/log/caddy`, which only caddy can create; the deploy user can already
+  reload Caddy with any vhost text it writes). Nineteen rules in all:
+  `systemctl enable`, `start`, `stop` and `restart` of the unit,
+  `systemctl reload caddy`, `tee` of the main vhost, of the staging file and
+  of `release.env`, `mv` of the staging file to the main vhost, `rm -f` of
+  the staging file and of the main vhost (heal's rollback removes a main
+  vhost that it created), the validation, and the seven step rules. It has no rule for preview
   vhost files: their name `<app>-<label>.caddy` would also match previews of
   another app whose name starts with `<app>-`. It has no `journalctl`,
   `daemon-reload` or `psql` rule: `samohost logs`
@@ -595,8 +605,8 @@ What hostile repository code can and cannot reach:
   `build/`, `build-cache/` or the checkout, so it cannot change the build
   that becomes the release.
 - runtime: the app role's `APP_DATABASE_URL`, `COOKIE_SECRET` and the rest
-  of the env file, write access to `uploads/`, its private `/tmp` and
-  `/var/tmp` and its private `/dev/shm`. It
+  of the env file, write access to `uploads/` and its private `/tmp` and
+  `/var/tmp`. It
   cannot read the checkout, `build/`, `build-cache/`, `migrate.env` or the
   token file, and cannot change its own release.
 - in no step: sudo (no rules; `NoNewPrivileges`), a process that outlives
@@ -656,6 +666,19 @@ file, and switch `current` back to `previous`. It cannot read
 `migrate.env` directly, change a release, or run a command as root other
 than the exact sudo rules.
 
+Bootstrap writes the main vhost `00-main-<app>.caddy` of these apps as
+root, from the values fixed at bootstrap (host names, app port,
+control-plane address) and with the text that `app heal` renders. It
+replaces a file with samohost's header (for example the vhost of a static
+app of the same name), keeps a file without it (with a warning), has Caddy
+validate the whole configuration as the caddy user and reloads Caddy; when
+the validation or the reload fails it puts the previous file back (or
+removes the new one) and stops. Host-prep, which writes this vhost for
+other node apps, refuses these apps. Caddy answers for the host from the
+end of bootstrap; the app behind it answers after the first deploy. `app
+heal` keeps the file: no drift on the bootstrap's file, and a missing file
+is written again.
+
 What remains open:
 
 - The deploy user writes the main vhost `00-main-<app>.caddy` and the heal
@@ -698,7 +721,7 @@ What remains open:
   `npm ci` and the app (test-server checklist).
 - Previews are not built for these apps (previous section).
 
-Design for the main vhost (not built): bootstrap renders
+Design for the main vhost helper (not built): bootstrap renders
 `00-main-<app>.caddy` from values fixed at bootstrap (host names, app port,
 control-plane address) and stores the content root-owned, for example in
 `/usr/local/lib/samohost/apps/<app>/00-main.caddy`. A root-owned helper

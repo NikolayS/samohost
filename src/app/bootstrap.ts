@@ -92,7 +92,8 @@ import {
   assertOptionalLinuxAppUser,
   linuxAppUserError,
 } from "./linux-user.ts";
-import { staticMainVhostLines } from "./heal-script.ts";
+import { CADDY_VALIDATE_COMMAND, SAMOHOST_PROVENANCE_HEADER, staticMainVhostLines } from "./heal-script.ts";
+import { mainVhostTrustedProxies, planFromApp, renderVhost } from "../caddy/render.ts";
 import { migrateEnvFileOf, releaseEnvFileOf, splitLayoutPathError } from "./db-layout.ts";
 import { buildModelPaths, buildStepScript, buildStepScriptPath, BUILD_STEP_NAMES } from "./build-steps.ts";
 import { isIP } from "node:net";
@@ -355,6 +356,8 @@ export function buildHostBootstrapScript(
   const mainVhostFile = `/etc/caddy/sites.d/00-main-${app.name}.caddy`;
   // Same name as the heal script's staging file (src/app/heal-script.ts).
   const healStagedVhostFile = `/etc/caddy/sites.d/.samohost-heal-next-00-main-${app.name}.caddy`;
+  // Same command as the heal script runs as the caddy user (CADDY_VALIDATE_AS_CADDY).
+  const caddyValidateAsCaddy = CADDY_VALIDATE_COMMAND;
   // No sudo rule for preview vhost files (/etc/caddy/sites.d/<app>-<label>.caddy):
   // that name pattern overlaps between apps whose names share a prefix, and
   // previews of new-layout apps are not designed yet (host-prep refuses them).
@@ -927,7 +930,8 @@ export function buildHostBootstrapScript(
       ...(runtimeUserUsable
         ? [
             `# split layout: exact file names for the main vhost, the heal staging file`,
-            `# and release.env. No wildcard, preview, journalctl, daemon-reload or psql`,
+            `# and release.env; Caddy's validation as the caddy user, which can open the`,
+            `# vhost's log file. No wildcard, preview, journalctl, daemon-reload or psql`,
             `# grant: the deploy and heal scripts do not use them (logs and doctor run`,
             `# as the operator user; previews of these apps are not designed yet).`,
             `if [[ "$SAMOHOST_DB_LAYOUT" == split ]]; then`,
@@ -941,6 +945,8 @@ export function buildHostBootstrapScript(
             `${appUser} ALL=(root) NOPASSWD: /usr/bin/tee ${healStagedVhostFile}`,
             `${appUser} ALL=(root) NOPASSWD: /usr/bin/mv -- ${healStagedVhostFile} ${mainVhostFile}`,
             `${appUser} ALL=(root) NOPASSWD: /usr/bin/rm -f ${healStagedVhostFile}`,
+            `${appUser} ALL=(root) NOPASSWD: /usr/bin/rm -f ${mainVhostFile}`,
+            `${appUser} ALL=(caddy) NOPASSWD: ${caddyValidateAsCaddy}`,
             `${appUser} ALL=(root) NOPASSWD: /usr/bin/tee ${releaseEnvFile}`,
             ...BUILD_STEP_NAMES.map((step) => `${appUser} ALL=(root) NOPASSWD: ${stepScriptPath} ${step}`),
             "SAMOHOST_SPLIT_SUDOERS",
@@ -1739,6 +1745,54 @@ export function buildHostBootstrapScript(
   // checkout and the runtime realpath containment guard above can inspect it.
   if (staticBranchVhostLines.length > 0) {
     push(...staticBranchVhostLines);
+  }
+
+  // ---- section 12b: main vhost of a split-layout node app -------------------
+  // Legacy node apps get the main vhost from host-prep, which refuses
+  // split-layout apps. Root writes it here from values fixed at bootstrap,
+  // with the text heal renders (heal then finds no drift).
+  if (runtimeUserUsable && app.mainHost !== undefined) {
+    const mainVhostText = renderVhost(
+      planFromApp(app, { trustedProxies: mainVhostTrustedProxies(app, opts.firewallOpts?.controlPlaneIp) }),
+    );
+    push(
+      `# ---------------------------------------------------------------------------`,
+      `# §12b. Main vhost ${mainVhostFile} (split layout).`,
+      `#      Root writes it from values fixed at bootstrap (host name, port,`,
+      `#      control-plane address), with the text that app heal renders. Caddy`,
+      `#      validates the whole configuration as the caddy user, which creates the`,
+      `#      vhost's log file as caddy, then one reload. The app answers through`,
+      `#      Caddy once the first deploy has started it.`,
+      `# ---------------------------------------------------------------------------`,
+      "",
+      `if [[ "$SAMOHOST_DB_LAYOUT" == split ]]; then`,
+      `  SAMOHOST_MAIN_VHOST=${sq(mainVhostFile)}`,
+      `  if [[ -L "$SAMOHOST_MAIN_VHOST" ]]; then echo "ERROR: $SAMOHOST_MAIN_VHOST is a symbolic link" >&2; exit 1; fi`,
+      `  SAMOHOST_MAIN_VHOST_NEXT="$(mktemp)"`,
+      `  cat > "$SAMOHOST_MAIN_VHOST_NEXT" <<'SAMOHOST_MAIN_VHOST_CONTENT'`,
+      ...mainVhostText.replace(/\n$/, "").split("\n"),
+      "SAMOHOST_MAIN_VHOST_CONTENT",
+      `  if [[ -f "$SAMOHOST_MAIN_VHOST" ]] && cmp -s "$SAMOHOST_MAIN_VHOST_NEXT" "$SAMOHOST_MAIN_VHOST"; then`,
+      `    echo "Caddy: main vhost $SAMOHOST_MAIN_VHOST unchanged."`,
+      `  elif [[ -e "$SAMOHOST_MAIN_VHOST" && "$(head -n 1 "$SAMOHOST_MAIN_VHOST")" != ${sq(SAMOHOST_PROVENANCE_HEADER)} ]]; then`,
+      `    echo "WARNING: $SAMOHOST_MAIN_VHOST has no samohost header (written by hand); left unchanged" >&2`,
+      `  else`,
+      `    SAMOHOST_MAIN_VHOST_PREV=""`,
+      `    if [[ -f "$SAMOHOST_MAIN_VHOST" ]]; then SAMOHOST_MAIN_VHOST_PREV="$(mktemp)"; cp "$SAMOHOST_MAIN_VHOST" "$SAMOHOST_MAIN_VHOST_PREV"; fi`,
+      `    install -m 644 "$SAMOHOST_MAIN_VHOST_NEXT" "$SAMOHOST_MAIN_VHOST"`,
+      `    if ! sudo -u caddy ${CADDY_VALIDATE_COMMAND} >/dev/null || ! /usr/bin/systemctl reload caddy; then`,
+      `      if [[ -n "$SAMOHOST_MAIN_VHOST_PREV" ]]; then install -m 644 "$SAMOHOST_MAIN_VHOST_PREV" "$SAMOHOST_MAIN_VHOST"; else rm -f "$SAMOHOST_MAIN_VHOST"; fi`,
+      `      rm -f "$SAMOHOST_MAIN_VHOST_NEXT" "$SAMOHOST_MAIN_VHOST_PREV"`,
+      `      echo "ERROR: Caddy did not accept the main vhost $SAMOHOST_MAIN_VHOST; the previous state was restored" >&2`,
+      `      exit 1`,
+      `    fi`,
+      `    rm -f "$SAMOHOST_MAIN_VHOST_PREV"`,
+      `    echo "Caddy: main vhost $SAMOHOST_MAIN_VHOST written, validated as caddy, reloaded."`,
+      `  fi`,
+      `  rm -f "$SAMOHOST_MAIN_VHOST_NEXT"`,
+      `fi`,
+      "",
+    );
   }
 
   // ---- section 13: extended self-check PASS/FAIL table (A1 + A2 rows) ------
