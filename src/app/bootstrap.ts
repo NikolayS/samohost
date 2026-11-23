@@ -983,6 +983,21 @@ export function buildHostBootstrapScript(
           "RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK",
           "CapabilityBoundingSet=",
           "LockPersonality=yes",
+          // @system-service is systemd's baseline for services; a call outside it
+          // fails with EPERM instead of killing the process (V8 and libuv fall
+          // back when an optional call such as pkey_alloc or io_uring fails).
+          "RestrictNamespaces=yes",
+          "SystemCallFilter=@system-service",
+          "SystemCallErrorNumber=EPERM",
+          "SystemCallArchitectures=native",
+          "ProtectClock=yes",
+          "ProtectHostname=yes",
+          "ProtectKernelLogs=yes",
+          "RestrictRealtime=yes",
+          "TemporaryFileSystem=/dev/shm",
+          "RemoveIPC=yes",
+          // The cloud metadata address (it can serve the server's user data).
+          "IPAddressDeny=169.254.169.254",
           "MemoryMax=50%",
           "TasksMax=256",
           `ReadWritePaths=${uploadsDir}`,

@@ -74,7 +74,8 @@ function sandbox(params: Partial<BuildStepParams> = {}) {
     .replaceAll("/opt/shop", base)
     .replace("export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin", `export PATH=${bin}:/usr/bin:/bin`)
     .replace("/proc/sys/fs/protected_hardlinks", join(dir, "protected_hardlinks"))
-    .replaceAll("/run/samohost", join(dir, "run-samohost"));
+    .replaceAll("/run/samohost", join(dir, "run-samohost"))
+    .replaceAll("/usr/bin/systemctl", join(bin, "systemctl"));
   const script = join(dir, "step");
   writeFileSync(script, text);
   chmodSync(script, 0o755);
@@ -95,7 +96,8 @@ describe("step script: rendered", () => {
       "-p NoNewPrivileges=yes -p ProtectSystem=strict -p ProtectHome=yes -p PrivateTmp=yes",
       "-p ProtectControlGroups=yes -p ProtectProc=invisible -p RestrictSUIDSGID=yes",
       '-p "RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK" -p CapabilityBoundingSet=',
-      '-p LockPersonality=yes -p MemoryMax=75% -p TasksMax=1024 -p "RuntimeMaxSec=$2"',
+      '-p MemoryMax=75% -p TasksMax=1024 -p "RuntimeMaxSec=$2"',
+      "-p LockPersonality=yes -p RestrictNamespaces=yes",
       '-p KillMode=control-group -p "InaccessiblePaths=$HIDDEN"',
     ]) {
       expect(text).toContain(line);
@@ -103,6 +105,16 @@ describe("step script: rendered", () => {
     expect(text).toContain(
       "HIDDEN='-/opt/shop/staging.env -/opt/shop/migrate.env -/opt/shop/.gh-token -/opt/shop/git-safe.conf -/opt/shop/app/.git -/opt/shop/releases'",
     );
+  });
+
+  test("step units: system call filter, namespaces, clock, hostname, kernel logs, realtime, private /dev/shm, IPC removal", () => {
+    for (const line of [
+      "-p RestrictNamespaces=yes -p SystemCallFilter=@system-service -p SystemCallErrorNumber=EPERM",
+      "-p SystemCallArchitectures=native -p ProtectClock=yes -p ProtectHostname=yes -p ProtectKernelLogs=yes",
+      "-p RestrictRealtime=yes -p TemporaryFileSystem=/dev/shm -p RemoveIPC=yes",
+    ]) {
+      expect(text).toContain(line);
+    }
   });
 
   test("install and build may write build/ and build-cache/ only; migrate and seed nothing but /tmp, with migrate.env", () => {
@@ -187,6 +199,26 @@ describe("step script: executed", () => {
       expect(s.step("release").status).toBe(0);
       expect(s.calls()).toMatch(/^cp -R -P --preserve=timestamps -- /m);
       expect(buildStepScript(PARAMS)).not.toContain("cp -a");
+    } finally {
+      s.cleanup();
+    }
+  });
+
+  test("network: no step reaches the metadata address; install and build reach no loopback address but the resolver stub", () => {
+    const s = sandbox();
+    try {
+      expect(s.step("install").status).toBe(0);
+      expect(s.step("build").status).toBe(0);
+      expect(s.step("migrate").status).toBe(0);
+      const lines = s.calls().split("\n");
+      for (const unit of ["install", "build"]) {
+        const line = lines.find((l) => l.includes(`--unit=samohost-shop-${unit}`))!;
+        expect(line, unit).toContain("-p IPAddressDeny=169.254.169.254 127.0.0.0/8 ::1 -p IPAddressAllow=127.0.0.53");
+      }
+      const migrate = lines.find((l) => l.includes("--unit=samohost-shop-migrate"))!;
+      expect(migrate).toContain("-p IPAddressDeny=169.254.169.254 ");
+      expect(migrate).not.toContain("127.0.0.0/8");
+      expect(migrate).not.toContain("IPAddressAllow");
     } finally {
       s.cleanup();
     }
