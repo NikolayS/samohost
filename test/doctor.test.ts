@@ -1401,15 +1401,37 @@ describe("20. split-layout node app: rls-nonsuperuser probe and cp-http80 caddy-
     expect(r.sections.get("app-health")).toBe("000");
   });
 
-  test("split layout: address passed in PG* variables, never as an argument; owner check in the query", () => {
+  test("split layout: password in PGPASSWORD, never as an argument; owner check in the query", () => {
     const path = envFile("APP_DATABASE_URL=postgresql://demo_app:s3cr%40t@127.0.0.1:5432/demo\n", { migrate: true });
     const r = runProbe({ envFile: path, rlsUrlVar: "APP_DATABASE_URL", appUser: "demo" });
     expect(r.sections.get("rls-nonsuperuser")).toBe("f");
     expect(r.psqlArgs).not.toContain("s3cr");
     expect(r.psqlArgs).toContain("datdba");
-    expect(r.psqlEnv).toContain("PGPASSWORD=s3cr@t");
-    expect(r.psqlEnv).toContain("PGUSER=demo_app");
+    expect(r.psqlArgs).toContain("-d\npostgresql://demo_app@127.0.0.1:5432/demo\n");
+    expect(r.psqlEnv).toContain("PGPASSWORD=s3cr@t\n");
   });
+
+  test("percent-decoding: a%40b%3Ac, a literal backslash, a lone percent sign, %25, %20 and +", () => {
+    const path = envFile("APP_DATABASE_URL='postgresql://demo_app:a%40b%3Ac\\x%zz%25%20+@127.0.0.1:5432/demo'\n");
+    const r = runProbe({ envFile: path, rlsUrlVar: "APP_DATABASE_URL" });
+    expect(r.sections.get("rls-nonsuperuser")).toBe("f");
+    expect(r.psqlEnv).toContain("PGPASSWORD=a@b:c\\x%zz% +\n");
+  });
+
+  for (const [label, address, arg] of [
+    ["sslmode=require and the postgres:// scheme", "postgres://demo_app:pw@db.internal:6543/demo?sslmode=require", "postgres://demo_app@db.internal:6543/demo?sslmode=require"],
+    ["an IPv6 host", "postgresql://demo_app:pw@[::1]:5432/demo", "postgresql://demo_app@[::1]:5432/demo"],
+    ["a socket directory and no user", "postgresql:///demo?host=/var/run/postgresql", "postgresql:///demo?host=/var/run/postgresql"],
+    ["a key=value address", "host=127.0.0.1 user=demo_app password=pw dbname=demo", "host=127.0.0.1 user=demo_app dbname=demo"],
+  ] as const) {
+    test(`legacy app with ${label}: accepted; psql gets the address without the password`, () => {
+      const path = envFile(`APP_DATABASE_URL='${address}'\n`);
+      const r = runProbe({ envFile: path, rlsUrlVar: "APP_DATABASE_URL" });
+      expect(r.sections.get("rls-nonsuperuser")).toBe("f");
+      expect(r.psqlArgs).toContain(`-d\n${arg}\n`);
+      expect(r.psqlArgs).not.toContain("pw");
+    });
+  }
 
   test("split layout: role owns the database → fail with a clear message", async () => {
     const path = envFile("APP_DATABASE_URL=postgresql://demo_app:pw@127.0.0.1:5432/demo\n", { migrate: true });

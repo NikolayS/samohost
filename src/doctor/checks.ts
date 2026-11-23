@@ -12,6 +12,7 @@
 
 import type { AuditCheck } from "../types.ts";
 import { hardeningModule } from "../cloudinit/hardening.ts";
+import { PG_CONNINFO_BASH } from "../app/pg-conninfo.ts";
 
 export type DoctorGroup = "core-host" | "core-liveness" | "core-suspicious" | "app-db" | "infra-sizing";
 export type DoctorKind = "match" | "liveness" | "suspicious";
@@ -392,8 +393,10 @@ const ENV_VAR_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
  * variable is not a superuser and, in the split layout (a migrate.env next
  * to the env file), not the owner of the app's database or a member of the
  * owner role. Every other outcome is one line that starts with "rls-probe:".
- * The address goes to psql in PG* variables, never as an argument, and is
- * never printed. It always exits 0, so it never stops the audit run.
+ * The password goes to psql in PGPASSWORD, never as an argument, and is never
+ * printed; the rest of the address is psql's -d argument as written, so every
+ * form psql accepts works (src/app/pg-conninfo.ts, shared with the deploy
+ * script's assert-rls probe). It always exits 0, so it never stops the audit run.
  */
 const RLS_PROBE_SCRIPT = [
   "set -u",
@@ -402,12 +405,12 @@ const RLS_PROBE_SCRIPT = [
   'set -a; . "$rls_env" >/dev/null 2>&1; set +a',
   'rls_url="${!rls_var:-}"',
   'if [ -z "$rls_url" ]; then echo "rls-probe: $rls_var is not set in $rls_env"; exit 0; fi',
-  'if ! [[ "$rls_url" =~ ^postgres(ql)?://([^:@/?#]+)(:([^@/?#]*))?@([^:@/?#]+)(:([0-9]+))?/([^?#]+) ]]; then echo "rls-probe: $rls_var is not a postgresql://user:password@host/db address"; exit 0; fi',
+  ...PG_CONNINFO_BASH,
+  'if ! samohost_pg_split "$rls_url"; then echo "rls-probe: $rls_var has a quoted value without its closing quote"; exit 0; fi',
   'rls_sql="SELECT CASE WHEN rolsuper THEN \'superuser\' ELSE \'f\' END FROM pg_catalog.pg_roles WHERE rolname = current_user"',
   'if [ -e "${rls_env%/*}/migrate.env" ]; then rls_sql="SELECT CASE WHEN r.rolsuper THEN \'superuser\' WHEN pg_catalog.pg_has_role(r.oid, d.datdba, \'MEMBER\') THEN \'owner\' ELSE \'f\' END FROM pg_catalog.pg_roles r JOIN pg_catalog.pg_database d ON d.datname = pg_catalog.current_database() WHERE r.rolname = current_user"; fi',
-  'rls_pw="$(printf \'%b\' "${BASH_REMATCH[4]//%/\\x}")"',
-  'rls_res="$(PGHOST="${BASH_REMATCH[5]}" PGPORT="${BASH_REMATCH[7]:-5432}" PGUSER="${BASH_REMATCH[2]}" PGPASSWORD="$rls_pw" PGDATABASE="${BASH_REMATCH[8]}" psql -X -w -tA -c "$rls_sql" 2>&1)" || true',
-  "unset rls_pw rls_url",
+  'rls_res="$(if [ -n "$samohost_pg_pw" ]; then export PGPASSWORD="$samohost_pg_pw"; fi; psql -X -w -tA -d "$samohost_pg_conn" -c "$rls_sql" 2>&1)" || true',
+  'samohost_pg_pw=""; unset rls_url',
   'case "$rls_res" in',
   "  f) echo f ;;",
   '  superuser) echo "rls-probe: the role in $rls_var is a superuser" ;;',
