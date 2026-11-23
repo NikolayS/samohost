@@ -314,6 +314,21 @@ describe("step script: executed", () => {
     }
   });
 
+  test("rollback refuses when the previous link names a release that does not exist", () => {
+    const s = sandbox();
+    try {
+      mkdirSync(join(s.base, "releases", "a"));
+      require("node:fs").symlinkSync("releases/a", join(s.base, "current"));
+      require("node:fs").symlinkSync("releases/gone", join(s.base, "previous"));
+      const res = s.step("rollback");
+      expect(res.status).toBe(1);
+      expect(res.stderr).toContain("previous release releases/gone does not exist");
+      expect(readlinkSync(join(s.base, "current"))).toBe("releases/a");
+    } finally {
+      s.cleanup();
+    }
+  });
+
   test("rollback switches current back to the previous release; without one it fails", () => {
     const s = sandbox();
     try {

@@ -220,6 +220,7 @@ export function buildStepScript(p: BuildStepParams): string {
     "    ;;",
     "  rollback)",
     '    if [[ ! -L "$PREVIOUS" ]]; then echo "rollback: no previous release" >&2; exit 1; fi',
+    '    if [[ ! -d "$PREVIOUS/" ]]; then echo "ERROR: rollback: the previous release $(readlink -- "$PREVIOUS") does not exist" >&2; exit 1; fi',
     '    samohost_switch_link "$CURRENT" "$(readlink -- "$PREVIOUS")"',
     '    echo "rollback: $CURRENT -> $(readlink -- "$CURRENT")"',
     "    ;;",

@@ -149,6 +149,13 @@ describe("deployOutcome", () => {
     expect(deployOutcome(events)).toBe("incomplete");
   });
 
+  test("build model: health fail, then stop:ok (no previous release) → 'stopped'", () => {
+    const events = parsePhaseStream(
+      [m("release", "start"), m("release", "ok"), m("health", "start"), m("health", "fail"), m("stop", "ok")].join("\n"),
+    );
+    expect(deployOutcome(events)).toBe("stopped");
+  });
+
   test("health:ok present, then seed:start + seed:fail → 'incomplete'", () => {
     // App is live but seed failed — the deploy is not complete.
     const events = parsePhaseStream(

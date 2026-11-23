@@ -954,7 +954,7 @@ export async function runAppDeploy(
         // Non-fatal: best-effort; staleness check will treat missing as stale.
       }
     }
-  } else if (outcome === "rolled-back" || outcome === "rollback-failed") {
+  } else if (outcome === "rolled-back" || outcome === "rollback-failed" || outcome === "stopped") {
     updated.failedSha = sha;
     // deployedSha is intentionally NOT advanced on failure.
     // generatorSha is intentionally NOT written on failure.

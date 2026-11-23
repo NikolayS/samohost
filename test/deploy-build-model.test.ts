@@ -11,6 +11,7 @@ import { chmodSync, existsSync, mkdirSync, readFileSync, symlinkSync, writeFileS
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
 import { buildDeployScript } from "../src/app/script.ts";
+import { parseDeployOutcome } from "../src/app/parse.ts";
 import { nodeApp } from "./bootstrap-db-harness.ts";
 import { makeDeploySandbox } from "./node-deploy-harness.ts";
 
@@ -127,6 +128,34 @@ describe("deploy: build model", () => {
       expect(r.res.stderr).toContain("another deploy of shop is running on this server");
       expect(r.res.stdout).not.toContain("SAMOHOST_PHASE:fetch");
       expect(r.text).toContain('exec 8>>"${HOME:?}/.samohost-deploy-shop.lock"');
+    } finally {
+      r.sb.cleanup();
+    }
+  });
+
+  test("first deploy (no previous release) fails after the release: the service is stopped; outcome 'stopped'", () => {
+    const r = setup({ healthCode: "500" });
+    try {
+      expect(r.res.status).toBe(1);
+      expect(r.steps).toEqual(["install", "build", "migrate", "release", "cleanup"]);
+      const sudo = r.sudo.split("\n");
+      expect(sudo.filter((l) => l === "/usr/bin/systemctl restart shop").length).toBe(1);
+      expect(sudo).toContain("/usr/bin/systemctl stop shop");
+      expect(r.res.stdout).toContain("<<<SAMOHOST_PHASE:stop:ok>>>");
+      expect(r.res.stderr).toContain("no previous release to roll back to; the service shop was stopped");
+      expect(parseDeployOutcome(r.res.stdout + r.res.stderr).outcome).toBe("stopped");
+    } finally {
+      r.sb.cleanup();
+    }
+  });
+
+  test("health fails and the step rollback fails (previous release missing): the service is stopped", () => {
+    const r = setup({ healthCode: "500", previousRelease: true, failStep: "rollback" });
+    try {
+      expect(r.res.status).toBe(1);
+      expect(r.steps).toEqual(["install", "build", "migrate", "release", "rollback", "cleanup"]);
+      expect(r.sudo.split("\n")).toContain("/usr/bin/systemctl stop shop");
+      expect(parseDeployOutcome(r.res.stdout + r.res.stderr).outcome).toBe("stopped");
     } finally {
       r.sb.cleanup();
     }

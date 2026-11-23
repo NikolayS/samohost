@@ -65,6 +65,7 @@ export type PhaseName =
   | "migrate"
   | "release"
   | "lock"
+  | "stop"
   | "restart"
   | "caddy-reload"
   | "health"
@@ -448,7 +449,21 @@ export function buildDeployScript(app: AppRecord, target: DeployTarget): string 
         ? [
             "  # build model: switch the current link back when this deploy switched it.",
             '  if [[ "${SAMOHOST_RELEASE_MODEL:-0}" == 1 ]]; then',
-            '    if [[ "${SAMOHOST_RELEASE_SWITCHED:-0}" == 1 ]]; then sudo "$SAMOHOST_STEP" rollback </dev/null || true; fi',
+            '    if [[ "${SAMOHOST_RELEASE_SWITCHED:-0}" == 1 ]]; then',
+            '      if [[ "${SAMOHOST_HAS_PREVIOUS_RELEASE:-0}" != 1 ]] || ! sudo "$SAMOHOST_STEP" rollback </dev/null; then',
+            "        # No release to go back to: stop the service rather than leave the",
+            "        # failing release running.",
+            '        if sudo /usr/bin/systemctl stop "${SAMOHOST_UNIT}"; then',
+            `          ${marker("stop", "ok")}`,
+            '          echo "deploy failed after the release, and there is no previous release to roll back to; the service ${SAMOHOST_UNIT} was stopped" >&2',
+            "        else",
+            `          ${marker("stop", "fail")}`,
+            `          ${marker("rollback", "fail")}`,
+            '          echo "deploy failed after the release, there is no previous release, and the service ${SAMOHOST_UNIT} could not be stopped — manual intervention required" >&2',
+            "        fi",
+            "        exit 1",
+            "      fi",
+            "    fi",
             '  elif [[ -d "${SAMOHOST_APP_DIR}/dist.prev" ]]; then',
           ]
         : ['  if [[ -d "${SAMOHOST_APP_DIR}/dist.prev" ]]; then']),
