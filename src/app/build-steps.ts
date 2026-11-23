@@ -87,6 +87,8 @@ export function buildStepScript(p: BuildStepParams): string {
     "chmod -R u+rwX . 2>/dev/null || true",
     'find . -mindepth 1 -maxdepth 1 -exec rm -rf -- {} + || { echo "ERROR: $PWD has entries the build user cannot remove; as root, empty it and deploy again" >&2; exit 1; }',
     'tar -C "$SAMOHOST_CHECKOUT" --exclude=./.git -cf - . | tar -xf -',
+    // tar gives build/ the mode of the archive's ./ entry (the checkout's).
+    "chmod 700 .",
     "if [ -f package-lock.json ] || [ -f npm-shrinkwrap.json ]; then npm ci --include=dev; else npm install --include=dev; fi",
   ].join("; ");
   return [

@@ -198,6 +198,31 @@ describe("step script: executed", () => {
     }
   });
 
+  test("install: build/ stays mode 700 although the checkout folder is 755 (the archive's ./ entry)", () => {
+    const s = sandbox();
+    try {
+      chmodSync(join(s.base, "build"), 0o700);
+      chmodSync(join(s.base, "app"), 0o755);
+      // GNU tar (on the server) gives an existing folder the mode of the
+      // archive's ./ entry; this stub does the same around the system tar.
+      const tar = join(s.dir, "bin", "tar");
+      writeFileSync(tar, [
+        "#!/usr/bin/env bash",
+        'if [[ "$*" != "-xf -" ]]; then exec /usr/bin/tar "$@"; fi',
+        't="$(mktemp)"; cat > "$t"; /usr/bin/tar -xf - < "$t"',
+        "p=\"$(/usr/bin/tar -tvf \"$t\" | awk '$NF == \"./\" || $NF == \".\" { print $1; exit }')\"",
+        'm=0; for i in 0 1 2; do x="${p:$((1 + i * 3)):3}"; v=0; [[ ${x:0:1} == r ]] && v=$((v + 4)); [[ ${x:1:1} == w ]] && v=$((v + 2)); [[ ${x:2:1} == x ]] && v=$((v + 1)); m="$m$v"; done',
+        'chmod "$m" .; rm -f "$t"',
+      ].join("\n") + "\n");
+      chmodSync(tar, 0o755);
+      expect(s.step("install").status).toBe(0);
+      expect(existsSync(join(s.base, "build", "package.json"))).toBe(true);
+      expect((statSync(join(s.base, "build")).mode & 0o777).toString(8)).toBe("700");
+    } finally {
+      s.cleanup();
+    }
+  });
+
   test("release copies without ACLs, extended attributes or owners (cp -R -P --preserve=timestamps)", () => {
     const s = sandbox();
     try {
