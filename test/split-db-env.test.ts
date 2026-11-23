@@ -111,6 +111,29 @@ describe("bootstrap — split env layout (executed with stubs)", () => {
   });
 });
 
+describe("bootstrap re-run — layout decision", () => {
+  for (const [label, line] of [
+    ["the postgres:// scheme", "DATABASE_URL=postgres://postgres:abc123@127.0.0.1:5432/shop"],
+    ["another user in a hand-edited address", "DATABASE_URL=postgresql://admin:Not-Hex@db.internal:5432/shop"],
+  ] as const) {
+    test(`an env file with a DATABASE_URL line (${label}) and no layout marker stays legacy`, () => {
+      const sb = makeSandbox();
+      try {
+        const envFile = join(sb.dir, "staging.env");
+        writeFileSync(envFile, `${line}\nSEED_OWNER_PASSWORD=0011223344556677\n`);
+        const res = runSection(sb, dbSection(sandboxScript(envFile)));
+        expect(res.stdout).toContain("legacy env layout");
+        expect(existsSync(join(sb.dir, "migrate.env"))).toBe(false);
+        // The legacy run keeps the superuser password; it may rewrite the scheme.
+        expect(readFileSync(envFile, "utf8")).toContain(line.replace(/^DATABASE_URL=postgres(ql)?:\/\//, ""));
+        expect(readOr(sb.sqlLog)).not.toContain("shop_owner");
+      } finally {
+        sb.cleanup();
+      }
+    });
+  }
+});
+
 describe("deploy — split env layout (executed with stubs)", () => {
   function setup(withMigrateEnv: boolean) {
     const sb = makeDeploySandbox();
