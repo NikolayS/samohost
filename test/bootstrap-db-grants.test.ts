@@ -131,7 +131,8 @@ describe("password statements are not logged by the server", () => {
       try {
         expect(res.status, res.stderr).toBe(0);
         const withPw = psqlCalls(readOr(sb.sqlLog)).filter((c) => c.includes("PASSWORD"));
-        expect(withPw.length).toBeGreaterThanOrEqual(name === "split" ? 2 : 2);
+        // Split: migration role and app role. Legacy: the postgres role only (no app role).
+        expect(withPw.length).toBeGreaterThanOrEqual(name === "split" ? 2 : 1);
         for (const c of withPw) expect(c.split("\n").slice(0, 3)).toEqual(NO_LOG);
       } finally {
         sb.cleanup();

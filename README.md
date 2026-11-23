@@ -254,6 +254,16 @@ What the app sees:
 - old layout (bootstrapped by an older samohost): the running app keeps
   `DATABASE_URL` (the superuser) and `APP_DATABASE_URL`.
 
+A bootstrap re-run keeps the old layout for an app whose env file has any
+`DATABASE_URL` line (any scheme, any user), no `migrate.env` and no
+root-owned marker `/var/lib/samohost/db-layout/<app>` that says `split`.
+In the old layout bootstrap creates no `<db>_app` role and keeps the
+`APP_DATABASE_URL` line as it is, also the `app_password` placeholder. It
+reads the superuser password from `DATABASE_URL` in §3b, before it changes
+anything on the server; when that line is not
+`postgresql://postgres:<hex>@...` (or `postgres://`), bootstrap stops there
+with nothing changed.
+
 Two env files sit next to each other on the server:
 
 - the runtime env file (`envFile`, loaded by the systemd unit): the app's

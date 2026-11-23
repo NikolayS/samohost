@@ -179,8 +179,8 @@ describe("env layout is decided before the sudo rules and the unit", () => {
 
   test("fresh server: split; superuser address and no migrate.env: legacy; migrate.env present: split", () => {
     expect(layoutOf(undefined, false)).toBe("split");
-    expect(layoutOf("DATABASE_URL=postgresql://postgres:pw@127.0.0.1:5432/shop\n", false)).toBe("legacy");
-    expect(layoutOf("DATABASE_URL=postgresql://postgres:pw@127.0.0.1:5432/shop\n", true)).toBe("split");
+    expect(layoutOf("DATABASE_URL=postgresql://postgres:abc123@127.0.0.1:5432/shop\n", false)).toBe("legacy");
+    expect(layoutOf("DATABASE_URL=postgresql://postgres:abc123@127.0.0.1:5432/shop\n", true)).toBe("split");
     expect(layoutOf("APP_DATABASE_URL=postgresql://shop_app:pw@127.0.0.1:5432/shop\n", false)).toBe("split");
   });
 
