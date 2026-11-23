@@ -198,6 +198,25 @@ serviceUnit = "field-record-1"                      # systemd unit restarted on 
 No secrets ever belong in the manifest — it lives in a (often public) client
 repo. Database URLs / tokens stay in the app's own `--env-file` on the host.
 
+The RLS probe (`--assert-rls` on deploy, `rls-nonsuperuser` in `doctor`)
+reads the address in the variable named by `rlsUrlVar` and accepts the forms
+psql accepts as its database argument:
+
+- `postgresql://` and `postgres://` URIs, with or without user and password,
+  host names, IPv6 literals such as `[::1]`, socket directories (`?host=/run/postgresql`
+  or a percent-encoded host such as `%2Frun%2Fpostgresql`), several hosts and
+  query parameters such as `sslmode=require`;
+- `key=value` strings such as `host=127.0.0.1 user=app password='p w' dbname=app`;
+- a plain database name.
+
+The probe removes the password (from `user:password@` or a `password=` query
+parameter of a URI, or the `password` pair of a `key=value` string) and passes
+it to psql in `PGPASSWORD`; the rest of the address is psql's `-d` argument as
+written. In a URI password each `%XX` of two hexadecimal digits is decoded;
+every other character stays as it is (`+`, a backslash, a `%` that is not
+followed by two hexadecimal digits, and `%00`). A `key=value` string with a
+quoted value that has no closing quote fails the probe; psql refuses it too.
+
 ### Database roles and env files of a node app
 
 `app bootstrap --db-name <db>` creates two PostgreSQL roles for a node app,
