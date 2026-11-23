@@ -215,9 +215,12 @@ tables in it (PostgreSQL 15 and later give CREATE on `public` only to its
 owner). `<db>_app` gets USAGE on schema `public`, SELECT, INSERT, UPDATE and
 DELETE on tables, and USAGE, SELECT and UPDATE on sequences: as default
 privileges for objects that `<db>_owner` creates later, and as grants on the
-objects that exist when bootstrap runs. After those grants bootstrap revokes
-INSERT, UPDATE and DELETE on `public.schema_migrations` from `<db>_app`, so
-a re-run does not let the app change the migration record. A re-run still
+objects that exist when bootstrap runs. The default privileges also apply
+to `public.schema_migrations`: from the moment a migration creates it,
+`<db>_app` can change it until the migrate run (in the SAMO app template)
+or a bootstrap re-run revokes INSERT, UPDATE and DELETE on it. After its
+grants, bootstrap revokes these rights, so a re-run does not give them
+back. A re-run still
 grants the rights again on other tables from which a migration revoked
 them; the next migrate run revokes them again. If
 `APP_DATABASE_URL` names a role that samohost did not create, that role and
@@ -267,8 +270,10 @@ favicon route, keeps the X-Forwarded-For entries of the control-plane
 address only (`trusted_proxies`). The runtime env file gets
 `TRUSTED_PROXIES=127.0.0.1,<control plane address>`: the app's TCP peer is
 Caddy on 127.0.0.1, then the control plane. In the new layout the env file
-has `HOST=127.0.0.1`, so the app accepts connections from this server only;
-the legacy layout keeps `HOST=0.0.0.0`. Bootstrap, heal and host-prep use the control-plane address
+gives the app `HOST=127.0.0.1`; an app that listens on `HOST` then accepts
+connections from this server only (the SAMO app template listens on
+127.0.0.1 unless `LISTEN_HOST` is set). The legacy layout keeps
+`HOST=0.0.0.0`. Bootstrap, heal and host-prep use the control-plane address
 recorded for the VM; `app bootstrap --control-plane-ip` with a different
 address is refused.
 
@@ -301,8 +306,9 @@ keep the legacy layout get the same sudo rules and unit as before.
 
 - The service runs as `<app>-run`: a system user with no login shell, no
   sudo rules and its own group only. It reads the release through the
-  world-read bit of the checkout, `node_modules` and `dist/`, and writes only
-  `/opt/<app>/uploads`. systemd reads `EnvironmentFile=` files before it
+  world-read bit of the checkout, `node_modules` and `dist/`. It can write
+  `/opt/<app>/uploads` and its private `/tmp` and `/var/tmp`
+  (`PrivateTmp`), nothing else. systemd reads `EnvironmentFile=` files before it
   drops to this user, so the runtime env file stays mode 600.
 - The unit sets `NoNewPrivileges`, `ProtectSystem=strict`, `ProtectHome`,
   `PrivateTmp`, `PrivateDevices`, the kernel and cgroup protections,
