@@ -81,6 +81,9 @@ const SPLIT_SUDOERS = [
   "shop ALL=(root) NOPASSWD: /usr/bin/mv -- /etc/caddy/sites.d/.samohost-heal-next-00-main-shop.caddy /etc/caddy/sites.d/00-main-shop.caddy",
   "shop ALL=(root) NOPASSWD: /usr/bin/rm -f /etc/caddy/sites.d/.samohost-heal-next-00-main-shop.caddy",
   "shop ALL=(root) NOPASSWD: /usr/bin/tee /opt/shop/release.env",
+  ...["install", "build", "migrate", "seed", "release", "rollback", "cleanup"].map(
+    (step) => `shop ALL=(root) NOPASSWD: /usr/local/lib/samohost/apps/shop/step ${step}`,
+  ),
 ].join("\n") + "\n";
 
 const SPLIT_UNIT = [
@@ -91,7 +94,7 @@ const SPLIT_UNIT = [
   "[Service]",
   "User=shop-run",
   "Group=shop-run",
-  "WorkingDirectory=/opt/shop/app",
+  "WorkingDirectory=/opt/shop/current",
   "EnvironmentFile=/opt/shop/staging.env",
   "EnvironmentFile=-/opt/shop/release.env",
   "ExecStart=/usr/bin/node dist/server.js",
@@ -112,7 +115,7 @@ const SPLIT_UNIT = [
   "MemoryMax=50%",
   "TasksMax=256",
   "ReadWritePaths=/opt/shop/uploads",
-  "InaccessiblePaths=-/opt/shop/migrate.env -/opt/shop/.gh-token -/opt/shop/git-safe.conf -/opt/shop/app/.git -/opt/shop/app/.npmrc",
+  "InaccessiblePaths=-/opt/shop/migrate.env -/opt/shop/.gh-token -/opt/shop/git-safe.conf -/opt/shop/app -/opt/shop/build -/opt/shop/build-cache",
   "",
   "[Install]",
   "WantedBy=multi-user.target",
@@ -197,7 +200,7 @@ describe("new layout: runtime user '<app>-run'", () => {
   test("created as a system user with no login shell, its own group only, owning only the uploads folder", () => {
     const sb = stubDir({ id: "exit 1", useradd: "", usermod: "", gpasswd: "", chown: "", chmod: "", install: "" });
     try {
-      const res = runBash(section(script(), "5c", "6"), sb.dir, { SAMOHOST_DB_LAYOUT: "split" });
+      const res = runBash(section(script(), "5c", "5d"), sb.dir, { SAMOHOST_DB_LAYOUT: "split" });
       expect(res.status, res.stderr).toBe(0);
       const calls = readFileSync(sb.log, "utf8").trim().split("\n");
       expect(calls).toEqual([
@@ -217,7 +220,7 @@ describe("new layout: runtime user '<app>-run'", () => {
     try {
       const link = join(sb.dir, "uploads");
       symlinkSync("/etc", link);
-      const text = section(script(), "5c", "6").replaceAll("/opt/shop/uploads", link);
+      const text = section(script(), "5c", "5d").replaceAll("/opt/shop/uploads", link);
       const res = runBash(text, sb.dir, { SAMOHOST_DB_LAYOUT: "split" });
       expect(res.status).toBe(1);
       expect(res.stderr).toContain("is a symbolic link");
@@ -236,7 +239,7 @@ describe("new layout: runtime user '<app>-run'", () => {
       writeFileSync(join(sb.dir, "outside"), "secret");
       linkSync(join(sb.dir, "outside"), join(uploads, "linked"));
       symlinkSync("/etc/hosts", join(uploads, "sub", "link"));
-      const text = section(script(), "5c", "6").replaceAll("/opt/shop/uploads", uploads);
+      const text = section(script(), "5c", "5d").replaceAll("/opt/shop/uploads", uploads);
       const res = runBash(text, sb.dir, { SAMOHOST_DB_LAYOUT: "split" });
       expect(res.status, res.stderr).toBe(0);
       const calls = readFileSync(sb.log, "utf8");
@@ -257,7 +260,7 @@ describe("new layout: runtime user '<app>-run'", () => {
   test("an existing runtime user is kept (no second useradd)", () => {
     const sb = stubDir({ id: "exit 0", useradd: "", usermod: "", gpasswd: "", chown: "", chmod: "", install: "" });
     try {
-      const res = runBash(section(script(), "5c", "6"), sb.dir, { SAMOHOST_DB_LAYOUT: "split" });
+      const res = runBash(section(script(), "5c", "5d"), sb.dir, { SAMOHOST_DB_LAYOUT: "split" });
       expect(res.status, res.stderr).toBe(0);
       expect(readFileSync(sb.log, "utf8")).not.toContain("useradd");
     } finally {
@@ -386,8 +389,9 @@ describe("new layout: hardened systemd unit", () => {
       "-/opt/shop/migrate.env",
       "-/opt/shop/.gh-token",
       "-/opt/shop/git-safe.conf",
-      "-/opt/shop/app/.git",
-      "-/opt/shop/app/.npmrc",
+      "-/opt/shop/app",
+      "-/opt/shop/build",
+      "-/opt/shop/build-cache",
     ]);
   });
 });

@@ -94,6 +94,7 @@ import {
 } from "./linux-user.ts";
 import { staticMainVhostLines } from "./heal-script.ts";
 import { migrateEnvFileOf, releaseEnvFileOf, splitLayoutPathError } from "./db-layout.ts";
+import { buildModelPaths, buildStepScript, buildStepScriptPath, BUILD_STEP_NAMES } from "./build-steps.ts";
 import { isIP } from "node:net";
 import { dirname } from "node:path";
 
@@ -768,6 +769,80 @@ export function buildHostBootstrapScript(
     );
   }
 
+  // ---- section 5d: build user and step script (node apps, split layout) ------
+  // Install, build, migrate and seed run as <app>-build through the root-owned
+  // step script (src/app/build-steps.ts); the service runs a root-owned copy
+  // of the build in /opt/<app>/releases through the /opt/<app>/current link.
+  const buildUser = `${app.name}-build`;
+  const buildModel = buildModelPaths(appBase);
+  const stepScriptPath = buildStepScriptPath(app.name);
+  if (!isStatic && runtimeUserUsable) {
+    for (const [what, cmd] of [["buildCmd", app.buildCmd], ["migrateCmd", app.migrateCmd], ["seedCmd", app.seedCmd]] as const) {
+      if (cmd !== undefined && /[\n\r]/.test(cmd)) {
+        throw new Error(`${what} must be one line: it is written into the root-owned step script`);
+      }
+    }
+    const stepScript = buildStepScript({
+      appName: app.name,
+      buildUser,
+      runUser: runtimeUser,
+      appBase,
+      checkoutDir: appDir,
+      envFile,
+      migrateEnvFile,
+      releaseEnvFile,
+      tokenFile,
+      gitSafeConf,
+      buildCmd: app.buildCmd,
+      ...(app.migrateCmd !== undefined ? { migrateCmd: app.migrateCmd } : {}),
+      ...(app.seedCmd !== undefined ? { seedCmd: app.seedCmd } : {}),
+    });
+    push(
+      `# ---------------------------------------------------------------------------`,
+      `# §5d. Build user ${sq(buildUser)} and the root-owned step script (split layout`,
+      `#      only). The deploy user runs install, build, migrate and seed through`,
+      `#      ${stepScriptPath}; they run as ${buildUser}, which has no login, no`,
+      `#      sudo rules, no home, no cron or at jobs and no lingering.`,
+      `# ---------------------------------------------------------------------------`,
+      "",
+      `if [[ "$SAMOHOST_DB_LAYOUT" == split ]]; then`,
+      `  if [[ "$(cat /proc/sys/fs/protected_hardlinks 2>/dev/null || echo 0)" != 1 ]]; then`,
+      `    echo "ERROR: fs.protected_hardlinks is not 1; the build model needs it (sysctl fs.protected_hardlinks=1)" >&2`,
+      `    exit 1`,
+      `  fi`,
+      `  if ! command -v systemd-run >/dev/null 2>&1; then echo "ERROR: systemd-run not found; the build model needs it" >&2; exit 1; fi`,
+      `  if id ${sq(buildUser)} >/dev/null 2>&1; then`,
+      `    echo "User ${sq(buildUser)} already exists — skipping useradd."`,
+      `  else`,
+      `    useradd --system --user-group --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin ${sq(buildUser)}`,
+      `  fi`,
+      `  usermod --shell /usr/sbin/nologin ${sq(buildUser)}`,
+      `  gpasswd -d ${sq(buildUser)} ${sq(appUser)} >/dev/null 2>&1 || true`,
+      `  for _f in /etc/cron.deny /etc/at.deny; do`,
+      `    touch "$_f"`,
+      `    grep -qxF ${sq(buildUser)} "$_f" || printf '%s\n' ${sq(buildUser)} >> "$_f"`,
+      `  done`,
+      `  loginctl disable-linger ${sq(buildUser)} >/dev/null 2>&1 || true`,
+      `  # /opt/${app.name} is root-owned (§5): only root can change these entries.`,
+      `  for _p in ${sq(buildModel.buildDir)} ${sq(buildModel.cacheDir)} ${sq(buildModel.releasesDir)}; do`,
+      `    if [[ -L "$_p" ]]; then echo "ERROR: $_p is a symbolic link" >&2; exit 1; fi`,
+      `  done`,
+      `  install -d -m 700 -o ${sq(buildUser)} -g ${sq(buildUser)} ${sq(buildModel.buildDir)}`,
+      `  install -d -m 700 -o ${sq(buildUser)} -g ${sq(buildUser)} ${sq(buildModel.cacheDir)}`,
+      `  install -d -m 750 -o root -g ${sq(runtimeUser)} ${sq(buildModel.releasesDir)}`,
+      `  install -d -m 755 -o root -g root /usr/local/lib/samohost /usr/local/lib/samohost/apps ${sq(dirname(stepScriptPath))}`,
+      `  cat > ${sq(`${stepScriptPath}.next`)} <<'SAMOHOST_STEP_SCRIPT'`,
+      ...stepScript.replace(/\n$/, "").split("\n"),
+      "SAMOHOST_STEP_SCRIPT",
+      `  chown root:root ${sq(`${stepScriptPath}.next`)}`,
+      `  chmod 755 ${sq(`${stepScriptPath}.next`)}`,
+      `  mv -fT ${sq(`${stepScriptPath}.next`)} ${sq(stepScriptPath)}`,
+      `  echo "Build user: ${buildUser}; step script ${stepScriptPath}"`,
+      `fi`,
+      "",
+    );
+  }
+
   // ---- section 6: deploy sudoers --------------------------------------------
   // Static apps get a reduced sudoers: no unit-specific grants (the main unit
   // does not exist), no psql grant (no DB). Only daemon-reload and journalctl
@@ -827,6 +902,7 @@ export function buildHostBootstrapScript(
             `${appUser} ALL=(root) NOPASSWD: /usr/bin/mv -- ${healStagedVhostFile} ${mainVhostFile}`,
             `${appUser} ALL=(root) NOPASSWD: /usr/bin/rm -f ${healStagedVhostFile}`,
             `${appUser} ALL=(root) NOPASSWD: /usr/bin/tee ${releaseEnvFile}`,
+            ...BUILD_STEP_NAMES.map((step) => `${appUser} ALL=(root) NOPASSWD: ${stepScriptPath} ${step}`),
             "SAMOHOST_SPLIT_SUDOERS",
             "else",
           ]
@@ -878,7 +954,7 @@ export function buildHostBootstrapScript(
           "[Service]",
           `User=${runtimeUser}`,
           `Group=${runtimeUser}`,
-          `WorkingDirectory=${appDir}`,
+          `WorkingDirectory=${buildModel.currentLink}`,
           `EnvironmentFile=${envFile}`,
           `EnvironmentFile=-${releaseEnvFile}`,
           `ExecStart=${execStart}`,
@@ -900,7 +976,7 @@ export function buildHostBootstrapScript(
           "MemoryMax=50%",
           "TasksMax=256",
           `ReadWritePaths=${uploadsDir}`,
-          `InaccessiblePaths=${[migrateEnvFile, tokenFile, gitSafeConf, `${appDir}/.git`, `${appDir}/.npmrc`].map((x) => `-${x}`).join(" ")}`,
+          `InaccessiblePaths=${[migrateEnvFile, tokenFile, gitSafeConf, appDir, buildModel.buildDir, buildModel.cacheDir].map((x) => `-${x}`).join(" ")}`,
           "",
           "[Install]",
           "WantedBy=multi-user.target",
@@ -1492,14 +1568,15 @@ export function buildHostBootstrapScript(
     ...trustedProxiesEnvLines,
     `ENVEOF`,
     `cat > "$SAMOHOST_WRITE_DIR/migrate" <<MIGRATEEOF`,
-    `# ${app.name} migrate env file — generated by samohost host-bootstrap. chmod 600, ${appUser}-owned.`,
-    `# Loaded only by the deploy's migrate step. NEVER commit.`,
+    `# ${app.name} migrate env file — generated by samohost host-bootstrap. chmod 600, root-owned.`,
+    `# systemd loads it for the migrate and seed steps only (step script). NEVER commit.`,
     `# DATABASE_URL is the migration role (owner of ${dbName} only, not a superuser).`,
     `DATABASE_URL=postgresql://\${OWNER_DB_ROLE}:\${OWNER_DB_PW}@127.0.0.1:5432/${dbName}`,
+    `\${APP_DB_LINE}`,
     `SEED_OWNER_LOGIN=${seedOwnerLogin}`,
     `SEED_OWNER_PASSWORD=\${SEED_PW}`,
     `MIGRATEEOF`,
-    `chown ${sq(appUser)}:${sq(appUser)} "$SAMOHOST_WRITE_DIR/migrate"`,
+    `chown root:root "$SAMOHOST_WRITE_DIR/migrate"`,
     `chmod 600 "$SAMOHOST_WRITE_DIR/migrate"`,
     `unset OWNER_DB_PW`,
     `fi`,
@@ -1513,7 +1590,7 @@ export function buildHostBootstrapScript(
     `echo "$ENV_FILE: written (600, ${appUser}). [secret values not logged]"`,
     `if [[ "$SAMOHOST_DB_LAYOUT" == split ]]; then`,
     `  mv -fT "$SAMOHOST_WRITE_DIR/migrate" "$MIGRATE_ENV_FILE"`,
-    `  echo "$MIGRATE_ENV_FILE: written (600, ${appUser}). [secret values not logged]"`,
+    `  echo "$MIGRATE_ENV_FILE: written (600, root). [secret values not logged]"`,
     `  mkdir -p /var/lib/samohost/db-layout`,
     `  printf 'split\\n' > "$SAMOHOST_LAYOUT_MARKER"`,
     `fi`,
