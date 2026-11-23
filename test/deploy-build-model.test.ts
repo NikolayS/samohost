@@ -9,6 +9,7 @@
 import { describe, expect, test } from "bun:test";
 import { chmodSync, existsSync, mkdirSync, readFileSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { spawnSync } from "node:child_process";
 import { buildDeployScript } from "../src/app/script.ts";
 import { nodeApp } from "./bootstrap-db-harness.ts";
 import { makeDeploySandbox } from "./node-deploy-harness.ts";
@@ -16,7 +17,7 @@ import { makeDeploySandbox } from "./node-deploy-harness.ts";
 const SHA = "5555555555555555555555555555555555555555";
 const STEP = "/usr/local/lib/samohost/apps/shop/step";
 
-function setup(o: { healthCode?: string; failStep?: string; withStep?: boolean; previousRelease?: boolean; seed?: boolean } = {}) {
+function setup(o: { healthCode?: string; failStep?: string; withStep?: boolean; previousRelease?: boolean; seed?: boolean; stdinScript?: boolean } = {}) {
   const sb = makeDeploySandbox({ healthCode: o.healthCode ?? "200" });
   writeFileSync(sb.envFile, "PORT=3100\nAPP_DATABASE_URL=postgresql://shop_app:0a0b@127.0.0.1:5432/shop\n");
   writeFileSync(sb.migrateEnvFile, "DATABASE_URL=postgresql://shop_owner:0c0d@127.0.0.1:5432/shop\n");
@@ -26,6 +27,8 @@ function setup(o: { healthCode?: string; failStep?: string; withStep?: boolean; 
     writeFileSync(step, [
       "#!/usr/bin/env bash",
       `printf '%s\\n' "$1" >> ${JSON.stringify(stepLog)}`,
+      // Repository code in a step could read its stdin.
+      "cat >/dev/null",
       ...(o.failStep !== undefined ? [`if [[ "$1" == ${o.failStep} ]]; then exit 1; fi`] : []),
       `if [[ "$1" == release ]]; then mkdir -p ${JSON.stringify(join(sb.dir, "releases", "new"))}; rm -f ${JSON.stringify(join(sb.dir, "current"))}; ln -s releases/new ${JSON.stringify(join(sb.dir, "current"))}; fi`,
       "exit 0",
@@ -38,7 +41,13 @@ function setup(o: { healthCode?: string; failStep?: string; withStep?: boolean; 
   }
   const app = nodeApp({ appDir: sb.appDir, envFile: sb.envFile, ...(o.seed ? { seedCmd: "npm run seed" } : {}) });
   const text = buildDeployScript(app, { sha: SHA, tag: "v20261123.1" }).replaceAll(STEP, step);
-  const res = sb.run(text);
+  // The deploy script reaches the server on stdin (`bash -s`).
+  const res = o.stdinScript
+    ? (() => {
+        const r = spawnSync("bash", ["-s"], { input: text, encoding: "utf8", env: { PATH: `${join(sb.dir, "bin")}:/usr/bin:/bin`, HOME: sb.dir } });
+        return { status: r.status, stdout: r.stdout, stderr: r.stderr };
+      })()
+    : sb.run(text);
   const steps = existsSync(stepLog) ? readFileSync(stepLog, "utf8").trim().split("\n") : [];
   const sudo = existsSync(sb.sudoLog) ? readFileSync(sb.sudoLog, "utf8") : "";
   return { sb, res, steps, sudo, text };
@@ -97,6 +106,17 @@ describe("deploy: build model", () => {
     }
   });
 
+  test("script on stdin (bash -s): a step that reads its stdin cannot consume the rest of the deploy script", () => {
+    const r = setup({ stdinScript: true, previousRelease: true });
+    try {
+      expect(r.res.status, r.res.stderr).toBe(0);
+      expect(r.steps).toEqual(["install", "build", "migrate", "release", "cleanup"]);
+      expect(r.res.stdout).toContain("<<<SAMOHOST_PHASE:health:ok>>>");
+    } finally {
+      r.sb.cleanup();
+    }
+  });
+
   test("seed runs through the step script after a healthy deploy", () => {
     const r = setup({ seed: true });
     try {
@@ -111,7 +131,7 @@ describe("deploy: build model", () => {
     const { text, sb } = setup();
     try {
       const repair = text.indexOf('find "$SAMOHOST_APP_DIR" -path "$SAMOHOST_APP_DIR/.git" -prune -o ! -type l -exec chmod go+rX {} +');
-      const install = text.indexOf('sudo "$SAMOHOST_STEP" install');
+      const install = text.indexOf('sudo "$SAMOHOST_STEP" install </dev/null');
       expect(repair).toBeGreaterThan(0);
       expect(repair).toBeLessThan(install);
     } finally {

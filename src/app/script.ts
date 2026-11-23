@@ -244,7 +244,9 @@ export function buildDeployScript(app: AppRecord, target: DeployTarget): string 
             "SAMOHOST_RELEASE_MODEL=0",
             'if [[ -f "$SAMOHOST_MIGRATE_ENV_FILE" && -x "$SAMOHOST_STEP" ]]; then SAMOHOST_RELEASE_MODEL=1; fi',
             "# No process of the build user outlives the deploy, whatever its outcome.",
-            `if [[ "$SAMOHOST_RELEASE_MODEL" == 1 ]]; then trap 'sudo "$SAMOHOST_STEP" cleanup >/dev/null 2>&1 || true' EXIT; fi`,
+            "# Every step gets stdin from /dev/null: this script reaches bash on stdin,",
+            "# and code in a step must not read or consume the rest of it.",
+            `if [[ "$SAMOHOST_RELEASE_MODEL" == 1 ]]; then trap 'sudo "$SAMOHOST_STEP" cleanup </dev/null >/dev/null 2>&1 || true' EXIT; fi`,
           ]
         : []),
       "",
@@ -435,7 +437,7 @@ export function buildDeployScript(app: AppRecord, target: DeployTarget): string 
         ? [
             "  # build model: switch the current link back when this deploy switched it.",
             '  if [[ "${SAMOHOST_RELEASE_MODEL:-0}" == 1 ]]; then',
-            '    if [[ "${SAMOHOST_RELEASE_SWITCHED:-0}" == 1 ]]; then sudo "$SAMOHOST_STEP" rollback || true; fi',
+            '    if [[ "${SAMOHOST_RELEASE_SWITCHED:-0}" == 1 ]]; then sudo "$SAMOHOST_STEP" rollback </dev/null || true; fi',
             '  elif [[ -d "${SAMOHOST_APP_DIR}/dist.prev" ]]; then',
           ]
         : ['  if [[ -d "${SAMOHOST_APP_DIR}/dist.prev" ]]; then']),
@@ -784,7 +786,7 @@ export function buildDeployScript(app: AppRecord, target: DeployTarget): string 
         ? ['if [[ "$SAMOHOST_RELEASE_MODEL" == 1 ]]; then samohost_write_release_env; fi']
         : []),
       splitLayout !== undefined
-        ? 'if (if [[ "$SAMOHOST_RELEASE_MODEL" == 1 ]]; then sudo "$SAMOHOST_STEP" install; elif [ -f package-lock.json ] || [ -f npm-shrinkwrap.json ]; then npm ci --include=dev; else npm install --include=dev; fi); then'
+        ? 'if (if [[ "$SAMOHOST_RELEASE_MODEL" == 1 ]]; then sudo "$SAMOHOST_STEP" install </dev/null; elif [ -f package-lock.json ] || [ -f npm-shrinkwrap.json ]; then npm ci --include=dev; else npm install --include=dev; fi); then'
         : "if (if [ -f package-lock.json ] || [ -f npm-shrinkwrap.json ]; then npm ci --include=dev; else npm install --include=dev; fi); then",
       `  ${marker("install", "ok")}`,
       "else",
@@ -808,7 +810,7 @@ export function buildDeployScript(app: AppRecord, target: DeployTarget): string 
       "# subshell + cd: a buildCmd that cd's must not leak its cwd into later phases (issue #122).",
       marker("build", "start"),
       splitLayout !== undefined
-        ? `if (if [[ "$SAMOHOST_RELEASE_MODEL" == 1 ]]; then sudo "$SAMOHOST_STEP" build; else (cd "$SAMOHOST_APP_DIR" && ${app.buildCmd}); fi); then`
+        ? `if (if [[ "$SAMOHOST_RELEASE_MODEL" == 1 ]]; then sudo "$SAMOHOST_STEP" build </dev/null; else (cd "$SAMOHOST_APP_DIR" && ${app.buildCmd}); fi); then`
         : `if (cd "$SAMOHOST_APP_DIR" && ${app.buildCmd}); then`,
       `  ${marker("build", "ok")}`,
       "else",
@@ -841,7 +843,7 @@ export function buildDeployScript(app: AppRecord, target: DeployTarget): string 
           : []),
         marker("migrate", "start"),
         splitLayout !== undefined
-          ? `if (if [[ "$SAMOHOST_RELEASE_MODEL" == 1 ]]; then sudo "$SAMOHOST_STEP" migrate; else (if [[ -f "$SAMOHOST_MIGRATE_ENV_FILE" ]]; then set -a; . "$SAMOHOST_MIGRATE_ENV_FILE"; set +a; export ${splitLayout.dbVars.join(" ")}; fi && cd "$SAMOHOST_APP_DIR" && ${app.migrateCmd}); fi); then`
+          ? `if (if [[ "$SAMOHOST_RELEASE_MODEL" == 1 ]]; then sudo "$SAMOHOST_STEP" migrate </dev/null; else (if [[ -f "$SAMOHOST_MIGRATE_ENV_FILE" ]]; then set -a; . "$SAMOHOST_MIGRATE_ENV_FILE"; set +a; export ${splitLayout.dbVars.join(" ")}; fi && cd "$SAMOHOST_APP_DIR" && ${app.migrateCmd}); fi); then`
           : `if (cd "$SAMOHOST_APP_DIR" && ${app.migrateCmd}); then`,
         `  ${marker("migrate", "ok")}`,
         "else",
@@ -860,7 +862,7 @@ export function buildDeployScript(app: AppRecord, target: DeployTarget): string 
         "# switches the current link the service runs from ---",
         'if [[ "$SAMOHOST_RELEASE_MODEL" == 1 ]]; then',
         `  ${marker("release", "start")}`,
-        '  if sudo "$SAMOHOST_STEP" release; then',
+        '  if sudo "$SAMOHOST_STEP" release </dev/null; then',
         "    SAMOHOST_RELEASE_SWITCHED=1",
         `    ${marker("release", "ok")}`,
         "  else",
@@ -981,7 +983,7 @@ export function buildDeployScript(app: AppRecord, target: DeployTarget): string 
         "# subshell + cd: always runs from the app dir, whatever earlier commands cd'd into (issue #122).",
         marker("seed", "start"),
         splitLayout !== undefined
-          ? `if (if [[ "$SAMOHOST_RELEASE_MODEL" == 1 ]]; then sudo "$SAMOHOST_STEP" seed; else (if [[ -f "$SAMOHOST_MIGRATE_ENV_FILE" ]]; then set -a; . "$SAMOHOST_MIGRATE_ENV_FILE"; set +a; export ${splitLayout.dbVars.join(" ")}; fi && cd "$SAMOHOST_APP_DIR" && ${app.seedCmd}); fi); then`
+          ? `if (if [[ "$SAMOHOST_RELEASE_MODEL" == 1 ]]; then sudo "$SAMOHOST_STEP" seed </dev/null; else (if [[ -f "$SAMOHOST_MIGRATE_ENV_FILE" ]]; then set -a; . "$SAMOHOST_MIGRATE_ENV_FILE"; set +a; export ${splitLayout.dbVars.join(" ")}; fi && cd "$SAMOHOST_APP_DIR" && ${app.seedCmd}); fi); then`
           : `if (cd "$SAMOHOST_APP_DIR" && ${app.seedCmd}); then`,
         `  ${marker("seed", "ok")}`,
         "else",

@@ -514,6 +514,11 @@ What hostile repository code can and cannot reach:
   ACLs and extended attributes are not copied), a change to the step
   script or the unit.
 
+The deploy script reaches the server on stdin (`ssh ... bash -s`). The
+deploy starts every step with stdin from `/dev/null`, so code in a step
+cannot read or consume the rest of the script. (Without the step script,
+npm and the app's commands still inherit that stdin, as before.)
+
 `step release` copies `build/` as root while no process of `<app>-build`
 runs. It requires `fs.protected_hardlinks=1` (bootstrap and the step stop
 otherwise), so `build/` can contain hard links only to files that

@@ -36,7 +36,9 @@ SAMOHOST_STEP='/usr/local/lib/samohost/apps/field-record/step'
 SAMOHOST_RELEASE_MODEL=0
 if [[ -f "$SAMOHOST_MIGRATE_ENV_FILE" && -x "$SAMOHOST_STEP" ]]; then SAMOHOST_RELEASE_MODEL=1; fi
 # No process of the build user outlives the deploy, whatever its outcome.
-if [[ "$SAMOHOST_RELEASE_MODEL" == 1 ]]; then trap 'sudo "$SAMOHOST_STEP" cleanup >/dev/null 2>&1 || true' EXIT; fi
+# Every step gets stdin from /dev/null: this script reaches bash on stdin,
+# and code in a step must not read or consume the rest of it.
+if [[ "$SAMOHOST_RELEASE_MODEL" == 1 ]]; then trap 'sudo "$SAMOHOST_STEP" cleanup </dev/null >/dev/null 2>&1 || true' EXIT; fi
 
 # --- fetch: bring the target SHA into the local object store ---
 echo "<<<SAMOHOST_PHASE:fetch:start>>>"
@@ -93,7 +95,7 @@ rollback() {
   fi
   # build model: switch the current link back when this deploy switched it.
   if [[ "${SAMOHOST_RELEASE_MODEL:-0}" == 1 ]]; then
-    if [[ "${SAMOHOST_RELEASE_SWITCHED:-0}" == 1 ]]; then sudo "$SAMOHOST_STEP" rollback || true; fi
+    if [[ "${SAMOHOST_RELEASE_SWITCHED:-0}" == 1 ]]; then sudo "$SAMOHOST_STEP" rollback </dev/null || true; fi
   elif [[ -d "${SAMOHOST_APP_DIR}/dist.prev" ]]; then
     rm -rf "${SAMOHOST_APP_DIR}/dist"
     cp -r "${SAMOHOST_APP_DIR}/dist.prev" "${SAMOHOST_APP_DIR}/dist"
@@ -155,7 +157,7 @@ samohost_write_release_env() {
 # lockfile fallback: apps without package-lock.json hard-fail npm ci (no-DB fixtures, greenfield).
 echo "<<<SAMOHOST_PHASE:install:start>>>"
 if [[ "$SAMOHOST_RELEASE_MODEL" == 1 ]]; then samohost_write_release_env; fi
-if (if [[ "$SAMOHOST_RELEASE_MODEL" == 1 ]]; then sudo "$SAMOHOST_STEP" install; elif [ -f package-lock.json ] || [ -f npm-shrinkwrap.json ]; then npm ci --include=dev; else npm install --include=dev; fi); then
+if (if [[ "$SAMOHOST_RELEASE_MODEL" == 1 ]]; then sudo "$SAMOHOST_STEP" install </dev/null; elif [ -f package-lock.json ] || [ -f npm-shrinkwrap.json ]; then npm ci --include=dev; else npm install --include=dev; fi); then
   echo "<<<SAMOHOST_PHASE:install:ok>>>"
 else
   echo "<<<SAMOHOST_PHASE:install:fail>>>"
@@ -166,7 +168,7 @@ fi
 # --- build ---
 # subshell + cd: a buildCmd that cd's must not leak its cwd into later phases (issue #122).
 echo "<<<SAMOHOST_PHASE:build:start>>>"
-if (if [[ "$SAMOHOST_RELEASE_MODEL" == 1 ]]; then sudo "$SAMOHOST_STEP" build; else (cd "$SAMOHOST_APP_DIR" && npm run build); fi); then
+if (if [[ "$SAMOHOST_RELEASE_MODEL" == 1 ]]; then sudo "$SAMOHOST_STEP" build </dev/null; else (cd "$SAMOHOST_APP_DIR" && npm run build); fi); then
   echo "<<<SAMOHOST_PHASE:build:ok>>>"
 else
   echo "<<<SAMOHOST_PHASE:build:fail>>>"
@@ -186,7 +188,7 @@ fi
 # subshell + cd: always runs from the app dir, whatever buildCmd cd'd into (issue #122).
 # split layout: only this subshell exports the database addresses and loads the migrate env file.
 echo "<<<SAMOHOST_PHASE:migrate:start>>>"
-if (if [[ "$SAMOHOST_RELEASE_MODEL" == 1 ]]; then sudo "$SAMOHOST_STEP" migrate; else (if [[ -f "$SAMOHOST_MIGRATE_ENV_FILE" ]]; then set -a; . "$SAMOHOST_MIGRATE_ENV_FILE"; set +a; export DATABASE_URL APP_DATABASE_URL; fi && cd "$SAMOHOST_APP_DIR" && node --import tsx/esm src/migration-runner-cli.ts); fi); then
+if (if [[ "$SAMOHOST_RELEASE_MODEL" == 1 ]]; then sudo "$SAMOHOST_STEP" migrate </dev/null; else (if [[ -f "$SAMOHOST_MIGRATE_ENV_FILE" ]]; then set -a; . "$SAMOHOST_MIGRATE_ENV_FILE"; set +a; export DATABASE_URL APP_DATABASE_URL; fi && cd "$SAMOHOST_APP_DIR" && node --import tsx/esm src/migration-runner-cli.ts); fi); then
   echo "<<<SAMOHOST_PHASE:migrate:ok>>>"
 else
   echo "<<<SAMOHOST_PHASE:migrate:fail>>>"
@@ -198,7 +200,7 @@ fi
 # switches the current link the service runs from ---
 if [[ "$SAMOHOST_RELEASE_MODEL" == 1 ]]; then
   echo "<<<SAMOHOST_PHASE:release:start>>>"
-  if sudo "$SAMOHOST_STEP" release; then
+  if sudo "$SAMOHOST_STEP" release </dev/null; then
     SAMOHOST_RELEASE_SWITCHED=1
     echo "<<<SAMOHOST_PHASE:release:ok>>>"
   else
@@ -265,7 +267,7 @@ fi
 # --- seed: idempotent post-deploy seed (only after healthy deploy) ---
 # subshell + cd: always runs from the app dir, whatever earlier commands cd'd into (issue #122).
 echo "<<<SAMOHOST_PHASE:seed:start>>>"
-if (if [[ "$SAMOHOST_RELEASE_MODEL" == 1 ]]; then sudo "$SAMOHOST_STEP" seed; else (if [[ -f "$SAMOHOST_MIGRATE_ENV_FILE" ]]; then set -a; . "$SAMOHOST_MIGRATE_ENV_FILE"; set +a; export DATABASE_URL APP_DATABASE_URL; fi && cd "$SAMOHOST_APP_DIR" && npm run db:seed); fi); then
+if (if [[ "$SAMOHOST_RELEASE_MODEL" == 1 ]]; then sudo "$SAMOHOST_STEP" seed </dev/null; else (if [[ -f "$SAMOHOST_MIGRATE_ENV_FILE" ]]; then set -a; . "$SAMOHOST_MIGRATE_ENV_FILE"; set +a; export DATABASE_URL APP_DATABASE_URL; fi && cd "$SAMOHOST_APP_DIR" && npm run db:seed); fi); then
   echo "<<<SAMOHOST_PHASE:seed:ok>>>"
 else
   echo "<<<SAMOHOST_PHASE:seed:fail>>>"
