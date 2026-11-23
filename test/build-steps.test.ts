@@ -98,7 +98,7 @@ describe("step script: rendered", () => {
       "--uid=\"$BUILD_USER\" --gid=\"$BUILD_USER\"",
       "-p NoNewPrivileges=yes -p ProtectSystem=strict -p ProtectHome=yes -p PrivateTmp=yes",
       "-p ProtectControlGroups=yes -p ProtectProc=invisible -p RestrictSUIDSGID=yes",
-      '-p "RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK" -p CapabilityBoundingSet=',
+      '-p "RestrictAddressFamilies=AF_INET AF_INET6 AF_NETLINK" -p CapabilityBoundingSet=',
       '-p MemoryMax=75% -p TasksMax=1024 -p "RuntimeMaxSec=$2"',
       "-p LockPersonality=yes -p RestrictNamespaces=yes",
       '-p KillMode=control-group -p "InaccessiblePaths=$HIDDEN"',
@@ -179,18 +179,20 @@ describe("step script: executed", () => {
     }
   });
 
-  test("install: root empties build/ after killing build-user processes, before the build user runs", () => {
+  test("install: the build user empties build/ in place inside its unit; root walks no tree in build/", () => {
     const s = sandbox();
     try {
       writeFileSync(join(s.base, "build", "stale.txt"), "old\n");
+      const inode = statSync(join(s.base, "build")).ino;
       expect(s.step("install").status).toBe(0);
-      const calls = s.calls().split("\n");
-      const kill = calls.findIndex((l) => l === "pkill -KILL -u shop-build");
-      const unit = calls.findIndex((l) => l.includes("--unit=samohost-shop-install"));
-      expect(kill).toBeGreaterThanOrEqual(0);
-      expect(kill).toBeLessThan(unit);
       expect(existsSync(join(s.base, "build", "stale.txt"))).toBe(false);
-      expect(buildStepScript(PARAMS)).not.toMatch(/INSTALL_CMD=.*rm -rf/);
+      expect(statSync(join(s.base, "build")).ino).toBe(inode);
+      const text = buildStepScript(PARAMS);
+      expect(text).toMatch(/INSTALL_CMD='[^\n]*find \. -mindepth 1 -maxdepth 1 -exec rm -rf -- \{\} \+/);
+      expect(text).not.toContain('find "$BUILD_DIR"');
+      expect(text).not.toContain('du -sk -- "$BUILD_DIR"');
+      const calls = s.calls().split("\n");
+      expect(calls.findIndex((l) => l === "pkill -KILL -u shop-build")).toBeLessThan(calls.findIndex((l) => l.includes("--unit=samohost-shop-install")));
     } finally {
       s.cleanup();
     }
@@ -313,24 +315,70 @@ describe("step script: executed", () => {
     }
   });
 
-  test("release copies from a root-owned snapshot of build/ and leaves an empty build/ for the build user", () => {
+  test("release: the copy runs as the build user in a unit without network, writing only the new folder; root changes owners after it", () => {
     const s = sandbox();
     try {
       expect(s.step("install").status).toBe(0);
       expect(s.step("build").status).toBe(0);
+      const inode = statSync(join(s.base, "build")).ino;
       const res = s.step("release");
       expect(res.status, res.stderr).toBe(0);
       const calls = s.calls().split("\n");
-      const mv = calls.findIndex((l) => l.startsWith(`mv -T -- ${s.base}/build ${s.base}/releases/`) && l.endsWith(".src"));
-      const own = calls.findIndex((l) => l.startsWith(`chown -hR root:root ${s.base}/releases/`) && l.endsWith(".src"));
-      const cp = calls.findIndex((l) => l.startsWith("cp -R -P"));
-      expect(mv).toBeGreaterThanOrEqual(0);
-      expect(own).toBeGreaterThan(mv);
-      expect(cp).toBeGreaterThan(own);
-      expect(calls[cp]).toContain(".src/. ");
-      expect(readdirSync(join(s.base, "build"))).toEqual([]);
-      expect(calls).toContain(`chown shop-build:shop-build ${s.base}/build`);
-      expect(readdirSync(join(s.base, "releases")).filter((n) => n.endsWith(".src"))).toEqual([]);
+      const unit = calls.findIndex((l) => l.includes("--unit=samohost-shop-copy --uid=shop-build --gid=shop-build"));
+      expect(unit).toBeGreaterThanOrEqual(0);
+      const line = calls[unit]!;
+      const dest = /-p ReadWritePaths=(\S+)/.exec(line)![1]!;
+      expect(dest).toMatch(new RegExp(`^${s.base}/releases/[0-9TZ]+-[0-9]+\\.tmp$`));
+      expect(line).toContain("-p PrivateNetwork=yes");
+      expect(line).toContain("-p IPAddressDeny=any");
+      expect(line).toContain(`InaccessiblePaths=-${s.base}/staging.env -${s.base}/migrate.env -${s.base}/.gh-token -${s.base}/git-safe.conf -${s.base}/app/.git `);
+      expect(line).not.toContain("EnvironmentFile");
+      const giveDest = calls.indexOf(`chown shop-build:shop-build ${dest}`);
+      const takeDest = calls.indexOf(`chown root:root ${dest}`);
+      const owners = calls.indexOf(`chown -hR root:shop-run ${dest}`);
+      expect(giveDest).toBeGreaterThanOrEqual(0);
+      expect(giveDest).toBeLessThan(unit);
+      expect(takeDest).toBeGreaterThan(unit);
+      expect(owners).toBeGreaterThan(takeDest);
+      // build/ stays in place (same inode) with its content; the service's InaccessiblePaths keeps covering it.
+      expect(statSync(join(s.base, "build")).ino).toBe(inode);
+      expect(readdirSync(join(s.base, "build"))).toContain("dist");
+      const text = buildStepScript(PARAMS);
+      expect(text).not.toContain('mv -T -- "$BUILD_DIR"');
+      expect(text).not.toContain("contains no other file of the server");
+      expect(text).not.toContain('chown -hR root:root "$snap"');
+    } finally {
+      s.cleanup();
+    }
+  });
+
+  test("release: special files (FIFOs) are removed from the release", () => {
+    const s = sandbox();
+    try {
+      expect(s.step("install").status).toBe(0);
+      spawnSync("mkfifo", [join(s.base, "build", "pipe")]);
+      expect(s.step("release").status).toBe(0);
+      const rel = join(s.base, readlinkSync(join(s.base, "current")));
+      expect(existsSync(join(rel, "package.json"))).toBe(true);
+      expect(existsSync(join(rel, "pipe"))).toBe(false);
+    } finally {
+      s.cleanup();
+    }
+  });
+
+  test("no step unit can create AF_UNIX sockets (no descriptor passing to the service over an abstract socket)", () => {
+    const s = sandbox();
+    try {
+      expect(s.step("install").status).toBe(0);
+      expect(s.step("build").status).toBe(0);
+      expect(s.step("migrate").status).toBe(0);
+      expect(s.step("release").status).toBe(0);
+      const units = s.calls().split("\n").filter((l) => l.startsWith("systemd-run "));
+      expect(units.length).toBe(4);
+      for (const line of units) {
+        expect(line).toContain("-p RestrictAddressFamilies=AF_INET AF_INET6 AF_NETLINK ");
+        expect(line).not.toContain("AF_UNIX");
+      }
     } finally {
       s.cleanup();
     }
