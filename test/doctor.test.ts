@@ -19,7 +19,7 @@ import {
   test,
   mock,
 } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { parseArgs } from "../src/cli.ts";
@@ -32,6 +32,7 @@ import {
 } from "../src/commands/doctor.ts";
 import { hardeningModule } from "../src/cloudinit/hardening.ts";
 import { buildDoctorChecks } from "../src/doctor/checks.ts";
+import { buildAuditScript, parseAuditOutput } from "../src/audit/batch.ts";
 import { StateStore } from "../src/state/store.ts";
 import { AppStore } from "../src/state/apps.ts";
 import type { VmRecord, AppRecord } from "../src/types.ts";
@@ -1301,5 +1302,135 @@ describe("CLI subprocess e2e", () => {
     const stderrText = await new Response(proc.stderr).text();
     expect(proc.exitCode).toBe(1);
     expect(stderrText).toMatch(/not found/i);
+  });
+});
+
+// ===========================================================================
+// 20. Split-layout node app: the env file is 600 and owned by the app user,
+//     and Caddy listens on :80 only (mainListen cp-http80).
+//
+//     rls-nonsuperuser reads the env file as the app user when the operator
+//     cannot read it, never stops the audit run, keeps the database address
+//     out of process arguments and output, and in the split layout (a
+//     migrate env file next to the env file) also requires that the role is
+//     not the owner of the app's database. caddy-serving requires only :80
+//     for a cp-http80 app.
+// ===========================================================================
+describe("20. split-layout node app: rls-nonsuperuser probe and cp-http80 caddy-serving", () => {
+  const SS_ONLY_80 = "LISTEN 0 128 0.0.0.0:2223 0.0.0.0:*\nLISTEN 0 4096 *:80 *:*";
+  const SS_ONLY_443 = "LISTEN 0 128 0.0.0.0:2223 0.0.0.0:*\nLISTEN 0 4096 *:443 *:*";
+
+  test("caddy-serving: cp-http80 node app with only :80 → pass", () => {
+    expect(parseLivenessOutput("caddy-serving", SS_ONLY_80, 2223, "node", "cp-http80").status).toBe("pass");
+  });
+
+  test("caddy-serving: cp-http80 app without :80 → fail", () => {
+    expect(parseLivenessOutput("caddy-serving", SS_ONLY_443, 2223, "node", "cp-http80").status).toBe("fail");
+  });
+
+  test("caddy-serving: tls node app still needs :80 and :443", () => {
+    expect(parseLivenessOutput("caddy-serving", SS_ONLY_80, 2223, "node", "tls").status).toBe("fail");
+  });
+
+  test("runDoctor: cp-http80 app record, Caddy on :80 only → caddy-serving pass", async () => {
+    store.upsert(rec());
+    appStore.upsert(appRec("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee", { kind: "node", mainListen: "cp-http80" }));
+    const c = capture();
+    await runDoctor({ target: "test-vm", infra: false }, { json: true }, store, appStore, c.out, c.err,
+      makePassRunner({ "caddy-serving": SS_ONLY_80, "ss-listeners": SS_ONLY_80 }));
+    const parsed = JSON.parse(c.o);
+    const row = parsed.checks.find((r: { id: string }) => r.id === "caddy-serving");
+    expect(row.status).toBe("pass");
+  });
+
+  // ---- rls-nonsuperuser probe, run by a local bash with fake sudo/psql/curl ----
+  let work: string;
+  beforeEach(() => {
+    work = mkdtempSync(join(tmpdir(), "samohost-rls-probe-"));
+    const bin = join(work, "bin");
+    mkdirSync(bin);
+    writeFileSync(join(bin, "sudo"),
+      '#!/bin/bash\nprintf "%s\\n" "$@" >> "$PROBE_WORK/sudo.args"\n[ "$1" = -n ] && [ "$2" = -u ] || exit 9\nshift 3\nexec "$@"\n');
+    writeFileSync(join(bin, "psql"),
+      '#!/bin/bash\nprintf "%s\\n" "$@" > "$PROBE_WORK/psql.args"\nenv > "$PROBE_WORK/psql.env"\nprintf "%s\\n" "${FAKE_PSQL_OUT:-f}"\n');
+    // curl -w '%{http_code}' prints the code without a newline unless the format adds one.
+    writeFileSync(join(bin, "curl"), '#!/bin/bash\nfor a in "$@"; do case "$a" in *http_code*) printf "${a/\\%\\{http_code\\}/${FAKE_CURL_CODE:-000}}";; esac; done\n');
+    for (const f of ["sudo", "psql", "curl"]) chmodSync(join(bin, f), 0o755);
+  });
+  afterEach(() => rmSync(work, { recursive: true, force: true }));
+
+  function runProbe(o: { envFile: string; rlsUrlVar: string; appUser?: string; psqlOut?: string; curlCode?: string }) {
+    const checks = buildDoctorChecks(2223, {
+      appDir: "/opt/demo/app",
+      envFile: o.envFile,
+      serviceUnit: "demo",
+      healthUrl: "http://127.0.0.1:4105/healthz",
+      rlsUrlVar: o.rlsUrlVar,
+      ...(o.appUser !== undefined ? { appUser: o.appUser } : {}),
+    }).filter((c) => c.id === "rls-nonsuperuser" || c.id === "app-health" || c.id === "dark-db");
+    const res = Bun.spawnSync(["/bin/bash", "-c", buildAuditScript(checks)], {
+      env: { ...process.env, PATH: `${join(work, "bin")}:${process.env["PATH"]}`, PROBE_WORK: work, FAKE_PSQL_OUT: o.psqlOut ?? "f", FAKE_CURL_CODE: o.curlCode ?? "000" },
+    });
+    const sections = parseAuditOutput(res.stdout.toString(), checks);
+    const read = (f: string) => (existsSync(join(work, f)) ? readFileSync(join(work, f), "utf8") : "");
+    return { sections, sudoArgs: read("sudo.args"), psqlArgs: read("psql.args"), psqlEnv: read("psql.env") };
+  }
+
+  function envFile(body: string, opts: { migrate?: boolean; mode?: number } = {}): string {
+    const dirPath = join(work, "opt");
+    mkdirSync(dirPath, { recursive: true });
+    const path = join(dirPath, "staging.env");
+    writeFileSync(path, body);
+    chmodSync(path, opts.mode ?? 0o600);
+    if (opts.migrate) writeFileSync(join(dirPath, "migrate.env"), "DATABASE_URL=postgresql://owner:x@127.0.0.1:5432/demo\n");
+    return path;
+  }
+
+  test("unreadable env file → read as the app user with sudo -n -u; the run continues", () => {
+    const path = envFile("APP_DATABASE_URL=postgresql://demo_app:pw@127.0.0.1:5432/demo\n", { mode: 0o000 });
+    const r = runProbe({ envFile: path, rlsUrlVar: "APP_DATABASE_URL", appUser: "demo" });
+    expect(r.sudoArgs).toContain("-n\n-u\ndemo\n/bin/bash\n-c\n");
+    expect(r.sections.get("rls-nonsuperuser")).toContain("cannot read the env file");
+    expect(r.sections.get("app-health")).toBe("000");
+  });
+
+  test("variable missing from the env file → clear message, the run continues", () => {
+    const path = envFile("NODE_ENV=production\n");
+    const r = runProbe({ envFile: path, rlsUrlVar: "APP_DATABASE_URL", appUser: "demo" });
+    expect(r.sections.get("rls-nonsuperuser")).toContain("APP_DATABASE_URL is not set");
+    expect(r.sections.get("app-health")).toBe("000");
+  });
+
+  test("split layout: address passed in PG* variables, never as an argument; owner check in the query", () => {
+    const path = envFile("APP_DATABASE_URL=postgresql://demo_app:s3cr%40t@127.0.0.1:5432/demo\n", { migrate: true });
+    const r = runProbe({ envFile: path, rlsUrlVar: "APP_DATABASE_URL", appUser: "demo" });
+    expect(r.sections.get("rls-nonsuperuser")).toBe("f");
+    expect(r.psqlArgs).not.toContain("s3cr");
+    expect(r.psqlArgs).toContain("datdba");
+    expect(r.psqlEnv).toContain("PGPASSWORD=s3cr@t");
+    expect(r.psqlEnv).toContain("PGUSER=demo_app");
+  });
+
+  test("split layout: role owns the database → fail with a clear message", async () => {
+    const path = envFile("APP_DATABASE_URL=postgresql://demo_app:pw@127.0.0.1:5432/demo\n", { migrate: true });
+    const r = runProbe({ envFile: path, rlsUrlVar: "APP_DATABASE_URL", appUser: "demo", psqlOut: "owner" });
+    const out = r.sections.get("rls-nonsuperuser") ?? "";
+    expect(out).toContain("owns the app's database");
+    expect(out).not.toContain("pw@");
+  });
+
+  test("app-health output ends with a newline, so dark-db keeps its own section", () => {
+    const path = envFile("APP_DATABASE_URL=postgresql://demo_app:pw@127.0.0.1:5432/demo\n", { migrate: true });
+    const r = runProbe({ envFile: path, rlsUrlVar: "APP_DATABASE_URL", appUser: "demo", curlCode: "200" });
+    expect(r.sections.get("app-health")).toBe("200");
+    expect(r.sections.has("dark-db")).toBe(true);
+  });
+
+  test("legacy layout: superuser DATABASE_URL → fail with a clear message; no owner check", () => {
+    const path = envFile("DATABASE_URL=postgresql://postgres:pw@127.0.0.1:5432/demo\n");
+    const r = runProbe({ envFile: path, rlsUrlVar: "DATABASE_URL", psqlOut: "superuser" });
+    expect(r.sections.get("rls-nonsuperuser")).toContain("is a superuser");
+    expect(r.psqlArgs).not.toContain("datdba");
+    expect(r.psqlArgs).not.toContain("pw@");
   });
 });

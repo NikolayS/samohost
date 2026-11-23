@@ -33,6 +33,7 @@ import type { AppStore } from "../state/apps.ts";
 import type { AppRecord } from "../types.ts";
 import {
   buildDoctorChecks,
+  type AppParams,
   type DoctorCheck,
   type DoctorGroup,
 } from "../doctor/checks.ts";
@@ -66,7 +67,8 @@ export interface DoctorInput {
 /**
  * Parse ss -ltnH output for port liveness.
  * - "ssh-port-listening": sshPort in ss output → pass; else fail.
- * - "caddy-serving": both 80 AND 443 in ss output → pass; else fail.
+ * - "caddy-serving": both 80 AND 443 in ss output → pass; else fail
+ *   (static: 443 only; mainListen cp-http80: 80 only).
  * - "fail2ban-jail": output contains "Status for the jail:" → pass; else fail.
  * - "service-crash-loop": ≥3 crash indicators → fail; else pass.
  * - "pg-localhost" (via parsePgLocalhostOutput): handled separately.
@@ -76,6 +78,7 @@ export function parseLivenessOutput(
   stdout: string,
   sshPort: number,
   serveKind?: "node" | "static",
+  mainListen?: "cp-http80" | "tls",
 ): Pick<DoctorResult, "status" | "stdout" | "stderr"> {
   const out = stdout.trim();
 
@@ -93,8 +96,11 @@ export function parseLivenessOutput(
     // only :443, leaving :80 intentionally closed. Only "node" (or absent,
     // backward-compat) requires both ports.
     const needsBoth = serveKind === undefined || serveKind === "node";
+    // A cp-http80 app is reached only through the control plane on :80
+    // (the control plane terminates TLS), so Caddy listens on :80 only.
+    const pass = mainListen === "cp-http80" ? has80 : has443 && (!needsBoth || has80);
     return {
-      status: has443 && (!needsBoth || has80) ? "pass" : "fail",
+      status: pass ? "pass" : "fail",
       stdout: out,
       stderr: "",
     };
@@ -468,7 +474,7 @@ function evaluateDoctorCheck(
 
   // Liveness checks: use parseLivenessOutput.
   if (check.kind === "liveness" && check.id !== "ss-listeners") {
-    const parsed = parseLivenessOutput(check.id, observed, sshPort, serveKind);
+    const parsed = parseLivenessOutput(check.id, observed, sshPort, serveKind, app?.mainListen);
     return {
       id: check.id,
       description: check.description,
@@ -633,21 +639,24 @@ export function defaultRemoteRunner(): RemoteRunner {
 // Callers (fleet-doctor) catch per-VM so one failure doesn't abort the sweep.
 // ---------------------------------------------------------------------------
 
+function appParamsOf(app: AppRecord): AppParams {
+  return {
+    appDir: app.appDir,
+    envFile: app.envFile ?? `/opt/${app.name}/.env`,
+    serviceUnit: app.serviceUnit,
+    healthUrl: app.healthUrl,
+    rlsUrlVar: app.rlsUrlVar ?? "DATABASE_URL",
+    ...(app.appUser !== undefined ? { appUser: app.appUser } : {}),
+  };
+}
+
 export async function auditVm(
   record: import("../types.ts").VmRecord,
   app: AppRecord | undefined,
   remote: RemoteRunner,
 ): Promise<DoctorResult[]> {
   // Build app params if an app is registered.
-  const appParams = app
-    ? {
-        appDir: app.appDir,
-        envFile: app.envFile ?? `/opt/${app.name}/.env`,
-        serviceUnit: app.serviceUnit,
-        healthUrl: app.healthUrl,
-        rlsUrlVar: app.rlsUrlVar ?? "DATABASE_URL",
-      }
-    : undefined;
+  const appParams = app ? appParamsOf(app) : undefined;
 
   // Build the full check list (with app-param substitutions).
   const checks = buildDoctorChecks(record.sshPort, appParams);
@@ -762,15 +771,7 @@ export async function runDoctor(
   // auditVm computes skipAppDb from (no-app AND no-pgLoopback); infra=true skips
   // regardless. We identify appScoped check IDs by rebuilding the check list.
   if (input.infra) {
-    const appParams = app
-      ? {
-          appDir: app.appDir,
-          envFile: app.envFile ?? `/opt/${app.name}/.env`,
-          serviceUnit: app.serviceUnit,
-          healthUrl: app.healthUrl,
-          rlsUrlVar: app.rlsUrlVar ?? "DATABASE_URL",
-        }
-      : undefined;
+    const appParams = app ? appParamsOf(app) : undefined;
     const allChecks = buildDoctorChecks(record.sshPort, appParams);
     const appScopedIds = new Set(allChecks.filter((c) => c.appScoped).map((c) => c.id));
     results = results.map((r) =>

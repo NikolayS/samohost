@@ -330,8 +330,9 @@ export const appDbCheckTemplates: DoctorCheck[] = [
   {
     id: "app-health",
     description: "app health endpoint returns HTTP 200",
-    // TEMPLATE: __HEALTH_URL__ is substituted.
-    probeCommand: "curl -s -o /dev/null -w '%{http_code}' __HEALTH_URL__ 2>/dev/null",
+    // TEMPLATE: __HEALTH_URL__ is substituted. The format ends with a newline
+    // so that the next section's delimiter starts on its own line.
+    probeCommand: "curl -s -o /dev/null -w '%{http_code}\\n' __HEALTH_URL__ 2>/dev/null",
     expect: "200",
     group: "app-db",
     appScoped: true,
@@ -374,6 +375,61 @@ export interface AppParams {
   serviceUnit: string;
   healthUrl: string;
   rlsUrlVar: string;
+  /** The app's deploy user; the rls-nonsuperuser probe reads the env file as this user when the operator cannot. */
+  appUser?: string;
+}
+
+function sq(s: string): string {
+  return `'${s.replace(/'/g, `'\\''`)}'`;
+}
+
+const APP_USER_RE = /^[a-z_][a-z0-9_-]{0,31}$/;
+const ENV_VAR_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
+
+/**
+ * The rls-nonsuperuser probe, run by bash as $0 rls-probe with arguments
+ * <env file> <variable name>. It prints exactly "f" when the role in the
+ * variable is not a superuser and, in the split layout (a migrate.env next
+ * to the env file), not the owner of the app's database or a member of the
+ * owner role. Every other outcome is one line that starts with "rls-probe:".
+ * The address goes to psql in PG* variables, never as an argument, and is
+ * never printed. It always exits 0, so it never stops the audit run.
+ */
+const RLS_PROBE_SCRIPT = [
+  "set -u",
+  'rls_env="$1"; rls_var="$2"',
+  'if ! [ -r "$rls_env" ]; then echo "rls-probe: cannot read the env file $rls_env"; exit 0; fi',
+  'set -a; . "$rls_env" >/dev/null 2>&1; set +a',
+  'rls_url="${!rls_var:-}"',
+  'if [ -z "$rls_url" ]; then echo "rls-probe: $rls_var is not set in $rls_env"; exit 0; fi',
+  'if ! [[ "$rls_url" =~ ^postgres(ql)?://([^:@/?#]+)(:([^@/?#]*))?@([^:@/?#]+)(:([0-9]+))?/([^?#]+) ]]; then echo "rls-probe: $rls_var is not a postgresql://user:password@host/db address"; exit 0; fi',
+  'rls_sql="SELECT CASE WHEN rolsuper THEN \'superuser\' ELSE \'f\' END FROM pg_catalog.pg_roles WHERE rolname = current_user"',
+  'if [ -e "${rls_env%/*}/migrate.env" ]; then rls_sql="SELECT CASE WHEN r.rolsuper THEN \'superuser\' WHEN pg_catalog.pg_has_role(r.oid, d.datdba, \'MEMBER\') THEN \'owner\' ELSE \'f\' END FROM pg_catalog.pg_roles r JOIN pg_catalog.pg_database d ON d.datname = pg_catalog.current_database() WHERE r.rolname = current_user"; fi',
+  'rls_pw="$(printf \'%b\' "${BASH_REMATCH[4]//%/\\x}")"',
+  'rls_res="$(PGHOST="${BASH_REMATCH[5]}" PGPORT="${BASH_REMATCH[7]:-5432}" PGUSER="${BASH_REMATCH[2]}" PGPASSWORD="$rls_pw" PGDATABASE="${BASH_REMATCH[8]}" psql -X -w -tA -c "$rls_sql" 2>&1)" || true',
+  "unset rls_pw rls_url",
+  'case "$rls_res" in',
+  "  f) echo f ;;",
+  '  superuser) echo "rls-probe: the role in $rls_var is a superuser" ;;',
+  '  owner) echo "rls-probe: the role in $rls_var owns the app\'s database or is a member of its owner role" ;;',
+  '  *) rls_line="${rls_res%%$\'\\n\'*}"; echo "rls-probe: the query as the role in $rls_var failed: ${rls_line:0:200}" ;;',
+  "esac",
+].join("\n");
+
+/**
+ * The rls-nonsuperuser probe command for one app. The operator runs the probe
+ * itself when it can read the env file; otherwise it runs it as the app user
+ * (`sudo -n -u <appUser>`), who owns the env file in the split layout.
+ */
+export function rlsNonSuperuserProbe(params: Pick<AppParams, "envFile" | "rlsUrlVar" | "appUser">): string {
+  if (!ENV_VAR_RE.test(params.rlsUrlVar)) {
+    return `echo ${sq(`rls-probe: invalid variable name ${JSON.stringify(params.rlsUrlVar)}`)}`;
+  }
+  const args = `rls-probe ${sq(params.envFile)} ${sq(params.rlsUrlVar)}`;
+  const asAppUser = params.appUser !== undefined && APP_USER_RE.test(params.appUser)
+    ? `sudo -n -u ${sq(params.appUser)} /bin/bash -c "$rls_probe" ${args}`
+    : `echo ${sq(`rls-probe: the operator cannot read the env file ${params.envFile} and the app has no valid app user to read it as`)}`;
+  return `rls_probe=${sq(RLS_PROBE_SCRIPT)}; if [ -r ${sq(params.envFile)} ]; then /bin/bash -c "$rls_probe" ${args}; else ${asAppUser}; fi`;
 }
 
 /**
@@ -454,10 +510,12 @@ export function buildDoctorChecks(
     for (const tmpl of appDbCheckTemplates) {
       checks.push({
         ...tmpl,
-        probeCommand: tmpl.probeCommand
-          .replace(/__ENV_FILE__/g, appParams.envFile)
-          .replace(/__RLS_URL_VAR__/g, appParams.rlsUrlVar)
-          .replace(/__HEALTH_URL__/g, appParams.healthUrl),
+        probeCommand: tmpl.id === "rls-nonsuperuser"
+          ? rlsNonSuperuserProbe(appParams)
+          : tmpl.probeCommand
+            .replace(/__ENV_FILE__/g, appParams.envFile)
+            .replace(/__RLS_URL_VAR__/g, appParams.rlsUrlVar)
+            .replace(/__HEALTH_URL__/g, appParams.healthUrl),
       });
     }
   } else {
