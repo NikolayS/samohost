@@ -33,7 +33,7 @@ function stub(bin: string, name: string, body: string, log: string) {
 }
 
 /** A sandbox /opt/shop with stubs; `step(name)` runs the script there. */
-function sandbox(params: Partial<BuildStepParams> = {}) {
+function sandbox(params: Partial<BuildStepParams> = {}, edits: Array<[string, string]> = []) {
   const dir = mkdtempSync(join(tmpdir(), "samohost-steps-"));
   const bin = join(dir, "bin");
   mkdirSync(bin);
@@ -67,7 +67,7 @@ function sandbox(params: Partial<BuildStepParams> = {}) {
   // systemctl is-active <unit>: the content of <dir>/state-<unit>, else inactive.
   stub(bin, "systemctl", `f=${JSON.stringify(dir)}/state-$2; if [[ -f "$f" ]]; then cat "$f"; [[ "$(cat "$f")" == active ]] && exit 0; exit 3; fi; echo inactive; exit 3`, log);
   // GNU cp options on macOS: drop --preserve=timestamps and --, copy with -RP.
-  stub(bin, "cp", 'a=(); for x in "$@"; do case "$x" in -R|-P|--preserve=timestamps|--) ;; *) a+=("$x");; esac; done\n/bin/cp -RP "${a[@]}"', log);
+  stub(bin, "cp", 'a=(); for x in "$@"; do case "$x" in -R|-P|--preserve=timestamps|--) ;; *) a+=("$x");; esac; done\nprintf "releases at copy: %s\\n" "$(ls "$(dirname "${a[1]}")" | grep -v "\\.src$" | grep -v "\\.tmp$" | tr "\\n" " ")" >> ' + JSON.stringify(log) + '\n/bin/cp -RP "${a[@]}"', log);
   // mv -T on macOS: replace the destination entry, then rename.
   stub(bin, "mv", 'args=(); t=0; for a in "$@"; do case "$a" in -fT|-T) t=1;; -f|--) ;; *) args+=("$a");; esac; done\nif [[ $t == 1 ]]; then rm -f "${args[1]}" 2>/dev/null || rmdir "${args[1]}" 2>/dev/null || true; fi\n/bin/mv -f "${args[0]}" "${args[1]}"', log);
   const text = buildStepScript({ ...PARAMS, ...params })
@@ -75,9 +75,12 @@ function sandbox(params: Partial<BuildStepParams> = {}) {
     .replace("export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin", `export PATH=${bin}:/usr/bin:/bin`)
     .replace("/proc/sys/fs/protected_hardlinks", join(dir, "protected_hardlinks"))
     .replaceAll("/run/samohost", join(dir, "run-samohost"))
-    .replaceAll("/usr/bin/systemctl", join(bin, "systemctl"));
+    .replaceAll("/usr/bin/systemctl", join(bin, "systemctl"))
+    .replace("MIN_FREE_KB=2097152", "MIN_FREE_KB=0");
+  let edited = text;
+  for (const [a, b] of edits) edited = edited.replace(a, b);
   const script = join(dir, "step");
-  writeFileSync(script, text);
+  writeFileSync(script, edited);
   chmodSync(script, 0o755);
   const step = (...args: string[]) => spawnSync("bash", [script, ...args], { encoding: "utf8", env: { PATH: `${bin}:/usr/bin:/bin` } });
   const calls = () => (existsSync(log) ? readFileSync(log, "utf8") : "");
@@ -328,6 +331,45 @@ describe("step script: executed", () => {
       expect(readdirSync(join(s.base, "build"))).toEqual([]);
       expect(calls).toContain(`chown shop-build:shop-build ${s.base}/build`);
       expect(readdirSync(join(s.base, "releases")).filter((n) => n.endsWith(".src"))).toEqual([]);
+    } finally {
+      s.cleanup();
+    }
+  });
+
+  test("disk: release refuses a build/ larger than the limit, and a copy that would leave less free space than the limit", () => {
+    const text = buildStepScript(PARAMS);
+    expect(text).toContain("MAX_BUILD_KB=2097152");
+    expect(text).toContain("MIN_FREE_KB=2097152");
+    for (const [edit, message] of [
+      [["MAX_BUILD_KB=2097152", "MAX_BUILD_KB=1"], "more than the limit of 1 KiB"],
+      [["MIN_FREE_KB=0", "MIN_FREE_KB=999999999999"], "less than 999999999999 KiB"],
+    ] as const) {
+      const s = sandbox({}, [edit as unknown as [string, string]]);
+      try {
+        expect(s.step("install").status).toBe(0);
+        expect(s.step("build").status).toBe(0);
+        const res = s.step("release");
+        expect(res.status).toBe(1);
+        expect(res.stderr).toContain(message);
+        expect(existsSync(join(s.base, "current"))).toBe(false);
+        expect(readdirSync(join(s.base, "build"))).toContain("dist");
+      } finally {
+        s.cleanup();
+      }
+    }
+  }, 60000);
+
+  test("release removes releases other than current and previous before the copy: at most three exist", () => {
+    const s = sandbox();
+    try {
+      for (const d of ["a", "b", "old1", "old2", "x.tmp"]) mkdirSync(join(s.base, "releases", d));
+      require("node:fs").symlinkSync("releases/a", join(s.base, "current"));
+      require("node:fs").symlinkSync("releases/b", join(s.base, "previous"));
+      expect(s.step("release").status).toBe(0);
+      expect(s.calls()).toContain("releases at copy: a b \n");
+      const now = readlinkSync(join(s.base, "current")).replace("releases/", "");
+      expect(readdirSync(join(s.base, "releases")).sort()).toEqual(["a", now].sort());
+      expect(readlinkSync(join(s.base, "previous"))).toBe("releases/a");
     } finally {
       s.cleanup();
     }
