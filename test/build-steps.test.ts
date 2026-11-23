@@ -134,6 +134,9 @@ describe("step script: executed", () => {
       expect(s.calls()).toContain("npm ci --include=dev");
       expect(s.calls()).toContain("npm run build");
       expect(s.calls()).toMatch(/systemd-run .*--unit=samohost-shop-install --uid=shop-build --gid=shop-build/);
+      // Release identity: the build reads SAMO_RELEASE_TAG and SAMO_RELEASE_SHA from release.env.
+      const buildLine = s.calls().split("\n").find((l) => l.includes("--unit=samohost-shop-build"))!;
+      expect(buildLine).toContain(`EnvironmentFile=-${s.base}/release.env`);
     } finally {
       s.cleanup();
     }

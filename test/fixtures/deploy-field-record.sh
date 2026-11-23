@@ -29,6 +29,14 @@ fi
 # split layout: the service runs as a separate runtime user, which reads
 # the checkout, node_modules and dist/ through their world-read bit.
 if [[ -f "$SAMOHOST_MIGRATE_ENV_FILE" ]]; then umask 022; fi
+# Build model (src/app/build-steps.ts): a root-owned step script runs install,
+# build, migrate, release and seed as the build user; this script runs no
+# app command itself. Servers bootstrapped before it keep the steps below.
+SAMOHOST_STEP='/usr/local/lib/samohost/apps/field-record/step'
+SAMOHOST_RELEASE_MODEL=0
+if [[ -f "$SAMOHOST_MIGRATE_ENV_FILE" && -x "$SAMOHOST_STEP" ]]; then SAMOHOST_RELEASE_MODEL=1; fi
+# No process of the build user outlives the deploy, whatever its outcome.
+if [[ "$SAMOHOST_RELEASE_MODEL" == 1 ]]; then trap 'sudo "$SAMOHOST_STEP" cleanup >/dev/null 2>&1 || true' EXIT; fi
 
 # --- fetch: bring the target SHA into the local object store ---
 echo "<<<SAMOHOST_PHASE:fetch:start>>>"
@@ -48,7 +56,11 @@ echo "pre-deploy sha: ${PRE_DEPLOY_SHA}"
 # A previous release exists when dist/ is present before this deploy. Its copy
 # dist.prev/ is made here, before install and build (a build may delete dist/).
 SAMOHOST_HAS_PREVIOUS_RELEASE=0
-if [[ -d "${SAMOHOST_APP_DIR}/dist" ]]; then
+SAMOHOST_RELEASE_SWITCHED=0
+# build model: the previous release is the one the current link names.
+if [[ "$SAMOHOST_RELEASE_MODEL" == 1 ]]; then
+  if [[ -L '/opt/field-record/current' ]]; then SAMOHOST_HAS_PREVIOUS_RELEASE=1; fi
+elif [[ -d "${SAMOHOST_APP_DIR}/dist" ]]; then
   rm -rf "${SAMOHOST_APP_DIR}/dist.prev"
   cp -r "${SAMOHOST_APP_DIR}/dist" "${SAMOHOST_APP_DIR}/dist.prev"
   SAMOHOST_HAS_PREVIOUS_RELEASE=1
@@ -79,7 +91,10 @@ rollback() {
       rm -f "$SAMOHOST_RELEASE_ENV_FILE" || true
     fi
   fi
-  if [[ -d "${SAMOHOST_APP_DIR}/dist.prev" ]]; then
+  # build model: switch the current link back when this deploy switched it.
+  if [[ "${SAMOHOST_RELEASE_MODEL:-0}" == 1 ]]; then
+    if [[ "${SAMOHOST_RELEASE_SWITCHED:-0}" == 1 ]]; then sudo "$SAMOHOST_STEP" rollback || true; fi
+  elif [[ -d "${SAMOHOST_APP_DIR}/dist.prev" ]]; then
     rm -rf "${SAMOHOST_APP_DIR}/dist"
     cp -r "${SAMOHOST_APP_DIR}/dist.prev" "${SAMOHOST_APP_DIR}/dist"
   fi
@@ -106,12 +121,41 @@ else
   echo "<<<SAMOHOST_PHASE:checkout:fail>>>"
   exit 1
 fi
+# build model: the build user reads the checkout through the world-read bit;
+# this covers files an earlier clone or deploy left owner-only. Skips .git.
+if [[ "$SAMOHOST_RELEASE_MODEL" == 1 ]]; then
+  find "$SAMOHOST_APP_DIR" -path "$SAMOHOST_APP_DIR/.git" -prune -o ! -type l -exec chmod go+rX {} + \
+    || echo "WARNING: could not make every file in $SAMOHOST_APP_DIR readable for the build user" >&2
+fi
+
+samohost_write_release_env() {
+  # --- release env: tag and sha for the running service (unit EnvironmentFile=-) ---
+  # No secret is written here. The previous content is kept in a variable for
+  # rollback. A failed write is a warning, not a failure: units written before
+  # this file existed do not load it, and the release runs without the values.
+  SAMOHOST_RELEASE_ENV_FILE='/opt/field-record/release.env'
+  SAMOHOST_RELEASE_ENV_HAD_PREVIOUS=0
+  SAMOHOST_RELEASE_ENV_PREVIOUS=""
+  if [[ -f "$SAMOHOST_RELEASE_ENV_FILE" ]] && SAMOHOST_RELEASE_ENV_PREVIOUS="$(cat "$SAMOHOST_RELEASE_ENV_FILE")"; then SAMOHOST_RELEASE_ENV_HAD_PREVIOUS=1; fi
+  SAMOHOST_RELEASE_ENV_WRITTEN=0
+  # split layout: the env file's directory is root-owned; the exact sudo tee rule writes the file.
+  if [[ -f "$SAMOHOST_MIGRATE_ENV_FILE" ]]; then
+    if printf 'SAMO_RELEASE_TAG=%s\nSAMO_RELEASE_SHA=%s\n' "$SAMO_RELEASE_TAG" "$SAMO_RELEASE_SHA" | sudo /usr/bin/tee "$SAMOHOST_RELEASE_ENV_FILE" >/dev/null; then SAMOHOST_RELEASE_ENV_WRITTEN=1; fi
+  elif printf 'SAMO_RELEASE_TAG=%s\nSAMO_RELEASE_SHA=%s\n' "$SAMO_RELEASE_TAG" "$SAMO_RELEASE_SHA" 2>/dev/null > "${SAMOHOST_RELEASE_ENV_FILE}.next" && chmod 0644 "${SAMOHOST_RELEASE_ENV_FILE}.next" && mv -f "${SAMOHOST_RELEASE_ENV_FILE}.next" "$SAMOHOST_RELEASE_ENV_FILE"; then
+    SAMOHOST_RELEASE_ENV_WRITTEN=1
+  fi
+  if [[ "$SAMOHOST_RELEASE_ENV_WRITTEN" != "1" ]]; then
+    rm -f "${SAMOHOST_RELEASE_ENV_FILE}.next" 2>/dev/null || true
+    echo "WARNING: could not write the release env file $SAMOHOST_RELEASE_ENV_FILE; the service starts without SAMO_RELEASE_TAG and SAMO_RELEASE_SHA" >&2
+  fi
+}
 
 # --- install: lockfile-aware install (npm ci if lockfile present, npm install otherwise) ---
 # --include=dev: NODE_ENV=production drops devDeps (build toolchain: tsc, tsx) — issue #2 bug 3.
 # lockfile fallback: apps without package-lock.json hard-fail npm ci (no-DB fixtures, greenfield).
 echo "<<<SAMOHOST_PHASE:install:start>>>"
-if (if [ -f package-lock.json ] || [ -f npm-shrinkwrap.json ]; then npm ci --include=dev; else npm install --include=dev; fi); then
+if [[ "$SAMOHOST_RELEASE_MODEL" == 1 ]]; then samohost_write_release_env; fi
+if (if [[ "$SAMOHOST_RELEASE_MODEL" == 1 ]]; then sudo "$SAMOHOST_STEP" install; elif [ -f package-lock.json ] || [ -f npm-shrinkwrap.json ]; then npm ci --include=dev; else npm install --include=dev; fi); then
   echo "<<<SAMOHOST_PHASE:install:ok>>>"
 else
   echo "<<<SAMOHOST_PHASE:install:fail>>>"
@@ -122,7 +166,7 @@ fi
 # --- build ---
 # subshell + cd: a buildCmd that cd's must not leak its cwd into later phases (issue #122).
 echo "<<<SAMOHOST_PHASE:build:start>>>"
-if (cd "$SAMOHOST_APP_DIR" && npm run build); then
+if (if [[ "$SAMOHOST_RELEASE_MODEL" == 1 ]]; then sudo "$SAMOHOST_STEP" build; else (cd "$SAMOHOST_APP_DIR" && npm run build); fi); then
   echo "<<<SAMOHOST_PHASE:build:ok>>>"
 else
   echo "<<<SAMOHOST_PHASE:build:fail>>>"
@@ -132,7 +176,8 @@ fi
 # split layout: the service's runtime user reads the release through the
 # world-read bit; umask 022 covers new files, this covers files an earlier
 # clone or deploy left owner-only. Skips .git; does not follow links.
-if [[ -f "$SAMOHOST_MIGRATE_ENV_FILE" ]]; then
+# (The build model's service reads its own root-owned release instead.)
+if [[ -f "$SAMOHOST_MIGRATE_ENV_FILE" && "$SAMOHOST_RELEASE_MODEL" != 1 ]]; then
   find "$SAMOHOST_APP_DIR" -path "$SAMOHOST_APP_DIR/.git" -prune -o ! -type l -exec chmod go+rX {} + \
     || echo "WARNING: could not make every file in $SAMOHOST_APP_DIR readable for the runtime user" >&2
 fi
@@ -141,7 +186,7 @@ fi
 # subshell + cd: always runs from the app dir, whatever buildCmd cd'd into (issue #122).
 # split layout: only this subshell exports the database addresses and loads the migrate env file.
 echo "<<<SAMOHOST_PHASE:migrate:start>>>"
-if (if [[ -f "$SAMOHOST_MIGRATE_ENV_FILE" ]]; then set -a; . "$SAMOHOST_MIGRATE_ENV_FILE"; set +a; export DATABASE_URL APP_DATABASE_URL; fi && cd "$SAMOHOST_APP_DIR" && node --import tsx/esm src/migration-runner-cli.ts); then
+if (if [[ "$SAMOHOST_RELEASE_MODEL" == 1 ]]; then sudo "$SAMOHOST_STEP" migrate; else (if [[ -f "$SAMOHOST_MIGRATE_ENV_FILE" ]]; then set -a; . "$SAMOHOST_MIGRATE_ENV_FILE"; set +a; export DATABASE_URL APP_DATABASE_URL; fi && cd "$SAMOHOST_APP_DIR" && node --import tsx/esm src/migration-runner-cli.ts); fi); then
   echo "<<<SAMOHOST_PHASE:migrate:ok>>>"
 else
   echo "<<<SAMOHOST_PHASE:migrate:fail>>>"
@@ -149,25 +194,21 @@ else
   exit 1
 fi
 
-# --- release env: tag and sha for the running service (unit EnvironmentFile=-) ---
-# No secret is written here. The previous content is kept in a variable for
-# rollback. A failed write is a warning, not a failure: units written before
-# this file existed do not load it, and the release runs without the values.
-SAMOHOST_RELEASE_ENV_FILE='/opt/field-record/release.env'
-SAMOHOST_RELEASE_ENV_HAD_PREVIOUS=0
-SAMOHOST_RELEASE_ENV_PREVIOUS=""
-if [[ -f "$SAMOHOST_RELEASE_ENV_FILE" ]] && SAMOHOST_RELEASE_ENV_PREVIOUS="$(cat "$SAMOHOST_RELEASE_ENV_FILE")"; then SAMOHOST_RELEASE_ENV_HAD_PREVIOUS=1; fi
-SAMOHOST_RELEASE_ENV_WRITTEN=0
-# split layout: the env file's directory is root-owned; the exact sudo tee rule writes the file.
-if [[ -f "$SAMOHOST_MIGRATE_ENV_FILE" ]]; then
-  if printf 'SAMO_RELEASE_TAG=%s\nSAMO_RELEASE_SHA=%s\n' "$SAMO_RELEASE_TAG" "$SAMO_RELEASE_SHA" | sudo /usr/bin/tee "$SAMOHOST_RELEASE_ENV_FILE" >/dev/null; then SAMOHOST_RELEASE_ENV_WRITTEN=1; fi
-elif printf 'SAMO_RELEASE_TAG=%s\nSAMO_RELEASE_SHA=%s\n' "$SAMO_RELEASE_TAG" "$SAMO_RELEASE_SHA" 2>/dev/null > "${SAMOHOST_RELEASE_ENV_FILE}.next" && chmod 0644 "${SAMOHOST_RELEASE_ENV_FILE}.next" && mv -f "${SAMOHOST_RELEASE_ENV_FILE}.next" "$SAMOHOST_RELEASE_ENV_FILE"; then
-  SAMOHOST_RELEASE_ENV_WRITTEN=1
+# --- release (build model): root copies the build into a release folder and
+# switches the current link the service runs from ---
+if [[ "$SAMOHOST_RELEASE_MODEL" == 1 ]]; then
+  echo "<<<SAMOHOST_PHASE:release:start>>>"
+  if sudo "$SAMOHOST_STEP" release; then
+    SAMOHOST_RELEASE_SWITCHED=1
+    echo "<<<SAMOHOST_PHASE:release:ok>>>"
+  else
+    echo "<<<SAMOHOST_PHASE:release:fail>>>"
+    if [[ "$SAMOHOST_HAS_PREVIOUS_RELEASE" == "1" ]]; then rollback before-restart; fi
+    exit 1
+  fi
 fi
-if [[ "$SAMOHOST_RELEASE_ENV_WRITTEN" != "1" ]]; then
-  rm -f "${SAMOHOST_RELEASE_ENV_FILE}.next" 2>/dev/null || true
-  echo "WARNING: could not write the release env file $SAMOHOST_RELEASE_ENV_FILE; the service starts without SAMO_RELEASE_TAG and SAMO_RELEASE_SHA" >&2
-fi
+
+if [[ "${SAMOHOST_RELEASE_MODEL:-0}" != 1 ]]; then samohost_write_release_env; fi
 
 # --- restart: full-path sudo systemctl (NOPASSWD exact-path + use_pty) ---
 echo "<<<SAMOHOST_PHASE:restart:start>>>"
@@ -224,7 +265,7 @@ fi
 # --- seed: idempotent post-deploy seed (only after healthy deploy) ---
 # subshell + cd: always runs from the app dir, whatever earlier commands cd'd into (issue #122).
 echo "<<<SAMOHOST_PHASE:seed:start>>>"
-if (if [[ -f "$SAMOHOST_MIGRATE_ENV_FILE" ]]; then set -a; . "$SAMOHOST_MIGRATE_ENV_FILE"; set +a; export DATABASE_URL APP_DATABASE_URL; fi && cd "$SAMOHOST_APP_DIR" && npm run db:seed); then
+if (if [[ "$SAMOHOST_RELEASE_MODEL" == 1 ]]; then sudo "$SAMOHOST_STEP" seed; else (if [[ -f "$SAMOHOST_MIGRATE_ENV_FILE" ]]; then set -a; . "$SAMOHOST_MIGRATE_ENV_FILE"; set +a; export DATABASE_URL APP_DATABASE_URL; fi && cd "$SAMOHOST_APP_DIR" && npm run db:seed); fi); then
   echo "<<<SAMOHOST_PHASE:seed:ok>>>"
 else
   echo "<<<SAMOHOST_PHASE:seed:fail>>>"

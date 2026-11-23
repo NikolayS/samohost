@@ -50,6 +50,7 @@ import {
 } from "./static-root.ts";
 import { staticMainVhostLines } from "./heal-script.ts";
 import { databaseUrlVarsOf, migrateEnvFileOf, releaseEnvFileOf } from "./db-layout.ts";
+import { buildModelPaths, buildStepScriptPath } from "./build-steps.ts";
 
 /** Marker prefix the parser keys on. */
 export const PHASE_PREFIX = "<<<SAMOHOST_PHASE:";
@@ -62,6 +63,7 @@ export type PhaseName =
   | "install"
   | "build"
   | "migrate"
+  | "release"
   | "restart"
   | "caddy-reload"
   | "health"
@@ -235,6 +237,14 @@ export function buildDeployScript(app: AppRecord, target: DeployTarget): string 
             "# split layout: the service runs as a separate runtime user, which reads",
             "# the checkout, node_modules and dist/ through their world-read bit.",
             'if [[ -f "$SAMOHOST_MIGRATE_ENV_FILE" ]]; then umask 022; fi',
+            "# Build model (src/app/build-steps.ts): a root-owned step script runs install,",
+            "# build, migrate, release and seed as the build user; this script runs no",
+            "# app command itself. Servers bootstrapped before it keep the steps below.",
+            `SAMOHOST_STEP=${sq(buildStepScriptPath(app.name))}`,
+            "SAMOHOST_RELEASE_MODEL=0",
+            'if [[ -f "$SAMOHOST_MIGRATE_ENV_FILE" && -x "$SAMOHOST_STEP" ]]; then SAMOHOST_RELEASE_MODEL=1; fi',
+            "# No process of the build user outlives the deploy, whatever its outcome.",
+            `if [[ "$SAMOHOST_RELEASE_MODEL" == 1 ]]; then trap 'sudo "$SAMOHOST_STEP" cleanup >/dev/null 2>&1 || true' EXIT; fi`,
           ]
         : []),
       "",
@@ -303,7 +313,15 @@ export function buildDeployScript(app: AppRecord, target: DeployTarget): string 
       "# A previous release exists when dist/ is present before this deploy. Its copy",
       "# dist.prev/ is made here, before install and build (a build may delete dist/).",
       "SAMOHOST_HAS_PREVIOUS_RELEASE=0",
-      'if [[ -d "${SAMOHOST_APP_DIR}/dist" ]]; then',
+      ...(splitLayout !== undefined
+        ? [
+            "SAMOHOST_RELEASE_SWITCHED=0",
+            "# build model: the previous release is the one the current link names.",
+            'if [[ "$SAMOHOST_RELEASE_MODEL" == 1 ]]; then',
+            `  if [[ -L ${sq(buildModelPaths(appBase).currentLink)} ]]; then SAMOHOST_HAS_PREVIOUS_RELEASE=1; fi`,
+            'elif [[ -d "${SAMOHOST_APP_DIR}/dist" ]]; then',
+          ]
+        : ['if [[ -d "${SAMOHOST_APP_DIR}/dist" ]]; then']),
       '  rm -rf "${SAMOHOST_APP_DIR}/dist.prev"',
       '  cp -r "${SAMOHOST_APP_DIR}/dist" "${SAMOHOST_APP_DIR}/dist.prev"',
       "  SAMOHOST_HAS_PREVIOUS_RELEASE=1",
@@ -413,7 +431,14 @@ export function buildDeployScript(app: AppRecord, target: DeployTarget): string 
             "  fi",
           ]
         : []),
-      '  if [[ -d "${SAMOHOST_APP_DIR}/dist.prev" ]]; then',
+      ...(splitLayout !== undefined
+        ? [
+            "  # build model: switch the current link back when this deploy switched it.",
+            '  if [[ "${SAMOHOST_RELEASE_MODEL:-0}" == 1 ]]; then',
+            '    if [[ "${SAMOHOST_RELEASE_SWITCHED:-0}" == 1 ]]; then sudo "$SAMOHOST_STEP" rollback || true; fi',
+            '  elif [[ -d "${SAMOHOST_APP_DIR}/dist.prev" ]]; then',
+          ]
+        : ['  if [[ -d "${SAMOHOST_APP_DIR}/dist.prev" ]]; then']),
       '    rm -rf "${SAMOHOST_APP_DIR}/dist"',
       '    cp -r "${SAMOHOST_APP_DIR}/dist.prev" "${SAMOHOST_APP_DIR}/dist"',
       "  fi",
@@ -465,6 +490,16 @@ export function buildDeployScript(app: AppRecord, target: DeployTarget): string 
       `  ${marker("checkout", "fail")}`,
       "  exit 1",
       "fi",
+      ...(splitLayout !== undefined
+        ? [
+            "# build model: the build user reads the checkout through the world-read bit;",
+            "# this covers files an earlier clone or deploy left owner-only. Skips .git.",
+            'if [[ "$SAMOHOST_RELEASE_MODEL" == 1 ]]; then',
+            '  find "$SAMOHOST_APP_DIR" -path "$SAMOHOST_APP_DIR/.git" -prune -o ! -type l -exec chmod go+rX {} + \\',
+            '    || echo "WARNING: could not make every file in $SAMOHOST_APP_DIR readable for the build user" >&2',
+            "fi",
+          ]
+        : []),
       "",
     );
   }
@@ -698,6 +733,36 @@ export function buildDeployScript(app: AppRecord, target: DeployTarget): string 
   } else {
     // ===== NODE PATH (default — existing behavior, unchanged) ===============
 
+    // ----- release env (function) ---------------------------------------------
+    // Defined here, called before install in the build model (the build steps
+    // load the file through systemd) and before the restart otherwise.
+    if (releaseEnvFile !== undefined) {
+      push(
+        "samohost_write_release_env() {",
+        "  # --- release env: tag and sha for the running service (unit EnvironmentFile=-) ---",
+        "  # No secret is written here. The previous content is kept in a variable for",
+        "  # rollback. A failed write is a warning, not a failure: units written before",
+        "  # this file existed do not load it, and the release runs without the values.",
+        `  SAMOHOST_RELEASE_ENV_FILE=${sq(releaseEnvFile)}`,
+        "  SAMOHOST_RELEASE_ENV_HAD_PREVIOUS=0",
+        '  SAMOHOST_RELEASE_ENV_PREVIOUS=""',
+        '  if [[ -f "$SAMOHOST_RELEASE_ENV_FILE" ]] && SAMOHOST_RELEASE_ENV_PREVIOUS="$(cat "$SAMOHOST_RELEASE_ENV_FILE")"; then SAMOHOST_RELEASE_ENV_HAD_PREVIOUS=1; fi',
+        "  SAMOHOST_RELEASE_ENV_WRITTEN=0",
+        "  # split layout: the env file's directory is root-owned; the exact sudo tee rule writes the file.",
+        '  if [[ -f "$SAMOHOST_MIGRATE_ENV_FILE" ]]; then',
+        '    if printf \'SAMO_RELEASE_TAG=%s\\nSAMO_RELEASE_SHA=%s\\n\' "$SAMO_RELEASE_TAG" "$SAMO_RELEASE_SHA" | sudo /usr/bin/tee "$SAMOHOST_RELEASE_ENV_FILE" >/dev/null; then SAMOHOST_RELEASE_ENV_WRITTEN=1; fi',
+        '  elif printf \'SAMO_RELEASE_TAG=%s\\nSAMO_RELEASE_SHA=%s\\n\' "$SAMO_RELEASE_TAG" "$SAMO_RELEASE_SHA" 2>/dev/null > "${SAMOHOST_RELEASE_ENV_FILE}.next" && chmod 0644 "${SAMOHOST_RELEASE_ENV_FILE}.next" && mv -f "${SAMOHOST_RELEASE_ENV_FILE}.next" "$SAMOHOST_RELEASE_ENV_FILE"; then',
+        "    SAMOHOST_RELEASE_ENV_WRITTEN=1",
+        "  fi",
+        '  if [[ "$SAMOHOST_RELEASE_ENV_WRITTEN" != "1" ]]; then',
+        '    rm -f "${SAMOHOST_RELEASE_ENV_FILE}.next" 2>/dev/null || true',
+        '    echo "WARNING: could not write the release env file $SAMOHOST_RELEASE_ENV_FILE; the service starts without SAMO_RELEASE_TAG and SAMO_RELEASE_SHA" >&2',
+        "  fi",
+        "}",
+        "",
+      );
+    }
+
     // ----- install -----------------------------------------------------------
     // --include=dev is mandatory: the env file sourced above exports
     // NODE_ENV=production into this shell, and a plain `npm ci` would then drop
@@ -715,7 +780,12 @@ export function buildDeployScript(app: AppRecord, target: DeployTarget): string 
       "# --include=dev: NODE_ENV=production drops devDeps (build toolchain: tsc, tsx) — issue #2 bug 3.",
       "# lockfile fallback: apps without package-lock.json hard-fail npm ci (no-DB fixtures, greenfield).",
       marker("install", "start"),
-      "if (if [ -f package-lock.json ] || [ -f npm-shrinkwrap.json ]; then npm ci --include=dev; else npm install --include=dev; fi); then",
+      ...(splitLayout !== undefined && releaseEnvFile !== undefined
+        ? ['if [[ "$SAMOHOST_RELEASE_MODEL" == 1 ]]; then samohost_write_release_env; fi']
+        : []),
+      splitLayout !== undefined
+        ? 'if (if [[ "$SAMOHOST_RELEASE_MODEL" == 1 ]]; then sudo "$SAMOHOST_STEP" install; elif [ -f package-lock.json ] || [ -f npm-shrinkwrap.json ]; then npm ci --include=dev; else npm install --include=dev; fi); then'
+        : "if (if [ -f package-lock.json ] || [ -f npm-shrinkwrap.json ]; then npm ci --include=dev; else npm install --include=dev; fi); then",
       `  ${marker("install", "ok")}`,
       "else",
       `  ${marker("install", "fail")}`,
@@ -737,7 +807,9 @@ export function buildDeployScript(app: AppRecord, target: DeployTarget): string 
       "# --- build ---",
       "# subshell + cd: a buildCmd that cd's must not leak its cwd into later phases (issue #122).",
       marker("build", "start"),
-      `if (cd "$SAMOHOST_APP_DIR" && ${app.buildCmd}); then`,
+      splitLayout !== undefined
+        ? `if (if [[ "$SAMOHOST_RELEASE_MODEL" == 1 ]]; then sudo "$SAMOHOST_STEP" build; else (cd "$SAMOHOST_APP_DIR" && ${app.buildCmd}); fi); then`
+        : `if (cd "$SAMOHOST_APP_DIR" && ${app.buildCmd}); then`,
       `  ${marker("build", "ok")}`,
       "else",
       `  ${marker("build", "fail")}`,
@@ -749,7 +821,8 @@ export function buildDeployScript(app: AppRecord, target: DeployTarget): string 
             "# split layout: the service's runtime user reads the release through the",
             "# world-read bit; umask 022 covers new files, this covers files an earlier",
             "# clone or deploy left owner-only. Skips .git; does not follow links.",
-            'if [[ -f "$SAMOHOST_MIGRATE_ENV_FILE" ]]; then',
+            "# (The build model's service reads its own root-owned release instead.)",
+            'if [[ -f "$SAMOHOST_MIGRATE_ENV_FILE" && "$SAMOHOST_RELEASE_MODEL" != 1 ]]; then',
             '  find "$SAMOHOST_APP_DIR" -path "$SAMOHOST_APP_DIR/.git" -prune -o ! -type l -exec chmod go+rX {} + \\',
             '    || echo "WARNING: could not make every file in $SAMOHOST_APP_DIR readable for the runtime user" >&2',
             "fi",
@@ -768,7 +841,7 @@ export function buildDeployScript(app: AppRecord, target: DeployTarget): string 
           : []),
         marker("migrate", "start"),
         splitLayout !== undefined
-          ? `if (if [[ -f "$SAMOHOST_MIGRATE_ENV_FILE" ]]; then set -a; . "$SAMOHOST_MIGRATE_ENV_FILE"; set +a; export ${splitLayout.dbVars.join(" ")}; fi && cd "$SAMOHOST_APP_DIR" && ${app.migrateCmd}); then`
+          ? `if (if [[ "$SAMOHOST_RELEASE_MODEL" == 1 ]]; then sudo "$SAMOHOST_STEP" migrate; else (if [[ -f "$SAMOHOST_MIGRATE_ENV_FILE" ]]; then set -a; . "$SAMOHOST_MIGRATE_ENV_FILE"; set +a; export ${splitLayout.dbVars.join(" ")}; fi && cd "$SAMOHOST_APP_DIR" && ${app.migrateCmd}); fi); then`
           : `if (cd "$SAMOHOST_APP_DIR" && ${app.migrateCmd}); then`,
         `  ${marker("migrate", "ok")}`,
         "else",
@@ -780,29 +853,31 @@ export function buildDeployScript(app: AppRecord, target: DeployTarget): string 
       );
     }
 
+    // ----- release (build model) ------------------------------------------------
+    if (splitLayout !== undefined) {
+      push(
+        "# --- release (build model): root copies the build into a release folder and",
+        "# switches the current link the service runs from ---",
+        'if [[ "$SAMOHOST_RELEASE_MODEL" == 1 ]]; then',
+        `  ${marker("release", "start")}`,
+        '  if sudo "$SAMOHOST_STEP" release; then',
+        "    SAMOHOST_RELEASE_SWITCHED=1",
+        `    ${marker("release", "ok")}`,
+        "  else",
+        `    ${marker("release", "fail")}`,
+        '    if [[ "$SAMOHOST_HAS_PREVIOUS_RELEASE" == "1" ]]; then rollback before-restart; fi',
+        "    exit 1",
+        "  fi",
+        "fi",
+        "",
+      );
+    }
+
     // ----- restart -----------------------------------------------------------
     // Full-path sudo systemctl, mandatory. See header note (3).
     if (releaseEnvFile !== undefined) {
       push(
-        "# --- release env: tag and sha for the running service (unit EnvironmentFile=-) ---",
-        "# No secret is written here. The previous content is kept in a variable for",
-        "# rollback. A failed write is a warning, not a failure: units written before",
-        "# this file existed do not load it, and the release runs without the values.",
-        `SAMOHOST_RELEASE_ENV_FILE=${sq(releaseEnvFile)}`,
-        "SAMOHOST_RELEASE_ENV_HAD_PREVIOUS=0",
-        'SAMOHOST_RELEASE_ENV_PREVIOUS=""',
-        'if [[ -f "$SAMOHOST_RELEASE_ENV_FILE" ]] && SAMOHOST_RELEASE_ENV_PREVIOUS="$(cat "$SAMOHOST_RELEASE_ENV_FILE")"; then SAMOHOST_RELEASE_ENV_HAD_PREVIOUS=1; fi',
-        "SAMOHOST_RELEASE_ENV_WRITTEN=0",
-        "# split layout: the env file's directory is root-owned; the exact sudo tee rule writes the file.",
-        'if [[ -f "$SAMOHOST_MIGRATE_ENV_FILE" ]]; then',
-        '  if printf \'SAMO_RELEASE_TAG=%s\\nSAMO_RELEASE_SHA=%s\\n\' "$SAMO_RELEASE_TAG" "$SAMO_RELEASE_SHA" | sudo /usr/bin/tee "$SAMOHOST_RELEASE_ENV_FILE" >/dev/null; then SAMOHOST_RELEASE_ENV_WRITTEN=1; fi',
-        'elif printf \'SAMO_RELEASE_TAG=%s\\nSAMO_RELEASE_SHA=%s\\n\' "$SAMO_RELEASE_TAG" "$SAMO_RELEASE_SHA" 2>/dev/null > "${SAMOHOST_RELEASE_ENV_FILE}.next" && chmod 0644 "${SAMOHOST_RELEASE_ENV_FILE}.next" && mv -f "${SAMOHOST_RELEASE_ENV_FILE}.next" "$SAMOHOST_RELEASE_ENV_FILE"; then',
-        "  SAMOHOST_RELEASE_ENV_WRITTEN=1",
-        "fi",
-        'if [[ "$SAMOHOST_RELEASE_ENV_WRITTEN" != "1" ]]; then',
-        '  rm -f "${SAMOHOST_RELEASE_ENV_FILE}.next" 2>/dev/null || true',
-        '  echo "WARNING: could not write the release env file $SAMOHOST_RELEASE_ENV_FILE; the service starts without SAMO_RELEASE_TAG and SAMO_RELEASE_SHA" >&2',
-        "fi",
+        'if [[ "${SAMOHOST_RELEASE_MODEL:-0}" != 1 ]]; then samohost_write_release_env; fi',
         "",
       );
     }
@@ -906,7 +981,7 @@ export function buildDeployScript(app: AppRecord, target: DeployTarget): string 
         "# subshell + cd: always runs from the app dir, whatever earlier commands cd'd into (issue #122).",
         marker("seed", "start"),
         splitLayout !== undefined
-          ? `if (if [[ -f "$SAMOHOST_MIGRATE_ENV_FILE" ]]; then set -a; . "$SAMOHOST_MIGRATE_ENV_FILE"; set +a; export ${splitLayout.dbVars.join(" ")}; fi && cd "$SAMOHOST_APP_DIR" && ${app.seedCmd}); then`
+          ? `if (if [[ "$SAMOHOST_RELEASE_MODEL" == 1 ]]; then sudo "$SAMOHOST_STEP" seed; else (if [[ -f "$SAMOHOST_MIGRATE_ENV_FILE" ]]; then set -a; . "$SAMOHOST_MIGRATE_ENV_FILE"; set +a; export ${splitLayout.dbVars.join(" ")}; fi && cd "$SAMOHOST_APP_DIR" && ${app.seedCmd}); fi); then`
           : `if (cd "$SAMOHOST_APP_DIR" && ${app.seedCmd}); then`,
         `  ${marker("seed", "ok")}`,
         "else",

@@ -47,6 +47,7 @@ const VALID_PHASES = new Set<PhaseName>([
   "install",
   "build",
   "migrate",
+  "release",
   "restart",
   "health",
   "assert-rls",

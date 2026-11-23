@@ -1,0 +1,132 @@
+/**
+ * Deploy in the build model (new layout with the root-owned step script on
+ * the server): the deploy user fetches and resets the checkout, then runs
+ * install, build, migrate, release and seed through `sudo <step script>`.
+ * It runs no npm or app command itself. Rollback switches the release link
+ * back. Without the step script the deploy keeps its previous behaviour.
+ */
+
+import { describe, expect, test } from "bun:test";
+import { chmodSync, existsSync, mkdirSync, readFileSync, symlinkSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
+import { buildDeployScript } from "../src/app/script.ts";
+import { nodeApp } from "./bootstrap-db-harness.ts";
+import { makeDeploySandbox } from "./node-deploy-harness.ts";
+
+const SHA = "5555555555555555555555555555555555555555";
+const STEP = "/usr/local/lib/samohost/apps/shop/step";
+
+function setup(o: { healthCode?: string; failStep?: string; withStep?: boolean; previousRelease?: boolean; seed?: boolean } = {}) {
+  const sb = makeDeploySandbox({ healthCode: o.healthCode ?? "200" });
+  writeFileSync(sb.envFile, "PORT=3100\nAPP_DATABASE_URL=postgresql://shop_app:0a0b@127.0.0.1:5432/shop\n");
+  writeFileSync(sb.migrateEnvFile, "DATABASE_URL=postgresql://shop_owner:0c0d@127.0.0.1:5432/shop\n");
+  const stepLog = join(sb.dir, "steps.log");
+  const step = join(sb.dir, "step");
+  if (o.withStep !== false) {
+    writeFileSync(step, [
+      "#!/usr/bin/env bash",
+      `printf '%s\\n' "$1" >> ${JSON.stringify(stepLog)}`,
+      ...(o.failStep !== undefined ? [`if [[ "$1" == ${o.failStep} ]]; then exit 1; fi`] : []),
+      `if [[ "$1" == release ]]; then mkdir -p ${JSON.stringify(join(sb.dir, "releases", "new"))}; rm -f ${JSON.stringify(join(sb.dir, "current"))}; ln -s releases/new ${JSON.stringify(join(sb.dir, "current"))}; fi`,
+      "exit 0",
+    ].join("\n") + "\n");
+    chmodSync(step, 0o755);
+  }
+  if (o.previousRelease) {
+    mkdirSync(join(sb.dir, "releases", "old"), { recursive: true });
+    symlinkSync("releases/old", join(sb.dir, "current"));
+  }
+  const app = nodeApp({ appDir: sb.appDir, envFile: sb.envFile, ...(o.seed ? { seedCmd: "npm run seed" } : {}) });
+  const text = buildDeployScript(app, { sha: SHA, tag: "v20261123.1" }).replaceAll(STEP, step);
+  const res = sb.run(text);
+  const steps = existsSync(stepLog) ? readFileSync(stepLog, "utf8").trim().split("\n") : [];
+  const sudo = existsSync(sb.sudoLog) ? readFileSync(sb.sudoLog, "utf8") : "";
+  return { sb, res, steps, sudo, text };
+}
+
+describe("deploy: build model", () => {
+  test("healthy deploy: the steps in order, no npm run by the deploy user, cleanup at the end", () => {
+    const r = setup({ previousRelease: true });
+    try {
+      expect(r.res.status, r.res.stderr).toBe(0);
+      expect(r.steps).toEqual(["install", "build", "migrate", "release", "cleanup"]);
+      expect(r.sb.npmCalls()).toEqual([]);
+      expect(r.sudo).toContain("/usr/bin/systemctl restart shop");
+      expect(r.res.stdout).toContain("<<<SAMOHOST_PHASE:release:ok>>>");
+    } finally {
+      r.sb.cleanup();
+    }
+  });
+
+  test("release.env is written before install, so the build sees the release tag", () => {
+    const r = setup();
+    try {
+      expect(r.res.status, r.res.stderr).toBe(0);
+      const lines = r.sudo.split("\n");
+      const tee = lines.findIndex((l) => l.startsWith("/usr/bin/tee ") && l.endsWith("release.env"));
+      const install = lines.findIndex((l) => l.endsWith("/step install"));
+      expect(tee).toBeGreaterThanOrEqual(0);
+      expect(tee).toBeLessThan(install);
+      expect(readFileSync(join(r.sb.dir, "release.env"), "utf8")).toBe(`SAMO_RELEASE_TAG=v20261123.1\nSAMO_RELEASE_SHA=${SHA}\n`);
+    } finally {
+      r.sb.cleanup();
+    }
+  });
+
+  test("build fails with a previous release: no release switch, no restart, release.env restored", () => {
+    const r = setup({ failStep: "build", previousRelease: true });
+    try {
+      expect(r.res.status).toBe(1);
+      expect(r.steps).toEqual(["install", "build", "cleanup"]);
+      expect(r.sudo).not.toContain("systemctl restart");
+      expect(r.res.stdout).toContain("<<<SAMOHOST_PHASE:rollback:ok>>>");
+      expect(readFileSync(join(r.sb.dir, "release.env"), "utf8")).toBe("");
+    } finally {
+      r.sb.cleanup();
+    }
+  });
+
+  test("health fails after the release: the step script switches current back, the service restarts", () => {
+    const r = setup({ healthCode: "500", previousRelease: true });
+    try {
+      expect(r.res.status).toBe(1);
+      expect(r.steps).toEqual(["install", "build", "migrate", "release", "rollback", "cleanup"]);
+      expect(r.sudo.split("\n").filter((l) => l === "/usr/bin/systemctl restart shop").length).toBe(2);
+    } finally {
+      r.sb.cleanup();
+    }
+  });
+
+  test("seed runs through the step script after a healthy deploy", () => {
+    const r = setup({ seed: true });
+    try {
+      expect(r.res.status, r.res.stderr).toBe(0);
+      expect(r.steps).toEqual(["install", "build", "migrate", "release", "seed", "cleanup"]);
+    } finally {
+      r.sb.cleanup();
+    }
+  });
+
+  test("the checkout is made readable for the build user before install", () => {
+    const { text, sb } = setup();
+    try {
+      const repair = text.indexOf('find "$SAMOHOST_APP_DIR" -path "$SAMOHOST_APP_DIR/.git" -prune -o ! -type l -exec chmod go+rX {} +');
+      const install = text.indexOf('sudo "$SAMOHOST_STEP" install');
+      expect(repair).toBeGreaterThan(0);
+      expect(repair).toBeLessThan(install);
+    } finally {
+      sb.cleanup();
+    }
+  });
+
+  test("no step script on the server (older new-layout bootstrap): npm runs as before, no step calls", () => {
+    const r = setup({ withStep: false });
+    try {
+      expect(r.res.status, r.res.stderr).toBe(0);
+      expect(r.steps).toEqual([]);
+      expect(r.sb.npmCalls().map((c) => c.args)).toContain("ci --include=dev");
+    } finally {
+      r.sb.cleanup();
+    }
+  });
+});
