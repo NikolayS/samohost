@@ -82,6 +82,14 @@ export interface PrPreviewSummary {
    * When set, results is always [] (no reap, no creates — fail-closed).
    */
   listError?: string;
+  /**
+   * Set when the pass created and redeployed no preview for this app on
+   * purpose, with the reason. `new-layout`: a node app whose server shows the
+   * split layout (separate database roles, runtime user <app>-run); previews
+   * of such apps are not supported yet. openPrs still counts the open PRs;
+   * results then holds no entry for them.
+   */
+  skipped?: { reason: "new-layout"; detail: string };
 }
 
 /** Return value of ensurePreview. */

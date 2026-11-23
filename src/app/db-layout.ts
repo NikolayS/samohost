@@ -101,3 +101,31 @@ export function splitLayoutPathError(appBase: string, envFile: string, appDir: s
   }
   return undefined;
 }
+
+/**
+ * Read-only check of the layout marker that bootstrap writes once a node app
+ * has the split layout (`/var/lib/samohost/db-layout/<app>`, root-owned, 644,
+ * content `split`). Prints `SAMOHOST_DB_LAYOUT=split` when the marker says
+ * so and `SAMOHOST_DB_LAYOUT=other` otherwise, including when the file is
+ * missing or cannot be read. Runs as the server's operator user; needs no
+ * sudo.
+ */
+export function layoutProbeScript(appName: string): string {
+  if (!/^[a-z][a-z0-9-]*$/.test(appName)) {
+    throw new Error(`invalid app name for the layout probe: ${JSON.stringify(appName)}`);
+  }
+  return [
+    "#!/usr/bin/env bash",
+    `if [ "$(cat '/var/lib/samohost/db-layout/${appName}' 2>/dev/null)" = split ]; then`,
+    "  echo SAMOHOST_DB_LAYOUT=split",
+    "else",
+    "  echo SAMOHOST_DB_LAYOUT=other",
+    "fi",
+    "",
+  ].join("\n");
+}
+
+/** True only when the probe ran (exit 0) and printed the split line. */
+export function probeSaysSplit(code: number, stdout: string): boolean {
+  return code === 0 && stdout.split("\n").some((l) => l.trim() === "SAMOHOST_DB_LAYOUT=split");
+}

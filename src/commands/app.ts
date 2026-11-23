@@ -349,16 +349,24 @@ export function runAppRegister(
   };
 
   const existing = appStore.get(vm.id, input.name);
+  // A register that changes the serve kind (static to node or back) starts a
+  // new deploy history: the deployed and failed commits, the release tag
+  // cursor and its initialized flag of the old kind are dropped. A failed
+  // static deploy of a commit says nothing about a node deploy of it, and a
+  // static deployedSha would make `trigger run` report the first node release
+  // as up-to-date or baseline it instead of deploying it.
+  const sameKind = existing !== undefined && (existing.kind ?? "node") === (input.kind ?? "node");
+  const kept = sameKind ? existing : undefined;
   const record: AppRecord = {
     ...spec,
     id: existing?.id ?? crypto.randomUUID(),
     vmId: vm.id,
     // Preserve deploy bookkeeping across a re-register of the same app.
-    ...(existing?.deployedSha !== undefined
-      ? { deployedSha: existing.deployedSha }
+    ...(kept?.deployedSha !== undefined
+      ? { deployedSha: kept.deployedSha }
       : {}),
-    ...(existing?.failedSha !== undefined
-      ? { failedSha: existing.failedSha }
+    ...(kept?.failedSha !== undefined
+      ? { failedSha: kept.failedSha }
       : {}),
     ...(existing?.lastDeployAt !== undefined
       ? { lastDeployAt: existing.lastDeployAt }
@@ -368,16 +376,16 @@ export function runAppRegister(
     ...(existing?.generatorSha !== undefined
       ? { generatorSha: existing.generatorSha }
       : {}),
-    ...(existing?.releaseTagPattern === input.releaseTagPattern &&
-    existing?.releaseTagFormat === input.releaseTagFormat &&
-    existing?.releaseCiWorkflow === input.releaseCiWorkflow &&
-    existing?.releaseTagCursor !== undefined
-      ? { releaseTagCursor: existing.releaseTagCursor }
+    ...(kept?.releaseTagPattern === input.releaseTagPattern &&
+    kept?.releaseTagFormat === input.releaseTagFormat &&
+    kept?.releaseCiWorkflow === input.releaseCiWorkflow &&
+    kept?.releaseTagCursor !== undefined
+      ? { releaseTagCursor: kept.releaseTagCursor }
       : {}),
-    ...(existing?.releaseTagPattern === input.releaseTagPattern &&
-    existing?.releaseTagFormat === input.releaseTagFormat &&
-    existing?.releaseCiWorkflow === input.releaseCiWorkflow &&
-    existing?.releaseTagChannelInitialized === true
+    ...(kept?.releaseTagPattern === input.releaseTagPattern &&
+    kept?.releaseTagFormat === input.releaseTagFormat &&
+    kept?.releaseCiWorkflow === input.releaseCiWorkflow &&
+    kept?.releaseTagChannelInitialized === true
       ? { releaseTagChannelInitialized: true }
       : {}),
   };
