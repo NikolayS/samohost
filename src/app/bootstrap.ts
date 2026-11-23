@@ -602,6 +602,21 @@ export function buildHostBootstrapScript(
       `fi`,
       "",
     );
+    // The new layout limits the deploy user to the rules in ${sudoersFile}.
+    // Another sudoers.d file that names the user (rule, Defaults:<user>, alias
+    // member, %<user>) would give it more; stop and name the file.
+    push(
+      `if [[ "$SAMOHOST_DB_LAYOUT" == split ]]; then`,
+      `  for _f in /etc/sudoers.d/*; do`,
+      `    if [[ ! -f "$_f" || "$_f" == ${sq(sudoersFile)} ]]; then continue; fi`,
+      `    if grep -Eq ${sq(`^[^#]*(^|[[:space:],=():!%])${appUser}([[:space:],=():]|$)`)} "$_f"; then`,
+      `      echo "ERROR: $_f names the deploy user ${appUser}; a new-layout app needs a deploy user that no other sudo rule names. Use another deploy user for this app, or remove ${appUser} from that file." >&2`,
+      `      exit 1`,
+      `    fi`,
+      `  done`,
+      `fi`,
+      "",
+    );
     // §5 makes appBase root-owned and the env files sit next to the env file:
     // other paths are refused in the split layout (the legacy layout continues).
     const pathError = splitLayoutPathError(appBase, envFile, appDir);

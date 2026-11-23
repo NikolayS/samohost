@@ -327,6 +327,10 @@ keep the legacy layout get the same sudo rules and unit as before.
   `uploads`, `migrate.env`, `release.env`, `git-safe.conf` or `.gh-token`.
   Bootstrap stops with an error for other paths when it finds the new
   layout. `migrate.env` and `release.env` are then always this app's files.
+- The deploy user must be unique to the app: bootstrap stops in the new
+  layout when a file in `/etc/sudoers.d` other than `<app>-agent` names
+  it (as the user of a rule, in `Defaults:<user>`, in a user alias, or
+  as `%<user>`). The message names the file.
 - Caddy's admin API listens on the unix socket `/var/lib/caddy/admin.sock`
   instead of TCP `localhost:2019`. Caddy creates the socket with mode 0200,
   so only the caddy user and root can use it. The first bootstrap that
