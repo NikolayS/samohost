@@ -277,15 +277,95 @@ if [[ -z "$RLS_URL" ]]; then
   echo "assert-rls: neither RLS_DATABASE_URL nor DATABASE_URL is set in the deploy environment" >&2
   rollback
 fi
-# The address is passed to psql in PG* variables, not as an argument (ps shows
-# arguments). Only postgresql://user:password@host[:port]/db URLs are accepted.
+# The password goes to psql in PGPASSWORD, not as an argument (ps shows arguments).
+samohost_pct_decode() {
+  local s="$1" c h
+  samohost_pct_out=""
+  while [[ -n "$s" ]]; do
+    c="${s:0:1}"
+    if [[ "$c" == "%" ]]; then
+      h="${s:1:2}"
+      case "$h" in
+        00) ;;
+        [0123456789ABCDEFabcdef][0123456789ABCDEFabcdef])
+          printf -v c "\\x$h"
+          samohost_pct_out+="$c"; s="${s:3}"; continue ;;
+      esac
+    fi
+    samohost_pct_out+="$c"; s="${s:1}"
+  done
+}
+samohost_pg_split() {
+  local a="$1" rest userspec user base q kv sep start k v c
+  samohost_pg_conn=""; samohost_pg_pw=""
+  case "$a" in
+    postgresql://*|postgres://*)
+      rest="${a#*://}"
+      userspec="${rest%%[@/]*}"
+      user=""
+      if [[ "${rest:${#userspec}:1}" == "@" ]]; then
+        rest="${rest:${#userspec}+1}"
+        user="${userspec%%:*}"
+        if [[ "$userspec" == *:* ]]; then samohost_pct_decode "${userspec#*:}"; samohost_pg_pw="$samohost_pct_out"; fi
+        if [[ -n "$user" ]]; then user="$user@"; fi
+      fi
+      base="${rest%%[?]*}"
+      if [[ "$rest" == *[?]* ]]; then
+        q="${rest#*[?]}&"; sep="?"
+        while [[ -n "$q" ]]; do
+          kv="${q%%&*}"; q="${q#*&}"
+          samohost_pct_decode "${kv%%=*}"
+          if [[ "$samohost_pct_out" == password && "$kv" == *=* ]]; then
+            samohost_pct_decode "${kv#*=}"; samohost_pg_pw="$samohost_pct_out"
+          else
+            base="$base$sep$kv"; sep="&"
+          fi
+        done
+      fi
+      samohost_pg_conn="${a%%://*}://$user$base"
+      ;;
+    *=*)
+      rest="$a"
+      while :; do
+        rest="${rest#"${rest%%[![:space:]]*}"}"
+        if [[ -z "$rest" ]]; then break; fi
+        start="$rest"
+        k="${rest%%[=[:space:]]*}"
+        rest="${rest:${#k}}"; rest="${rest#"${rest%%[![:space:]]*}"}"
+        if [[ -z "$k" || "${rest:0:1}" != "=" ]]; then return 1; fi
+        rest="${rest:1}"; rest="${rest#"${rest%%[![:space:]]*}"}"
+        v=""
+        if [[ "${rest:0:1}" == "'" ]]; then
+          rest="${rest:1}"
+          while :; do
+            if [[ -z "$rest" ]]; then return 1; fi
+            c="${rest:0:1}"; rest="${rest:1}"
+            if [[ "$c" == "'" ]]; then break; fi
+            if [[ "$c" == "\\" ]]; then c="${rest:0:1}"; rest="${rest:1}"; fi
+            v="$v$c"
+          done
+        else
+          while [[ -n "$rest" ]]; do
+            c="${rest:0:1}"
+            if [[ "$c" == [[:space:]] ]]; then break; fi
+            rest="${rest:1}"
+            if [[ "$c" == "\\" ]]; then c="${rest:0:1}"; rest="${rest:1}"; fi
+            v="$v$c"
+          done
+        fi
+        if [[ "$k" == password ]]; then samohost_pg_pw="$v"; else samohost_pg_conn="$samohost_pg_conn ${start:0:${#start}-${#rest}}"; fi
+      done
+      samohost_pg_conn="${samohost_pg_conn# }"
+      ;;
+    *) samohost_pg_conn="$a" ;;
+  esac
+}
 rls_result=CONNECTION_FAILED
-if [[ "$RLS_URL" =~ ^postgres(ql)?://([^:@/?#]+)(:([^@/?#]*))?@([^:@/?#]+)(:([0-9]+))?/([^?#]+) ]]; then
-  rls_pw="$(printf '%b' "${BASH_REMATCH[4]//%/\x}")"
-  rls_result=$(PGHOST="${BASH_REMATCH[5]}" PGPORT="${BASH_REMATCH[7]:-5432}" PGUSER="${BASH_REMATCH[2]}" PGPASSWORD="$rls_pw" PGDATABASE="${BASH_REMATCH[8]}" psql -X -w -tAc "SELECT rolsuper FROM pg_catalog.pg_roles WHERE rolname = current_user" 2>&1 || echo CONNECTION_FAILED)
-  unset rls_pw
+if samohost_pg_split "$RLS_URL"; then
+  rls_result=$(if [[ -n "$samohost_pg_pw" ]]; then export PGPASSWORD="$samohost_pg_pw"; fi; psql -X -w -tA -d "$samohost_pg_conn" -c "SELECT rolsuper FROM pg_catalog.pg_roles WHERE rolname = current_user" 2>&1 || echo CONNECTION_FAILED)
+  samohost_pg_pw=""
 else
-  echo "assert-rls: the database address is not a postgresql://user:password@host/db URL" >&2
+  echo "assert-rls: the database address has a quoted value without its closing quote" >&2
 fi
 if [[ "$rls_result" == "f" ]]; then
   echo "<<<SAMOHOST_PHASE:assert-rls:ok>>>"

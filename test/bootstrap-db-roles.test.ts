@@ -117,20 +117,44 @@ describe("bootstrap — app database role (executed with stubs)", () => {
     }
   });
 
-  test("an existing placeholder URL is replaced by a real role", () => {
+  test("legacy layout: the placeholder URL is kept and no app role is created", () => {
     const sb = makeSandbox();
     try {
+      const placeholder = "APP_DATABASE_URL=postgresql://app_user:app_password@127.0.0.1:5432/shop";
       writeFileSync(
         join(sb.dir, "staging.env"),
-        "DATABASE_URL=postgresql://postgres:abc@127.0.0.1:5432/shop\n" +
-          "APP_DATABASE_URL=postgresql://app_user:app_password@127.0.0.1:5432/shop\n",
+        `DATABASE_URL=postgresql://postgres:abc@127.0.0.1:5432/shop\n${placeholder}\n`,
       );
       const script = sandboxScript(join(sb.dir, "staging.env"));
       const res = runSection(sb, dbSection(script));
-      expect(res.status).toBe(0);
+      expect(res.status, res.stderr).toBe(0);
       const env = readFileSync(join(sb.dir, "staging.env"), "utf8");
-      expect(env).not.toContain("app_password");
-      expect(env).toMatch(/^APP_DATABASE_URL=postgresql:\/\/shop_app:[0-9a-f]{48}@/m);
+      expect(env).toContain(placeholder);
+      expect(env).not.toContain("shop_app");
+      expect(readOr(sb.sqlLog)).not.toMatch(/ROLE[^\n]*shop_app/);
+    } finally {
+      sb.cleanup();
+    }
+  });
+
+  test("legacy layout: a superuser password that is not hex stops the run in §3b, before §4", () => {
+    const sb = makeSandbox();
+    try {
+      const body = "DATABASE_URL=postgresql://postgres:not-hex@127.0.0.1:5432/shop\n";
+      writeFileSync(join(sb.dir, "staging.env"), body);
+      const script = sandboxScript(join(sb.dir, "staging.env"));
+      const res = runSection(sb, dbSection(script));
+      expect(res.status).toBe(1);
+      expect(res.stderr).toContain("bootstrap changed nothing");
+      expect(readFileSync(join(sb.dir, "staging.env"), "utf8")).toBe(body);
+      expect(readOr(sb.sqlLog)).toBe("");
+      // The check is rendered before the first section that writes sudo rules,
+      // the unit or the Caddyfile.
+      const lines = script.split("\n");
+      const check = lines.findIndex((l) => l.includes("bootstrap changed nothing"));
+      expect(check).toBeGreaterThan(lines.findIndex((l) => l.startsWith("# §3b.")));
+      expect(check).toBeLessThan(lines.findIndex((l) => l.startsWith("# §4.")));
+      expect(script).not.toContain("generated new superuser password");
     } finally {
       sb.cleanup();
     }

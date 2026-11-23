@@ -85,7 +85,7 @@ describe("buildDeployScript hard-won behaviors", () => {
     expect(script).not.toContain("DATABASE_URL=");
     // The assert-rls probe passes the password to psql in PGPASSWORD, from a
     // variable parsed out of the env file at run time; never a literal value.
-    expect(script).not.toMatch(/PGPASSWORD=(?!"\$rls_pw" )/);
+    expect(script).not.toMatch(/PGPASSWORD=(?!"\$samohost_pg_pw")/);
     // Issue #2 (bug 1): the env file IS now sourced (read-only) so migrate/
     // seed/probes get the app environment — but it must never be WRITTEN:
     // no append-redirect, no in-place edit, no DEPLOYED_SHA bookkeeping in it.

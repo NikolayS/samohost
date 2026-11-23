@@ -51,6 +51,7 @@ import {
 import { staticMainVhostLines } from "./heal-script.ts";
 import { databaseUrlVarsOf, migrateEnvFileOf, releaseEnvFileOf } from "./db-layout.ts";
 import { buildModelPaths, buildStepScriptPath } from "./build-steps.ts";
+import { PG_CONNINFO_BASH } from "./pg-conninfo.ts";
 
 /** Marker prefix the parser keys on. */
 export const PHASE_PREFIX = "<<<SAMOHOST_PHASE:";
@@ -984,17 +985,19 @@ export function buildDeployScript(app: AppRecord, target: DeployTarget): string 
         "# --- assert-rls: app must connect as a non-superuser (RLS not bypassed) ---",
         marker("assert-rls", "start"),
         ...rlsLookup,
-        // The URL is split into PG* variables so that the password is not a
-        // process argument (visible in ps). Probe returns 'f' for non-superuser.
-        "# The address is passed to psql in PG* variables, not as an argument (ps shows",
-        "# arguments). Only postgresql://user:password@host[:port]/db URLs are accepted.",
+        // The password is taken out of the address and passed in PGPASSWORD, so
+        // that it is not a process argument (ps shows arguments to every user);
+        // the rest of the address goes to psql -d unchanged, so every form psql
+        // accepts as its database argument still works (src/app/pg-conninfo.ts).
+        // Probe returns 'f' for non-superuser.
+        "# The password goes to psql in PGPASSWORD, not as an argument (ps shows arguments).",
+        ...PG_CONNINFO_BASH,
         "rls_result=CONNECTION_FAILED",
-        'if [[ "$RLS_URL" =~ ^postgres(ql)?://([^:@/?#]+)(:([^@/?#]*))?@([^:@/?#]+)(:([0-9]+))?/([^?#]+) ]]; then',
-        '  rls_pw="$(printf \'%b\' "${BASH_REMATCH[4]//%/\\x}")"',
-        '  rls_result=$(PGHOST="${BASH_REMATCH[5]}" PGPORT="${BASH_REMATCH[7]:-5432}" PGUSER="${BASH_REMATCH[2]}" PGPASSWORD="$rls_pw" PGDATABASE="${BASH_REMATCH[8]}" psql -X -w -tAc "SELECT rolsuper FROM pg_catalog.pg_roles WHERE rolname = current_user" 2>&1 || echo CONNECTION_FAILED)',
-        "  unset rls_pw",
+        'if samohost_pg_split "$RLS_URL"; then',
+        '  rls_result=$(if [[ -n "$samohost_pg_pw" ]]; then export PGPASSWORD="$samohost_pg_pw"; fi; psql -X -w -tA -d "$samohost_pg_conn" -c "SELECT rolsuper FROM pg_catalog.pg_roles WHERE rolname = current_user" 2>&1 || echo CONNECTION_FAILED)',
+        '  samohost_pg_pw=""',
         "else",
-        '  echo "assert-rls: the database address is not a postgresql://user:password@host/db URL" >&2',
+        '  echo "assert-rls: the database address has a quoted value without its closing quote" >&2',
         "fi",
         'if [[ "$rls_result" == "f" ]]; then',
         `  ${marker("assert-rls", "ok")}`,

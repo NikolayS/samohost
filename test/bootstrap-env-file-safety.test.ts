@@ -69,7 +69,7 @@ describe("legacy layout: reused superuser password", () => {
       writeFileSync(envFile, "DATABASE_URL=postgresql://postgres:x$pgpw$;DROP@127.0.0.1:5432/shop\n");
       const res = run();
       expect(res.status).toBe(1);
-      expect(res.stderr).toContain("not a hex value");
+      expect(res.stderr).toContain("is not a postgres superuser address with a hex password");
       expect(readOr(sb.sqlLog)).not.toContain("ALTER ROLE postgres");
     } finally {
       sb.cleanup();
