@@ -500,7 +500,8 @@ Who runs what:
 
 - root: `app bootstrap` (the operator over SSH with sudo); the step script,
   which the deploy user starts through sudo. The step script runs as root
-  for `release`, `rollback` and `cleanup`, and starts the other steps as
+  for `rollback`, `cleanup` and the owner and mode changes of `release`,
+  and starts install, build, migrate, seed and the release copy as
   transient systemd services (`systemd-run`) that run as `<app>-build`.
   systemd (PID 1) reads the env files for the units.
 - the deploy user `<app>`: the SSH login of samohost for this app. It runs
