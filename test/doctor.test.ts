@@ -1434,3 +1434,63 @@ describe("20. split-layout node app: rls-nonsuperuser probe and cp-http80 caddy-
     expect(r.psqlArgs).not.toContain("pw@");
   });
 });
+
+// ===========================================================================
+// 21. An app that has never been deployed in its current kind (no
+//     deployedSha in its record) has nothing serving its health address yet.
+//     app-health is then reported as unknown with the detail "the app has not
+//     been deployed yet", not as a failure. With deployedSha the check is
+//     evaluated as before.
+// ===========================================================================
+describe("21. app-health for an app that has never been deployed", () => {
+  const VM_ID = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+
+  async function doctorJson(app: AppRecord, overrides: Record<string, string>) {
+    store.upsert(rec());
+    appStore.upsert(app);
+    const c = capture();
+    const code = await runDoctor({ target: "test-vm", infra: false }, { json: true }, store, appStore, c.out, c.err,
+      makePassRunner(overrides));
+    const parsed = JSON.parse(c.o);
+    const row = parsed.checks.find((r: { id: string }) => r.id === "app-health");
+    return { code, row };
+  }
+
+  test("node app without deployedSha, health 000 → unknown with the not-deployed detail, exit 0", async () => {
+    const { code, row } = await doctorJson(appRec(VM_ID, { kind: "node" }), { "app-health": "000" });
+    expect(row.status).toBe("unknown");
+    expect(row.stderr).toBe("the app has not been deployed yet");
+    expect(code).toBe(0);
+  });
+
+  test("static cp-http80 app without deployedSha, health 000 → unknown", async () => {
+    const { row } = await doctorJson(
+      appRec(VM_ID, { kind: "static", mainListen: "cp-http80", healthUrl: "http://127.0.0.1:4100/index.html" }),
+      { "app-health": "000" },
+    );
+    expect(row.status).toBe("unknown");
+    expect(row.stderr).toBe("the app has not been deployed yet");
+  });
+
+  test("deployed app (deployedSha set), health 000 → fail, exit 1", async () => {
+    const { code, row } = await doctorJson(appRec(VM_ID, { kind: "node", deployedSha: "a".repeat(40) }), { "app-health": "000" });
+    expect(row.status).toBe("fail");
+    expect(code).toBe(1);
+  });
+
+  test("deployed app, health 200 → pass", async () => {
+    const { row } = await doctorJson(appRec(VM_ID, { kind: "node", deployedSha: "a".repeat(40) }), { "app-health": "200" });
+    expect(row.status).toBe("pass");
+  });
+
+  test("human output names the reason instead of the needs-root note", async () => {
+    store.upsert(rec());
+    appStore.upsert(appRec(VM_ID, { kind: "node" }));
+    const c = capture();
+    await runDoctor({ target: "test-vm", infra: false }, { json: false }, store, appStore, c.out, c.err,
+      makePassRunner({ "app-health": "000" }));
+    const line = c.o.split("\n").find((l) => l.includes("app-health")) ?? "";
+    expect(line).toContain("the app has not been deployed yet");
+    expect(line).not.toContain("probe needs root");
+  });
+});

@@ -418,6 +418,9 @@ export function parseDarkDbOutput(
 // Evaluate a single DoctorCheck against its observed output.
 // ---------------------------------------------------------------------------
 
+/** Detail of app-health for an app that has no deployedSha. */
+export const APP_NOT_DEPLOYED = "the app has not been deployed yet";
+
 function evaluateDoctorCheck(
   check: DoctorCheck,
   observed: string | undefined,
@@ -436,6 +439,20 @@ function evaluateDoctorCheck(
       status: "skip",
       stdout: "",
       stderr: "",
+    };
+  }
+
+  // An app with no deployedSha has never been deployed in its current kind
+  // (register with another kind drops it), so nothing serves its health
+  // address yet: its health cannot be judged.
+  if (check.id === "app-health" && app !== undefined && !app.deployedSha) {
+    return {
+      id: check.id,
+      description: check.description,
+      group: check.group,
+      status: "unknown",
+      stdout: observed ?? "",
+      stderr: APP_NOT_DEPLOYED,
     };
   }
 
@@ -585,7 +602,9 @@ function formatDoctor(results: DoctorResult[]): string {
     for (const r of groupResults) {
       let line = `${STATUS_LABEL[r.status]}  ${r.id}  ${r.description}`;
       if (r.status === "unknown") {
-        line += "  (probe needs root — not verifiable as this user)";
+        line += r.stderr === APP_NOT_DEPLOYED
+          ? `  (${APP_NOT_DEPLOYED})`
+          : "  (probe needs root — not verifiable as this user)";
       }
       if (r.status === "skip") {
         line += "  n/a (infra mode / no app)";
