@@ -314,11 +314,17 @@ deploy. A failure in install, build, migrate or the release step leaves
 `current` unchanged; the deploy restores `release.env` and checks health
 without a restart. A failure after the release step switched `current`
 switches it back to `previous` (`step rollback`), restores `release.env`,
-restarts the service and checks health again. When there is no previous
-release (a first deploy), or `step rollback` fails (for example because the
-previous release no longer exists), the deploy stops the service instead of
-leaving the failing release running; the outcome is `stopped` and the
-commit is recorded as failed.
+restarts the service and checks health again. When this fails, the deploy
+stops the service instead of leaving the failing release running; the
+outcome is `stopped` and the commit is recorded as failed:
+
+- no previous release (a first deploy): `step rollback` removes the
+  `current` link. The unit stays enabled; a restart or a reboot leaves it
+  failed (its working directory does not exist) until the next successful
+  deploy. The next release does not keep the failed one as `previous`.
+- `step rollback` fails with a previous release present (for example
+  because its folder no longer exists): `current` still names the failed
+  release, and the message says so.
 
 Migrations that already ran are not undone, in either case. `node_modules`
 is not restored. The previous release must therefore work with the new
@@ -338,8 +344,12 @@ keep the legacy layout get the same sudo rules and unit as before.
   root-owned release in `/opt/<app>/current` through its group; before the
   build model (servers without the step script) it read the checkout,
   `node_modules` and `dist/` through their world-read bit. It can write
-  `/opt/<app>/uploads` and its private `/tmp` and `/var/tmp`
-  (`PrivateTmp`), nothing else. systemd reads `EnvironmentFile=` files before it
+  `/opt/<app>/uploads`, its private `/tmp` and `/var/tmp` (`PrivateTmp`)
+  and its private `/dev/shm` (`TemporaryFileSystem`); `ProtectSystem=strict`
+  makes every other path read-only for it, except the device nodes that
+  systemd puts in its private `/dev`. No build step can hand it a
+  descriptor into `build/`: the step units cannot create unix sockets.
+  systemd reads `EnvironmentFile=` files before it
   drops to this user, so the runtime env file stays mode 600.
 - The unit sets `NoNewPrivileges`, `ProtectSystem=strict`, `ProtectHome`,
   `PrivateTmp`, `PrivateDevices`, the kernel and cgroup protections,
@@ -511,9 +521,9 @@ Files and folders (`/opt/<app>` is root:root 755):
 | Path | Owner, mode | Read by | Written by |
 | --- | --- | --- | --- |
 | `app/` (checkout) | deploy user, readable for all | deploy user, build steps (not `.git`) | deploy user |
-| `build/` | `<app>-build`, 700 | build steps | install and build steps; root empties it before install |
+| `build/` | `<app>-build`, 700 | build steps, the copy unit | install and build steps (the install unit empties it in place) |
 | `build-cache/` | `<app>-build`, 700 | install and build steps (npm cache) | install and build steps |
-| `releases/<name>/` | root:`<app>-run`, 750, files 640 or 750 | service | root (`step release`) |
+| `releases/<name>/` | root:`<app>-run`, 750, files 640 or 750 | service | the copy unit (as `<app>-build`, into a fresh folder), then root (owners and modes) |
 | `current`, `previous` | root, links into `releases/` | systemd, root | root (`step release`, `step rollback`) |
 | env file | deploy user, 600 | systemd for the service; the deploy (sources it) | bootstrap |
 | `migrate.env` | root, 600 | systemd for the migrate and seed steps | bootstrap |
@@ -526,7 +536,10 @@ Files and folders (`/opt/<app>` is root:root 755):
 Each step unit has the app unit's hardening (`NoNewPrivileges`,
 `ProtectSystem=strict`, `ProtectHome`, `PrivateTmp`, `PrivateDevices`, the
 kernel and cgroup protections, `ProtectProc=invisible`, `RestrictSUIDSGID`,
-`RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK`, an empty
+`RestrictAddressFamilies=AF_INET AF_INET6 AF_NETLINK` (without `AF_UNIX`,
+which the service keeps: a step cannot create a unix socket, so it cannot
+pass a descriptor to the service through an abstract socket; `socketpair()`
+is not affected), an empty
 `CapabilityBoundingSet`, `LockPersonality`, `RestrictNamespaces`,
 `SystemCallFilter=@system-service` with `SystemCallErrorNumber=EPERM`,
 `SystemCallArchitectures=native`, `ProtectClock`, `ProtectHostname`,
@@ -542,13 +555,16 @@ seed can write only their private `/tmp` and `/var/tmp`. Network:
 `IPAddressDeny=169.254.169.254` in every step unit. Install and build also
 deny `127.0.0.0/8` and `::1` except `127.0.0.53` (the systemd-resolved stub
 that resolves names for npm), so they cannot call the app or PostgreSQL
-over loopback; they reach the internet (the npm registry). Migrate and seed
-reach PostgreSQL on 127.0.0.1 and the internet.
+over loopback. They reach the internet (the npm registry), including the
+app's public address, like any visitor: only loopback is denied. Migrate
+and seed reach PostgreSQL over TCP on 127.0.0.1 and the internet. Bootstrap
+stops when `/etc/resolv.conf` names a loopback resolver other than
+`127.0.0.53`, because npm could not resolve names in install and build.
 
 Steps and deploys of one app do not overlap. Every step takes `flock -n` on
 the root-owned `/run/samohost/<app>.lock` for its whole run and stops with
 an error while another step holds it. Every step but `cleanup` also stops
-while a unit `samohost-<app>-install`, `-build`, `-migrate` or `-seed` is
+while a unit `samohost-<app>-install`, `-build`, `-migrate`, `-seed` or `-copy` is
 still active (a unit can outlive its step when the deploy's connection
 drops). The deploy takes `flock -n` on `~/.samohost-deploy-<app>.lock`
 before the fetch; a second deploy prints `lock:fail`, changes nothing and
@@ -564,8 +580,9 @@ What hostile repository code can and cannot reach:
   the system that every user can read, and send them over the network. It
   can write `build/`, which becomes the next release, and the npm cache. It
   cannot read the env file, `migrate.env`, the token file, the deploy
-  user's home or the releases, and cannot reach the app, PostgreSQL or the
-  metadata address.
+  user's home or the releases. It cannot reach the metadata address, or
+  the app and PostgreSQL over loopback; it can reach the app's public
+  address like any visitor.
 - migrate and seed: the same user and limits, with the values of
   `migrate.env` in the environment: the owner role's `DATABASE_URL`,
   `APP_DATABASE_URL`, `SEED_OWNER_LOGIN` and `SEED_OWNER_PASSWORD`
@@ -575,7 +592,8 @@ What hostile repository code can and cannot reach:
   `build/`, `build-cache/` or the checkout, so it cannot change the build
   that becomes the release.
 - runtime: the app role's `APP_DATABASE_URL`, `COOKIE_SECRET` and the rest
-  of the env file, write access to `uploads/` and its private `/tmp`. It
+  of the env file, write access to `uploads/`, its private `/tmp` and
+  `/var/tmp` and its private `/dev/shm`. It
   cannot read the checkout, `build/`, `build-cache/`, `migrate.env` or the
   token file, and cannot change its own release.
 - in no step: sudo (no rules; `NoNewPrivileges`), a process that outlives
@@ -592,20 +610,39 @@ deploy starts every step with stdin from `/dev/null`, so code in a step
 cannot read or consume the rest of the script. (Without the step script,
 npm and the app's commands still inherit that stdin, as before.)
 
-`step release` works as root while no process of `<app>-build` runs and
-no other step runs (the lock). It refuses a `build/` larger than 2 GiB and
-a copy that would leave less than 2 GiB free. It renames `build/` to a
-root-owned snapshot name, creates an empty `build/` for the build user,
-makes the snapshot `root:root` without group and other bits, copies it
-into the new release and removes it, so the copy does not depend on the
-lock alone. It requires `fs.protected_hardlinks=1` (bootstrap and the step
-stop otherwise), so `build/` can contain hard links only to files that
-`<app>-build` owns or can read and write. Symbolic links are copied as
-links; the service follows them with the rights of `<app>-run`. The
-release is the whole `build/` folder (the checkout without `.git`,
-`node_modules` with devDependencies, `dist/`), without a top-level
+`step release` runs while no other step of the app runs (the lock) and
+after killing every process of `<app>-build`. Root does not read or walk
+`build/`. It works like this:
+
+1. Root creates the destination `releases/<name>.tmp` fresh, mode 700,
+   inside the root-owned `releases/`, and gives it to `<app>-build`.
+   `<app>-run` cannot enter it, and only root can create entries in
+   `releases/`.
+2. A transient unit `samohost-<app>-copy` runs `cp -R -P` from `build/` to
+   the destination as `<app>-build`. It has the step hardening, no network
+   (`PrivateNetwork`, `IPAddressDeny=any`), no unix sockets, the env files,
+   the token, `git-safe.conf` and the checkout's `.git` hidden, and write
+   access to the destination only. It also refuses a `build/` larger than
+   2 GiB and a copy that would leave less than 2 GiB free. A race in
+   `build/` can only make it copy files that `<app>-build` can read.
+3. After the unit, root kills any process of `<app>-build` and takes the
+   destination (`root:root`, 700) before anything else. No other process
+   has a descriptor into it: the copy unit ran `cp`, not repository code,
+   and its processes ended with it.
+4. Only then root walks the result: it removes special files and the
+   top-level `.npmrc`, sets the owner `root:<app>-run` and modes without
+   setuid, setgid and world bits, and renames it into place. Every entry is
+   a new file made by `cp` (hard links are not kept), so `chown` and
+   `chmod` change no other file of the server. Symbolic links stay links;
+   the service follows them with the rights of `<app>-run`.
+
+`build/` is never renamed or recreated: the install unit empties it in
+place as `<app>-build`, so the service unit's `InaccessiblePaths` keeps
+covering it. The release is the whole `build/` folder (the checkout without
+`.git`, `node_modules` with devDependencies, `dist/`), without a top-level
 `.npmrc`. Before the copy only `current` and `previous` stay, so at most
-three releases exist during the copy; two stay after it.
+three releases exist during the copy; two stay after it. Bootstrap and the
+release step require `fs.protected_hardlinks=1`.
 
 The deploy user decides which commit is checked out, so it decides which
 code the build steps run. Whoever has the deploy user's SSH key can run
@@ -626,7 +663,8 @@ What remains open:
   repository registered that way chooses its own host names.
 - The service, migrate and seed can reach every network address except
   the metadata address, including other services on 127.0.0.1. Install
-  and build can reach every address on the internet.
+  and build can reach every address on the internet, including the app's
+  public address.
 - `build-cache/` persists between deploys and is written by repository
   code. `npm ci` checks every registry package against the lockfile's
   integrity value; git dependencies have no integrity value and are not
