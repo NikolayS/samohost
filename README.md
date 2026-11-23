@@ -252,11 +252,14 @@ Two env files sit next to each other on the server:
 The repository code that `migrateCmd` and `seedCmd` run holds the owner
 role's password (`DATABASE_URL`) while it runs. It can do anything the
 owner role can do. The owner role is confined to the app's own database:
-it owns `<db>` and schema `public` there, has CONNECT on no other database
-(CONNECT is revoked from PUBLIC on each samohost database), and has no
-superuser, CREATEDB, CREATEROLE, REPLICATION or BYPASSRLS. It can read and
-change every table of `<db>`, including rows that row-level security hides
-from `<db>_app`.
+it owns `<db>` and schema `public` there and has no superuser, CREATEDB,
+CREATEROLE, REPLICATION or BYPASSRLS. It can read and change every table of
+`<db>`, including rows that row-level security hides from `<db>_app`.
+Bootstrap revokes CONNECT and TEMPORARY on `<db>` from PUBLIC, so the owner
+roles of other apps cannot connect to it. The owner role can still connect
+to databases that keep PostgreSQL's default CONNECT for PUBLIC (the
+`postgres` database, and databases not created by this samohost version),
+with the rights PUBLIC has there.
 
 An app bootstrapped by an older samohost has the superuser `DATABASE_URL` in
 its runtime env file and no `migrate.env`. Bootstrap and deploy detect that
@@ -305,6 +308,15 @@ health check. `dist/` is copied to `dist.prev/` before install and build.
 - On a first deploy (no `dist/` before it) a failure is reported without a
   rollback.
 
+In the build model (see "Security model of the new layout") the service runs
+`/opt/<app>/current`, a link to a root-owned release folder, and `dist.prev/`
+is not used. A previous release exists when `current` exists before the
+deploy. A failure in install, build, migrate or the release step leaves
+`current` unchanged; the deploy restores `release.env` and checks health
+without a restart. A failure after the release step switched `current`
+switches it back to `previous` (`step rollback`), restores `release.env`,
+restarts the service and checks health again.
+
 Migrations that already ran are not undone, in either case. `node_modules`
 is not restored. The previous release must therefore work with the new
 schema: add columns as nullable or with a default, and drop a column only
@@ -319,8 +331,10 @@ the runtime env file; every new node app). Static apps and node apps that
 keep the legacy layout get the same sudo rules and unit as before.
 
 - The service runs as `<app>-run`: a system user with no login shell, no
-  sudo rules and its own group only. It reads the release through the
-  world-read bit of the checkout, `node_modules` and `dist/`. It can write
+  sudo rules and its own group only. In the build model it reads the
+  root-owned release in `/opt/<app>/current` through its group; before the
+  build model (servers without the step script) it read the checkout,
+  `node_modules` and `dist/` through their world-read bit. It can write
   `/opt/<app>/uploads` and its private `/tmp` and `/var/tmp`
   (`PrivateTmp`), nothing else. systemd reads `EnvironmentFile=` files before it
   drops to this user, so the runtime env file stays mode 600.
@@ -330,10 +344,13 @@ keep the legacy layout get the same sudo rules and unit as before.
   `RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK` (Node's
   `os.networkInterfaces()` needs `AF_NETLINK`), an
   empty `CapabilityBoundingSet`, `LockPersonality`, `MemoryMax=50%`,
-  `TasksMax=256`, `ReadWritePaths=/opt/<app>/uploads`, and
-  `InaccessiblePaths=` for `migrate.env`, `.gh-token`, `git-safe.conf`, the
-  checkout's `.git` and `.npmrc`. `MemoryDenyWriteExecute` is not set
-  because Node's JIT needs it off.
+  `TasksMax=256`, `ReadWritePaths=/opt/<app>/uploads`,
+  `WorkingDirectory=/opt/<app>/current`, and `InaccessiblePaths=` for
+  `migrate.env`, `.gh-token`, `git-safe.conf`, the checkout, `build/` and
+  `build-cache/`. `MemoryDenyWriteExecute` is not set because Node's JIT
+  needs it off. `ExecStart` must use paths relative to the release (the
+  default is `/usr/bin/node dist/server.js`): the service cannot read the
+  checkout.
 - `/opt/<app>` is root-owned (755). The deploy user owns only the checkout
   `/opt/<app>/app`, and the runtime user owns `/opt/<app>/uploads` (on a
   fresh server bootstrap creates it for the runtime user directly). Nobody
@@ -360,17 +377,21 @@ keep the legacy layout get the same sudo rules and unit as before.
   and stops. The socket needs Caddy 2.5.1 or later. Every later bootstrap
   on the server, of any app, keeps the socket line when the Caddyfile has
   it or a layout marker says `split`.
-- The deploy user keeps building and deploying. It writes `release.env`
-  through an exact `sudo /usr/bin/tee /opt/<app>/release.env` rule. Its
-  other sudo rules name exact files: `00-main-<app>.caddy` and the heal
-  staging file
+- The deploy user fetches and resets the checkout and runs the deploy. It
+  runs install, build, migrate, the release copy and seed through seven
+  exact rules `sudo /usr/local/lib/samohost/apps/<app>/step <step>`. It
+  writes `release.env` through an exact
+  `sudo /usr/bin/tee /opt/<app>/release.env` rule. Its other sudo rules
+  name exact files: `00-main-<app>.caddy` and the heal staging file
   `.samohost-heal-next-00-main-<app>.caddy`. It has no rule for preview
   vhost files: their name `<app>-<label>.caddy` would also match previews of
   another app whose name starts with `<app>-`. It has no `journalctl`,
   `daemon-reload` or `psql` rule: `samohost logs`
   and `samohost doctor` connect as the operator user, and the deploy and
   heal scripts of these apps do not use the other two.
-- The deploy sets `umask 022` so the runtime user can read what it builds.
+- The deploy sets `umask 022`, and after the checkout makes the checkout
+  readable for others (`go+rX`, not `.git`, not following links), so the
+  build user can copy it.
 
 Previews of these apps are not built yet. Host-prep stops before any change
 when the server has the layout marker `/var/lib/samohost/db-layout/<app>`
@@ -388,15 +409,174 @@ runtime user and hardening.
 
 To move an existing server that already has `migrate.env`:
 
-1. Run `samohost app bootstrap` again. It creates `<app>-run`, gives it
-   `/opt/<app>/uploads` (the owner of each entry is changed without
-   following links; files with more than one hard link are skipped with a
-   warning), rewrites the sudo rules and the unit, and runs
-   `systemctl daemon-reload`. The running service keeps its old user until
-   it restarts.
-2. Deploy, or restart the service. It then runs as `<app>-run`.
-3. If the app writes files anywhere other than `/opt/<app>/uploads`, those
-   writes now fail. Move that data under `uploads/` first.
+1. If the app writes files anywhere other than `/opt/<app>/uploads`, those
+   writes fail after the move. Move that data under `uploads/` first.
+2. Run `samohost app bootstrap` again. It creates `<app>-run` and
+   `<app>-build`, gives `<app>-run` `/opt/<app>/uploads` (the owner of each
+   entry is changed without following links; files with more than one hard
+   link are skipped with a warning), creates `build/`, `build-cache/` and
+   `releases/`, writes the step script, rewrites `migrate.env` (root-owned,
+   now with `APP_DATABASE_URL`), the sudo rules and the unit
+   (`WorkingDirectory=/opt/<app>/current`), and runs
+   `systemctl daemon-reload`. The running service keeps running from its
+   old working directory until it restarts.
+3. Deploy right away, with this samohost version. Until the first deploy
+   makes `/opt/<app>/current`, a restart of the service fails, because its
+   working directory does not exist.
+4. Remove what the build model no longer uses: `dist.prev/` and, as root,
+   `node_modules/` and `dist/` in the checkout (the deploy user can remove
+   them too).
+
+### Security model of the new layout
+
+This section applies to node apps with the split env layout that were
+bootstrapped by this samohost version (the server has the step script
+`/usr/local/lib/samohost/apps/<app>/step`). The deploy detects the step
+script; servers without it keep the steps of the previous section.
+
+Who runs what:
+
+- root: `app bootstrap` (the operator over SSH with sudo); the step script,
+  which the deploy user starts through sudo. The step script runs as root
+  for `release`, `rollback` and `cleanup`, and starts the other steps as
+  transient systemd services (`systemd-run`) that run as `<app>-build`.
+  systemd (PID 1) reads the env files for the units.
+- the deploy user `<app>`: the SSH login of samohost for this app. It runs
+  the deploy and heal scripts: `git fetch` with the token file, `git reset
+  --hard`, the permission repair of the checkout, the `release.env` write,
+  the step script, `systemctl restart <app>`, the health check and the RLS
+  check. It runs no repository code itself.
+- `<app>-build`: `npm ci` (or `npm install` without a lockfile), `buildCmd`,
+  `migrateCmd` and `seedCmd`. System user, shell `/usr/sbin/nologin`, home
+  `/nonexistent`, its own group only, no sudo rules, listed in
+  `/etc/cron.deny` and `/etc/at.deny`, lingering disabled.
+- `<app>-run`: the service (previous section).
+
+Files and folders (`/opt/<app>` is root:root 755):
+
+| Path | Owner, mode | Read by | Written by |
+| --- | --- | --- | --- |
+| `app/` (checkout) | deploy user, readable for all | deploy user, build steps (not `.git`) | deploy user |
+| `build/` | `<app>-build`, 700 | build steps | install and build steps; root empties it before install |
+| `build-cache/` | `<app>-build`, 700 | install and build steps (npm cache) | install and build steps |
+| `releases/<name>/` | root:`<app>-run`, 750, files 640 or 750 | service | root (`step release`) |
+| `current`, `previous` | root, links into `releases/` | systemd, root | root (`step release`, `step rollback`) |
+| env file | deploy user, 600 | systemd for the service; the deploy (sources it) | bootstrap |
+| `migrate.env` | root, 600 | systemd for the migrate and seed steps | bootstrap |
+| `release.env` | root, 644 | systemd for the service and the build steps | deploy user through `sudo tee` |
+| `.gh-token` | deploy user, 600 | deploy user (git) | bootstrap |
+| `git-safe.conf` | deploy user, 644 | deploy user (git) | bootstrap |
+| `uploads/` | `<app>-run`, 750 | service | service |
+| step script | root, 755 | anyone | bootstrap |
+
+Each step unit has the app unit's hardening (`NoNewPrivileges`,
+`ProtectSystem=strict`, `ProtectHome`, `PrivateTmp`, `PrivateDevices`, the
+kernel and cgroup protections, `ProtectProc=invisible`, `RestrictSUIDSGID`,
+`RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK`, an empty
+`CapabilityBoundingSet`, `LockPersonality`), `MemoryMax=75%`,
+`TasksMax=1024`, `RuntimeMaxSec` (1800 s for install and build, 900 s for
+migrate and seed) and `KillMode=control-group`. The env file,
+`migrate.env`, `.gh-token`, `git-safe.conf`, the checkout's `.git` and
+`releases/` are inaccessible in every step unit. `HOME` is the unit's
+private `/tmp`. Install and build can write `build/` and `build-cache/`
+(`npm_config_cache`); migrate and seed can write nothing but their private
+`/tmp`. The units have network access (npm needs the registry, migrate
+needs PostgreSQL on 127.0.0.1).
+
+What hostile repository code can and cannot reach:
+
+- install (the lifecycle scripts of the repository and of every
+  dependency) and build: it runs as `<app>-build` with no secret in its
+  environment: no database address, no cookie secret, no token. It can read
+  the checkout (without `.git`), `build/`, `build-cache/` and the files of
+  the system that every user can read, and send them over the network. It
+  can write `build/`, which becomes the next release, and the npm cache. It
+  cannot read the env file, `migrate.env`, the token file, the deploy
+  user's home or the releases.
+- migrate and seed: the same user and limits, with the values of
+  `migrate.env` in the environment: the owner role's `DATABASE_URL`,
+  `APP_DATABASE_URL`, `SEED_OWNER_LOGIN` and `SEED_OWNER_PASSWORD`
+  (and `SAMO_RELEASE_TAG` / `SAMO_RELEASE_SHA` from `release.env`). It can
+  do what the owner role can do (see "Database roles and env files of a
+  node app") and send these values over the network. It cannot write
+  `build/`, `build-cache/` or the checkout, so it cannot change the build
+  that becomes the release.
+- runtime: the app role's `APP_DATABASE_URL`, `COOKIE_SECRET` and the rest
+  of the env file, write access to `uploads/` and its private `/tmp`. It
+  cannot read the checkout, `build/`, `build-cache/`, `migrate.env` or the
+  token file, and cannot change its own release.
+- in no step: sudo (no rules; `NoNewPrivileges`), a process that outlives
+  the step (the unit's cgroup is killed when the step ends; `release` and
+  `install` kill any process of `<app>-build` first, and the deploy runs
+  `step cleanup` on exit), cron or at jobs, a user manager (no login, no
+  lingering), a change to a release after `step release` made it (root
+  owns it; group and others have no write bit; no setuid or setgid bit;
+  ACLs and extended attributes are not copied), a change to the step
+  script or the unit.
+
+`step release` copies `build/` as root while no process of `<app>-build`
+runs. It requires `fs.protected_hardlinks=1` (bootstrap and the step stop
+otherwise), so `build/` can contain hard links only to files that
+`<app>-build` owns. Symbolic links are copied as links; the service follows
+them with the rights of `<app>-run`. The release is the whole `build/`
+folder (the checkout without `.git`, `node_modules` with devDependencies,
+`dist/`), without a top-level `.npmrc`. Two releases are kept: `current`
+and `previous`.
+
+The deploy user decides which commit is checked out, so it decides which
+code the build steps run. Whoever has the deploy user's SSH key can run
+code with the owner role's password (through `migrateCmd`), read the env
+file, and switch `current` back to `previous`. It cannot read
+`migrate.env` directly, change a release, or run a command as root other
+than the exact sudo rules.
+
+What remains open:
+
+- The deploy user writes the main vhost `00-main-<app>.caddy` and the heal
+  staging file through `sudo tee` rules with content it chooses. A design
+  for a root-owned vhost helper is below; it is not built.
+- The build steps and the service can reach every network address,
+  including services on 127.0.0.1 and the cloud metadata address
+  169.254.169.254. `IPAddressDeny=` is not set.
+- `build-cache/` persists between deploys and is written by repository
+  code. `npm ci` checks every package against the lockfile's integrity
+  value. An app without a lockfile runs `npm install`, which resolves
+  versions; package metadata cached by an earlier deploy could affect that
+  resolution. Commit a lockfile.
+- `buildCmd`, `migrateCmd` and `seedCmd` are written into the step script
+  by bootstrap. After a change to them, run bootstrap again; the deploy
+  uses the commands in the step script.
+- The build steps do not get the values of the env file. Build-time
+  configuration must come from the repository or from `release.env`
+  (`SAMO_RELEASE_TAG`, `SAMO_RELEASE_SHA`).
+- `release.env` is written before install. If the service restarts on its
+  own between that write and the deploy's restart, it runs the previous
+  release with the new tag and sha.
+- An older samohost version that deploys to such a server runs npm as the
+  deploy user in the checkout and fails at migrate (it cannot read the
+  root-owned `migrate.env`); it does not update `current`. Deploy these
+  servers only with this version or later.
+- `ProtectSystem=strict` leaves `/dev` writable. Whether `/dev/shm` under
+  `PrivateDevices` is the host's `/dev/shm` (shared between the steps and
+  the service) was not checked on a server.
+- Previews are not built for these apps (previous section).
+
+Design for the main vhost (not built): bootstrap renders
+`00-main-<app>.caddy` from values fixed at bootstrap (host names, app port,
+control-plane address) and stores the content root-owned, for example in
+`/usr/local/lib/samohost/apps/<app>/00-main.caddy`. A root-owned helper
+`/usr/local/lib/samohost/apps/<app>/vhost` with exactly one argument
+(`apply`) copies that file to the staging name, runs `caddy validate` on
+the full configuration, renames it to `00-main-<app>.caddy`, reloads Caddy
+over the admin socket, and restores the previous file when the validation
+or the reload fails. The deploy user's `tee`, `mv` and `rm` rules for
+`00-main-<app>.caddy` and the heal staging file are replaced by one rule
+`sudo /usr/local/lib/samohost/apps/<app>/vhost apply`. Heal then sends no
+vhost content: for these apps it compares the live file with the stored
+one and runs `vhost apply` on a difference. A change of a host name, the
+port or the control-plane address needs a bootstrap re-run instead of a
+heal. This changes the heal script's node path (about 700 lines, with its
+own byte-identity tests for static apps) and was not done in this change.
 
 ## How it's tested
 
