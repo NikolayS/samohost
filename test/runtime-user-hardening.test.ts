@@ -44,6 +44,8 @@ function stubDir(stubs: Record<string, string>): { dir: string; log: string; cle
   return { dir, log, cleanup: () => rmSync(dir, { recursive: true, force: true }) };
 }
 
+const GETENT = `case "$1 $2" in "passwd $T_USER") [[ -n "\${T_PASSWD:-}" ]] && echo "$T_PASSWD" || exit 2 ;; "group $T_GID") echo "$T_GROUP:x:$T_GID:" ;; *) exit 2 ;; esac`;
+
 function runBash(text: string, path: string, env: Record<string, string> = {}) {
   return spawnSync("bash", ["-c", `set -euo pipefail\n${text}`], {
     encoding: "utf8",
@@ -209,16 +211,14 @@ describe("env layout is decided before the sudo rules and the unit", () => {
 
 describe("new layout: runtime user '<app>-run'", () => {
   test("created as a system user with no login shell, its own group only, owning only the uploads folder", () => {
-    const sb = stubDir({ id: "exit 1", useradd: "", usermod: "", gpasswd: "", chown: "", chmod: "", install: "" });
+    const sb = stubDir({ getent: GETENT, useradd: "", usermod: "", gpasswd: "", chown: "", chmod: "", install: "" });
     try {
-      const res = runBash(section(script(), "5c", "5d"), sb.dir, { SAMOHOST_DB_LAYOUT: "split" });
+      const res = runBash(section(script(), "5c", "5d"), sb.dir, { SAMOHOST_DB_LAYOUT: "split", T_USER: "shop-run" });
       expect(res.status, res.stderr).toBe(0);
       const calls = readFileSync(sb.log, "utf8").trim().split("\n");
       expect(calls).toEqual([
-        "id shop-run",
+        "getent passwd shop-run",
         "useradd --system --user-group --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin shop-run",
-        "usermod --shell /usr/sbin/nologin shop-run",
-        "gpasswd -d shop-run shop",
         "install -d -m 750 -o shop-run -g shop-run /opt/shop/uploads",
       ]);
     } finally {
@@ -268,14 +268,41 @@ describe("new layout: runtime user '<app>-run'", () => {
     }
   });
 
-  test("an existing runtime user is kept (no second useradd)", () => {
-    const sb = stubDir({ id: "exit 0", useradd: "", usermod: "", gpasswd: "", chown: "", chmod: "", install: "" });
+  test("an existing runtime user that bootstrap created is kept (no second useradd)", () => {
+    const sb = stubDir({ getent: GETENT, id: 'echo "$T_GROUPS"', useradd: "", chown: "", chmod: "", install: "" });
     try {
-      const res = runBash(section(script(), "5c", "5d"), sb.dir, { SAMOHOST_DB_LAYOUT: "split" });
+      const res = runBash(section(script(), "5c", "5d"), sb.dir, {
+        SAMOHOST_DB_LAYOUT: "split", T_USER: "shop-run", T_PASSWD: "shop-run:x:990:990::/nonexistent:/usr/sbin/nologin",
+        T_GID: "990", T_GROUP: "shop-run", T_GROUPS: "shop-run",
+      });
       expect(res.status, res.stderr).toBe(0);
       expect(readFileSync(sb.log, "utf8")).not.toContain("useradd");
     } finally {
       sb.cleanup();
+    }
+  });
+
+  test("an existing runtime account that bootstrap did not create is refused (shell, home, uid, groups)", () => {
+    const ok = { passwd: "shop-run:x:990:990::/nonexistent:/usr/sbin/nologin", gid: "990", group: "shop-run", groups: "shop-run" };
+    for (const bad of [
+      { ...ok, passwd: "shop-run:x:990:990::/nonexistent:/bin/bash" },
+      { ...ok, passwd: "shop-run:x:990:990::/home/shop-run:/usr/sbin/nologin" },
+      { ...ok, passwd: "shop-run:x:1001:990::/nonexistent:/usr/sbin/nologin" },
+      { ...ok, passwd: "shop-run:x:50:990::/nonexistent:/usr/sbin/nologin" },
+      { ...ok, groups: "shop-run sudo" },
+      { ...ok, group: "users" },
+    ]) {
+      const sb = stubDir({ getent: GETENT, id: 'echo "$T_GROUPS"', useradd: "", chown: "", chmod: "", install: "" });
+      try {
+        const res = runBash(section(script(), "5c", "5d"), sb.dir, {
+          SAMOHOST_DB_LAYOUT: "split", T_USER: "shop-run", T_PASSWD: bad.passwd, T_GID: bad.gid, T_GROUP: bad.group, T_GROUPS: bad.groups,
+        });
+        expect(res.status, JSON.stringify(bad)).toBe(1);
+        expect(res.stderr).toContain("the account shop-run exists and was not created by samohost bootstrap");
+        expect(readFileSync(sb.log, "utf8")).not.toContain("install -d");
+      } finally {
+        sb.cleanup();
+      }
     }
   });
 

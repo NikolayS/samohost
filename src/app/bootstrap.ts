@@ -230,6 +230,33 @@ function bootstrapPort(app: AppRecord): number {
  * NOT executed by samohost itself: the operator pipes it to `bash` after
  * review (same contract as `buildHostPrepScript`).
  */
+/**
+ * Bash lines (new layout) that create a service account of an app
+ * (`<app>-run`, `<app>-build`), or refuse an existing account that bootstrap
+ * did not create: shell not /usr/sbin/nologin, home not /nonexistent, uid
+ * outside the system range of /etc/login.defs (default 100-999), primary
+ * group not its own, or any other group.
+ */
+function serviceAccountLines(user: string, indent: string): string[] {
+  const u = sq(user);
+  return [
+    `if _entry="$(getent passwd ${u})"; then`,
+    `  IFS=: read -r _ _ _uid _gid _ _home _shell <<<"$_entry"`,
+    `  _min="$(awk '$1 == "SYS_UID_MIN" { print $2 }' /etc/login.defs 2>/dev/null || true)"; _min="\${_min:-100}"`,
+    `  _max="$(awk '$1 == "SYS_UID_MAX" { print $2 }' /etc/login.defs 2>/dev/null || true)"; _max="\${_max:-999}"`,
+    `  _group="$(getent group "$_gid" | cut -d: -f1 || true)"`,
+    `  _groups="$(id -Gn ${u} || true)"`,
+    `  if [[ "$_shell" != /usr/sbin/nologin || "$_home" != /nonexistent || ! "$_uid" =~ ^[0-9]+$ || "$_uid" -lt "$_min" || "$_uid" -gt "$_max" || "$_group" != ${u} || "$_groups" != ${u} ]]; then`,
+    `    echo "ERROR: the account ${user} exists and was not created by samohost bootstrap (shell $_shell, home $_home, uid $_uid, groups $_groups). A new-layout app needs ${user} as a system user (uid $_min to $_max) with shell /usr/sbin/nologin, home /nonexistent and its own group only. Remove the account or use another app name." >&2`,
+    `    exit 1`,
+    `  fi`,
+    `  echo "User ${u} already exists (shell, home, uid and groups checked) — skipping useradd."`,
+    `else`,
+    `  useradd --system --user-group --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin ${u}`,
+    `fi`,
+  ].map((l) => indent + l);
+}
+
 export function buildHostBootstrapScript(
   app: AppRecord,
   opts: HostBootstrapOptions,
@@ -739,15 +766,9 @@ export function buildHostBootstrapScript(
       `if [[ "$SAMOHOST_DB_LAYOUT" == split ]]; then`,
       ...(runtimeUserUsable
         ? [
-            `  if id ${sq(runtimeUser)} >/dev/null 2>&1; then`,
-            `    echo "User ${sq(runtimeUser)} already exists — skipping useradd."`,
-            `  else`,
-            `    useradd --system --user-group --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin ${sq(runtimeUser)}`,
-            `  fi`,
-            `  usermod --shell /usr/sbin/nologin ${sq(runtimeUser)}`,
+            ...serviceAccountLines(runtimeUser, "  "),
             `  # chmod follows symbolic links: refuse one at the uploads folder.`,
             `  if [[ -L ${sq(uploadsDir)} ]]; then echo "ERROR: ${uploadsDir} is a symbolic link" >&2; exit 1; fi`,
-            `  gpasswd -d ${sq(runtimeUser)} ${sq(appUser)} >/dev/null 2>&1 || true`,
             `  if [[ -d ${sq(uploadsDir)} ]]; then`,
             `    # An older bootstrap gave this folder to the deploy user. Change the owner`,
             `    # without following links, and skip files with more than one hard link:`,
@@ -821,13 +842,7 @@ export function buildHostBootstrapScript(
       `    exit 1`,
       `  fi`,
       `  if ! command -v systemd-run >/dev/null 2>&1; then echo "ERROR: systemd-run not found; the build model needs it" >&2; exit 1; fi`,
-      `  if id ${sq(buildUser)} >/dev/null 2>&1; then`,
-      `    echo "User ${sq(buildUser)} already exists — skipping useradd."`,
-      `  else`,
-      `    useradd --system --user-group --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin ${sq(buildUser)}`,
-      `  fi`,
-      `  usermod --shell /usr/sbin/nologin ${sq(buildUser)}`,
-      `  gpasswd -d ${sq(buildUser)} ${sq(appUser)} >/dev/null 2>&1 || true`,
+      ...serviceAccountLines(buildUser, "  "),
       `  for _f in /etc/cron.deny /etc/at.deny; do`,
       `    touch "$_f"`,
       `    grep -qxF ${sq(buildUser)} "$_f" || printf '%s\n' ${sq(buildUser)} >> "$_f"`,

@@ -23,7 +23,7 @@ function section(text: string, from: string, to: string): string {
   return lines.slice(start, end - 1).join("\n");
 }
 
-function run5d(layout: "split" | "legacy", opts: { hardlinks?: string; userExists?: boolean } = {}) {
+function run5d(layout: "split" | "legacy", opts: { hardlinks?: string; passwd?: string; groups?: string } = {}) {
   const dir = mkdtempSync(join(tmpdir(), "samohost-5d-"));
   const bin = join(dir, "bin");
   mkdirSync(bin);
@@ -32,7 +32,8 @@ function run5d(layout: "split" | "legacy", opts: { hardlinks?: string; userExist
     writeFileSync(join(bin, name), `#!/usr/bin/env bash\nprintf '%s %s\\n' ${name} "$*" >> ${JSON.stringify(log)}\n${body}\n`);
     chmodSync(join(bin, name), 0o755);
   };
-  stub("id", opts.userExists ? "exit 0" : "exit 1");
+  stub("getent", `case "$1 $2" in "passwd $T_USER") [[ -n "\${T_PASSWD:-}" ]] && echo "$T_PASSWD" || exit 2 ;; "group $T_GID") echo "$T_GROUP:x:$T_GID:" ;; *) exit 2 ;; esac`);
+  stub("id", 'echo "$T_GROUPS"');
   for (const name of ["useradd", "usermod", "gpasswd", "loginctl", "chown", "chmod"]) stub(name, "exit 0");
   stub("install", 'if [[ "$1" == -d ]]; then mkdir -p "${@: -1}"; fi');
   stub("systemd-run", "exit 0");
@@ -54,7 +55,10 @@ function run5d(layout: "split" | "legacy", opts: { hardlinks?: string; userExist
   const runOnce = () =>
     spawnSync("bash", ["-c", `set -euo pipefail\nSAMOHOST_DB_LAYOUT=${layout}\n${body}`], {
       encoding: "utf8",
-      env: { PATH: `${bin}:/usr/bin:/bin` },
+      env: {
+        PATH: `${bin}:/usr/bin:/bin`, T_USER: "shop-build", T_PASSWD: opts.passwd ?? "", T_GID: "991", T_GROUP: "shop-build",
+        T_GROUPS: opts.groups ?? "shop-build",
+      },
     });
   return {
     dir, base, etc, lib, runOnce, replace,
@@ -74,14 +78,34 @@ describe("§5d build user and step script", () => {
       expect(calls).toContain(
         "useradd --system --user-group --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin shop-build",
       );
-      expect(calls).toContain("usermod --shell /usr/sbin/nologin shop-build");
-      expect(calls).toContain("gpasswd -d shop-build shop");
+      expect(calls).toContain("getent passwd shop-build");
       expect(calls).toContain("loginctl disable-linger shop-build");
       for (const f of ["cron.deny", "at.deny"]) {
         expect(readFileSync(join(r.etc, f), "utf8").split("\n").filter((l) => l === "shop-build").length, f).toBe(1);
       }
     } finally {
       r.cleanup();
+    }
+  });
+
+  test("split layout: an existing build user that bootstrap created is kept; one in another group is refused", () => {
+    const passwd = "shop-build:x:991:991::/nonexistent:/usr/sbin/nologin";
+    const kept = run5d("split", { passwd });
+    try {
+      const res = kept.runOnce();
+      expect(res.status, res.stderr).toBe(0);
+      expect(kept.calls()).not.toContain("useradd");
+    } finally {
+      kept.cleanup();
+    }
+    const refused = run5d("split", { passwd, groups: "shop-build shop" });
+    try {
+      const res = refused.runOnce();
+      expect(res.status).toBe(1);
+      expect(res.stderr).toContain("the account shop-build exists and was not created by samohost bootstrap");
+      expect(refused.calls()).not.toContain("install -d");
+    } finally {
+      refused.cleanup();
     }
   });
 
