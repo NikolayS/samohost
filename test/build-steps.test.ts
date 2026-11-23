@@ -62,6 +62,10 @@ function sandbox(params: Partial<BuildStepParams> = {}) {
   stub(bin, "npm", 'if [[ "$1" == run && "$2" == build ]]; then mkdir -p dist && echo built > dist/server.js; fi', log);
   stub(bin, "pkill", "exit 1", log);
   stub(bin, "chown", "exit 0", log);
+  // flock: held when <dir>/locked exists.
+  stub(bin, "flock", `if [[ -e ${JSON.stringify(join(dir, "locked"))} ]]; then exit 1; fi`, log);
+  // systemctl is-active <unit>: the content of <dir>/state-<unit>, else inactive.
+  stub(bin, "systemctl", `f=${JSON.stringify(dir)}/state-$2; if [[ -f "$f" ]]; then cat "$f"; [[ "$(cat "$f")" == active ]] && exit 0; exit 3; fi; echo inactive; exit 3`, log);
   // GNU cp options on macOS: drop --preserve=timestamps and --, copy with -RP.
   stub(bin, "cp", 'a=(); for x in "$@"; do case "$x" in -R|-P|--preserve=timestamps|--) ;; *) a+=("$x");; esac; done\n/bin/cp -RP "${a[@]}"', log);
   // mv -T on macOS: replace the destination entry, then rename.
@@ -69,7 +73,8 @@ function sandbox(params: Partial<BuildStepParams> = {}) {
   const text = buildStepScript({ ...PARAMS, ...params })
     .replaceAll("/opt/shop", base)
     .replace("export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin", `export PATH=${bin}:/usr/bin:/bin`)
-    .replace("/proc/sys/fs/protected_hardlinks", join(dir, "protected_hardlinks"));
+    .replace("/proc/sys/fs/protected_hardlinks", join(dir, "protected_hardlinks"))
+    .replaceAll("/run/samohost", join(dir, "run-samohost"));
   const script = join(dir, "step");
   writeFileSync(script, text);
   chmodSync(script, 0o755);
@@ -214,10 +219,10 @@ describe("step script: executed", () => {
   test("release: root-owned copy without .npmrc and world bits; current and previous links; two kept", () => {
     const s = sandbox();
     try {
-      expect(s.step("install").status).toBe(0);
-      expect(s.step("build").status).toBe(0);
       const names: string[] = [];
       for (let i = 0; i < 3; i++) {
+        expect(s.step("install").status).toBe(0);
+        expect(s.step("build").status).toBe(0);
         const res = s.step("release");
         expect(res.status, res.stderr).toBe(0);
         names.push(readlinkSync(join(s.base, "current")));
@@ -233,6 +238,64 @@ describe("step script: executed", () => {
       expect(statSync(rel).mode & 0o777).toBe(0o750);
       expect(s.calls()).toContain(`chown -hR root:shop-run ${s.base}/releases/`);
       expect(s.calls()).toContain("pkill -KILL -u shop-build");
+    } finally {
+      s.cleanup();
+    }
+  }, 60000);
+
+  test("one lock per app: while another step holds it, every step refuses and changes nothing", () => {
+    const s = sandbox();
+    try {
+      writeFileSync(join(s.dir, "locked"), "");
+      for (const step of ["install", "build", "migrate", "release", "rollback", "cleanup"]) {
+        const res = s.step(step);
+        expect(res.status, step).toBe(1);
+        expect(res.stderr, step).toContain("another step of app shop is running");
+      }
+      expect(s.calls()).not.toContain("systemd-run");
+      expect(s.calls()).not.toContain("pkill");
+      expect(s.calls()).toContain(`flock -n 9`);
+      expect(buildStepScript(PARAMS)).toContain("LOCK=/run/samohost/shop.lock");
+    } finally {
+      s.cleanup();
+    }
+  });
+
+  test("a step unit of the app still active (for example after a dropped connection): install, build and release refuse", () => {
+    const s = sandbox();
+    try {
+      expect(s.step("install").status).toBe(0);
+      writeFileSync(join(s.dir, "state-samohost-shop-build"), "active\n");
+      for (const step of ["install", "build", "release"]) {
+        const res = s.step(step);
+        expect(res.status, step).toBe(1);
+        expect(res.stderr, step).toContain("samohost-shop-build is active");
+      }
+      expect(existsSync(join(s.base, "current"))).toBe(false);
+      expect(readdirSync(join(s.base, "build"))).toContain("package.json");
+    } finally {
+      s.cleanup();
+    }
+  });
+
+  test("release copies from a root-owned snapshot of build/ and leaves an empty build/ for the build user", () => {
+    const s = sandbox();
+    try {
+      expect(s.step("install").status).toBe(0);
+      expect(s.step("build").status).toBe(0);
+      const res = s.step("release");
+      expect(res.status, res.stderr).toBe(0);
+      const calls = s.calls().split("\n");
+      const mv = calls.findIndex((l) => l.startsWith(`mv -T -- ${s.base}/build ${s.base}/releases/`) && l.endsWith(".src"));
+      const own = calls.findIndex((l) => l.startsWith(`chown -hR root:root ${s.base}/releases/`) && l.endsWith(".src"));
+      const cp = calls.findIndex((l) => l.startsWith("cp -R -P"));
+      expect(mv).toBeGreaterThanOrEqual(0);
+      expect(own).toBeGreaterThan(mv);
+      expect(cp).toBeGreaterThan(own);
+      expect(calls[cp]).toContain(".src/. ");
+      expect(readdirSync(join(s.base, "build"))).toEqual([]);
+      expect(calls).toContain(`chown shop-build:shop-build ${s.base}/build`);
+      expect(readdirSync(join(s.base, "releases")).filter((n) => n.endsWith(".src"))).toEqual([]);
     } finally {
       s.cleanup();
     }

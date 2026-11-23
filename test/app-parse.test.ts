@@ -143,6 +143,12 @@ describe("deployOutcome", () => {
     expect(events.map((e) => `${e.phase}:${e.status}`)).toEqual(["migrate:start", "migrate:ok", "release:start", "release:fail", "rollback:ok"]);
   });
 
+  test("build model: a deploy refused by the deploy lock (lock:fail) → 'incomplete' (no failed sha recorded)", () => {
+    const events = parsePhaseStream(m("lock", "fail"));
+    expect(events.map((e) => `${e.phase}:${e.status}`)).toEqual(["lock:fail"]);
+    expect(deployOutcome(events)).toBe("incomplete");
+  });
+
   test("health:ok present, then seed:start + seed:fail → 'incomplete'", () => {
     // App is live but seed failed — the deploy is not complete.
     const events = parsePhaseStream(

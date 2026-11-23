@@ -41,6 +41,7 @@ export type DeployOutcome =
 // treated as noise (so a literal `<<<SAMOHOST_PHASE:bogus:ok>>>` in log text is
 // ignored rather than mis-parsed).
 const VALID_PHASES = new Set<PhaseName>([
+  "lock",
   "fetch",
   "checkpoint",
   "checkout",

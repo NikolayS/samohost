@@ -64,6 +64,7 @@ export type PhaseName =
   | "build"
   | "migrate"
   | "release"
+  | "lock"
   | "restart"
   | "caddy-reload"
   | "health"
@@ -243,6 +244,16 @@ export function buildDeployScript(app: AppRecord, target: DeployTarget): string 
             `SAMOHOST_STEP=${sq(buildStepScriptPath(app.name))}`,
             "SAMOHOST_RELEASE_MODEL=0",
             'if [[ -f "$SAMOHOST_MIGRATE_ENV_FILE" && -x "$SAMOHOST_STEP" ]]; then SAMOHOST_RELEASE_MODEL=1; fi',
+            "# One deploy of this app at a time. A second deploy stops here, before any",
+            "# change; the outcome is not a failed commit.",
+            'if [[ "$SAMOHOST_RELEASE_MODEL" == 1 ]]; then',
+            `  exec 8>>"\${HOME:?}/.samohost-deploy-${app.name}.lock"`,
+            "  if ! flock -n 8; then",
+            `    ${marker("lock", "fail")}`,
+            `    echo ${sq(`ERROR: another deploy of ${app.name} is running on this server; this deploy changed nothing. Try again when it has finished.`)} >&2`,
+            "    exit 1",
+            "  fi",
+            "fi",
             "# No process of the build user outlives the deploy, whatever its outcome.",
             "# Every step gets stdin from /dev/null: this script reaches bash on stdin,",
             "# and code in a step must not read or consume the rest of it.",

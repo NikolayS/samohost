@@ -35,6 +35,16 @@ if [[ -f "$SAMOHOST_MIGRATE_ENV_FILE" ]]; then umask 022; fi
 SAMOHOST_STEP='/usr/local/lib/samohost/apps/field-record/step'
 SAMOHOST_RELEASE_MODEL=0
 if [[ -f "$SAMOHOST_MIGRATE_ENV_FILE" && -x "$SAMOHOST_STEP" ]]; then SAMOHOST_RELEASE_MODEL=1; fi
+# One deploy of this app at a time. A second deploy stops here, before any
+# change; the outcome is not a failed commit.
+if [[ "$SAMOHOST_RELEASE_MODEL" == 1 ]]; then
+  exec 8>>"${HOME:?}/.samohost-deploy-field-record.lock"
+  if ! flock -n 8; then
+    echo "<<<SAMOHOST_PHASE:lock:fail>>>"
+    echo 'ERROR: another deploy of field-record is running on this server; this deploy changed nothing. Try again when it has finished.' >&2
+    exit 1
+  fi
+fi
 # No process of the build user outlives the deploy, whatever its outcome.
 # Every step gets stdin from /dev/null: this script reaches bash on stdin,
 # and code in a step must not read or consume the rest of it.

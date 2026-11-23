@@ -87,6 +87,8 @@ export function makeDeploySandbox(opts: { headSha?: string; healthCode?: string;
     "echo f",
   ]);
   stub(bin, "sleep", ["exit 0"]);
+  // flock: held when <sandbox>/deploy-locked exists.
+  stub(bin, "flock", [`if [[ -e ${JSON.stringify(join(dir, "deploy-locked"))} ]]; then exit 1; fi`]);
   return {
     dir,
     appDir,

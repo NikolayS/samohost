@@ -17,7 +17,7 @@ import { makeDeploySandbox } from "./node-deploy-harness.ts";
 const SHA = "5555555555555555555555555555555555555555";
 const STEP = "/usr/local/lib/samohost/apps/shop/step";
 
-function setup(o: { healthCode?: string; failStep?: string; withStep?: boolean; previousRelease?: boolean; seed?: boolean; stdinScript?: boolean } = {}) {
+function setup(o: { healthCode?: string; failStep?: string; withStep?: boolean; previousRelease?: boolean; seed?: boolean; stdinScript?: boolean; deployLocked?: boolean } = {}) {
   const sb = makeDeploySandbox({ healthCode: o.healthCode ?? "200" });
   writeFileSync(sb.envFile, "PORT=3100\nAPP_DATABASE_URL=postgresql://shop_app:0a0b@127.0.0.1:5432/shop\n");
   writeFileSync(sb.migrateEnvFile, "DATABASE_URL=postgresql://shop_owner:0c0d@127.0.0.1:5432/shop\n");
@@ -39,6 +39,7 @@ function setup(o: { healthCode?: string; failStep?: string; withStep?: boolean; 
     mkdirSync(join(sb.dir, "releases", "old"), { recursive: true });
     symlinkSync("releases/old", join(sb.dir, "current"));
   }
+  if (o.deployLocked) writeFileSync(join(sb.dir, "deploy-locked"), "");
   const app = nodeApp({ appDir: sb.appDir, envFile: sb.envFile, ...(o.seed ? { seedCmd: "npm run seed" } : {}) });
   const text = buildDeployScript(app, { sha: SHA, tag: "v20261123.1" }).replaceAll(STEP, step);
   // The deploy script reaches the server on stdin (`bash -s`).
@@ -112,6 +113,20 @@ describe("deploy: build model", () => {
       expect(r.res.status, r.res.stderr).toBe(0);
       expect(r.steps).toEqual(["install", "build", "migrate", "release", "cleanup"]);
       expect(r.res.stdout).toContain("<<<SAMOHOST_PHASE:health:ok>>>");
+    } finally {
+      r.sb.cleanup();
+    }
+  });
+
+  test("a second deploy of the app while one runs: fails fast, runs no step and no cleanup, records nothing", () => {
+    const r = setup({ deployLocked: true, previousRelease: true });
+    try {
+      expect(r.res.status).toBe(1);
+      expect(r.steps).toEqual([]);
+      expect(r.res.stdout).toContain("<<<SAMOHOST_PHASE:lock:fail>>>");
+      expect(r.res.stderr).toContain("another deploy of shop is running on this server");
+      expect(r.res.stdout).not.toContain("SAMOHOST_PHASE:fetch");
+      expect(r.text).toContain('exec 8>>"${HOME:?}/.samohost-deploy-shop.lock"');
     } finally {
       r.sb.cleanup();
     }
