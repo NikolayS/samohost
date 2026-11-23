@@ -325,6 +325,9 @@ describe("step script: executed", () => {
       expect(s.calls()).not.toContain("pkill");
       expect(s.calls()).toContain(`flock -n 9`);
       expect(buildStepScript(PARAMS)).toContain("LOCK=/run/samohost/shop.lock");
+      // install -d also sets the mode of a folder that already exists.
+      expect(buildStepScript(PARAMS)).toContain("\ninstall -d -m 755 /run/samohost\n");
+      expect(buildStepScript(PARAMS)).not.toContain("mkdir -p -m 755 /run/samohost");
     } finally {
       s.cleanup();
     }

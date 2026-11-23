@@ -133,7 +133,7 @@ export function buildStepScript(p: BuildStepParams): string {
     "# One lock per app for the whole run of every step: no two steps of this app",
     "# run at the same time (for example a release copy and a second deploy's",
     "# install or build). /run/samohost is root-owned; the lock file is root's.",
-    "mkdir -p -m 755 /run/samohost",
+    "install -d -m 755 /run/samohost",
     'exec 9>>"$LOCK"',
     "if ! flock -n 9; then",
     '  echo "ERROR: another step of app $APP is running; try again when it has finished" >&2',
