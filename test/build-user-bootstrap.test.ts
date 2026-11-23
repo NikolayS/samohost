@@ -128,6 +128,18 @@ describe("§5d build user and step script", () => {
     }
   });
 
+  test("an app name whose build user would be longer than 32 characters: the new layout is refused", () => {
+    const name = "a".repeat(28); // a...a-run has 32 characters, a...a-build 34
+    const text = buildHostBootstrapScript(
+      nodeApp({ name, serviceUnit: name, appDir: `/opt/${name}/app`, envFile: `/opt/${name}/staging.env` }),
+      nodeOpts({ appUser: "shop" }),
+    );
+    const body = section(text, "5d", "6");
+    expect(body).toContain('if [[ "$SAMOHOST_DB_LAYOUT" == split ]]; then');
+    expect(body).toContain(`ERROR: the build user name ${name}-build is not a valid user name`);
+    expect(body).not.toContain("SAMOHOST_STEP_SCRIPT");
+  });
+
   test("legacy layout: nothing", () => {
     const r = run5d("legacy");
     try {
@@ -140,6 +152,16 @@ describe("§5d build user and step script", () => {
 });
 
 describe("§11 migrate.env in the build model", () => {
+  test("an app without a usable runtime user keeps migrate.env owned by the deploy user (the deploy reads it)", () => {
+    const name = "b".repeat(29); // b...b-run has 33 characters
+    const text = buildHostBootstrapScript(
+      nodeApp({ name, serviceUnit: name, appDir: `/opt/${name}/app`, envFile: `/opt/${name}/staging.env` }),
+      nodeOpts({ appUser: "shop" }),
+    );
+    expect(text).toContain(`chown 'shop':'shop' "$SAMOHOST_WRITE_DIR/migrate"`);
+    expect(text).not.toContain('chown root:root "$SAMOHOST_WRITE_DIR/migrate"');
+  });
+
   test("has APP_DATABASE_URL next to the owner role's DATABASE_URL, and is written for root only", () => {
     const sb = makeSandbox();
     try {

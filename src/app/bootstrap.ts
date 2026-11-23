@@ -776,7 +776,17 @@ export function buildHostBootstrapScript(
   const buildUser = `${app.name}-build`;
   const buildModel = buildModelPaths(appBase);
   const stepScriptPath = buildStepScriptPath(app.name);
-  if (!isStatic && runtimeUserUsable) {
+  if (!isStatic && runtimeUserUsable && linuxAppUserError(buildUser) !== undefined) {
+    push(
+      `# §5d. Build user: the name ${buildUser} is not a valid user name.`,
+      "",
+      `if [[ "$SAMOHOST_DB_LAYOUT" == split ]]; then`,
+      `  echo ${sq(`ERROR: the build user name ${buildUser} is not a valid user name (at most 32 characters); the new layout needs it. Use a shorter app name.`)} >&2`,
+      `  exit 1`,
+      `fi`,
+      "",
+    );
+  } else if (!isStatic && runtimeUserUsable) {
     for (const [what, cmd] of [["buildCmd", app.buildCmd], ["migrateCmd", app.migrateCmd], ["seedCmd", app.seedCmd]] as const) {
       if (cmd !== undefined && /[\n\r]/.test(cmd)) {
         throw new Error(`${what} must be one line: it is written into the root-owned step script`);
@@ -1576,7 +1586,12 @@ export function buildHostBootstrapScript(
     `SEED_OWNER_LOGIN=${seedOwnerLogin}`,
     `SEED_OWNER_PASSWORD=\${SEED_PW}`,
     `MIGRATEEOF`,
-    `chown root:root "$SAMOHOST_WRITE_DIR/migrate"`,
+    // Build model: systemd (root) loads migrate.env for the migrate and seed
+    // steps. Without a runtime user there is no step script, and the deploy
+    // user loads the file itself.
+    runtimeUserUsable
+      ? `chown root:root "$SAMOHOST_WRITE_DIR/migrate"`
+      : `chown ${sq(appUser)}:${sq(appUser)} "$SAMOHOST_WRITE_DIR/migrate"`,
     `chmod 600 "$SAMOHOST_WRITE_DIR/migrate"`,
     `unset OWNER_DB_PW`,
     `fi`,
@@ -1590,7 +1605,7 @@ export function buildHostBootstrapScript(
     `echo "$ENV_FILE: written (600, ${appUser}). [secret values not logged]"`,
     `if [[ "$SAMOHOST_DB_LAYOUT" == split ]]; then`,
     `  mv -fT "$SAMOHOST_WRITE_DIR/migrate" "$MIGRATE_ENV_FILE"`,
-    `  echo "$MIGRATE_ENV_FILE: written (600, root). [secret values not logged]"`,
+    `  echo "$MIGRATE_ENV_FILE: written (600, ${runtimeUserUsable ? "root" : appUser}). [secret values not logged]"`,
     `  mkdir -p /var/lib/samohost/db-layout`,
     `  printf 'split\\n' > "$SAMOHOST_LAYOUT_MARKER"`,
     `fi`,

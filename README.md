@@ -239,10 +239,24 @@ Two env files sit next to each other on the server:
 
 - the runtime env file (`envFile`, loaded by the systemd unit): the app's
   `APP_DATABASE_URL` and no other database address;
-- `migrate.env` in the same directory: the owner role's `DATABASE_URL` and
-  `SEED_OWNER_LOGIN` / `SEED_OWNER_PASSWORD`. Only the deploy's migrate and
-  seed steps load it. `npm ci` and the build run with no database address in
-  their environment.
+- `migrate.env` in the same directory: the owner role's `DATABASE_URL`,
+  `APP_DATABASE_URL` and `SEED_OWNER_LOGIN` / `SEED_OWNER_PASSWORD`. It is
+  root:root, mode 600. Only the migrate and seed steps get its values:
+  systemd reads it as root for the transient service that runs `migrateCmd`
+  or `seedCmd` as `<app>-build` (see "Security model of the new layout").
+  The deploy user cannot read it. `npm ci` and the build run with no
+  database address in their environment. (An app whose `<app>-run` name is
+  not a valid user name gets no build user; its `migrate.env` stays owned
+  by the deploy user, who loads it for migrate and seed.)
+
+The repository code that `migrateCmd` and `seedCmd` run holds the owner
+role's password (`DATABASE_URL`) while it runs. It can do anything the
+owner role can do. The owner role is confined to the app's own database:
+it owns `<db>` and schema `public` there, has CONNECT on no other database
+(CONNECT is revoked from PUBLIC on each samohost database), and has no
+superuser, CREATEDB, CREATEROLE, REPLICATION or BYPASSRLS. It can read and
+change every table of `<db>`, including rows that row-level security hides
+from `<db>_app`.
 
 An app bootstrapped by an older samohost has the superuser `DATABASE_URL` in
 its runtime env file and no `migrate.env`. Bootstrap and deploy detect that
