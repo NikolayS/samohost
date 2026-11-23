@@ -315,3 +315,39 @@ describe("register with another kind clears the deploy bookkeeping of the old ki
     expect(appStore.get("vm-1111", "field-record")?.deployedSha).toBe(SHA);
   });
 });
+
+describe("register and the TOML parser refuse a mainHost that is not a DNS name", () => {
+  test("app register: exit 1, nothing stored", () => {
+    const dir = mkdtempSync(join(tmpdir(), "samohost-mainhost-"));
+    try {
+      const vmStore = new StateStore(join(dir, "state.json"));
+      const appStore = new AppStore(join(dir, "apps.json"));
+      vmStore.upsert(vm());
+      const c = capture();
+      const code = runAppRegister(
+        {
+          vm: "samo-we-field-record", name: "field-record", repo: "Tanya301/field-record-1", branch: "main",
+          appDir: "/opt/field-record/app", buildCmd: "npm run build", serviceUnit: "field-record",
+          healthUrl: "http://localhost:3000/api/version", rlsNonSuperuser: false,
+          mainHost: "shop.example.com\nx",
+        },
+        { json: false }, vmStore, appStore, c.out, c.err,
+      );
+      expect(code).toBe(1);
+      expect(c.e).toContain("mainHost");
+      expect(appStore.get("vm-1111", "field-record")).toBeUndefined();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("TOML: an error names mainHost", async () => {
+    const { parseSamohostToml } = await import("../src/manifest/toml.ts");
+    const toml = [
+      'name = "shop"', 'repo = "o/shop"', 'branch = "main"', 'appDir = "/opt/shop/app"', 'buildCmd = "true"',
+      'healthUrl = "http://127.0.0.1:3000/healthz"', 'serviceUnit = "shop"', 'mainHost = "Shop Example"',
+    ].join("\n");
+    const res = parseSamohostToml(toml) as { ok?: boolean; errors?: string[] };
+    expect(JSON.stringify(res)).toContain("mainHost");
+  });
+});

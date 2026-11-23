@@ -21,6 +21,7 @@ import { checkCiGreen, type CiStatus } from "../app/cigate.ts";
 import { parseDeployOutcome, type DeployOutcome } from "../app/parse.ts";
 import { buildDeployScript } from "../app/script.ts";
 import { buildConfigHealScript } from "../app/heal-script.ts";
+import { isValidMainHost } from "../env/script.ts";
 import { validateStaticRoot } from "../app/static-root.ts";
 import { linuxAppUserError } from "../app/linux-user.ts";
 import {
@@ -251,6 +252,10 @@ export function runAppRegister(
       `error: releaseCiWorkflow must be the canonical trusted workflow path ` +
       `'${CANONICAL_RELEASE_CI_WORKFLOW}'`,
     );
+    return 1;
+  }
+  if (input.mainHost !== undefined && !isValidMainHost(input.mainHost)) {
+    err(`error: mainHost ${JSON.stringify(input.mainHost)} is not a dotted lowercase DNS name like "app.example.com"`);
     return 1;
   }
   if (input.kind === "static" && input.releaseTagPattern !== undefined && input.mainHost === undefined) {

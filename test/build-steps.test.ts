@@ -68,6 +68,8 @@ function sandbox(params: Partial<BuildStepParams> = {}, edits: Array<[string, st
   stub(bin, "systemctl", `f=${JSON.stringify(dir)}/state-$2; if [[ -f "$f" ]]; then cat "$f"; [[ "$(cat "$f")" == active ]] && exit 0; exit 3; fi; echo inactive; exit 3`, log);
   // GNU cp options on macOS: drop --preserve=timestamps and --, copy with -RP.
   stub(bin, "cp", 'a=(); for x in "$@"; do case "$x" in -R|-P|--preserve=timestamps|--) ;; *) a+=("$x");; esac; done\nprintf "releases at copy: %s\\n" "$(ls "$(dirname "${a[1]}")" | grep -v "\\.src$" | grep -v "\\.tmp$" | tr "\\n" " ")" >> ' + JSON.stringify(log) + '\n/bin/cp -RP "${a[@]}"', log);
+  // GNU tar's --no-overwrite-dir is not in macOS tar; drop it there.
+  stub(bin, "tar", 'a=(); for x in "$@"; do [[ "$x" == --no-overwrite-dir ]] || a+=("$x"); done\nexec /usr/bin/tar "${a[@]}"', log);
   // mv -T on macOS: replace the destination entry, then rename.
   stub(bin, "mv", 'args=(); t=0; for a in "$@"; do case "$a" in -fT|-T) t=1;; -f|--) ;; *) args+=("$a");; esac; done\nif [[ $t == 1 ]]; then rm -f "${args[1]}" 2>/dev/null || rmdir "${args[1]}" 2>/dev/null || true; fi\n/bin/mv -f "${args[0]}" "${args[1]}"', log);
   const text = buildStepScript({ ...PARAMS, ...params })
@@ -198,6 +200,11 @@ describe("step script: executed", () => {
     }
   });
 
+  test("install: the extracting tar keeps the mode of the existing build/ (--no-overwrite-dir), then chmod 700", () => {
+    const text = buildStepScript(PARAMS);
+    expect(text).toContain("tar --no-overwrite-dir -xf -; chmod 700 .");
+  });
+
   test("install: build/ stays mode 700 although the checkout folder is 755 (the archive's ./ entry)", () => {
     const s = sandbox();
     try {
@@ -208,7 +215,7 @@ describe("step script: executed", () => {
       const tar = join(s.dir, "bin", "tar");
       writeFileSync(tar, [
         "#!/usr/bin/env bash",
-        'if [[ "$*" != "-xf -" ]]; then exec /usr/bin/tar "$@"; fi',
+        'if [[ "$*" != "--no-overwrite-dir -xf -" ]]; then exec /usr/bin/tar "$@"; fi',
         't="$(mktemp)"; cat > "$t"; /usr/bin/tar -xf - < "$t"',
         "p=\"$(/usr/bin/tar -tvf \"$t\" | awk '$NF == \"./\" || $NF == \".\" { print $1; exit }')\"",
         'm=0; for i in 0 1 2; do x="${p:$((1 + i * 3)):3}"; v=0; [[ ${x:0:1} == r ]] && v=$((v + 4)); [[ ${x:1:1} == w ]] && v=$((v + 2)); [[ ${x:2:1} == x ]] && v=$((v + 1)); m="$m$v"; done',

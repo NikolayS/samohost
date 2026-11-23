@@ -81,7 +81,7 @@
  */
 
 import type { AppRecord } from "../types.ts";
-import { buildFirewallLines, type HostPrepFirewallOpts } from "../env/script.ts";
+import { buildFirewallLines, isValidMainHost, type HostPrepFirewallOpts } from "../env/script.ts";
 import {
   staticReleaseStatePaths,
   staticRootOf,
@@ -97,6 +97,9 @@ import { mainVhostTrustedProxies, planFromApp, renderVhost } from "../caddy/rend
 import { migrateEnvFileOf, releaseEnvFileOf, splitLayoutPathError } from "./db-layout.ts";
 import { buildModelPaths, buildStepScript, buildStepScriptPath, BUILD_STEP_NAMES } from "./build-steps.ts";
 import { isIP } from "node:net";
+
+/** End marker of the here-document that carries the main vhost text in §12b. */
+const MAIN_VHOST_HEREDOC_END = "SAMOHOST_MAIN_VHOST_CONTENT";
 import { dirname } from "node:path";
 
 // ---------------------------------------------------------------------------
@@ -1752,9 +1755,36 @@ export function buildHostBootstrapScript(
   // split-layout apps. Root writes it here from values fixed at bootstrap,
   // with the text heal renders (heal then finds no drift).
   if (runtimeUserUsable && app.mainHost !== undefined) {
+    if (!isValidMainHost(app.mainHost)) {
+      throw new Error(
+        `invalid mainHost ${JSON.stringify(app.mainHost)} for app '${app.name}': expected a dotted ` +
+          `lowercase DNS name like "app.example.com"; bootstrap writes the main vhost as root`,
+      );
+    }
+    for (const route of app.routes ?? []) {
+      for (const value of [route.matchPath, route.matchRegexp, route.respond?.body]) {
+        if (value !== undefined && /[\u0000-\u001f\u007f]/.test(value)) {
+          throw new Error(
+            `main vhost of app '${app.name}': route value ${JSON.stringify(value)} holds a control ` +
+              `character (newline included); check the routes (matchPath, matchRegexp, respond body)`,
+          );
+        }
+      }
+    }
     const mainVhostText = renderVhost(
       planFromApp(app, { trustedProxies: mainVhostTrustedProxies(app, opts.firewallOpts?.controlPlaneIp) }),
     );
+    const mainVhostLines = mainVhostText.replace(/\n$/, "").split("\n");
+    for (const line of mainVhostLines) {
+      if (line === MAIN_VHOST_HEREDOC_END || /[\u0000-\u0008\u000b-\u001f\u007f]/.test(line)) {
+        throw new Error(
+          `main vhost of app '${app.name}': rendered line ${JSON.stringify(line)} is the end marker ` +
+            `of the script's here-document or holds a control character; check the routes ` +
+            `(matchPath, matchRegexp, respond body)`,
+        );
+      }
+    }
+    const mainVhostNextFile = `/etc/caddy/sites.d/.00-main-${app.name}.caddy.next`;
     push(
       `# ---------------------------------------------------------------------------`,
       `# §12b. Main vhost ${mainVhostFile} (split layout).`,
@@ -1767,11 +1797,13 @@ export function buildHostBootstrapScript(
       "",
       `if [[ "$SAMOHOST_DB_LAYOUT" == split ]]; then`,
       `  SAMOHOST_MAIN_VHOST=${sq(mainVhostFile)}`,
+      `  SAMOHOST_MAIN_VHOST_TMP=${sq(mainVhostNextFile)}`,
+      `  if [[ -L /etc/caddy/sites.d || ! -d /etc/caddy/sites.d || ! -O /etc/caddy/sites.d ]]; then echo "ERROR: /etc/caddy/sites.d is not a folder owned by root (or is a symbolic link)" >&2; exit 1; fi`,
       `  if [[ -L "$SAMOHOST_MAIN_VHOST" ]]; then echo "ERROR: $SAMOHOST_MAIN_VHOST is a symbolic link" >&2; exit 1; fi`,
       `  SAMOHOST_MAIN_VHOST_NEXT="$(mktemp)"`,
-      `  cat > "$SAMOHOST_MAIN_VHOST_NEXT" <<'SAMOHOST_MAIN_VHOST_CONTENT'`,
-      ...mainVhostText.replace(/\n$/, "").split("\n"),
-      "SAMOHOST_MAIN_VHOST_CONTENT",
+      `  cat > "$SAMOHOST_MAIN_VHOST_NEXT" <<'${MAIN_VHOST_HEREDOC_END}'`,
+      ...mainVhostLines,
+      MAIN_VHOST_HEREDOC_END,
       `  if [[ -f "$SAMOHOST_MAIN_VHOST" ]] && cmp -s "$SAMOHOST_MAIN_VHOST_NEXT" "$SAMOHOST_MAIN_VHOST"; then`,
       `    echo "Caddy: main vhost $SAMOHOST_MAIN_VHOST unchanged."`,
       `  elif [[ -e "$SAMOHOST_MAIN_VHOST" && "$(head -n 1 "$SAMOHOST_MAIN_VHOST")" != ${sq(SAMOHOST_PROVENANCE_HEADER)} ]]; then`,
@@ -1779,9 +1811,9 @@ export function buildHostBootstrapScript(
       `  else`,
       `    SAMOHOST_MAIN_VHOST_PREV=""`,
       `    if [[ -f "$SAMOHOST_MAIN_VHOST" ]]; then SAMOHOST_MAIN_VHOST_PREV="$(mktemp)"; cp "$SAMOHOST_MAIN_VHOST" "$SAMOHOST_MAIN_VHOST_PREV"; fi`,
-      `    install -m 644 "$SAMOHOST_MAIN_VHOST_NEXT" "$SAMOHOST_MAIN_VHOST"`,
+      `    rm -f "$SAMOHOST_MAIN_VHOST_TMP"; install -m 644 "$SAMOHOST_MAIN_VHOST_NEXT" "$SAMOHOST_MAIN_VHOST_TMP"; mv -fT "$SAMOHOST_MAIN_VHOST_TMP" "$SAMOHOST_MAIN_VHOST"`,
       `    if ! sudo -u caddy ${CADDY_VALIDATE_COMMAND} >/dev/null || ! /usr/bin/systemctl reload caddy; then`,
-      `      if [[ -n "$SAMOHOST_MAIN_VHOST_PREV" ]]; then install -m 644 "$SAMOHOST_MAIN_VHOST_PREV" "$SAMOHOST_MAIN_VHOST"; else rm -f "$SAMOHOST_MAIN_VHOST"; fi`,
+      `      if [[ -n "$SAMOHOST_MAIN_VHOST_PREV" ]]; then rm -f "$SAMOHOST_MAIN_VHOST_TMP"; install -m 644 "$SAMOHOST_MAIN_VHOST_PREV" "$SAMOHOST_MAIN_VHOST_TMP"; mv -fT "$SAMOHOST_MAIN_VHOST_TMP" "$SAMOHOST_MAIN_VHOST"; else rm -f "$SAMOHOST_MAIN_VHOST"; fi`,
       `      rm -f "$SAMOHOST_MAIN_VHOST_NEXT" "$SAMOHOST_MAIN_VHOST_PREV"`,
       `      echo "ERROR: Caddy did not accept the main vhost $SAMOHOST_MAIN_VHOST; the previous state was restored" >&2`,
       `      exit 1`,

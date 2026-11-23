@@ -2165,7 +2165,7 @@ export function buildSecretsRotateScript(
  * a ROOT-run script, so fail closed on anything that is not a dotted
  * lowercase DNS name (same posture as the invalid-preview-domain fix, #28).
  */
-function isValidMainHost(host: string): boolean {
+export function isValidMainHost(host: string): boolean {
   if (host.length === 0 || host.length > 253) return false;
   const label = "[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?";
   return (

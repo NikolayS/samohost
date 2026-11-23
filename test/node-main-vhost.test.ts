@@ -22,6 +22,8 @@ import { mainVhostTrustedProxies, planFromApp, renderVhost } from "../src/caddy/
 import { goldenNodeApp, goldenNodeOpts } from "./bootstrap-golden-fixtures.ts";
 
 const VALIDATE_AS_CADDY = "sudo -u caddy /usr/bin/caddy validate --config /etc/caddy/Caddyfile";
+/** Heal runs as the deploy user: non-interactive sudo, so a missing rule fails at once. */
+const HEAL_VALIDATE_AS_CADDY = "sudo -n -u caddy /usr/bin/caddy validate --config /etc/caddy/Caddyfile";
 const CONTROL_PLANE = "192.0.2.10";
 
 /** The vhost text that `app heal` renders for the golden node app. */
@@ -58,11 +60,13 @@ function sandbox() {
     writeFileSync(join(bin, name), `#!/usr/bin/env bash\nprintf '%s %s\\n' ${JSON.stringify(name)} "$*" >> ${JSON.stringify(log)}\n${body}\n`);
     chmodSync(join(bin, name), 0o755);
   };
-  stub("sudo", ['if [[ "$1" == -u ]]; then shift 2; fi', 'c="$1"; shift', 'exec "${c#/usr/bin/}" "$@"'].join("\n"));
+  stub("sudo", ['while [[ "$1" == -n || "$1" == -u ]]; do if [[ "$1" == -u ]]; then shift 2; else shift; fi; done', 'c="$1"; shift', 'exec "${c#/usr/bin/}" "$@"'].join("\n"));
   stub("caddy", 'if [[ "${T_CADDY_FAIL:-0}" == 1 ]]; then echo "caddy: invalid config" >&2; exit 1; fi');
-  stub("systemctl", "exit 0");
+  stub("systemctl", 'if [[ "${T_RELOAD_FAIL:-0}" == 1 ]]; then echo "reload failed" >&2; exit 1; fi');
   stub("curl", 'printf "%s" "${T_CURL_CODE:-200}"');
   stub("sleep", "exit 0");
+  // GNU mv -T is not in macOS mv; the targets here are files, so mv -f is the same.
+  stub("mv", 'a=(); for x in "$@"; do if [[ "$x" == -fT ]]; then a+=(-f); else a+=("$x"); fi; done\nexec /bin/mv "${a[@]}"');
   const run = (text: string, env: Record<string, string> = {}) =>
     spawnSync("bash", ["-c", text.replaceAll("/etc/caddy/", `${caddyDir}/`).replaceAll(" /usr/bin/systemctl ", " systemctl ")], {
       encoding: "utf8",
@@ -149,6 +153,42 @@ describe("bootstrap: main vhost of a split-layout node app", () => {
     }
   });
 
+  test("reload fails: the previous vhost is restored, exit 1", () => {
+    const sb = sandbox();
+    try {
+      const old = `${SAMOHOST_PROVENANCE_HEADER}\nhttp://shop.example.com {\n}\n`;
+      writeFileSync(sb.vhost, old);
+      const res = runSection(sb, "split", { T_RELOAD_FAIL: "1" });
+      expect(res.status).toBe(1);
+      expect(readFileSync(sb.vhost, "utf8")).toBe(old);
+      expect(existsSync(join(sb.dir, "etc-caddy", "sites.d", ".00-main-shop.caddy.next"))).toBe(false);
+    } finally {
+      sb.cleanup();
+    }
+  });
+
+  test("the vhost is written to a dot file in sites.d and moved into place", () => {
+    expect(mainSection()).toContain('mv -fT "$SAMOHOST_MAIN_VHOST_TMP" "$SAMOHOST_MAIN_VHOST"');
+    expect(mainSection()).toContain("SAMOHOST_MAIN_VHOST_TMP='/etc/caddy/sites.d/.00-main-shop.caddy.next'");
+  });
+
+  test("sites.d that is a symbolic link: error, nothing written", () => {
+    const sb = sandbox();
+    try {
+      const sites = join(sb.dir, "etc-caddy", "sites.d");
+      const real = join(sb.dir, "elsewhere");
+      mkdirSync(real);
+      rmSync(sites, { recursive: true });
+      spawnSync("ln", ["-s", real, sites]);
+      const res = runSection(sb, "split");
+      expect(res.status).toBe(1);
+      expect(res.stderr).toContain("/sites.d is not a folder owned by root");
+      expect(spawnSync("ls", ["-A", real], { encoding: "utf8" }).stdout).toBe("");
+    } finally {
+      sb.cleanup();
+    }
+  });
+
   test("a symbolic link at the vhost path: error, nothing written", () => {
     const sb = sandbox();
     try {
@@ -199,7 +239,7 @@ describe("heal: node app on a split-layout server", () => {
       const res = runHeal(sb);
       expect(res.status, res.stderr).toBe(0);
       expect(res.stdout).toContain("main vhost: created");
-      expect(sb.calls()).toContain(VALIDATE_AS_CADDY);
+      expect(sb.calls()).toContain(HEAL_VALIDATE_AS_CADDY);
       expect(readFileSync(sb.vhost, "utf8")).toBe(healRender());
     } finally {
       sb.cleanup();
@@ -251,10 +291,39 @@ describe("heal: node app on a split-layout server", () => {
     try {
       const res = sb.run(heal());
       expect(res.status, res.stderr).toBe(0);
-      expect(sb.calls()).not.toContain("sudo -u caddy");
+      expect(sb.calls()).not.toContain("-u caddy");
       expect(sb.calls()).toContain("caddy validate --config /etc/caddy/Caddyfile");
     } finally {
       sb.cleanup();
     }
+  });
+});
+
+describe("bootstrap: the main vhost is rendered only from a valid host name and plain lines", () => {
+  const withRoute = (body: string, matchPath = "/x") => ({
+    ...goldenNodeApp(),
+    services: [{ name: "web", unit: "shop", listeners: [{ name: "web", port: 3000, portEnv: "PORT" }] }],
+    defaultListener: "web",
+    routes: [{ matchPath, respond: { status: 200, body } }],
+  });
+
+  test("a mainHost that is not a dotted lowercase DNS name: error before any script text", () => {
+    for (const host of ["shop.example.com\nSAMOHOST_MAIN_VHOST_CONTENT", "Shop.Example.com", "shop example.com", ""]) {
+      expect(() => buildHostBootstrapScript({ ...goldenNodeApp(), mainHost: host }, goldenNodeOpts()), JSON.stringify(host)).toThrow(/mainHost/);
+    }
+  });
+
+  test("a rendered vhost line equal to the heredoc delimiter: error", () => {
+    expect(() => buildHostBootstrapScript(withRoute("a\nSAMOHOST_MAIN_VHOST_CONTENT\nb"), goldenNodeOpts())).toThrow(/main vhost/);
+    expect(() => buildHostBootstrapScript(withRoute("ok", "/x\nSAMOHOST_MAIN_VHOST_CONTENT"), goldenNodeOpts())).toThrow(/main vhost/);
+  });
+
+  test("a rendered vhost line with a control character: error", () => {
+    expect(() => buildHostBootstrapScript(withRoute("a\u0007b"), goldenNodeOpts())).toThrow(/main vhost/);
+    expect(() => buildHostBootstrapScript(withRoute("a\rb"), goldenNodeOpts())).toThrow(/main vhost/);
+  });
+
+  test("plain routes still render", () => {
+    expect(buildHostBootstrapScript(withRoute("not here"), goldenNodeOpts())).toContain("# §12b.");
   });
 });

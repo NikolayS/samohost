@@ -407,7 +407,12 @@ keep the legacy layout get the same sudo rules and unit as before.
   caddy user, `sudo -u caddy /usr/bin/caddy validate --config
   /etc/caddy/Caddyfile` (the validation opens each vhost's log file in
   `/var/log/caddy`, which only caddy can create; the deploy user can already
-  reload Caddy with any vhost text it writes). Nineteen rules in all:
+  reload Caddy with any vhost text it writes). Heal calls it with `sudo -n`,
+  so on a server bootstrapped before this rule existed it fails at once
+  instead of waiting for a password: run bootstrap again before heal there.
+  The rules rely on sudo's default `env_reset`: the commands they allow run
+  without most of the deploy user's environment (no `LD_PRELOAD` or
+  `BASH_ENV`; Ubuntu's `secure_path` also replaces `PATH`). Nineteen rules in all:
   `systemctl enable`, `start`, `stop` and `restart` of the unit,
   `systemctl reload caddy`, `tee` of the main vhost, of the staging file and
   of `release.env`, `mv` of the staging file to the main vhost, `rm -f` of
@@ -669,6 +674,9 @@ than the exact sudo rules.
 Bootstrap writes the main vhost `00-main-<app>.caddy` of these apps as
 root, from the values fixed at bootstrap (host names, app port,
 control-plane address) and with the text that `app heal` renders. It
+refuses a `mainHost` that is not a dotted lowercase DNS name and route
+values with control characters, writes the file as a dot file in the
+root-owned `/etc/caddy/sites.d` (not a link) and moves it into place. It
 replaces a file with samohost's header (for example the vhost of a static
 app of the same name), keeps a file without it (with a warning), has Caddy
 validate the whole configuration as the caddy user and reloads Caddy; when

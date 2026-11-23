@@ -364,7 +364,7 @@ describe("new layout: deploy user's sudo rules", () => {
     const allowed = sudoMatcher(SPLIT_SUDOERS);
     const seen: string[] = [];
     for (const text of texts) {
-      for (const m of text.matchAll(/\bsudo (?:-u ([a-z]+) )?(\/usr\/bin\/[a-z]+)((?: (?:'[^']*'|"[^"]*"|[^\s;|&<>'"]+))*)/g)) {
+      for (const m of text.matchAll(/\bsudo (?:-n )?(?:-u ([a-z]+) )?(\/usr\/bin\/[a-z]+)((?: (?:'[^']*'|"[^"]*"|[^\s;|&<>'"]+))*)/g)) {
         const runas = m[1] ?? "root";
         const cmd = m[2]!;
         const args = m[3]!

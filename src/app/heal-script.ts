@@ -314,7 +314,7 @@ export function buildConfigHealScript(app: AppRecord, opts: BuildConfigHealScrip
       `SAMOHOST_STEP=${sq(buildStepScriptPath(app.name))}`,
       "samohost_caddy_validate() {",
       '  if [[ -x "$SAMOHOST_STEP" ]]; then',
-      `    sudo -u caddy ${CADDY_VALIDATE_COMMAND} >/dev/null`,
+      `    sudo -n -u caddy ${CADDY_VALIDATE_COMMAND} >/dev/null`,
       "  else",
       "    caddy validate --config /etc/caddy/Caddyfile >/dev/null",
       "  fi",
