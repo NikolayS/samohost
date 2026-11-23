@@ -398,6 +398,10 @@ export function buildHostBootstrapScript(
     `#   ${tokenFile}. NEVER from FD 0 (the script body is piped there via 'bash -s'),`,
     "#   NEVER in argv, NEVER in remote URL.",
     "set -euo pipefail",
+    "# Commands run as other users (sudo -u) start in the working directory;",
+    "# the caller's folder (for example /home/<operator>, mode 750) can be closed",
+    "# to them, and find then exits 1. Run from /.",
+    "cd /",
     "",
     ...(isStatic && !isStaticReleaseChannel && app.mainHost !== undefined
       ? [...staticTreeGuardFnLines(), ""]
