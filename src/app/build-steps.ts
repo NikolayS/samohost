@@ -11,7 +11,8 @@
  * - app/          the checkout, owned by the deploy user (git fetch and reset).
  * - build/        owned by <app>-build. Install copies the checkout (without
  *                 .git) here, then npm and the build command write here.
- * - build-cache/  owned by <app>-build; HOME of install and build (npm cache).
+ * - build-cache/  owned by <app>-build; the npm cache of install and build
+ *                 (npm_config_cache). HOME of every step is its private /tmp.
  * - releases/<n>/ root-owned copies of build/ (group <app>-run, no world bits),
  *                 made by `step release` after migrate.
  * - current, previous: root-owned links to releases/<n>. The service unit
@@ -70,7 +71,6 @@ export function buildStepScript(p: BuildStepParams): string {
     .join(" ");
   const installCmd = [
     "set -euo pipefail",
-    "find . -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +",
     'tar -C "$SAMOHOST_CHECKOUT" --exclude=./.git -cf - . | tar -xf -',
     "if [ -f package-lock.json ] || [ -f npm-shrinkwrap.json ]; then npm ci --include=dev; else npm install --include=dev; fi",
   ].join("; ");
@@ -104,7 +104,9 @@ export function buildStepScript(p: BuildStepParams): string {
     "# Run one command as the build user in a transient systemd service. The",
     "# service's cgroup ends with the command (KillMode=control-group), so no",
     "# process of the build user outlives the step.",
-    "# Arguments: unit name, time limit (s), writable paths, env file, HOME, command.",
+    "# Arguments: unit name, time limit (s), writable paths, env file, npm cache",
+    "# folder, command. HOME is the unit's private /tmp, so no configuration file",
+    "# (~/.npmrc and others) outlives the step; only the npm cache folder persists.",
     "samohost_build_unit() {",
     '  local props=(',
     "    -p NoNewPrivileges=yes -p ProtectSystem=strict -p ProtectHome=yes -p PrivateTmp=yes",
@@ -116,11 +118,12 @@ export function buildStepScript(p: BuildStepParams): string {
     "  )",
     '  if [[ -n "$3" ]]; then props+=(-p "ReadWritePaths=$3"); fi',
     '  if [[ -n "$4" ]]; then props+=(-p "EnvironmentFile=$4"); fi',
+    '  local envs=(-E HOME=/tmp -E NODE_ENV=production -E PATH=/usr/local/bin:/usr/bin:/bin -E SAMOHOST_CHECKOUT="$CHECKOUT")',
+    '  if [[ -n "$5" ]]; then envs+=(-E "npm_config_cache=$5"); fi',
     '  systemd-run --quiet --wait --pipe --collect --service-type=exec \\',
     '    --unit="samohost-$APP-$1" --uid="$BUILD_USER" --gid="$BUILD_USER" \\',
     '    --working-directory="$BUILD_DIR" \\',
-    '    -E HOME="$5" -E NODE_ENV=production -E PATH=/usr/local/bin:/usr/bin:/bin -E SAMOHOST_CHECKOUT="$CHECKOUT" \\',
-    '    "${props[@]}" /bin/bash -c "$6"',
+    '    "${envs[@]}" "${props[@]}" /bin/bash -c "$6"',
     "}",
     "",
     "samohost_switch_link() { # <link> <target>: replace the link in one rename",
@@ -130,6 +133,10 @@ export function buildStepScript(p: BuildStepParams): string {
     "",
     'case "$1" in',
     "  install)",
+    "    # Root empties build/ while no process of the build user runs; rm -rf does",
+    "    # not follow symbolic links.",
+    '    pkill -KILL -u "$BUILD_USER" 2>/dev/null || true',
+    '    find "$BUILD_DIR" -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +',
     '    samohost_build_unit install 1800 "$BUILD_DIR $CACHE_DIR" "" "$CACHE_DIR" "$INSTALL_CMD"',
     "    ;;",
     "  build)",
@@ -140,13 +147,14 @@ export function buildStepScript(p: BuildStepParams): string {
     '    if [[ -z "$cmd" ]]; then echo "ERROR: no $1 command was set when bootstrap wrote this script; run bootstrap again" >&2; exit 1; fi',
     "    # Only migrate.env (owner role DATABASE_URL, APP_DATABASE_URL, seed values)",
     "    # and release.env; nothing writable but the private /tmp.",
-    '    samohost_build_unit "$1" 900 "" "$MIGRATE_ENV" /tmp "$cmd"',
+    '    samohost_build_unit "$1" 900 "" "$MIGRATE_ENV" "" "$cmd"',
     "    ;;",
     "  release)",
     "    # Root copies build/ while no process of the build user runs. With",
     "    # fs.protected_hardlinks=1 the build user cannot hard-link files it does",
-    "    # not own, so the copy contains only the build user's own files; cp -a",
-    "    # copies symbolic links as links.",
+    "    # not own, so the copy contains only the build user's own files. cp -R -P",
+    "    # copies symbolic links as links and keeps no owner, ACL or extended",
+    "    # attribute of the source.",
     '    if [[ "$(cat /proc/sys/fs/protected_hardlinks 2>/dev/null || echo 0)" != 1 ]]; then',
     '      echo "ERROR: fs.protected_hardlinks is not 1; refusing to copy the build" >&2; exit 1',
     "    fi",
@@ -155,7 +163,7 @@ export function buildStepScript(p: BuildStepParams): string {
     '    new="$RELEASES/$name"',
     '    rm -rf -- "$new.tmp"',
     '    mkdir -m 750 -- "$new.tmp"',
-    '    cp -a -- "$BUILD_DIR/." "$new.tmp/"',
+    '    cp -R -P --preserve=timestamps -- "$BUILD_DIR/." "$new.tmp/"',
     '    rm -f -- "$new.tmp/.npmrc"',
     '    chown -hR "root:$RUN_USER" "$new.tmp"',
     '    chmod -R u=rwX,g=rX,o=,ug-s "$new.tmp"',

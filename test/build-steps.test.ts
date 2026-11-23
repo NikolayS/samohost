@@ -62,6 +62,8 @@ function sandbox(params: Partial<BuildStepParams> = {}) {
   stub(bin, "npm", 'if [[ "$1" == run && "$2" == build ]]; then mkdir -p dist && echo built > dist/server.js; fi', log);
   stub(bin, "pkill", "exit 1", log);
   stub(bin, "chown", "exit 0", log);
+  // GNU cp options on macOS: drop --preserve=timestamps and --, copy with -RP.
+  stub(bin, "cp", 'a=(); for x in "$@"; do case "$x" in -R|-P|--preserve=timestamps|--) ;; *) a+=("$x");; esac; done\n/bin/cp -RP "${a[@]}"', log);
   // mv -T on macOS: replace the destination entry, then rename.
   stub(bin, "mv", 'args=(); t=0; for a in "$@"; do case "$a" in -fT|-T) t=1;; -f|--) ;; *) args+=("$a");; esac; done\nif [[ $t == 1 ]]; then rm -f "${args[1]}" 2>/dev/null || rmdir "${args[1]}" 2>/dev/null || true; fi\n/bin/mv -f "${args[0]}" "${args[1]}"', log);
   const text = buildStepScript({ ...PARAMS, ...params })
@@ -101,7 +103,7 @@ describe("step script: rendered", () => {
   test("install and build may write build/ and build-cache/ only; migrate and seed nothing but /tmp, with migrate.env", () => {
     expect(text).toContain('samohost_build_unit install 1800 "$BUILD_DIR $CACHE_DIR" "" "$CACHE_DIR" "$INSTALL_CMD"');
     expect(text).toContain('samohost_build_unit build 1800 "$BUILD_DIR $CACHE_DIR" "" "$CACHE_DIR" "$BUILD_CMD"');
-    expect(text).toContain('samohost_build_unit "$1" 900 "" "$MIGRATE_ENV" /tmp "$cmd"');
+    expect(text).toContain('samohost_build_unit "$1" 900 "" "$MIGRATE_ENV" "" "$cmd"');
   });
 
   test("commands are fixed in the script", () => {
@@ -137,6 +139,49 @@ describe("step script: executed", () => {
       // Release identity: the build reads SAMO_RELEASE_TAG and SAMO_RELEASE_SHA from release.env.
       const buildLine = s.calls().split("\n").find((l) => l.includes("--unit=samohost-shop-build"))!;
       expect(buildLine).toContain(`EnvironmentFile=-${s.base}/release.env`);
+    } finally {
+      s.cleanup();
+    }
+  });
+
+  test("install and build: HOME is the private /tmp; only the npm cache folder persists between deploys", () => {
+    const s = sandbox();
+    try {
+      expect(s.step("install").status).toBe(0);
+      expect(s.step("build").status).toBe(0);
+      for (const unit of ["install", "build"]) {
+        const line = s.calls().split("\n").find((l) => l.includes(`--unit=samohost-shop-${unit}`))!;
+        expect(line, unit).toContain("-E HOME=/tmp");
+        expect(line, unit).toContain(`-E npm_config_cache=${s.base}/build-cache`);
+      }
+    } finally {
+      s.cleanup();
+    }
+  });
+
+  test("install: root empties build/ after killing build-user processes, before the build user runs", () => {
+    const s = sandbox();
+    try {
+      writeFileSync(join(s.base, "build", "stale.txt"), "old\n");
+      expect(s.step("install").status).toBe(0);
+      const calls = s.calls().split("\n");
+      const kill = calls.findIndex((l) => l === "pkill -KILL -u shop-build");
+      const unit = calls.findIndex((l) => l.includes("--unit=samohost-shop-install"));
+      expect(kill).toBeGreaterThanOrEqual(0);
+      expect(kill).toBeLessThan(unit);
+      expect(existsSync(join(s.base, "build", "stale.txt"))).toBe(false);
+      expect(buildStepScript(PARAMS)).not.toMatch(/INSTALL_CMD=.*rm -rf/);
+    } finally {
+      s.cleanup();
+    }
+  });
+
+  test("release copies without ACLs, extended attributes or owners (cp -R -P --preserve=timestamps)", () => {
+    const s = sandbox();
+    try {
+      expect(s.step("release").status).toBe(0);
+      expect(s.calls()).toMatch(/^cp -R -P --preserve=timestamps -- /m);
+      expect(buildStepScript(PARAMS)).not.toContain("cp -a");
     } finally {
       s.cleanup();
     }
