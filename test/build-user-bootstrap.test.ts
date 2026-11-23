@@ -23,7 +23,7 @@ function section(text: string, from: string, to: string): string {
   return lines.slice(start, end - 1).join("\n");
 }
 
-function run5d(layout: "split" | "legacy", opts: { hardlinks?: string; passwd?: string; groups?: string } = {}) {
+function run5d(layout: "split" | "legacy", opts: { hardlinks?: string; passwd?: string; groups?: string; resolv?: string } = {}) {
   const dir = mkdtempSync(join(tmpdir(), "samohost-5d-"));
   const bin = join(dir, "bin");
   mkdirSync(bin);
@@ -43,6 +43,7 @@ function run5d(layout: "split" | "legacy", opts: { hardlinks?: string; passwd?: 
   const etc = join(dir, "etc");
   mkdirSync(etc);
   writeFileSync(join(dir, "protected_hardlinks"), `${opts.hardlinks ?? "1"}\n`);
+  writeFileSync(join(dir, "resolv.conf"), opts.resolv ?? "nameserver 127.0.0.53\noptions edns0 trust-ad\nsearch .\n");
   const lib = join(dir, "usr-local-lib-samohost");
   const replace = (t: string) =>
     t
@@ -50,7 +51,8 @@ function run5d(layout: "split" | "legacy", opts: { hardlinks?: string; passwd?: 
       .replaceAll("/usr/local/lib/samohost", lib)
       .replaceAll("/etc/cron.deny", join(etc, "cron.deny"))
       .replaceAll("/etc/at.deny", join(etc, "at.deny"))
-      .replaceAll("/proc/sys/fs/protected_hardlinks", join(dir, "protected_hardlinks"));
+      .replaceAll("/proc/sys/fs/protected_hardlinks", join(dir, "protected_hardlinks"))
+      .replaceAll("/etc/resolv.conf", join(dir, "resolv.conf"));
   const body = replace(section(buildHostBootstrapScript(nodeApp(), nodeOpts()), "5d", "6"));
   const runOnce = () =>
     spawnSync("bash", ["-c", `set -euo pipefail\nSAMOHOST_DB_LAYOUT=${layout}\n${body}`], {
@@ -162,6 +164,28 @@ describe("§5d build user and step script", () => {
     expect(body).toContain('if [[ "$SAMOHOST_DB_LAYOUT" == split ]]; then');
     expect(body).toContain(`ERROR: the build user name ${name}-build is not a valid user name`);
     expect(body).not.toContain("SAMOHOST_STEP_SCRIPT");
+  });
+
+  test("split layout: a loopback resolver other than 127.0.0.53 in /etc/resolv.conf stops bootstrap", () => {
+    for (const ns of ["127.0.0.1", "127.0.1.1", "::1"]) {
+      const r = run5d("split", { resolv: `nameserver ${ns}\n` });
+      try {
+        const res = r.runOnce();
+        expect(res.status, ns).toBe(1);
+        expect(res.stderr).toContain(`resolv.conf names the loopback resolver ${ns}.`);
+        expect(r.calls()).not.toContain("useradd");
+      } finally {
+        r.cleanup();
+      }
+    }
+    for (const ok of ["nameserver 127.0.0.53\n", "nameserver 192.0.2.53\nnameserver 2001:db8::53\n", "# nameserver 127.0.0.1\nnameserver 127.0.0.53\n"]) {
+      const r = run5d("split", { resolv: ok });
+      try {
+        expect(r.runOnce().status, ok).toBe(0);
+      } finally {
+        r.cleanup();
+      }
+    }
   });
 
   test("legacy layout: nothing", () => {
