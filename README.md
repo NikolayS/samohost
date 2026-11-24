@@ -262,7 +262,12 @@ In the old layout bootstrap creates no `<db>_app` role and keeps the
 reads the superuser password from `DATABASE_URL` in §3b, before it changes
 anything on the server; when that line is not
 `postgresql://postgres:<hex>@...` (or `postgres://`), bootstrap stops there
-with nothing changed.
+with nothing changed. A legacy app's env file must keep its `DATABASE_URL=`
+line: when the env file is missing or has no `DATABASE_URL=` line, there is
+no `migrate.env` and no marker, and `/etc/systemd/system/<serviceUnit>.service`
+has `User=<appUser>` (the unit a legacy bootstrap writes; the new layout
+writes `User=<app>-run`), bootstrap stops in §3b with nothing changed instead
+of converting the app.
 
 Two env files sit next to each other on the server:
 
@@ -278,7 +283,8 @@ its runtime env file and no `migrate.env`. Bootstrap and deploy detect that
 and keep it as it is. To move such an app to the new layout:
 
 1. As root on the server, remove the `DATABASE_URL=postgresql://postgres:...`
-   and `SEED_OWNER_*` lines from the runtime env file.
+   and `SEED_OWNER_*` lines from the runtime env file, and write the marker:
+   `install -d -m 755 /var/lib/samohost/db-layout && echo split > /var/lib/samohost/db-layout/<app>`.
 2. Run `app bootstrap` again. It now uses the new layout: it creates
    `<db>_owner`, makes it the owner of `<db>`, writes `migrate.env`, and prints
    a warning when objects in schema `public` are owned by another role.
