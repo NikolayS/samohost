@@ -736,6 +736,65 @@ describe("app commands", () => {
     expect(rec?.deployedSha).toBe("GOODSHA"); // NOT advanced on failure
   });
 
+  for (const phase of ["install", "build"] as const) {
+    test(`rollback after a failed ${phase}: exit 1, outcome rolled-back, no failedSha recorded`, async () => {
+      register();
+      appStore.upsert({ ...appStore.get("vm-1111", "field-record")!, deployedSha: "GOODSHA" });
+      const c = capture();
+      const stream = [
+        "<<<SAMOHOST_PHASE:fetch:start>>>", "<<<SAMOHOST_PHASE:fetch:ok>>>",
+        ...(phase === "build" ? ["<<<SAMOHOST_PHASE:install:start>>>", "<<<SAMOHOST_PHASE:install:ok>>>"] : []),
+        `<<<SAMOHOST_PHASE:${phase}:start>>>`, `<<<SAMOHOST_PHASE:${phase}:fail>>>`,
+        "<<<SAMOHOST_PHASE:rollback:ok>>>",
+      ].join("\n");
+      const code = await runAppDeploy(
+        { vm: "samo-we-field-record", app: "field-record", sha: SHA, skipCiGate: false },
+        { json: true }, vmStore, appStore, deployDeps(stream), c.out, c.err,
+      );
+      expect(code).toBe(1);
+      expect(JSON.parse(c.o).outcome).toBe("rolled-back");
+      const rec = appStore.get("vm-1111", "field-record");
+      expect(rec?.failedSha).toBeUndefined();
+      expect(rec?.deployedSha).toBe("GOODSHA");
+    });
+  }
+
+  for (const phase of ["migrate", "health", "assert-rls"] as const) {
+    test(`rollback after a failed ${phase}: failedSha recorded`, async () => {
+      register();
+      const c = capture();
+      const stream = [
+        "<<<SAMOHOST_PHASE:install:start>>>", "<<<SAMOHOST_PHASE:install:ok>>>",
+        "<<<SAMOHOST_PHASE:build:start>>>", "<<<SAMOHOST_PHASE:build:ok>>>",
+        `<<<SAMOHOST_PHASE:${phase}:start>>>`, `<<<SAMOHOST_PHASE:${phase}:fail>>>`,
+        "<<<SAMOHOST_PHASE:rollback:ok>>>",
+      ].join("\n");
+      const code = await runAppDeploy(
+        { vm: "samo-we-field-record", app: "field-record", sha: SHA, skipCiGate: false },
+        { json: true }, vmStore, appStore, deployDeps(stream), c.out, c.err,
+      );
+      expect(code).toBe(1);
+      expect(JSON.parse(c.o).outcome).toBe("rolled-back");
+      expect(appStore.get("vm-1111", "field-record")?.failedSha).toBe(SHA);
+    });
+  }
+
+  test("failed rollback after a failed install: no failedSha recorded", async () => {
+    register();
+    const c = capture();
+    const stream = [
+      "<<<SAMOHOST_PHASE:install:start>>>", "<<<SAMOHOST_PHASE:install:fail>>>",
+      "<<<SAMOHOST_PHASE:rollback:fail>>>",
+    ].join("\n");
+    const code = await runAppDeploy(
+      { vm: "samo-we-field-record", app: "field-record", sha: SHA, skipCiGate: false },
+      { json: true }, vmStore, appStore, deployDeps(stream), c.out, c.err,
+    );
+    expect(code).toBe(1);
+    expect(JSON.parse(c.o).outcome).toBe("rollback-failed");
+    expect(appStore.get("vm-1111", "field-record")?.failedSha).toBeUndefined();
+  });
+
   test("known-bad-SHA guard refuses a recorded failedSha", async () => {
     register();
     appStore.upsert({ ...appStore.get("vm-1111", "field-record")!, failedSha: SHA });

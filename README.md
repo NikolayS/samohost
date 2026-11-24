@@ -330,8 +330,11 @@ Migrations that already ran are not undone, in either case. `node_modules`
 is not restored. The previous release must therefore work with the new
 schema: add columns as nullable or with a default, and drop a column only
 in a release after the code stopped using it. samohost records the commit as
-failed (`failedSha`) after a rollback and does not deploy it again until
-`app clear-failed`.
+failed (`failedSha`) after a rollback that follows a failed migrate, health
+check or `assert-rls`, and does not deploy it again until `app clear-failed`.
+A rollback after a failed install or build (for example an npm registry
+outage) does not record the commit: the outcome is `rolled-back`, the exit
+code 1, and the next trigger cycle deploys the same commit again.
 
 ### Runtime user and service hardening of a node app
 

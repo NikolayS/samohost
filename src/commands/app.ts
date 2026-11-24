@@ -18,7 +18,7 @@ import { readFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { isIP } from "node:net";
 import { checkCiGreen, type CiStatus } from "../app/cigate.ts";
-import { parseDeployOutcome, type DeployOutcome } from "../app/parse.ts";
+import { parseDeployOutcome, rollbackRecordsFailedSha, type DeployOutcome } from "../app/parse.ts";
 import { buildDeployScript } from "../app/script.ts";
 import { buildConfigHealScript } from "../app/heal-script.ts";
 import { validateStaticRoot } from "../app/static-root.ts";
@@ -936,7 +936,7 @@ export async function runAppDeploy(
   }
 
   const combined = result.stdout + "\n" + result.stderr;
-  const { outcome } = parseDeployOutcome(combined);
+  const { events, outcome } = parseDeployOutcome(combined);
 
   // ---- update bookkeeping -------------------------------------------------
   const stamped = deps.now().toISOString();
@@ -954,7 +954,9 @@ export async function runAppDeploy(
         // Non-fatal: best-effort; staleness check will treat missing as stale.
       }
     }
-  } else if (outcome === "rolled-back" || outcome === "rollback-failed") {
+  } else if ((outcome === "rolled-back" || outcome === "rollback-failed") && rollbackRecordsFailedSha(events)) {
+    // A rollback after a failed install or build does not record the commit:
+    // the next trigger cycle deploys it again (src/app/parse.ts).
     updated.failedSha = sha;
     // deployedSha is intentionally NOT advanced on failure.
     // generatorSha is intentionally NOT written on failure.

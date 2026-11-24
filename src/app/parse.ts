@@ -110,6 +110,28 @@ export function deployOutcome(events: PhaseEvent[]): DeployOutcome {
   return "deployed";
 }
 
+/**
+ * Phases whose failure says nothing about the commit itself (an npm registry
+ * outage, a full disk): a rollback after one of them does not record the
+ * commit as failed, so the next trigger cycle deploys it again.
+ */
+const RETRYABLE_FAILED_PHASES = new Set<PhaseName>(["install", "build"]);
+
+/**
+ * Whether a rolled-back deploy records its commit as failed (`failedSha`).
+ * Yes, unless the phase that failed before the rollback was install or build.
+ * A failed migrate, health check or assert-rls, and a rollback with no failed
+ * phase marker (static deploy steps), record it.
+ */
+export function rollbackRecordsFailedSha(events: PhaseEvent[]): boolean {
+  let failed: PhaseName | undefined;
+  for (const ev of events) {
+    if (ev.phase === "rollback") break;
+    if (ev.status === "fail") failed = ev.phase;
+  }
+  return failed === undefined || !RETRYABLE_FAILED_PHASES.has(failed);
+}
+
 /** Convenience: parse a raw blob straight to its terminal outcome. */
 export function parseDeployOutcome(raw: string): {
   events: PhaseEvent[];
