@@ -596,11 +596,18 @@ export function buildHostBootstrapScript(
       `elif [[ -f "$ENV_FILE" ]] && grep -q '^DATABASE_URL=' "$ENV_FILE" && [[ ! -e "$MIGRATE_ENV_FILE" ]]; then`,
       `  SAMOHOST_DB_LAYOUT=legacy`,
       `  echo "postgres: legacy env layout (DATABASE_URL in $ENV_FILE) kept unchanged"`,
-      `# No marker, no migrate env file, no DATABASE_URL line, and the legacy unit:`,
-      `# the app runs in the legacy layout. Stop instead of converting it.`,
-      `elif [[ ! -e "$MIGRATE_ENV_FILE" && -f "$SAMOHOST_UNIT_FILE" ]] && grep -Eq ${sq(`^[[:space:]]*User[[:space:]]*=[[:space:]]*${appUser}[[:space:]]*$`)} "$SAMOHOST_UNIT_FILE"; then`,
-      `  echo "ERROR: $SAMOHOST_UNIT_FILE runs ${app.name} as ${appUser}: ${app.name} is in the legacy layout, and its env file $ENV_FILE is missing or has no DATABASE_URL= line; bootstrap changed nothing. A legacy app's env file must contain its DATABASE_URL= line. A move to the new layout is the manual procedure in the README (Database roles and env files of a node app)." >&2`,
-      `  exit 1`,
+      // Only when the runtime user name is usable: otherwise the new layout's
+      // unit also runs as the deploy user, and a retry of an interrupted
+      // first run must not be refused.
+      ...(runtimeUserUsable
+        ? [
+            `# No marker, no migrate env file, no DATABASE_URL line, and the legacy unit:`,
+            `# the app runs in the legacy layout. Stop instead of converting it.`,
+            `elif [[ ! -e "$MIGRATE_ENV_FILE" && -f "$SAMOHOST_UNIT_FILE" ]] && grep -Eq ${sq(`^[[:space:]]*User[[:space:]]*=[[:space:]]*${appUser}[[:space:]]*$`)} "$SAMOHOST_UNIT_FILE"; then`,
+            `  echo "ERROR: $SAMOHOST_UNIT_FILE runs ${app.name} as ${appUser}: ${app.name} is in the legacy layout, and its env file $ENV_FILE is missing or has no DATABASE_URL= line; bootstrap changed nothing. A legacy app's env file must contain its DATABASE_URL= line. A move to the new layout is the manual procedure in the README (Database roles and env files of a node app)." >&2`,
+            `  exit 1`,
+          ]
+        : []),
       `else`,
       `  SAMOHOST_DB_LAYOUT=split`,
       `fi`,

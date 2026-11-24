@@ -120,6 +120,27 @@ describe("bootstrap re-run — legacy unit without a DATABASE_URL line", () => {
     }
   });
 
+  test("an app whose runtime user name is not usable: a retry of an interrupted first run (unit with User=<appUser>, no env file) is not refused", () => {
+    const sb = makeSandbox();
+    try {
+      const envFile = join(sb.dir, "staging.env");
+      // "shop.v2-run" is not a valid Linux user name: that unit runs as the deploy user.
+      writeFileSync(join(unitDirOf(sb), "shop.service"), LEGACY_UNIT);
+      const section = dbSection(sandboxScript(envFile, { name: "shop.v2" })).replaceAll("/etc/systemd/system", unitDirOf(sb));
+      const res = runSection(sb, section);
+      expect(res.stderr).not.toContain("is in the legacy layout");
+      expect(res.status, res.stderr).toBe(0);
+      expect(existsSync(join(sb.dir, "migrate.env"))).toBe(true);
+    } finally {
+      sb.cleanup();
+    }
+  });
+
+  test("the refusal is rendered only for an app whose runtime user name is usable", () => {
+    expect(sandboxScript("/opt/shop/staging.env")).toContain("is in the legacy layout");
+    expect(sandboxScript("/opt/shop/staging.env", { name: "shop.v2" })).not.toContain("is in the legacy layout");
+  });
+
   test("a split marker uses the new layout even with a unit that runs as the deploy user", () => {
     const sb = makeSandbox();
     try {
