@@ -9,3 +9,4 @@ shop ALL=(root) NOPASSWD: /usr/bin/mv -- /etc/caddy/sites.d/*.caddy /etc/caddy/s
 shop ALL=(root) NOPASSWD: /usr/bin/rm -f /etc/caddy/sites.d/*.caddy
 shop ALL=(postgres) NOPASSWD: /usr/bin/psql
 shop ALL=(root) NOPASSWD: /usr/bin/journalctl *
+shop ALL=(caddy) NOPASSWD: /usr/bin/caddy validate --config /etc/caddy/Caddyfile

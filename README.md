@@ -318,6 +318,23 @@ an older samohost wrote: a file byte-equal to the earlier host-prep form
 whose first line is samohost's provenance header. Host-prep still refuses any
 other differing file unless `--force-main-vhost` is given.
 
+### Caddy validation and log files
+
+`caddy validate` opens the log file of every vhost in `/var/log/caddy`; only
+the caddy user can open those files, and a file that validation creates as
+root is one Caddy cannot open. Host-prep and bootstrap (root) validate with
+`sudo -u caddy`, and give an existing `/var/log/caddy/<app>-prod.log` that
+another user owns to caddy (a symbolic link there is left as it is). When the
+reload after host-prep wrote the main vhost fails, host-prep puts the
+previous file back. Deploy and heal (the deploy user) validate through the
+sudo rule `<deploy user> ALL=(caddy) NOPASSWD: /usr/bin/caddy validate
+--config /etc/caddy/Caddyfile`, which bootstrap writes for static, legacy
+and new-layout apps. A deploy user without the rule (bootstrapped by an older
+samohost) validates as itself, as before, and that fails on a server where
+another app's vhost names a log file. On a server that gets a new-layout app
+or a cp-http80 node vhost with a log file, run bootstrap again once for its
+static and legacy apps.
+
 ### Rollback of a node deploy
 
 A node deploy runs fetch, checkout, install, build, migrate, restart and the

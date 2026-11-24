@@ -81,6 +81,7 @@ const SPLIT_SUDOERS = [
   "shop ALL=(root) NOPASSWD: /usr/bin/mv -- /etc/caddy/sites.d/.samohost-heal-next-00-main-shop.caddy /etc/caddy/sites.d/00-main-shop.caddy",
   "shop ALL=(root) NOPASSWD: /usr/bin/rm -f /etc/caddy/sites.d/.samohost-heal-next-00-main-shop.caddy",
   "shop ALL=(root) NOPASSWD: /usr/bin/tee /opt/shop/release.env",
+  "shop ALL=(caddy) NOPASSWD: /usr/bin/caddy validate --config /etc/caddy/Caddyfile",
 ].join("\n") + "\n";
 
 const SPLIT_UNIT = [

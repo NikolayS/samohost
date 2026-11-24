@@ -142,6 +142,7 @@ agent ALL=(root) NOPASSWD: /usr/bin/tee /etc/caddy/sites.d/*.caddy
 agent ALL=(root) NOPASSWD: /usr/bin/mv -- /etc/caddy/sites.d/*.caddy /etc/caddy/sites.d/*.caddy
 agent ALL=(root) NOPASSWD: /usr/bin/rm -f /etc/caddy/sites.d/*.caddy
 agent ALL=(root) NOPASSWD: /usr/bin/journalctl *
+agent ALL=(caddy) NOPASSWD: /usr/bin/caddy validate --config /etc/caddy/Caddyfile
 SUDOERS
 chmod 440 '/etc/sudoers.d/my-static-site-agent'
 visudo -cf '/etc/sudoers.d/my-static-site-agent'

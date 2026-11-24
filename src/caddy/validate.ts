@@ -38,3 +38,26 @@ export function caddyLogOwnerRepairLines(appName: string): string[] {
     `fi`,
   ];
 }
+
+/** The sudo rule that lets a deploy user validate as the caddy user. */
+export function caddyValidateSudoRule(deployUser: string): string {
+  return `${deployUser} ALL=(caddy) NOPASSWD: ${CADDY_VALIDATE}`;
+}
+
+/**
+ * samohost_caddy_validate for scripts that run as the deploy user (deploy,
+ * heal). With the sudo rule (bootstrap writes it), it validates as the caddy
+ * user, which can open every vhost's log file. Without it (a server whose
+ * apps were bootstrapped before the rule), it validates as the deploy user,
+ * as before; that fails when another app's vhost names a log file that only
+ * caddy can open, until bootstrap runs again for this app.
+ */
+export const CADDY_VALIDATE_FN_LINES: readonly string[] = [
+  "samohost_caddy_validate() {",
+  `  if sudo -n -l -u caddy ${CADDY_VALIDATE} >/dev/null 2>&1; then`,
+  `    sudo -n -u caddy ${CADDY_VALIDATE} >/dev/null`,
+  "  else",
+  "    caddy validate --config /etc/caddy/Caddyfile >/dev/null",
+  "  fi",
+  "}",
+];

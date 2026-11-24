@@ -94,7 +94,7 @@ import {
 } from "./linux-user.ts";
 import { staticMainVhostLines } from "./heal-script.ts";
 import { migrateEnvFileOf, releaseEnvFileOf, splitLayoutPathError } from "./db-layout.ts";
-import { CADDY_VALIDATE_AS_CADDY_FROM_ROOT, caddyLogOwnerRepairLines } from "../caddy/validate.ts";
+import { CADDY_VALIDATE_AS_CADDY_FROM_ROOT, caddyLogOwnerRepairLines, caddyValidateSudoRule } from "../caddy/validate.ts";
 import { isIP } from "node:net";
 import { dirname } from "node:path";
 
@@ -818,6 +818,7 @@ export function buildHostBootstrapScript(
         ]
         : []),
       `${appUser} ALL=(root) NOPASSWD: /usr/bin/journalctl *`,
+      caddyValidateSudoRule(appUser),
       "SUDOERS",
       `chmod 440 ${sq(sudoersFile)}`,
       `visudo -cf ${sq(sudoersFile)}`,
@@ -851,6 +852,7 @@ export function buildHostBootstrapScript(
             `${appUser} ALL=(root) NOPASSWD: /usr/bin/mv -- ${healStagedVhostFile} ${mainVhostFile}`,
             `${appUser} ALL=(root) NOPASSWD: /usr/bin/rm -f ${healStagedVhostFile}`,
             `${appUser} ALL=(root) NOPASSWD: /usr/bin/tee ${releaseEnvFile}`,
+            caddyValidateSudoRule(appUser),
             "SAMOHOST_SPLIT_SUDOERS",
             "else",
           ]
@@ -867,6 +869,7 @@ export function buildHostBootstrapScript(
       `${appUser} ALL=(root) NOPASSWD: /usr/bin/rm -f /etc/caddy/sites.d/*.caddy`,
       `${appUser} ALL=(postgres) NOPASSWD: /usr/bin/psql`,
       `${appUser} ALL=(root) NOPASSWD: /usr/bin/journalctl *`,
+      caddyValidateSudoRule(appUser),
       "SUDOERS",
       ...(runtimeUserUsable ? ["fi"] : []),
       `chmod 440 ${sq(sudoersFile)}`,

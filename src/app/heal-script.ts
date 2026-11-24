@@ -46,6 +46,7 @@ import type { AppRecord } from "../types.ts";
 import { staticCacheHeaderLines } from "../static-cache.ts";
 import { staticReleaseStatePaths } from "./static-root.ts";
 import { renderVhost, planFromApp, mainVhostTrustedProxies, previousNodeMainVhost } from "../caddy/render.ts";
+import { CADDY_VALIDATE_FN_LINES } from "../caddy/validate.ts";
 import { faviconVhostBodyLines } from "../caddy/favicon.ts";
 import { PHASE_PREFIX } from "./script.ts";
 
@@ -263,7 +264,7 @@ export function buildConfigHealScript(app: AppRecord, opts: BuildConfigHealScrip
           "  fi",
         ]
       : []),
-    "  caddy validate --config /etc/caddy/Caddyfile >/dev/null || rb_ok=0",
+    "  samohost_caddy_validate || rb_ok=0",
     '  if [[ "$rb_ok" == "1" ]]; then sudo /usr/bin/systemctl reload caddy || rb_ok=0; fi',
     `  sleep ${RESTART_SETTLE_SEC}`,
     "  local rb_code",
@@ -286,6 +287,13 @@ export function buildConfigHealScript(app: AppRecord, opts: BuildConfigHealScrip
       : []),
     "  exit 1",
     "}",
+    "",
+  );
+
+  // Defined after rollback(), which calls it at run time.
+  push(
+    "# Validation as the caddy user when the sudo rule exists (src/caddy/validate.ts).",
+    ...CADDY_VALIDATE_FN_LINES,
     "",
   );
 
@@ -641,7 +649,7 @@ export function buildConfigHealScript(app: AppRecord, opts: BuildConfigHealScrip
   // ---- Validate the combined Caddy config ----------------------------------
   push(
     "# --- validate: check the combined Caddy config before reload ---",
-    "caddy validate --config /etc/caddy/Caddyfile >/dev/null || rollback",
+    "samohost_caddy_validate || rollback",
     "",
   );
 
