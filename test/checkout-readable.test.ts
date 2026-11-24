@@ -7,12 +7,13 @@
 
 import { describe, expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { buildHostBootstrapScript } from "../src/app/bootstrap.ts";
 import { buildDeployScript } from "../src/app/script.ts";
 import { nodeApp, nodeOpts } from "./bootstrap-db-harness.ts";
+import { goldenCases } from "./bootstrap-golden-fixtures.ts";
 import { makeDeploySandbox } from "./node-deploy-harness.ts";
 
 const mode = (p: string): string => (statSync(p).mode & 0o777).toString(8);
@@ -24,17 +25,41 @@ function section12(text: string): string {
   return lines.slice(start, end - 1).join("\n");
 }
 
-/** Run §12 after `umask 077` (as §11 leaves it) with stub sudo and git. */
-function runClone(layout: "split" | "legacy") {
+/** The lines before §0: shebang, comments, shell options and folder. */
+function header(text: string): string {
+  const lines = text.split("\n");
+  const s0 = lines.findIndex((l) => l.startsWith("# §0."));
+  return lines.slice(0, s0 - 1).join("\n");
+}
+
+/**
+ * Run §12 after `umask 077` (as §11 leaves it) with stub sudo and git.
+ * fromDeniedFolder: run the script header first, from a folder that the stub
+ * sudo treats as closed to the other user (as /home/<operator>, mode 750, is
+ * for the deploy user): a command run there as another user fails.
+ */
+function runClone(layout: "split" | "legacy", fromDeniedFolder = false) {
   const dir = mkdtempSync(join(tmpdir(), "samohost-clone-"));
   const bin = join(dir, "bin");
   mkdirSync(bin);
+  const denied = join(dir, "operator-home");
+  mkdirSync(denied);
   const stub = (name: string, body: string) => {
     writeFileSync(join(bin, name), `#!/usr/bin/env bash\n${body}\n`);
     chmodSync(join(bin, name), 0o755);
   };
-  // sudo -u <user> [VAR=value ...] cmd args: run the command as the test user.
-  stub("sudo", 'if [[ "$1" == -u ]]; then shift 2; fi\nexec env "$@"');
+  // sudo -u <user> [VAR=value ...] cmd args: run the command as the test user,
+  // unless the working directory is the folder closed to the other user.
+  stub(
+    "sudo",
+    [
+      'if [[ "$1" == -u ]]; then',
+      '  if [[ -n "${T_DENIED:-}" && "$(pwd -P)" == "$T_DENIED" ]]; then echo "find: Failed to change directory: $T_DENIED: Permission denied" >&2; exit 1; fi',
+      "  shift 2",
+      "fi",
+      'exec env "$@"',
+    ].join("\n"),
+  );
   stub("chown", "exit 0");
   stub(
     "git",
@@ -49,12 +74,20 @@ function runClone(layout: "split" | "legacy") {
   );
   const appDir = join(dir, "app");
   const app = nodeApp({ appDir, envFile: join(dir, "staging.env") });
-  const text = section12(buildHostBootstrapScript(app, nodeOpts({ appBase: dir })));
+  const full = buildHostBootstrapScript(app, nodeOpts({ appBase: dir }));
+  const text = section12(full);
   writeFileSync(join(dir, ".gh-token"), "token\n");
   const res = spawnSync(
     "bash",
-    ["-c", `set -euo pipefail\numask 077\nTOKEN_FILE=${JSON.stringify(join(dir, ".gh-token"))}\nSAMOHOST_DB_LAYOUT=${layout}\n${text}`],
-    { encoding: "utf8", env: { PATH: `${bin}:/usr/bin:/bin`, HOME: dir } },
+    [
+      "-c",
+      `${fromDeniedFolder ? `${header(full)}\n` : ""}set -euo pipefail\numask 077\nTOKEN_FILE=${JSON.stringify(join(dir, ".gh-token"))}\nSAMOHOST_DB_LAYOUT=${layout}\n${text}`,
+    ],
+    {
+      encoding: "utf8",
+      env: { PATH: `${bin}:/usr/bin:/bin`, HOME: dir, ...(fromDeniedFolder ? { T_DENIED: realpathSync(denied) } : {}) },
+      ...(fromDeniedFolder ? { cwd: denied } : {}),
+    },
   );
   return { dir, appDir, res, cleanup: () => rmSync(dir, { recursive: true, force: true }) };
 }
@@ -91,6 +124,35 @@ describe("bootstrap clone (§12)", () => {
       expect(r.res.status, r.res.stderr).toBe(0);
       expect(mode(join(r.appDir, "package.json"))).toBe("600");
       expect(mode(join(r.appDir, "src"))).toBe("700");
+    } finally {
+      r.cleanup();
+    }
+  });
+});
+
+describe("bootstrap working directory", () => {
+  const cases: Array<[string, string]> = [
+    ["node", buildHostBootstrapScript(nodeApp(), nodeOpts())],
+    ...goldenCases().map((c): [string, string] => [c.file, buildHostBootstrapScript(c.app, c.opts)]),
+  ];
+  for (const [name, text] of cases) {
+    test(`${name}: cd / right after set -euo pipefail, before the first command run as another user`, () => {
+      const lines = text.split("\n");
+      const set = lines.indexOf("set -euo pipefail");
+      const cd = lines.indexOf("cd /");
+      const otherUser = lines.findIndex((l) => !l.trimStart().startsWith("#") && /\b(sudo -u|runuser)\b/.test(l));
+      expect(set).toBeGreaterThan(0);
+      expect(cd).toBeGreaterThan(set);
+      expect(lines.slice(set + 1, cd).every((l) => l === "" || l.startsWith("#"))).toBe(true);
+      expect(otherUser).toBeGreaterThan(cd);
+    });
+  }
+
+  test("split layout: §12 passes when the caller's folder is closed to the deploy user", () => {
+    const r = runClone("split", true);
+    try {
+      expect(r.res.status, r.res.stderr).toBe(0);
+      expect(mode(join(r.appDir, "package.json"))).toBe("644");
     } finally {
       r.cleanup();
     }

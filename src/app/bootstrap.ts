@@ -81,7 +81,7 @@
  */
 
 import type { AppRecord } from "../types.ts";
-import { buildFirewallLines, type HostPrepFirewallOpts } from "../env/script.ts";
+import { buildFirewallLines, isValidMainHost, type HostPrepFirewallOpts } from "../env/script.ts";
 import {
   staticReleaseStatePaths,
   staticRootOf,
@@ -92,10 +92,15 @@ import {
   assertOptionalLinuxAppUser,
   linuxAppUserError,
 } from "./linux-user.ts";
-import { staticMainVhostLines } from "./heal-script.ts";
+import { CADDY_VALIDATE_COMMAND, SAMOHOST_PROVENANCE_HEADER, staticMainVhostLines } from "./heal-script.ts";
+import { mainVhostTrustedProxies, planFromApp, renderVhost } from "../caddy/render.ts";
 import { migrateEnvFileOf, releaseEnvFileOf, splitLayoutPathError } from "./db-layout.ts";
+import { buildModelPaths, buildStepScript, buildStepScriptPath, BUILD_STEP_NAMES } from "./build-steps.ts";
 import { CADDY_VALIDATE_AS_CADDY_FROM_ROOT, caddyLogOwnerRepairLines, caddyValidateSudoRule } from "../caddy/validate.ts";
 import { isIP } from "node:net";
+
+/** End marker of the here-document that carries the main vhost text in §12b. */
+const MAIN_VHOST_HEREDOC_END = "SAMOHOST_MAIN_VHOST_CONTENT";
 import { dirname } from "node:path";
 
 // ---------------------------------------------------------------------------
@@ -230,6 +235,33 @@ function bootstrapPort(app: AppRecord): number {
  * NOT executed by samohost itself: the operator pipes it to `bash` after
  * review (same contract as `buildHostPrepScript`).
  */
+/**
+ * Bash lines (new layout) that create a service account of an app
+ * (`<app>-run`, `<app>-build`), or refuse an existing account that bootstrap
+ * did not create: shell not /usr/sbin/nologin, home not /nonexistent, uid
+ * outside the system range of /etc/login.defs (default 100-999), primary
+ * group not its own, or any other group.
+ */
+function serviceAccountLines(user: string, indent: string): string[] {
+  const u = sq(user);
+  return [
+    `if _entry="$(getent passwd ${u})"; then`,
+    `  IFS=: read -r _ _ _uid _gid _ _home _shell <<<"$_entry"`,
+    `  _min="$(awk '$1 == "SYS_UID_MIN" { print $2 }' /etc/login.defs 2>/dev/null || true)"; _min="\${_min:-100}"`,
+    `  _max="$(awk '$1 == "SYS_UID_MAX" { print $2 }' /etc/login.defs 2>/dev/null || true)"; _max="\${_max:-999}"`,
+    `  _group="$(getent group "$_gid" | cut -d: -f1 || true)"`,
+    `  _groups="$(id -Gn ${u} || true)"`,
+    `  if [[ "$_shell" != /usr/sbin/nologin || "$_home" != /nonexistent || ! "$_uid" =~ ^[0-9]+$ || "$_uid" -lt "$_min" || "$_uid" -gt "$_max" || "$_group" != ${u} || "$_groups" != ${u} ]]; then`,
+    `    echo "ERROR: the account ${user} exists and was not created by samohost bootstrap (shell $_shell, home $_home, uid $_uid, groups $_groups). A new-layout app needs ${user} as a system user (uid $_min to $_max) with shell /usr/sbin/nologin, home /nonexistent and its own group only. Remove the account or use another app name." >&2`,
+    `    exit 1`,
+    `  fi`,
+    `  echo "User ${u} already exists (shell, home, uid and groups checked) — skipping useradd."`,
+    `else`,
+    `  useradd --system --user-group --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin ${u}`,
+    `fi`,
+  ].map((l) => indent + l);
+}
+
 export function buildHostBootstrapScript(
   app: AppRecord,
   opts: HostBootstrapOptions,
@@ -328,6 +360,8 @@ export function buildHostBootstrapScript(
   const mainVhostFile = `/etc/caddy/sites.d/00-main-${app.name}.caddy`;
   // Same name as the heal script's staging file (src/app/heal-script.ts).
   const healStagedVhostFile = `/etc/caddy/sites.d/.samohost-heal-next-00-main-${app.name}.caddy`;
+  // Same command as the heal script runs as the caddy user (CADDY_VALIDATE_AS_CADDY).
+  const caddyValidateAsCaddy = CADDY_VALIDATE_COMMAND;
   // No sudo rule for preview vhost files (/etc/caddy/sites.d/<app>-<label>.caddy):
   // that name pattern overlaps between apps whose names share a prefix, and
   // previews of new-layout apps are not designed yet (host-prep refuses them).
@@ -371,6 +405,10 @@ export function buildHostBootstrapScript(
     `#   ${tokenFile}. NEVER from FD 0 (the script body is piped there via 'bash -s'),`,
     "#   NEVER in argv, NEVER in remote URL.",
     "set -euo pipefail",
+    "# Commands run as other users (sudo -u) start in the working directory;",
+    "# the caller's folder (for example /home/<operator>, mode 750) can be closed",
+    "# to them, and find then exits 1. Run from /.",
+    "cd /",
     "",
     ...(isStatic && !isStaticReleaseChannel && app.mainHost !== undefined
       ? [...staticTreeGuardFnLines(), ""]
@@ -769,15 +807,9 @@ export function buildHostBootstrapScript(
       `if [[ "$SAMOHOST_DB_LAYOUT" == split ]]; then`,
       ...(runtimeUserUsable
         ? [
-            `  if id ${sq(runtimeUser)} >/dev/null 2>&1; then`,
-            `    echo "User ${sq(runtimeUser)} already exists — skipping useradd."`,
-            `  else`,
-            `    useradd --system --user-group --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin ${sq(runtimeUser)}`,
-            `  fi`,
-            `  usermod --shell /usr/sbin/nologin ${sq(runtimeUser)}`,
+            ...serviceAccountLines(runtimeUser, "  "),
             `  # chmod follows symbolic links: refuse one at the uploads folder.`,
             `  if [[ -L ${sq(uploadsDir)} ]]; then echo "ERROR: ${uploadsDir} is a symbolic link" >&2; exit 1; fi`,
-            `  gpasswd -d ${sq(runtimeUser)} ${sq(appUser)} >/dev/null 2>&1 || true`,
             `  if [[ -d ${sq(uploadsDir)} ]]; then`,
             `    # An older bootstrap gave this folder to the deploy user. Change the owner`,
             `    # without following links, and skip files with more than one hard link:`,
@@ -794,6 +826,95 @@ export function buildHostBootstrapScript(
             `  echo "ERROR: the runtime user name ${runtimeUser} is not a valid Linux user name (^[a-z_][a-z0-9_-]{0,31}$); use a shorter app name" >&2`,
             `  exit 1`,
           ]),
+      `fi`,
+      "",
+    );
+  }
+
+  // ---- section 5d: build user and step script (node apps, split layout) ------
+  // Install, build, migrate and seed run as <app>-build through the root-owned
+  // step script (src/app/build-steps.ts); the service runs a root-owned copy
+  // of the build in /opt/<app>/releases through the /opt/<app>/current link.
+  const buildUser = `${app.name}-build`;
+  const buildModel = buildModelPaths(appBase);
+  const stepScriptPath = buildStepScriptPath(app.name);
+  if (!isStatic && runtimeUserUsable && linuxAppUserError(buildUser) !== undefined) {
+    push(
+      `# §5d. Build user: the name ${buildUser} is not a valid user name.`,
+      "",
+      `if [[ "$SAMOHOST_DB_LAYOUT" == split ]]; then`,
+      `  echo ${sq(`ERROR: the build user name ${buildUser} is not a valid user name (at most 32 characters); the new layout needs it. Use a shorter app name.`)} >&2`,
+      `  exit 1`,
+      `fi`,
+      "",
+    );
+  } else if (!isStatic && runtimeUserUsable) {
+    for (const [what, cmd] of [["buildCmd", app.buildCmd], ["migrateCmd", app.migrateCmd], ["seedCmd", app.seedCmd]] as const) {
+      if (cmd !== undefined && /[\n\r]/.test(cmd)) {
+        throw new Error(`${what} must be one line: it is written into the root-owned step script`);
+      }
+    }
+    const stepScript = buildStepScript({
+      appName: app.name,
+      buildUser,
+      runUser: runtimeUser,
+      appBase,
+      checkoutDir: appDir,
+      envFile,
+      migrateEnvFile,
+      releaseEnvFile,
+      tokenFile,
+      gitSafeConf,
+      buildCmd: app.buildCmd,
+      ...(app.migrateCmd !== undefined ? { migrateCmd: app.migrateCmd } : {}),
+      ...(app.seedCmd !== undefined ? { seedCmd: app.seedCmd } : {}),
+    });
+    push(
+      `# ---------------------------------------------------------------------------`,
+      `# §5d. Build user ${sq(buildUser)} and the root-owned step script (split layout`,
+      `#      only). The deploy user runs install, build, migrate and seed through`,
+      `#      ${stepScriptPath}; they run as ${buildUser}, which has no login, no`,
+      `#      sudo rules, no home, no cron or at jobs and no lingering.`,
+      `# ---------------------------------------------------------------------------`,
+      "",
+      `if [[ "$SAMOHOST_DB_LAYOUT" == split ]]; then`,
+      `  if [[ "$(cat /proc/sys/fs/protected_hardlinks 2>/dev/null || echo 0)" != 1 ]]; then`,
+      `    echo "ERROR: fs.protected_hardlinks is not 1; the build model needs it (sysctl fs.protected_hardlinks=1)" >&2`,
+      `    exit 1`,
+      `  fi`,
+      `  if ! command -v systemd-run >/dev/null 2>&1; then echo "ERROR: systemd-run not found; the build model needs it" >&2; exit 1; fi`,
+      `  # install and build reach no loopback address except 127.0.0.53 (the`,
+      `  # systemd-resolved stub): another loopback resolver would leave npm without`,
+      `  # name resolution.`,
+      `  _bad_ns="$(awk '$1 == "nameserver" && ($2 ~ /^127\\./ || $2 == "::1") && $2 != "127.0.0.53" { print $2; exit }' /etc/resolv.conf 2>/dev/null || true)"`,
+      `  if [[ -n "$_bad_ns" ]]; then`,
+      `    echo "ERROR: /etc/resolv.conf names the loopback resolver $_bad_ns. The build steps of the new layout reach no loopback address except 127.0.0.53 (systemd-resolved), so npm could not resolve names. Use systemd-resolved (127.0.0.53) or a resolver that is not on loopback, then run bootstrap again." >&2`,
+      `    exit 1`,
+      `  fi`,
+      ...serviceAccountLines(buildUser, "  "),
+      `  for _f in /etc/cron.deny /etc/at.deny; do`,
+      `    touch "$_f"`,
+      `    grep -qxF ${sq(buildUser)} "$_f" || printf '%s\n' ${sq(buildUser)} >> "$_f"`,
+      `  done`,
+      `  loginctl disable-linger ${sq(buildUser)} >/dev/null 2>&1 || true`,
+      `  # /opt/${app.name} is root-owned (§5): only root can change these entries.`,
+      `  for _p in ${sq(buildModel.buildDir)} ${sq(buildModel.cacheDir)} ${sq(buildModel.releasesDir)}; do`,
+      `    if [[ -L "$_p" ]]; then echo "ERROR: $_p is a symbolic link" >&2; exit 1; fi`,
+      `  done`,
+      `  install -d -m 700 -o ${sq(buildUser)} -g ${sq(buildUser)} ${sq(buildModel.buildDir)}`,
+      `  install -d -m 700 -o ${sq(buildUser)} -g ${sq(buildUser)} ${sq(buildModel.cacheDir)}`,
+      `  # 751: the release copy unit runs as ${buildUser} and reaches its destination`,
+      `  # releases/<name>.tmp by name. Others cannot list releases/, and every release`,
+      `  # folder is 750 root:${runtimeUser}.`,
+      `  install -d -m 751 -o root -g ${sq(runtimeUser)} ${sq(buildModel.releasesDir)}`,
+      `  install -d -m 755 -o root -g root /usr/local/lib/samohost /usr/local/lib/samohost/apps ${sq(dirname(stepScriptPath))}`,
+      `  cat > ${sq(`${stepScriptPath}.next`)} <<'SAMOHOST_STEP_SCRIPT'`,
+      ...stepScript.replace(/\n$/, "").split("\n"),
+      "SAMOHOST_STEP_SCRIPT",
+      `  chown root:root ${sq(`${stepScriptPath}.next`)}`,
+      `  chmod 755 ${sq(`${stepScriptPath}.next`)}`,
+      `  mv -fT ${sq(`${stepScriptPath}.next`)} ${sq(stepScriptPath)}`,
+      `  echo "Build user: ${buildUser}; step script ${stepScriptPath}"`,
       `fi`,
       "",
     );
@@ -844,7 +965,8 @@ export function buildHostBootstrapScript(
       ...(runtimeUserUsable
         ? [
             `# split layout: exact file names for the main vhost, the heal staging file`,
-            `# and release.env. No wildcard, preview, journalctl, daemon-reload or psql`,
+            `# and release.env; Caddy's validation as the caddy user, which can open the`,
+            `# vhost's log file. No wildcard, preview, journalctl, daemon-reload or psql`,
             `# grant: the deploy and heal scripts do not use them (logs and doctor run`,
             `# as the operator user; previews of these apps are not designed yet).`,
             `if [[ "$SAMOHOST_DB_LAYOUT" == split ]]; then`,
@@ -859,8 +981,9 @@ export function buildHostBootstrapScript(
             `${appUser} ALL=(root) NOPASSWD: /usr/bin/mv -- ${healStagedVhostFile} ${mainVhostFile}`,
             `${appUser} ALL=(root) NOPASSWD: /usr/bin/rm -f ${healStagedVhostFile}`,
             `${appUser} ALL=(root) NOPASSWD: /usr/bin/rm -f ${mainVhostFile}`,
+            `${appUser} ALL=(caddy) NOPASSWD: ${caddyValidateAsCaddy}`,
             `${appUser} ALL=(root) NOPASSWD: /usr/bin/tee ${releaseEnvFile}`,
-            caddyValidateSudoRule(appUser),
+            ...BUILD_STEP_NAMES.map((step) => `${appUser} ALL=(root) NOPASSWD: ${stepScriptPath} ${step}`),
             "SAMOHOST_SPLIT_SUDOERS",
             "else",
           ]
@@ -913,7 +1036,7 @@ export function buildHostBootstrapScript(
           "[Service]",
           `User=${runtimeUser}`,
           `Group=${runtimeUser}`,
-          `WorkingDirectory=${appDir}`,
+          `WorkingDirectory=${buildModel.currentLink}`,
           `EnvironmentFile=${envFile}`,
           `EnvironmentFile=-${releaseEnvFile}`,
           `ExecStart=${execStart}`,
@@ -932,10 +1055,25 @@ export function buildHostBootstrapScript(
           "RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK",
           "CapabilityBoundingSet=",
           "LockPersonality=yes",
+          // @system-service is systemd's baseline for services; a call outside it
+          // fails with EPERM instead of killing the process (V8 and libuv fall
+          // back when an optional call such as pkey_alloc or io_uring fails).
+          "RestrictNamespaces=yes",
+          "SystemCallFilter=@system-service",
+          "SystemCallErrorNumber=EPERM",
+          "SystemCallArchitectures=native",
+          "ProtectClock=yes",
+          "ProtectHostname=yes",
+          "ProtectKernelLogs=yes",
+          "RestrictRealtime=yes",
+          "TemporaryFileSystem=/dev/shm",
+          "RemoveIPC=yes",
+          // The cloud metadata address (it can serve the server's user data).
+          "IPAddressDeny=169.254.169.254",
           "MemoryMax=50%",
           "TasksMax=256",
           `ReadWritePaths=${uploadsDir}`,
-          `InaccessiblePaths=${[migrateEnvFile, tokenFile, gitSafeConf, `${appDir}/.git`, `${appDir}/.npmrc`].map((x) => `-${x}`).join(" ")}`,
+          `InaccessiblePaths=${[migrateEnvFile, tokenFile, gitSafeConf, appDir, buildModel.buildDir, buildModel.cacheDir].map((x) => `-${x}`).join(" ")}`,
           "",
           "[Install]",
           "WantedBy=multi-user.target",
@@ -1525,14 +1663,20 @@ export function buildHostBootstrapScript(
     ...trustedProxiesEnvLines,
     `ENVEOF`,
     `cat > "$SAMOHOST_WRITE_DIR/migrate" <<MIGRATEEOF`,
-    `# ${app.name} migrate env file — generated by samohost host-bootstrap. chmod 600, ${appUser}-owned.`,
-    `# Loaded only by the deploy's migrate step. NEVER commit.`,
+    `# ${app.name} migrate env file — generated by samohost host-bootstrap. chmod 600, root-owned.`,
+    `# systemd loads it for the migrate and seed steps only (step script). NEVER commit.`,
     `# DATABASE_URL is the migration role (owner of ${dbName} only, not a superuser).`,
     `DATABASE_URL=postgresql://\${OWNER_DB_ROLE}:\${OWNER_DB_PW}@127.0.0.1:5432/${dbName}`,
+    `\${APP_DB_LINE}`,
     `SEED_OWNER_LOGIN=${seedOwnerLogin}`,
     `SEED_OWNER_PASSWORD=\${SEED_PW}`,
     `MIGRATEEOF`,
-    `chown ${sq(appUser)}:${sq(appUser)} "$SAMOHOST_WRITE_DIR/migrate"`,
+    // Build model: systemd (root) loads migrate.env for the migrate and seed
+    // steps. Without a runtime user there is no step script, and the deploy
+    // user loads the file itself.
+    runtimeUserUsable
+      ? `chown root:root "$SAMOHOST_WRITE_DIR/migrate"`
+      : `chown ${sq(appUser)}:${sq(appUser)} "$SAMOHOST_WRITE_DIR/migrate"`,
     `chmod 600 "$SAMOHOST_WRITE_DIR/migrate"`,
     `unset OWNER_DB_PW`,
     `fi`,
@@ -1546,7 +1690,7 @@ export function buildHostBootstrapScript(
     `echo "$ENV_FILE: written (600, ${appUser}). [secret values not logged]"`,
     `if [[ "$SAMOHOST_DB_LAYOUT" == split ]]; then`,
     `  mv -fT "$SAMOHOST_WRITE_DIR/migrate" "$MIGRATE_ENV_FILE"`,
-    `  echo "$MIGRATE_ENV_FILE: written (600, ${appUser}). [secret values not logged]"`,
+    `  echo "$MIGRATE_ENV_FILE: written (600, ${runtimeUserUsable ? "root" : appUser}). [secret values not logged]"`,
     `  mkdir -p /var/lib/samohost/db-layout`,
     `  printf 'split\\n' > "$SAMOHOST_LAYOUT_MARKER"`,
     `fi`,
@@ -1635,6 +1779,83 @@ export function buildHostBootstrapScript(
   // checkout and the runtime realpath containment guard above can inspect it.
   if (staticBranchVhostLines.length > 0) {
     push(...staticBranchVhostLines);
+  }
+
+  // ---- section 12b: main vhost of a split-layout node app -------------------
+  // Legacy node apps get the main vhost from host-prep, which refuses
+  // split-layout apps. Root writes it here from values fixed at bootstrap,
+  // with the text heal renders (heal then finds no drift).
+  if (runtimeUserUsable && app.mainHost !== undefined) {
+    if (!isValidMainHost(app.mainHost)) {
+      throw new Error(
+        `invalid mainHost ${JSON.stringify(app.mainHost)} for app '${app.name}': expected a dotted ` +
+          `lowercase DNS name like "app.example.com"; bootstrap writes the main vhost as root`,
+      );
+    }
+    for (const route of app.routes ?? []) {
+      for (const value of [route.matchPath, route.matchRegexp, route.respond?.body]) {
+        if (value !== undefined && /[\u0000-\u001f\u007f]/.test(value)) {
+          throw new Error(
+            `main vhost of app '${app.name}': route value ${JSON.stringify(value)} holds a control ` +
+              `character (newline included); check the routes (matchPath, matchRegexp, respond body)`,
+          );
+        }
+      }
+    }
+    const mainVhostText = renderVhost(
+      planFromApp(app, { trustedProxies: mainVhostTrustedProxies(app, opts.firewallOpts?.controlPlaneIp) }),
+    );
+    const mainVhostLines = mainVhostText.replace(/\n$/, "").split("\n");
+    for (const line of mainVhostLines) {
+      if (line === MAIN_VHOST_HEREDOC_END || /[\u0000-\u0008\u000b-\u001f\u007f]/.test(line)) {
+        throw new Error(
+          `main vhost of app '${app.name}': rendered line ${JSON.stringify(line)} is the end marker ` +
+            `of the script's here-document or holds a control character; check the routes ` +
+            `(matchPath, matchRegexp, respond body)`,
+        );
+      }
+    }
+    const mainVhostNextFile = `/etc/caddy/sites.d/.00-main-${app.name}.caddy.next`;
+    push(
+      `# ---------------------------------------------------------------------------`,
+      `# §12b. Main vhost ${mainVhostFile} (split layout).`,
+      `#      Root writes it from values fixed at bootstrap (host name, port,`,
+      `#      control-plane address), with the text that app heal renders. Caddy`,
+      `#      validates the whole configuration as the caddy user, which creates the`,
+      `#      vhost's log file as caddy, then one reload. The app answers through`,
+      `#      Caddy once the first deploy has started it.`,
+      `# ---------------------------------------------------------------------------`,
+      "",
+      `if [[ "$SAMOHOST_DB_LAYOUT" == split ]]; then`,
+      `  SAMOHOST_MAIN_VHOST=${sq(mainVhostFile)}`,
+      `  SAMOHOST_MAIN_VHOST_TMP=${sq(mainVhostNextFile)}`,
+      `  if [[ -L /etc/caddy/sites.d || ! -d /etc/caddy/sites.d || ! -O /etc/caddy/sites.d ]]; then echo "ERROR: /etc/caddy/sites.d is not a folder owned by root (or is a symbolic link)" >&2; exit 1; fi`,
+      `  if [[ -L "$SAMOHOST_MAIN_VHOST" ]]; then echo "ERROR: $SAMOHOST_MAIN_VHOST is a symbolic link" >&2; exit 1; fi`,
+      `  SAMOHOST_MAIN_VHOST_NEXT="$(mktemp)"`,
+      `  cat > "$SAMOHOST_MAIN_VHOST_NEXT" <<'${MAIN_VHOST_HEREDOC_END}'`,
+      ...mainVhostLines,
+      MAIN_VHOST_HEREDOC_END,
+      `  if [[ -f "$SAMOHOST_MAIN_VHOST" ]] && cmp -s "$SAMOHOST_MAIN_VHOST_NEXT" "$SAMOHOST_MAIN_VHOST"; then`,
+      `    echo "Caddy: main vhost $SAMOHOST_MAIN_VHOST unchanged."`,
+      `  elif [[ -e "$SAMOHOST_MAIN_VHOST" && "$(head -n 1 "$SAMOHOST_MAIN_VHOST")" != ${sq(SAMOHOST_PROVENANCE_HEADER)} ]]; then`,
+      `    echo "WARNING: $SAMOHOST_MAIN_VHOST has no samohost header (written by hand); left unchanged" >&2`,
+      `  else`,
+      `    SAMOHOST_MAIN_VHOST_PREV=""`,
+      `    if [[ -f "$SAMOHOST_MAIN_VHOST" ]]; then SAMOHOST_MAIN_VHOST_PREV="$(mktemp)"; cp "$SAMOHOST_MAIN_VHOST" "$SAMOHOST_MAIN_VHOST_PREV"; fi`,
+      `    rm -f "$SAMOHOST_MAIN_VHOST_TMP"; install -m 644 "$SAMOHOST_MAIN_VHOST_NEXT" "$SAMOHOST_MAIN_VHOST_TMP"; mv -fT "$SAMOHOST_MAIN_VHOST_TMP" "$SAMOHOST_MAIN_VHOST"`,
+      `    if ! sudo -u caddy ${CADDY_VALIDATE_COMMAND} >/dev/null || ! /usr/bin/systemctl reload caddy; then`,
+      `      if [[ -n "$SAMOHOST_MAIN_VHOST_PREV" ]]; then rm -f "$SAMOHOST_MAIN_VHOST_TMP"; install -m 644 "$SAMOHOST_MAIN_VHOST_PREV" "$SAMOHOST_MAIN_VHOST_TMP"; mv -fT "$SAMOHOST_MAIN_VHOST_TMP" "$SAMOHOST_MAIN_VHOST"; else rm -f "$SAMOHOST_MAIN_VHOST"; fi`,
+      `      rm -f "$SAMOHOST_MAIN_VHOST_NEXT" "$SAMOHOST_MAIN_VHOST_PREV"`,
+      `      echo "ERROR: Caddy did not accept the main vhost $SAMOHOST_MAIN_VHOST; the previous state was restored" >&2`,
+      `      exit 1`,
+      `    fi`,
+      `    rm -f "$SAMOHOST_MAIN_VHOST_PREV"`,
+      `    echo "Caddy: main vhost $SAMOHOST_MAIN_VHOST written, validated as caddy, reloaded."`,
+      `  fi`,
+      `  rm -f "$SAMOHOST_MAIN_VHOST_NEXT"`,
+      `fi`,
+      "",
+    );
   }
 
   // ---- section 13: extended self-check PASS/FAIL table (A1 + A2 rows) ------

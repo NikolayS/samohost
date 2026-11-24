@@ -79,12 +79,16 @@ export function makeDeploySandbox(opts: { headSha?: string; healthCode?: string;
   stub(bin, "sudo", [
     `printf '%s\\n' "$*" >> ${JSON.stringify(sudoLog)}`,
     'if [[ "$1" == /usr/bin/tee ]]; then shift; exec tee "$@"; fi',
+    // The build model's step script (a test stub at <sandbox>/step).
+    'if [[ "$1" == */step ]]; then exec "$@"; fi',
   ]);
   stub(bin, "psql", [
     `{ printf 'ARGS %s\\n' "$*"; printf 'ENV PGHOST=%s PGPORT=%s PGUSER=%s PGPASSWORD=%s PGDATABASE=%s\\n' "\${PGHOST:-}" "\${PGPORT:-}" "\${PGUSER:-}" "\${PGPASSWORD:-}" "\${PGDATABASE:-}"; } >> ${JSON.stringify(psqlLog)}`,
     "echo f",
   ]);
   stub(bin, "sleep", ["exit 0"]);
+  // flock: held when <sandbox>/deploy-locked exists.
+  stub(bin, "flock", [`if [[ -e ${JSON.stringify(join(dir, "deploy-locked"))} ]]; then exit 1; fi`]);
   return {
     dir,
     appDir,

@@ -225,3 +225,129 @@ describe("failedSha escape hatches", () => {
     expect(c.e).toContain("--force");
   });
 });
+
+describe("register with another kind clears the deploy bookkeeping of the old kind", () => {
+  let dir: string;
+  let vmStore: StateStore;
+  let appStore: AppStore;
+
+  const base = {
+    vm: "samo-we-field-record",
+    name: "field-record",
+    repo: "Tanya301/field-record-1",
+    branch: "main",
+    appDir: "/opt/field-record/app",
+    buildCmd: "npm run build",
+    serviceUnit: "field-record",
+    healthUrl: "http://localhost:3000/api/version",
+    rlsNonSuperuser: false,
+  };
+
+  function register(kind: "node" | "static" | undefined): void {
+    const c = capture();
+    const code = runAppRegister(
+      { ...base, ...(kind !== undefined ? { kind } : {}) },
+      { json: false }, vmStore, appStore, c.out, c.err,
+    );
+    expect(code).toBe(0);
+  }
+
+  function seedBookkeeping(): void {
+    appStore.upsert({
+      ...appStore.get("vm-1111", "field-record")!,
+      failedSha: SHA,
+      deployedSha: "a".repeat(40),
+      releaseTagCursor: "2026.11.23-1",
+      releaseTagChannelInitialized: true,
+    });
+  }
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), "samohost-kindchange-"));
+    vmStore = new StateStore(join(dir, "state.json"));
+    appStore = new AppStore(join(dir, "apps.json"));
+    vmStore.upsert(vm());
+  });
+
+  afterEach(() => rmSync(dir, { recursive: true, force: true }));
+
+  test("static to node drops failedSha, deployedSha and the release tag cursor", () => {
+    register("static");
+    seedBookkeeping();
+    register("node");
+    const rec = appStore.get("vm-1111", "field-record");
+    expect(rec?.kind).toBe("node");
+    expect(rec?.failedSha).toBeUndefined();
+    expect(rec?.deployedSha).toBeUndefined();
+    expect(rec?.releaseTagCursor).toBeUndefined();
+    expect(rec?.releaseTagChannelInitialized).toBeUndefined();
+  });
+
+  test("static to a manifest without kind (node) is a kind change", () => {
+    register("static");
+    seedBookkeeping();
+    register(undefined);
+    const rec = appStore.get("vm-1111", "field-record");
+    expect(rec?.failedSha).toBeUndefined();
+    expect(rec?.deployedSha).toBeUndefined();
+  });
+
+  test("a re-register with the same kind keeps failedSha and deployedSha", () => {
+    register("static");
+    seedBookkeeping();
+    register("static");
+    const rec = appStore.get("vm-1111", "field-record");
+    expect(rec?.failedSha).toBe(SHA);
+    expect(rec?.deployedSha).toBe("a".repeat(40));
+  });
+
+  test("a node deploy of the commit whose static deploy failed is not refused after the kind change", async () => {
+    register("static");
+    seedBookkeeping();
+    register("node");
+    const c = capture();
+    const code = await runAppDeploy(
+      { vm: "samo-we-field-record", app: "field-record", sha: SHA, skipCiGate: false },
+      { json: true }, vmStore, appStore, deployDeps(), c.out, c.err,
+    );
+    expect(c.e).not.toContain("known-bad");
+    expect(code).toBe(0);
+    expect(appStore.get("vm-1111", "field-record")?.deployedSha).toBe(SHA);
+  });
+});
+
+describe("register and the TOML parser refuse a mainHost that is not a DNS name", () => {
+  test("app register: exit 1, nothing stored", () => {
+    const dir = mkdtempSync(join(tmpdir(), "samohost-mainhost-"));
+    try {
+      const vmStore = new StateStore(join(dir, "state.json"));
+      const appStore = new AppStore(join(dir, "apps.json"));
+      vmStore.upsert(vm());
+      const c = capture();
+      const code = runAppRegister(
+        {
+          vm: "samo-we-field-record", name: "field-record", repo: "Tanya301/field-record-1", branch: "main",
+          appDir: "/opt/field-record/app", buildCmd: "npm run build", serviceUnit: "field-record",
+          healthUrl: "http://localhost:3000/api/version", rlsNonSuperuser: false,
+          mainHost: "shop.example.com\nx",
+        },
+        { json: false }, vmStore, appStore, c.out, c.err,
+      );
+      expect(code).toBe(1);
+      expect(c.e).toContain("mainHost");
+      expect(appStore.get("vm-1111", "field-record")).toBeUndefined();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("TOML: an error names mainHost", async () => {
+    const { parseSamohostToml } = await import("../src/manifest/toml.ts");
+    const toml = [
+      'name = "shop"', 'repo = "o/shop"', 'branch = "main"', 'appDir = "/opt/shop/app"', 'buildCmd = "true"',
+      'healthUrl = "http://127.0.0.1:3000/healthz"', 'serviceUnit = "shop"', 'mainHost = "Shop Example"',
+    ].join("\n");
+    const res = parseSamohostToml(toml) as { ok?: boolean; errors?: string[] };
+    expect(JSON.stringify(res)).toContain("mainHost");
+  });
+});

@@ -22,6 +22,7 @@ import { parseDeployOutcome, rollbackRecordsFailedSha, type DeployOutcome } from
 import { migrateEnvFileOf, releaseEnvFileOf } from "../app/db-layout.ts";
 import { buildDeployScript } from "../app/script.ts";
 import { buildConfigHealScript } from "../app/heal-script.ts";
+import { isValidMainHost } from "../env/script.ts";
 import { validateStaticRoot } from "../app/static-root.ts";
 import { linuxAppUserError } from "../app/linux-user.ts";
 import {
@@ -265,6 +266,10 @@ export function runAppRegister(
     );
     return 1;
   }
+  if (input.mainHost !== undefined && !isValidMainHost(input.mainHost)) {
+    err(`error: mainHost ${JSON.stringify(input.mainHost)} is not a dotted lowercase DNS name like "app.example.com"`);
+    return 1;
+  }
   if (input.kind === "static" && input.releaseTagPattern !== undefined && input.mainHost === undefined) {
     err("error: a static release-channel app requires mainHost for an owned production vhost");
     return 1;
@@ -361,16 +366,24 @@ export function runAppRegister(
   };
 
   const existing = appStore.get(vm.id, input.name);
+  // A register that changes the serve kind (static to node or back) starts a
+  // new deploy history: the deployed and failed commits, the release tag
+  // cursor and its initialized flag of the old kind are dropped. A failed
+  // static deploy of a commit says nothing about a node deploy of it, and a
+  // static deployedSha would make `trigger run` report the first node release
+  // as up-to-date or baseline it instead of deploying it.
+  const sameKind = existing !== undefined && (existing.kind ?? "node") === (input.kind ?? "node");
+  const kept = sameKind ? existing : undefined;
   const record: AppRecord = {
     ...spec,
     id: existing?.id ?? crypto.randomUUID(),
     vmId: vm.id,
     // Preserve deploy bookkeeping across a re-register of the same app.
-    ...(existing?.deployedSha !== undefined
-      ? { deployedSha: existing.deployedSha }
+    ...(kept?.deployedSha !== undefined
+      ? { deployedSha: kept.deployedSha }
       : {}),
-    ...(existing?.failedSha !== undefined
-      ? { failedSha: existing.failedSha }
+    ...(kept?.failedSha !== undefined
+      ? { failedSha: kept.failedSha }
       : {}),
     ...(existing?.lastDeployAt !== undefined
       ? { lastDeployAt: existing.lastDeployAt }
@@ -380,16 +393,16 @@ export function runAppRegister(
     ...(existing?.generatorSha !== undefined
       ? { generatorSha: existing.generatorSha }
       : {}),
-    ...(existing?.releaseTagPattern === input.releaseTagPattern &&
-    existing?.releaseTagFormat === input.releaseTagFormat &&
-    existing?.releaseCiWorkflow === input.releaseCiWorkflow &&
-    existing?.releaseTagCursor !== undefined
-      ? { releaseTagCursor: existing.releaseTagCursor }
+    ...(kept?.releaseTagPattern === input.releaseTagPattern &&
+    kept?.releaseTagFormat === input.releaseTagFormat &&
+    kept?.releaseCiWorkflow === input.releaseCiWorkflow &&
+    kept?.releaseTagCursor !== undefined
+      ? { releaseTagCursor: kept.releaseTagCursor }
       : {}),
-    ...(existing?.releaseTagPattern === input.releaseTagPattern &&
-    existing?.releaseTagFormat === input.releaseTagFormat &&
-    existing?.releaseCiWorkflow === input.releaseCiWorkflow &&
-    existing?.releaseTagChannelInitialized === true
+    ...(kept?.releaseTagPattern === input.releaseTagPattern &&
+    kept?.releaseTagFormat === input.releaseTagFormat &&
+    kept?.releaseCiWorkflow === input.releaseCiWorkflow &&
+    kept?.releaseTagChannelInitialized === true
       ? { releaseTagChannelInitialized: true }
       : {}),
   };
@@ -967,9 +980,13 @@ export async function runAppDeploy(
         // Non-fatal: best-effort; staleness check will treat missing as stale.
       }
     }
-  } else if ((outcome === "rolled-back" || outcome === "rollback-failed") && rollbackRecordsFailedSha(events)) {
+  } else if (
+    outcome === "stopped" ||
+    ((outcome === "rolled-back" || outcome === "rollback-failed") && rollbackRecordsFailedSha(events))
+  ) {
     // A rollback after a failed install or build does not record the commit:
-    // the next trigger cycle deploys it again (src/app/parse.ts).
+    // the next trigger cycle deploys it again (src/app/parse.ts). A stopped
+    // service follows a failure after the release switch, and records it.
     updated.failedSha = sha;
     // deployedSha is intentionally NOT advanced on failure.
     // generatorSha is intentionally NOT written on failure.

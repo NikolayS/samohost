@@ -35,18 +35,22 @@ export type DeployOutcome =
   | "deployed"
   | "rolled-back"
   | "rollback-failed"
+  | "stopped"
   | "incomplete";
 
 // Global marker regex. Phase names are a fixed allowlist; anything else is
 // treated as noise (so a literal `<<<SAMOHOST_PHASE:bogus:ok>>>` in log text is
 // ignored rather than mis-parsed).
 const VALID_PHASES = new Set<PhaseName>([
+  "lock",
   "fetch",
   "checkpoint",
   "checkout",
   "install",
   "build",
   "migrate",
+  "release",
+  "stop",
   "restart",
   "health",
   "assert-rls",
@@ -81,11 +85,18 @@ export function deployOutcome(events: PhaseEvent[]): DeployOutcome {
   let pendingStart: PhaseName | undefined;
   let sawFailure = false;
   let sawHealthOk = false;
+  // Build model: a release failed and there was none to go back to; the
+  // deploy stopped the service (stop:ok, no rollback marker).
+  let sawStopOk = false;
 
   for (const ev of events) {
     if (ev.phase === "rollback") {
       if (ev.status === "ok") return "rolled-back";
       if (ev.status === "fail") return "rollback-failed";
+      continue;
+    }
+    if (ev.phase === "stop" && ev.status === "ok") {
+      sawStopOk = true;
       continue;
     }
     if (ev.status === "start") {
@@ -99,6 +110,7 @@ export function deployOutcome(events: PhaseEvent[]): DeployOutcome {
     }
   }
 
+  if (sawStopOk) return "stopped";
   // A failure with no rollback:ok/fail seen ⇒ the rollback path didn't complete.
   if (sawFailure) return "incomplete";
   // A start with no matching terminal status ⇒ stream cut off mid-phase.

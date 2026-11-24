@@ -132,6 +132,30 @@ describe("deployOutcome", () => {
     expect(deployOutcome(events)).toBe("deployed");
   });
 
+  test("build model: release phase markers are parsed; release start and fail are parsed", () => {
+    const events = parsePhaseStream(
+      [
+        m("migrate", "start"), m("migrate", "ok"),
+        m("release", "start"), m("release", "fail"),
+        m("rollback", "ok"),
+      ].join("\n"),
+    );
+    expect(events.map((e) => `${e.phase}:${e.status}`)).toEqual(["migrate:start", "migrate:ok", "release:start", "release:fail", "rollback:ok"]);
+  });
+
+  test("build model: a deploy refused by the deploy lock (lock:fail) → 'incomplete' (no failed sha recorded)", () => {
+    const events = parsePhaseStream(m("lock", "fail"));
+    expect(events.map((e) => `${e.phase}:${e.status}`)).toEqual(["lock:fail"]);
+    expect(deployOutcome(events)).toBe("incomplete");
+  });
+
+  test("build model: health fail, then stop:ok (no previous release) → 'stopped'", () => {
+    const events = parsePhaseStream(
+      [m("release", "start"), m("release", "ok"), m("health", "start"), m("health", "fail"), m("stop", "ok")].join("\n"),
+    );
+    expect(deployOutcome(events)).toBe("stopped");
+  });
+
   test("health:ok present, then seed:start + seed:fail → 'incomplete'", () => {
     // App is live but seed failed — the deploy is not complete.
     const events = parsePhaseStream(

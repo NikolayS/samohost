@@ -736,6 +736,23 @@ describe("app commands", () => {
     expect(rec?.deployedSha).toBe("GOODSHA"); // NOT advanced on failure
   });
 
+  test("deploy stopped (first release failed, service stopped): exit 1, outcome stopped, failedSha set", async () => {
+    register();
+    const c = capture();
+    const STOPPED = [
+      "<<<SAMOHOST_PHASE:release:start>>>", "<<<SAMOHOST_PHASE:release:ok>>>",
+      "<<<SAMOHOST_PHASE:health:start>>>", "<<<SAMOHOST_PHASE:health:fail>>>",
+      "<<<SAMOHOST_PHASE:stop:ok>>>",
+    ].join("\n");
+    const code = await runAppDeploy(
+      { vm: "samo-we-field-record", app: "field-record", sha: SHA, skipCiGate: false },
+      { json: true }, vmStore, appStore, deployDeps(STOPPED), c.out, c.err,
+    );
+    expect(code).toBe(1);
+    expect(JSON.parse(c.o).outcome).toBe("stopped");
+    expect(appStore.get("vm-1111", "field-record")?.failedSha).toBe(SHA);
+  });
+
   test("deploy lowercases an uppercase --sha and records it lowercase", async () => {
     register();
     const c = capture();

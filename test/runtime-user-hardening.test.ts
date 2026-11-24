@@ -44,6 +44,8 @@ function stubDir(stubs: Record<string, string>): { dir: string; log: string; cle
   return { dir, log, cleanup: () => rmSync(dir, { recursive: true, force: true }) };
 }
 
+const GETENT = `case "$1 $2" in "passwd $T_USER") [[ -n "\${T_PASSWD:-}" ]] && echo "$T_PASSWD" || exit 2 ;; "group $T_GID") echo "$T_GROUP:x:$T_GID:" ;; *) exit 2 ;; esac`;
+
 function runBash(text: string, path: string, env: Record<string, string> = {}) {
   return spawnSync("bash", ["-c", `set -euo pipefail\n${text}`], {
     encoding: "utf8",
@@ -81,8 +83,11 @@ const SPLIT_SUDOERS = [
   "shop ALL=(root) NOPASSWD: /usr/bin/mv -- /etc/caddy/sites.d/.samohost-heal-next-00-main-shop.caddy /etc/caddy/sites.d/00-main-shop.caddy",
   "shop ALL=(root) NOPASSWD: /usr/bin/rm -f /etc/caddy/sites.d/.samohost-heal-next-00-main-shop.caddy",
   "shop ALL=(root) NOPASSWD: /usr/bin/rm -f /etc/caddy/sites.d/00-main-shop.caddy",
-  "shop ALL=(root) NOPASSWD: /usr/bin/tee /opt/shop/release.env",
   "shop ALL=(caddy) NOPASSWD: /usr/bin/caddy validate --config /etc/caddy/Caddyfile",
+  "shop ALL=(root) NOPASSWD: /usr/bin/tee /opt/shop/release.env",
+  ...["install", "build", "migrate", "seed", "release", "rollback", "cleanup"].map(
+    (step) => `shop ALL=(root) NOPASSWD: /usr/local/lib/samohost/apps/shop/step ${step}`,
+  ),
 ].join("\n") + "\n";
 
 const SPLIT_UNIT = [
@@ -93,7 +98,7 @@ const SPLIT_UNIT = [
   "[Service]",
   "User=shop-run",
   "Group=shop-run",
-  "WorkingDirectory=/opt/shop/app",
+  "WorkingDirectory=/opt/shop/current",
   "EnvironmentFile=/opt/shop/staging.env",
   "EnvironmentFile=-/opt/shop/release.env",
   "ExecStart=/usr/bin/node dist/server.js",
@@ -111,10 +116,21 @@ const SPLIT_UNIT = [
   "RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK",
   "CapabilityBoundingSet=",
   "LockPersonality=yes",
+  "RestrictNamespaces=yes",
+  "SystemCallFilter=@system-service",
+  "SystemCallErrorNumber=EPERM",
+  "SystemCallArchitectures=native",
+  "ProtectClock=yes",
+  "ProtectHostname=yes",
+  "ProtectKernelLogs=yes",
+  "RestrictRealtime=yes",
+  "TemporaryFileSystem=/dev/shm",
+  "RemoveIPC=yes",
+  "IPAddressDeny=169.254.169.254",
   "MemoryMax=50%",
   "TasksMax=256",
   "ReadWritePaths=/opt/shop/uploads",
-  "InaccessiblePaths=-/opt/shop/migrate.env -/opt/shop/.gh-token -/opt/shop/git-safe.conf -/opt/shop/app/.git -/opt/shop/app/.npmrc",
+  "InaccessiblePaths=-/opt/shop/migrate.env -/opt/shop/.gh-token -/opt/shop/git-safe.conf -/opt/shop/app -/opt/shop/build -/opt/shop/build-cache",
   "",
   "[Install]",
   "WantedBy=multi-user.target",
@@ -127,9 +143,9 @@ function sudoMatcher(rules: string) {
     if (m === null) throw new Error(`unparsed rule: ${line}`);
     return { runas: m[1]!, cmd: m[2]!, args: m[3] ?? "" };
   });
-  return (cmd: string, args: string): boolean =>
+  return (cmd: string, args: string, runas = "root"): boolean =>
     parsed.some((r) => {
-      if (r.runas !== "root" || r.cmd !== cmd) return false;
+      if (r.runas !== runas || r.cmd !== cmd) return false;
       if (r.args.startsWith("^") && r.args.endsWith("$")) return new RegExp(r.args).test(args);
       return r.args === args;
     });
@@ -197,16 +213,14 @@ describe("env layout is decided before the sudo rules and the unit", () => {
 
 describe("new layout: runtime user '<app>-run'", () => {
   test("created as a system user with no login shell, its own group only, owning only the uploads folder", () => {
-    const sb = stubDir({ id: "exit 1", useradd: "", usermod: "", gpasswd: "", chown: "", chmod: "", install: "" });
+    const sb = stubDir({ getent: GETENT, useradd: "", usermod: "", gpasswd: "", chown: "", chmod: "", install: "" });
     try {
-      const res = runBash(section(script(), "5c", "6"), sb.dir, { SAMOHOST_DB_LAYOUT: "split" });
+      const res = runBash(section(script(), "5c", "5d"), sb.dir, { SAMOHOST_DB_LAYOUT: "split", T_USER: "shop-run" });
       expect(res.status, res.stderr).toBe(0);
       const calls = readFileSync(sb.log, "utf8").trim().split("\n");
       expect(calls).toEqual([
-        "id shop-run",
+        "getent passwd shop-run",
         "useradd --system --user-group --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin shop-run",
-        "usermod --shell /usr/sbin/nologin shop-run",
-        "gpasswd -d shop-run shop",
         "install -d -m 750 -o shop-run -g shop-run /opt/shop/uploads",
       ]);
     } finally {
@@ -219,7 +233,7 @@ describe("new layout: runtime user '<app>-run'", () => {
     try {
       const link = join(sb.dir, "uploads");
       symlinkSync("/etc", link);
-      const text = section(script(), "5c", "6").replaceAll("/opt/shop/uploads", link);
+      const text = section(script(), "5c", "5d").replaceAll("/opt/shop/uploads", link);
       const res = runBash(text, sb.dir, { SAMOHOST_DB_LAYOUT: "split" });
       expect(res.status).toBe(1);
       expect(res.stderr).toContain("is a symbolic link");
@@ -238,7 +252,7 @@ describe("new layout: runtime user '<app>-run'", () => {
       writeFileSync(join(sb.dir, "outside"), "secret");
       linkSync(join(sb.dir, "outside"), join(uploads, "linked"));
       symlinkSync("/etc/hosts", join(uploads, "sub", "link"));
-      const text = section(script(), "5c", "6").replaceAll("/opt/shop/uploads", uploads);
+      const text = section(script(), "5c", "5d").replaceAll("/opt/shop/uploads", uploads);
       const res = runBash(text, sb.dir, { SAMOHOST_DB_LAYOUT: "split" });
       expect(res.status, res.stderr).toBe(0);
       const calls = readFileSync(sb.log, "utf8");
@@ -256,14 +270,41 @@ describe("new layout: runtime user '<app>-run'", () => {
     }
   });
 
-  test("an existing runtime user is kept (no second useradd)", () => {
-    const sb = stubDir({ id: "exit 0", useradd: "", usermod: "", gpasswd: "", chown: "", chmod: "", install: "" });
+  test("an existing runtime user that bootstrap created is kept (no second useradd)", () => {
+    const sb = stubDir({ getent: GETENT, id: 'echo "$T_GROUPS"', useradd: "", chown: "", chmod: "", install: "" });
     try {
-      const res = runBash(section(script(), "5c", "6"), sb.dir, { SAMOHOST_DB_LAYOUT: "split" });
+      const res = runBash(section(script(), "5c", "5d"), sb.dir, {
+        SAMOHOST_DB_LAYOUT: "split", T_USER: "shop-run", T_PASSWD: "shop-run:x:990:990::/nonexistent:/usr/sbin/nologin",
+        T_GID: "990", T_GROUP: "shop-run", T_GROUPS: "shop-run",
+      });
       expect(res.status, res.stderr).toBe(0);
       expect(readFileSync(sb.log, "utf8")).not.toContain("useradd");
     } finally {
       sb.cleanup();
+    }
+  });
+
+  test("an existing runtime account that bootstrap did not create is refused (shell, home, uid, groups)", () => {
+    const ok = { passwd: "shop-run:x:990:990::/nonexistent:/usr/sbin/nologin", gid: "990", group: "shop-run", groups: "shop-run" };
+    for (const bad of [
+      { ...ok, passwd: "shop-run:x:990:990::/nonexistent:/bin/bash" },
+      { ...ok, passwd: "shop-run:x:990:990::/home/shop-run:/usr/sbin/nologin" },
+      { ...ok, passwd: "shop-run:x:1001:990::/nonexistent:/usr/sbin/nologin" },
+      { ...ok, passwd: "shop-run:x:50:990::/nonexistent:/usr/sbin/nologin" },
+      { ...ok, groups: "shop-run sudo" },
+      { ...ok, group: "users" },
+    ]) {
+      const sb = stubDir({ getent: GETENT, id: 'echo "$T_GROUPS"', useradd: "", chown: "", chmod: "", install: "" });
+      try {
+        const res = runBash(section(script(), "5c", "5d"), sb.dir, {
+          SAMOHOST_DB_LAYOUT: "split", T_USER: "shop-run", T_PASSWD: bad.passwd, T_GID: bad.gid, T_GROUP: bad.group, T_GROUPS: bad.groups,
+        });
+        expect(res.status, JSON.stringify(bad)).toBe(1);
+        expect(res.stderr).toContain("the account shop-run exists and was not created by samohost bootstrap");
+        expect(readFileSync(sb.log, "utf8")).not.toContain("install -d");
+      } finally {
+        sb.cleanup();
+      }
     }
   });
 
@@ -323,16 +364,17 @@ describe("new layout: deploy user's sudo rules", () => {
     const allowed = sudoMatcher(SPLIT_SUDOERS);
     const seen: string[] = [];
     for (const text of texts) {
-      for (const m of text.matchAll(/\bsudo (\/usr\/bin\/[a-z]+)((?: (?:'[^']*'|"[^"]*"|[^\s;|&<>'"]+))*)/g)) {
-        const cmd = m[1]!;
-        const args = m[2]!
+      for (const m of text.matchAll(/\bsudo (?:-n )?(?:-u ([a-z]+) )?(\/usr\/bin\/[a-z]+)((?: (?:'[^']*'|"[^"]*"|[^\s;|&<>'"]+))*)/g)) {
+        const runas = m[1] ?? "root";
+        const cmd = m[2]!;
+        const args = m[3]!
           .trim()
           .replaceAll('"${SAMOHOST_UNIT}"', "shop")
           .replaceAll('"$SAMOHOST_RELEASE_ENV_FILE"', "/opt/shop/release.env")
           .replace(/'([^']*)'/g, "$1");
         if (args.includes("$")) throw new Error(`unresolved argument in: sudo ${cmd} ${args}`);
-        seen.push(`${cmd} ${args}`);
-        expect(allowed(cmd, args), `sudo ${cmd} ${args}`).toBe(true);
+        seen.push(`${runas === "root" ? "" : `-u ${runas} `}${cmd} ${args}`);
+        expect(allowed(cmd, args, runas), `sudo -u ${runas} ${cmd} ${args}`).toBe(true);
       }
     }
     // The heal staging file name in the rules is the one the heal script uses.
@@ -341,6 +383,13 @@ describe("new layout: deploy user's sudo rules", () => {
     );
     expect(seen).toContain("/usr/bin/systemctl restart shop");
     expect(seen).toContain("/usr/bin/tee /opt/shop/release.env");
+    // Heal validates as the caddy user and its rollback can remove a vhost it created.
+    expect(seen).toContain("-u caddy /usr/bin/caddy validate --config /etc/caddy/Caddyfile");
+    expect(seen).toContain("/usr/bin/rm -f /etc/caddy/sites.d/00-main-shop.caddy");
+  });
+
+  test("the deploy user has 19 rules: 12 exact commands and 7 step rules", () => {
+    expect(SPLIT_SUDOERS.trim().split("\n").length).toBe(19);
   });
 
   test("the sudo grant self-check still passes with the new rule count", () => {
@@ -388,8 +437,9 @@ describe("new layout: hardened systemd unit", () => {
       "-/opt/shop/migrate.env",
       "-/opt/shop/.gh-token",
       "-/opt/shop/git-safe.conf",
-      "-/opt/shop/app/.git",
-      "-/opt/shop/app/.npmrc",
+      "-/opt/shop/app",
+      "-/opt/shop/build",
+      "-/opt/shop/build-cache",
     ]);
   });
 });

@@ -517,3 +517,160 @@ describe("(2) prereq-wired — trigger-run emits startup error when CF token abs
     },
   );
 });
+
+// ---------------------------------------------------------------------------
+// (4) NEW-LAYOUT SKIP: the preview pass skips node apps whose server shows the
+// new layout (marker /var/lib/samohost/db-layout/<app> = split). Host-prep and
+// preview creation refuse such apps, so the pass reports a skipped entry with
+// a reason instead of a failed result per PR, allocates no env record, asks
+// for no DNS record and runs no work batch. The release deploy of the same app
+// in the same trigger run is unaffected.
+// ---------------------------------------------------------------------------
+
+describe("(4) new-layout skip — preview pass skips node apps with the split layout marker", () => {
+  let dir: string;
+  let vmStore: StateStore;
+  let appStore: AppStore;
+  let envStore: EnvStore;
+
+  const PR = { number: 7, headRef: "feature/x", headSha: "b".repeat(40) };
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), "samohost-newlayout-skip-"));
+    vmStore = new StateStore(join(dir, "state.json"));
+    appStore = new AppStore(join(dir, "apps.json"));
+    envStore = new EnvStore(join(dir, "envs.json"));
+    vmStore.upsert(makeVm());
+  });
+
+  afterEach(() => rmSync(dir, { recursive: true, force: true }));
+
+  async function cycle(
+    app: AppRecord,
+    remote: (vm: VmRecord, script: string) => Promise<{ code: number; stdout: string; stderr: string }>,
+    dnsCalls: string[],
+  ) {
+    const { defaultTriggerDeps } = await import("../src/commands/trigger.ts");
+    const deps = defaultTriggerDeps({
+      envStore,
+      remote,
+      listOpenPrs: async () => [PR],
+      ensurePreviewDns: async (vhost: string) => {
+        dnsCalls.push(vhost);
+      },
+    } as Parameters<typeof defaultTriggerDeps>[0]);
+    return deps.batchedVmCycle!(app, makeVm(), { heal: true, prPreviews: true });
+  }
+
+  test("split marker: skipped entry with a reason, no failed result, no env record, no DNS, one probe call", async () => {
+    const app = makeApp({ kind: "node", name: "shop" });
+    const scripts: string[] = [];
+    const dnsCalls: string[] = [];
+    const result = await cycle(app, async (_vm, script) => {
+      scripts.push(script);
+      return { code: 0, stdout: "SAMOHOST_DB_LAYOUT=split\n", stderr: "" };
+    }, dnsCalls);
+
+    expect(result.prPreview.skipped?.reason).toBe("new-layout");
+    expect(result.prPreview.skipped?.detail).toContain("shop");
+    expect(result.prPreview.openPrs).toBe(1);
+    expect(result.prPreview.results.filter((r) => r.action === "failed" || r.action === "error")).toEqual([]);
+    expect(envStore.listFor("vm-1111", "shop")).toEqual([]);
+    expect(dnsCalls).toEqual([]);
+    expect(scripts.length).toBe(1);
+    expect(scripts[0]).toContain("/var/lib/samohost/db-layout/shop");
+  });
+
+  test("marker absent or unreadable: the pass goes on as before (env created through the work batch)", async () => {
+    const app = makeApp({ kind: "node", name: "shop" });
+    const scripts: string[] = [];
+    const dnsCalls: string[] = [];
+    const result = await cycle(app, async (_vm, script) => {
+      scripts.push(script);
+      if (scripts.length === 1) return { code: 0, stdout: "SAMOHOST_DB_LAYOUT=other\n", stderr: "" };
+      return { code: 0, stdout: "", stderr: "" };
+    }, dnsCalls);
+
+    expect(result.prPreview.skipped).toBeUndefined();
+    expect(scripts.length).toBe(2);
+    expect(envStore.listFor("vm-1111", "shop").length).toBe(1);
+  });
+
+  test("probe that fails to run counts as not split", async () => {
+    const app = makeApp({ kind: "node", name: "shop" });
+    let calls = 0;
+    const result = await cycle(app, async () => {
+      calls += 1;
+      if (calls === 1) throw new Error("ssh: connection refused");
+      return { code: 0, stdout: "", stderr: "" };
+    }, []);
+    expect(result.prPreview.skipped).toBeUndefined();
+    expect(calls).toBe(2);
+  });
+
+  test("static app: no layout probe", async () => {
+    const app = makeApp({ kind: "static", name: "shop" });
+    const scripts: string[] = [];
+    await cycle(app, async (_vm, script) => {
+      scripts.push(script);
+      return { code: 0, stdout: "", stderr: "" };
+    }, []);
+    expect(scripts.every((s) => !s.includes("/var/lib/samohost/db-layout/"))).toBe(true);
+  });
+
+  test("no PR to create or redeploy: no probe call", async () => {
+    const app = makeApp({ kind: "node", name: "shop" });
+    const { defaultTriggerDeps } = await import("../src/commands/trigger.ts");
+    let calls = 0;
+    const deps = defaultTriggerDeps({
+      envStore,
+      remote: async () => {
+        calls += 1;
+        return { code: 0, stdout: "SAMOHOST_DB_LAYOUT=split\n", stderr: "" };
+      },
+      listOpenPrs: async () => [],
+    } as Parameters<typeof defaultTriggerDeps>[0]);
+    const result = await deps.batchedVmCycle!(app, makeVm(), { heal: true, prPreviews: true });
+    expect(calls).toBe(0);
+    expect(result.prPreview.skipped).toBeUndefined();
+  });
+
+  test("trigger run: the release deploy of the app still runs, exit 0, the JSON report carries the skipped entry", async () => {
+    appStore.upsert(makeApp({ kind: "node", name: "shop" }));
+    const { defaultTriggerDeps } = await import("../src/commands/trigger.ts");
+    const deployed: string[] = [];
+    const base = defaultTriggerDeps({
+      envStore,
+      remote: async () => ({ code: 0, stdout: "SAMOHOST_DB_LAYOUT=split\n", stderr: "" }),
+      listOpenPrs: async () => [PR],
+      ensurePreviewDns: async () => {},
+    } as Parameters<typeof defaultTriggerDeps>[0]);
+    const deps = {
+      ...base,
+      resolveRef: async () => "c".repeat(40),
+      fetch: (async () =>
+        ({ ok: true, json: async () => ({ workflow_runs: [{ status: "completed", conclusion: "success" }] }) }) as Response) as unknown as typeof fetch,
+      env: { GH_TOKEN: "tok" },
+      deploy: async (input: { app: string; sha?: string }) => {
+        deployed.push(`${input.app}@${input.sha}`);
+        return 0;
+      },
+    };
+    let out = "";
+    const code = await runTriggerRun(
+      { prPreviews: true, dryRun: false },
+      { json: true },
+      vmStore,
+      appStore,
+      deps as Parameters<typeof runTriggerRun>[4],
+      (s) => (out += s + "\n"),
+      noop,
+    );
+    expect(code).toBe(0);
+    expect(deployed).toEqual([`shop@${"c".repeat(40)}`]);
+    const report = JSON.parse(out);
+    expect(report.results[0].action).toBe("deployed");
+    expect(report.prPreviews[0].skipped.reason).toBe("new-layout");
+    expect(report.prPreviews[0].results).toEqual([]);
+  });
+});

@@ -20,6 +20,7 @@ import type { TomlValueWithoutBigInt } from "smol-toml";
 import type { ListenerSpec, ServiceSpec, RouteSpec } from "../types.ts";
 import { validateStaticRoot } from "../app/static-root.ts";
 import { linuxAppUserError } from "../app/linux-user.ts";
+import { isValidMainHost } from "../env/script.ts";
 import {
   CANONICAL_RELEASE_CI_WORKFLOW,
   isCanonicalReleaseCiWorkflow,
@@ -748,6 +749,10 @@ export function parseSamohostToml(text: string): ParseTomlResult {
   const envDbVars = optionalStringArray(raw, "envDbVars", errors);
   const rlsNonSuperuser = optionalBoolean(raw, "rlsNonSuperuser", errors);
   const staticRoot = optionalString(raw, "staticRoot", errors);
+
+  if (mainHost !== undefined && !isValidMainHost(mainHost)) {
+    errors.push(`mainHost: ${JSON.stringify(mainHost)} is not a dotted lowercase DNS name like "app.example.com"`);
+  }
 
   if (appUser !== undefined) {
     const appUserError = linuxAppUserError(appUser);

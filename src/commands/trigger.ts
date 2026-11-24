@@ -2103,10 +2103,42 @@ export function defaultTriggerDeps(opts: TriggerDepsOpts = {}): TriggerDeps {
       }
 
       // PRs that need a deploy (new env or changed SHA).
-      const prsNeedingDeploy = openPrs.filter((pr) => {
+      const prsWanted = openPrs.filter((pr) => {
         const existing = envStore.get(vmRecord.id, app.name, pr.headRef);
         return existing === undefined || existing.lastDeployedSha !== pr.headSha;
       });
+
+      // New-layout node apps (separate database roles, runtime user
+      // <app>-run) have no previews yet: host-prep and the env script refuse
+      // them. The app record does not carry the layout; the server decides it
+      // and records it in /var/lib/samohost/db-layout/<app>. Read that marker
+      // (one short SSH call as the operator user) only when there is a
+      // preview to create or redeploy, so an app without open PRs costs no
+      // extra connection. A probe that fails or cannot read the marker counts
+      // as "not split" and the pass goes on as before.
+      let newLayoutSkip: PrPreviewSummary["skipped"];
+      if (cycleOpts.prPreviews && app.kind !== "static" && prsWanted.length > 0) {
+        const { layoutProbeScript, probeSaysSplit } = await import("../app/db-layout.ts");
+        const layoutRemote = opts.remote ?? mkEnvExecDeps2().remote;
+        try {
+          const probe = await layoutRemote(vmRecord, layoutProbeScript(app.name));
+          if (probeSaysSplit(probe.code, probe.stdout)) {
+            newLayoutSkip = {
+              reason: "new-layout",
+              detail:
+                `app ${app.name} on ${vmRecord.name} uses the new layout (separate database roles, ` +
+                `runtime user ${app.name}-run); previews of such apps are not supported yet, ` +
+                `so no preview was created or redeployed`,
+            };
+          }
+        } catch (e) {
+          process.stderr.write(
+            `samohost: batchedVmCycle: layout probe failed for ${app.name}@${vmRecord.name} — ` +
+              `${e instanceof Error ? e.message : String(e)}; treating the app as not split\n`,
+          );
+        }
+      }
+      const prsNeedingDeploy = newLayoutSkip !== undefined ? [] : prsWanted;
 
       // ------------------------------------------------------------------
       // Phase 3: Build batch work items (no SSH).
@@ -2601,8 +2633,9 @@ export function defaultTriggerDeps(opts: TriggerDepsOpts = {}): TriggerDeps {
         }
       }
 
-      // Unchanged PRs (already up to date — no deploy needed).
-      for (const pr of openPrs) {
+      // Unchanged PRs (already up to date — no deploy needed). None when the
+      // pass skipped the app (new layout).
+      for (const pr of newLayoutSkip !== undefined ? [] : openPrs) {
         const alreadyProcessed = prsNeedingDeploy.some((p) => p.headRef === pr.headRef);
         if (!alreadyProcessed) {
           const existing = envStore.get(vmRecord.id, app.name, pr.headRef);
@@ -2669,6 +2702,7 @@ export function defaultTriggerDeps(opts: TriggerDepsOpts = {}): TriggerDeps {
         // FIX 5b (REPORTING_PRLIST): surface gh-list error so callers can
         // distinguish "zero open PRs" from "PR list call failed → zero processed".
         ...(prListError !== undefined ? { listError: prListError } : {}),
+        ...(newLayoutSkip !== undefined ? { skipped: newLayoutSkip } : {}),
       };
 
       return { heal: healSummaryOut, prPreview: prPreviewSummaryOut };

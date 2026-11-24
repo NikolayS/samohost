@@ -50,6 +50,9 @@ import { CADDY_VALIDATE, CADDY_VALIDATE_FN_LINES, CADDY_VALIDATE_RULE_PROBE } fr
 import { faviconVhostBodyLines } from "../caddy/favicon.ts";
 import { PHASE_PREFIX } from "./script.ts";
 
+/** Caddy's validation of the whole configuration (src/caddy/validate.ts). */
+export const CADDY_VALIDATE_COMMAND = CADDY_VALIDATE;
+
 /**
  * Build the static main-vhost address expression — matches the deploy path
  * in buildDeployScript (src/app/script.ts).
