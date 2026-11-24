@@ -33,7 +33,7 @@ export function caddyLogOwnerRepairLines(appName: string): string[] {
     `if [[ -L "$SAMOHOST_APP_CADDY_LOG" ]]; then`,
     `  echo "WARNING: $SAMOHOST_APP_CADDY_LOG is a symbolic link; left as it is" >&2`,
     `elif [[ -f "$SAMOHOST_APP_CADDY_LOG" ]] && id -u caddy >/dev/null 2>&1 && [[ "$(stat -c %U "$SAMOHOST_APP_CADDY_LOG")" != caddy ]]; then`,
-    `  chown caddy:caddy "$SAMOHOST_APP_CADDY_LOG"`,
+    `  chown -h caddy:caddy "$SAMOHOST_APP_CADDY_LOG"`,
     `  echo "Caddy: $SAMOHOST_APP_CADDY_LOG given to caddy (Caddy opens it as caddy)"`,
     `fi`,
   ];

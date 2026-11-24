@@ -415,7 +415,8 @@ describe("host-prep and bootstrap — the app's Caddy log file belongs to caddy"
       expect(script.indexOf(validation, repair)).toBeGreaterThan(repair);
       const r = runRepair(script, { owner: "root" });
       expect(r.code, r.out).toBe(0);
-      expect(r.calls).toMatch(/^chown caddy:caddy .*\/shop-prod\.log$/m);
+      // -h: a symbolic link put there after the check is not followed.
+      expect(r.calls).toMatch(/^chown -h caddy:caddy .*\/shop-prod\.log$/m);
     });
 
     test(`${name}: a log file owned by caddy is left as it is; a symbolic link is not followed`, () => {
