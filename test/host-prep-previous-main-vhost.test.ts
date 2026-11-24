@@ -163,41 +163,86 @@ describe("host-prep re-run — main vhost written by an older samohost", () => {
   });
 });
 
-/** Run the whole heal script with /etc/caddy in a sandbox and stub commands. */
-function runHeal(live: string) {
+/**
+ * Run the whole heal script with /etc/caddy, $HOME and $TMPDIR in a sandbox
+ * and stub commands. `rule` is whether the deploy user has the sudo rule to
+ * validate as caddy (sudo -n -l answers it). `failNewVhost` makes validation
+ * fail while the live vhost is the current render. `codes` are the HTTP codes
+ * curl answers, one per call; the last one repeats.
+ */
+function runHeal(live: string | null, opts: { rule?: boolean; failNewVhost?: boolean; codes?: string[] } = {}) {
   const script = buildConfigHealScript(cpApp(), { controlPlaneIp: CP });
   const dir = mkdtempSync(join(tmpdir(), "samohost-prev-heal-"));
   try {
     const bin = join(dir, "bin");
     mkdirSync(bin);
+    const home = join(dir, "home");
+    const tmp = join(dir, "tmp");
+    mkdirSync(home);
+    mkdirSync(tmp);
     const log = join(dir, "calls.log");
+    const etc = join(dir, "etc-caddy");
+    const livePath = join(etc, "sites.d", "00-main-shop.caddy");
     const stub = (name: string, body: string) => writeFileSync(join(bin, name), `#!/usr/bin/env bash\n${body}\n`, { mode: 0o755 });
-    stub("caddy", `printf 'caddy %s\\n' "$*" >> '${log}'`);
+    stub(
+      "caddy",
+      [
+        `printf 'caddy %s\\n' "$*" >> '${log}'`,
+        ...(opts.failNewVhost === true ? [`if [[ "$1" == validate ]] && grep -q trusted_proxies '${livePath}' 2>/dev/null; then echo "caddy: invalid" >&2; exit 1; fi`] : []),
+        "exit 0",
+      ].join("\n"),
+    );
     stub("systemctl", `printf 'systemctl %s\\n' "$*" >> '${log}'`);
-    stub("curl", "printf 200");
+    const codes = opts.codes ?? ["200"];
+    const counter = join(dir, "curl.count");
+    stub(
+      "curl",
+      [
+        `n=$(cat '${counter}' 2>/dev/null || echo 0); echo $((n + 1)) > '${counter}'`,
+        `codes=(${codes.join(" ")}); i=$n; if (( i >= \${#codes[@]} )); then i=$(( \${#codes[@]} - 1 )); fi`,
+        'printf "%s" "${codes[$i]}"',
+      ].join("\n"),
+    );
     stub("sleep", "exit 0");
     stub(
       "sudo",
       [
         `printf 'sudo %s\\n' "$*" >> '${log}'`,
-        "while [[ $# -gt 0 ]]; do case \"$1\" in -n) shift ;; -l) shift ;; -u) shift 2 ;; *) break ;; esac; done",
+        `if [[ " $* " == *" -l "* ]]; then exit ${opts.rule === false ? 1 : 0}; fi`,
+        "while [[ $# -gt 0 ]]; do case \"$1\" in -n) shift ;; -u) shift 2 ;; *) break ;; esac; done",
         'c="$1"; shift; case "$c" in /usr/bin/*) c="${c#/usr/bin/}" ;; esac',
         'exec "$c" "$@"',
       ].join("\n"),
     );
-    const etc = join(dir, "etc-caddy");
     mkdirSync(join(etc, "sites.d"), { recursive: true });
     writeFileSync(join(etc, "Caddyfile"), "{\n}\nimport sites.d/*.caddy\n");
-    const livePath = join(etc, "sites.d", "00-main-shop.caddy");
-    writeFileSync(livePath, live);
+    if (live !== null) writeFileSync(livePath, live);
     const res = spawnSync("bash", ["-c", script.replaceAll("/etc/caddy", etc)], {
       encoding: "utf8",
-      env: { ...process.env, PATH: `${bin}:${process.env["PATH"] ?? ""}` },
+      env: { ...process.env, PATH: `${bin}:${process.env["PATH"] ?? ""}`, HOME: home, TMPDIR: tmp },
     });
-    return { code: res.status, out: res.stdout + res.stderr, live: readFileSync(livePath, "utf8") };
+    const backupDir = join(home, "samohost-backups");
+    return {
+      code: res.status,
+      out: res.stdout + res.stderr,
+      live: existsSync(livePath) ? readFileSync(livePath, "utf8") : null,
+      sites: readdirSync(join(etc, "sites.d")),
+      tmpLeft: readdirSync(tmp),
+      kept: existsSync(backupDir) ? readdirSync(backupDir).map((f) => ({ name: f, text: readFileSync(join(backupDir, f), "utf8") })) : [],
+      calls: existsSync(log) ? readFileSync(log, "utf8") : "",
+    };
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
+}
+
+/** The outcome `app heal` reports for this output (src/commands/app.ts parseHealOutcome). */
+function outcomeOf(out: string): string {
+  if (out.includes("<<<SAMOHOST_PHASE:no-drift:ok>>>")) return "no-drift";
+  if (out.includes("<<<SAMOHOST_PHASE:rollback:fail>>>")) return "rollback-failed";
+  if (out.includes("<<<SAMOHOST_PHASE:rollback:ok>>>")) return "rolled-back";
+  if (out.includes("<<<SAMOHOST_PHASE:heal:ok>>>")) return out.includes("drift-foreign:") ? "drift-foreign" : "healed";
+  return "incomplete";
 }
 
 describe("heal — main vhost written by an older samohost's host-prep", () => {
@@ -214,6 +259,93 @@ describe("heal — main vhost written by an older samohost's host-prep", () => {
     const r = runHeal(hand);
     expect(r.out).toContain("drift-foreign");
     expect(r.live).toBe(hand);
+  });
+
+  test("the previous form without the caddy validate sudo rule: drift-foreign, exit 0, the file byte-identical, no backup written", () => {
+    const r = runHeal(PREVIOUS, { rule: false });
+    expect(r.code, r.out).toBe(0);
+    expect(outcomeOf(r.out)).toBe("drift-foreign");
+    expect(r.live).toBe(PREVIOUS);
+    expect(r.sites).toEqual(["00-main-shop.caddy"]);
+    expect(r.tmpLeft).toEqual([]);
+    expect(r.kept).toEqual([]);
+    expect(r.calls).not.toContain("tee");
+    // Only the sudo -n -l check of the rule names the validation; nothing validates.
+    expect(r.calls).not.toMatch(/^caddy validate/m);
+    expect(r.calls).not.toContain("sudo -n -u caddy");
+    expect(r.calls).not.toContain("systemctl reload");
+    expect(r.out.split("\n").filter((l) => l.includes("host-prep or a bootstrap re-run")).length).toBe(1);
+  });
+
+  test("the previous form with the caddy validate sudo rule: upgraded, a backup of it kept, no drift on the next heal", () => {
+    const r = runHeal(PREVIOUS, { rule: true });
+    expect(r.code, r.out).toBe(0);
+    expect(outcomeOf(r.out)).toBe("healed");
+    expect(r.live).toBe(NEW);
+    expect(r.kept.map((k) => k.text)).toEqual([PREVIOUS]);
+    expect(r.kept[0]!.name).toMatch(/^00-main-shop\.caddy\.bak\.\d{8}T\d{6}Z$/);
+    // Validated as caddy before the write and after it.
+    expect(r.calls.split("\n").filter((l) => l.startsWith("sudo -n -u caddy /usr/bin/caddy validate --config ")).length).toBe(2);
+    expect(r.sites).toEqual(["00-main-shop.caddy"]);
+    expect(r.tmpLeft).toEqual([]);
+    const again = runHeal(NEW, { rule: true });
+    expect(again.code, again.out).toBe(0);
+    expect(outcomeOf(again.out)).toBe("no-drift");
+    expect(again.kept).toEqual([]);
+  });
+
+  test("the previous form with the rule and a failed validation of the new file: previous file restored, rolled back cleanly, no new file", () => {
+    // The previous form answered with a redirect before the change, and after the restore.
+    const r = runHeal(PREVIOUS, { rule: true, failNewVhost: true, codes: ["308"] });
+    expect(r.code).toBe(1);
+    expect(r.live).toBe(PREVIOUS);
+    expect(outcomeOf(r.out)).toBe("rolled-back");
+    expect(r.sites).toEqual(["00-main-shop.caddy"]);
+    expect(r.tmpLeft).toEqual([]);
+    expect(r.kept).toEqual([]);
+    // Caddy was not reloaded with the change: the rollback does not reload it either.
+    expect(r.calls).not.toContain("systemctl reload");
+  });
+
+  test("a hand-authored main vhost with the rule is still drift-foreign and unchanged", () => {
+    const hand = "shop.example.com {\n\treverse_proxy localhost:3100\n\theader X-Hand 1\n}\n";
+    const r = runHeal(hand, { rule: true });
+    expect(r.code).toBe(0);
+    expect(outcomeOf(r.out)).toBe("drift-foreign");
+    expect(r.live).toBe(hand);
+    expect(r.calls).not.toContain("caddy validate");
+    expect(r.tmpLeft).toEqual([]);
+  });
+});
+
+describe("heal — rollback compares the health check with the state before the change", () => {
+  test("a health check that fails after the reload, and the same code as before the change after the restore: rolled-back", () => {
+    const older = `${SAMOHOST_PROVENANCE_HEADER}\nhttp://shop.example.com:80 {\n\treverse_proxy localhost:3100\n}\n`;
+    // Before: 404; after the reload: 502 (ten tries); after the restore: 404.
+    const r = runHeal(older, { codes: ["404", ...Array(10).fill("502"), "404"] });
+    expect(r.code).toBe(1);
+    expect(r.live).toBe(older);
+    expect(outcomeOf(r.out)).toBe("rolled-back");
+    // The change and the restore are each reloaded once.
+    expect(r.calls.split("\n").filter((l) => l === "systemctl reload caddy").length).toBe(2);
+  });
+
+  test("a code after the restore that differs from the code before the change: rollback-failed", () => {
+    const older = `${SAMOHOST_PROVENANCE_HEADER}\nhttp://shop.example.com:80 {\n\treverse_proxy localhost:3100\n}\n`;
+    const r = runHeal(older, { codes: ["200", "502"] });
+    expect(r.code).toBe(1);
+    expect(r.live).toBe(older);
+    expect(outcomeOf(r.out)).toBe("rollback-failed");
+    expect(r.out).toContain("before the change: HTTP 200");
+  });
+
+  test("a failed validation of a vhost that heal created removes it and leaves no temporary file", () => {
+    const r = runHeal(null, { failNewVhost: true });
+    expect(r.code).toBe(1);
+    expect(r.live).toBeNull();
+    expect(r.sites).toEqual([]);
+    expect(r.tmpLeft).toEqual([]);
+    expect(outcomeOf(r.out)).toBe("rolled-back");
   });
 });
 

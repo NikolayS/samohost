@@ -316,7 +316,15 @@ Host-prep and heal replace, with a backup, a main vhost of such an app that
 an older samohost wrote: a file byte-equal to the earlier host-prep form
 `<host> {` / `reverse_proxy localhost:<port>` / `}`, or (host-prep) a file
 whose first line is samohost's provenance header. Host-prep still refuses any
-other differing file unless `--force-main-vhost` is given.
+other differing file unless `--force-main-vhost` is given. Heal replaces the
+earlier form only when the deploy user has the caddy validate sudo rule (see
+below) and the current configuration validates as caddy, both checked before
+any write; heal keeps the backup in `~/samohost-backups/` of the deploy user.
+Without the rule, heal reports `drift-foreign` and changes nothing, as an
+older samohost did, until host-prep or a bootstrap re-run with this version
+replaces the file. When heal restores files after a failure, it compares the
+health check with the answer before its first write: an app that answered
+with a redirect before answers the same after a clean rollback.
 
 ### Caddy validation and log files
 

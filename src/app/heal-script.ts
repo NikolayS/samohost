@@ -46,7 +46,7 @@ import type { AppRecord } from "../types.ts";
 import { staticCacheHeaderLines } from "../static-cache.ts";
 import { staticReleaseStatePaths } from "./static-root.ts";
 import { renderVhost, planFromApp, mainVhostTrustedProxies, previousNodeMainVhost } from "../caddy/render.ts";
-import { CADDY_VALIDATE_FN_LINES } from "../caddy/validate.ts";
+import { CADDY_VALIDATE, CADDY_VALIDATE_FN_LINES, CADDY_VALIDATE_RULE_PROBE } from "../caddy/validate.ts";
 import { faviconVhostBodyLines } from "../caddy/favicon.ts";
 import { PHASE_PREFIX } from "./script.ts";
 
@@ -213,6 +213,12 @@ export function buildConfigHealScript(app: AppRecord, opts: BuildConfigHealScrip
   // Node cp-http80 apps: host-prep of upstream main wrote this form.
   const previousMainVhost = !isStatic && app.mainListen === "cp-http80" ? previousNodeMainVhost(app) : undefined;
 
+  // The health probe of the health phase, the rollback and the state before
+  // the change: the same request each time.
+  const probeExpr = app.mainListen === "cp-http80"
+    ? `curl -s -k -H ${sq(`Host: ${app.mainHost}`)} -o /dev/null -w "%{http_code}" --max-time 10 http://127.0.0.1/ || echo 000`
+    : `curl -s -k -H ${sq(`Host: ${app.mainHost}`)} -o /dev/null -w "%{http_code}" --max-time 10 https://127.0.0.1/ || echo 000`;
+
   // ---- Script header --------------------------------------------------------
   push(
     "#!/usr/bin/env bash",
@@ -223,6 +229,11 @@ export function buildConfigHealScript(app: AppRecord, opts: BuildConfigHealScrip
     "",
     `SAMOHOST_MAIN_VHOST=${sq(mainVhostPath)}`,
     `SAMOHOST_STAGED_MAIN_VHOST=${sq(stagedMainVhost)}`,
+    "# HTTP code of the health probe before heal's first write; the rollback",
+    "# compares with it. SAMOHOST_HEAL_RELOADED=1 once Caddy was asked to reload.",
+    'SAMOHOST_HEAL_CODE_BEFORE=""',
+    "SAMOHOST_HEAL_RELOADED=0",
+    "SAMOHOST_MAIN_VHOST_UPGRADE=0",
     ...(isStatic && staticPaths !== undefined
       ? [
           `SAMOHOST_ACTIVE_STATE=${sq(staticPaths.activeState)}`,
@@ -246,6 +257,10 @@ export function buildConfigHealScript(app: AppRecord, opts: BuildConfigHealScrip
           '  sudo /usr/bin/rm -f "${SAMOHOST_ACTIVE_ROUTE_STAGED:-}" || true',
         ]
       : []),
+    "  # A main vhost that heal created (none existed before) is removed.",
+    '  if [[ "${SAMOHOST_MAIN_VHOST_CREATED:-0}" == "1" ]]; then',
+    `    sudo /usr/bin/rm -f ${sq(mainVhostPath)} || rb_ok=0`,
+    "  fi",
     "  # Restore main vhost backup",
     '  if [[ "${SAMOHOST_MAIN_VHOST_HAD_BACKUP:-0}" == "1" && -f "${SAMOHOST_MAIN_VHOST_BACKUP:-}" ]]; then',
     `    if sudo /usr/bin/tee ${sq(stagedMainVhost)} >/dev/null < "$SAMOHOST_MAIN_VHOST_BACKUP"; then`,
@@ -262,20 +277,29 @@ export function buildConfigHealScript(app: AppRecord, opts: BuildConfigHealScrip
           `      /usr/bin/mv -f "$rb_tmp" ${sq(staticPaths.activeRoute)} || rb_ok=0`,
           "    else rb_ok=0; fi",
           "  fi",
+          "  # An active-route snippet that heal created is removed.",
+          '  if [[ "${SAMOHOST_ACTIVE_ROUTE_CREATED:-0}" == "1" ]]; then',
+          `    rm -f ${sq(staticPaths.activeRoute)} || rb_ok=0`,
+          "  fi",
         ]
       : []),
-    "  samohost_caddy_validate || rb_ok=0",
-    '  if [[ "$rb_ok" == "1" ]]; then sudo /usr/bin/systemctl reload caddy || rb_ok=0; fi',
-    `  sleep ${RESTART_SETTLE_SEC}`,
+    '  rm -f "${_new_main_vhost:-}" "${_new_no_header:-}" "${_prev_main_vhost:-}" || true',
+    "  # Caddy serves what it loaded at its last reload. Before heal asked for a",
+    "  # reload, that is the files just restored: no validation, no reload.",
+    '  if [[ "$SAMOHOST_HEAL_RELOADED" == "1" ]]; then',
+    "    samohost_caddy_validate || rb_ok=0",
+    '    if [[ "$rb_ok" == "1" ]]; then sudo /usr/bin/systemctl reload caddy || rb_ok=0; fi',
+    `    sleep ${RESTART_SETTLE_SEC}`,
+    "  fi",
     "  local rb_code",
-    ...(app.mainListen === "cp-http80"
-      ? [`  rb_code=$(curl -s -k -H ${sq(`Host: ${app.mainHost}`)} -o /dev/null -w "%{http_code}" --max-time 10 http://127.0.0.1/ || echo 000)`]
-      : [`  rb_code=$(curl -s -k -H ${sq(`Host: ${app.mainHost}`)} -o /dev/null -w "%{http_code}" --max-time 10 https://127.0.0.1/ || echo 000)`]),
-    '  if [[ "$rb_ok" == "1" && "$rb_code" == "200" ]]; then',
+    `  rb_code=$(${probeExpr})`,
+    "  # Rolled back cleanly: the files are restored and the app answers as it",
+    "  # did before heal's first write (or with 200).",
+    '  if [[ "$rb_ok" == "1" && ( "$rb_code" == "200" || "$rb_code" == "$SAMOHOST_HEAL_CODE_BEFORE" ) ]]; then',
     `    ${marker("rollback", "ok")}`,
     "  else",
     `    ${marker("rollback", "fail")}`,
-    '    echo "heal rollback health re-check failed (HTTP $rb_code) — manual intervention required" >&2',
+    '    echo "heal rollback health re-check failed (HTTP $rb_code; before the change: HTTP ${SAMOHOST_HEAL_CODE_BEFORE:-none}) — manual intervention required" >&2',
     "  fi",
     "  # Cleanup backup temps",
     '  rm -f "${SAMOHOST_MAIN_VHOST_BACKUP:-}" || true',
@@ -294,6 +318,12 @@ export function buildConfigHealScript(app: AppRecord, opts: BuildConfigHealScrip
   push(
     "# Validation as the caddy user when the sudo rule exists (src/caddy/validate.ts).",
     ...CADDY_VALIDATE_FN_LINES,
+    "# Records the health probe's code before heal's first write (once).",
+    "samohost_heal_before_change() {",
+    '  if [[ -z "$SAMOHOST_HEAL_CODE_BEFORE" ]]; then',
+    `    SAMOHOST_HEAL_CODE_BEFORE=$(${probeExpr})`,
+    "  fi",
+    "}",
     "",
   );
 
@@ -419,7 +449,21 @@ export function buildConfigHealScript(app: AppRecord, opts: BuildConfigHealScrip
             `  cat > "$_prev_main_vhost" <<'SAMOHOST_PREVIOUS_MAIN_VHOST'`,
             ...previousMainVhost.replace(/\n$/, "").split("\n"),
             "SAMOHOST_PREVIOUS_MAIN_VHOST",
-            `  if cmp -s ${sq(mainVhostPath)} "$_prev_main_vhost"; then _provenance=${sq(SAMOHOST_PROVENANCE_HEADER)}; echo "main vhost: the form an older samohost's host-prep wrote; regenerating"; fi`,
+            "  # Replaced only when the deploy user can validate as the caddy user",
+            "  # (the new vhost names a log file only caddy can open): the sudo rule",
+            "  # exists and the current configuration validates that way, checked",
+            "  # before any write. Otherwise it is left as it is (drift-foreign).",
+            `  if cmp -s ${sq(mainVhostPath)} "$_prev_main_vhost"; then`,
+            `    if ! ${CADDY_VALIDATE_RULE_PROBE} >/dev/null 2>&1; then`,
+            `      echo "main vhost: the form an older samohost's host-prep wrote, left as it is: the deploy user has no sudo rule to validate as caddy; host-prep or a bootstrap re-run with this samohost version upgrades it"`,
+            `    elif ! sudo -n -u caddy ${CADDY_VALIDATE} >/dev/null 2>&1; then`,
+            `      echo "main vhost: the form an older samohost's host-prep wrote, left as it is: the current Caddy configuration does not validate as caddy"`,
+            "    else",
+            `      _provenance=${sq(SAMOHOST_PROVENANCE_HEADER)}`,
+            "      SAMOHOST_MAIN_VHOST_UPGRADE=1",
+            `      echo "main vhost: the form an older samohost's host-prep wrote; regenerating"`,
+            "    fi",
+            "  fi",
             '  rm -f "$_prev_main_vhost"',
           ]
         : []),
@@ -444,6 +488,7 @@ export function buildConfigHealScript(app: AppRecord, opts: BuildConfigHealScrip
             `    if cmp -s ${sq(mainVhostPath)} "$_new_no_header"; then`,
             // Content matches (modulo missing header). Safe to adopt.
             `      # Content is byte-identical minus header — adopt by prepending provenance header`,
+            `      samohost_heal_before_change`,
             `      if sudo /usr/bin/tee ${sq(stagedMainVhost)} >/dev/null < "$_new_main_vhost"; then`,
             `        sudo /usr/bin/mv -- ${sq(stagedMainVhost)} ${sq(mainVhostPath)} || rollback`,
             `        echo "main vhost: adopted (provenance header prepended)"`,
@@ -476,6 +521,7 @@ export function buildConfigHealScript(app: AppRecord, opts: BuildConfigHealScrip
       "      echo \"main vhost: no drift\"",
       "    else",
       "      # Stage: tee to staged path, then atomic mv",
+      "      samohost_heal_before_change",
       `      if sudo /usr/bin/tee ${sq(stagedMainVhost)} >/dev/null < "$_new_main_vhost"; then`,
       `        sudo /usr/bin/mv -- ${sq(stagedMainVhost)} ${sq(mainVhostPath)} || rollback`,
       "        echo \"main vhost: regenerated\"",
@@ -488,6 +534,9 @@ export function buildConfigHealScript(app: AppRecord, opts: BuildConfigHealScrip
       "  fi",
       'elif [[ "${SAMOHOST_MAIN_VHOST_BACKUP:-}" != "" ]]; then',
       "  # File did not exist — no provenance check needed, write fresh",
+      "  # (the rollback removes it again).",
+      "  samohost_heal_before_change",
+      "  SAMOHOST_MAIN_VHOST_CREATED=1",
       `  if sudo /usr/bin/tee ${sq(mainVhostPath)} >/dev/null <<'SAMOHOST_MAIN_VHOST_CONTENT'`,
       ...regeneratedMainVhost!.replace(/\n$/, "").split("\n"),
       "SAMOHOST_MAIN_VHOST_CONTENT",
@@ -527,6 +576,7 @@ export function buildConfigHealScript(app: AppRecord, opts: BuildConfigHealScrip
             `      _new_no_header=$(mktemp)`,
             `      tail -n +2 "$_new_main_vhost" > "$_new_no_header"`,
             `      if cmp -s ${sq(mainVhostPath)} "$_new_no_header"; then`,
+            `        samohost_heal_before_change`,
             `        if sudo /usr/bin/tee ${sq(stagedMainVhost)} >/dev/null < "$_new_main_vhost"; then`,
             `          sudo /usr/bin/mv -- ${sq(stagedMainVhost)} ${sq(mainVhostPath)} || rollback`,
             `          echo "main vhost: adopted (provenance header prepended)"`,
@@ -560,6 +610,7 @@ export function buildConfigHealScript(app: AppRecord, opts: BuildConfigHealScrip
       '        echo "main vhost: no drift"',
       "      else",
       "        # Stage: tee to staged path, then atomic mv",
+      "        samohost_heal_before_change",
       `        if sudo /usr/bin/tee ${sq(stagedMainVhost)} >/dev/null < "$_new_main_vhost"; then`,
       `          sudo /usr/bin/mv -- ${sq(stagedMainVhost)} ${sq(mainVhostPath)} || rollback`,
       '          echo "main vhost: regenerated"',
@@ -572,6 +623,9 @@ export function buildConfigHealScript(app: AppRecord, opts: BuildConfigHealScrip
       "    fi",
       "  else",
       "    # File did not exist — write fresh (no provenance check needed)",
+      "    # (the rollback removes it again).",
+      "    samohost_heal_before_change",
+      "    SAMOHOST_MAIN_VHOST_CREATED=1",
       `    if sudo /usr/bin/tee ${sq(mainVhostPath)} >/dev/null <<SAMOHOST_STATIC_VHOST_CONTENT`,
       ...staticMainVhostLines(address!, "$SAMOHOST_RELEASE_DIR", "$SAMOHOST_STATIC_DIR", tlsLine !== undefined, app.name),
       "SAMOHOST_STATIC_VHOST_CONTENT",
@@ -608,7 +662,9 @@ export function buildConfigHealScript(app: AppRecord, opts: BuildConfigHealScrip
       '      rm -f "$SAMOHOST_ACTIVE_ROUTE_STAGED"',
       '      echo "active-route: no drift"',
       "    else",
-      "      # Atomic mv into place",
+      "      # Atomic mv into place (the rollback removes a snippet heal created)",
+      "      samohost_heal_before_change",
+      `      if [[ ! -e ${sq(staticPaths.activeRoute)} ]]; then SAMOHOST_ACTIVE_ROUTE_CREATED=1; fi`,
       `      if /usr/bin/mv -f "$SAMOHOST_ACTIVE_ROUTE_STAGED" ${sq(staticPaths.activeRoute)}; then`,
       '        echo "active-route: regenerated"',
       "        SAMOHOST_HEAL_ANY_CHANGED=1",
@@ -629,6 +685,7 @@ export function buildConfigHealScript(app: AppRecord, opts: BuildConfigHealScrip
     '# The app is still serving; we refuse to overwrite hand-edited config.',
     'if [[ "$SAMOHOST_HEAL_DRIFT_FOREIGN" == "1" ]]; then',
     '  echo "heal: drift-foreign finding present — skipping caddy reload (hand-edited files preserved)"',
+    '  rm -f "${SAMOHOST_MAIN_VHOST_BACKUP:-}" "${SAMOHOST_ACTIVE_ROUTE_BACKUP:-}" || true',
     `  ${marker("heal", "ok")}`,
     "  exit 0",
     "fi",
@@ -640,6 +697,7 @@ export function buildConfigHealScript(app: AppRecord, opts: BuildConfigHealScrip
     '# If no artifact was changed, emit no-drift and exit successfully.',
     '# generatorSha + lastHealAt are stamped on the TypeScript side regardless.',
     'if [[ "$SAMOHOST_HEAL_ANY_CHANGED" == "0" ]]; then',
+    '  rm -f "${SAMOHOST_MAIN_VHOST_BACKUP:-}" "${SAMOHOST_ACTIVE_ROUTE_BACKUP:-}" || true',
     `  ${marker("no-drift", "ok")}`,
     "  exit 0",
     "fi",
@@ -658,6 +716,7 @@ export function buildConfigHealScript(app: AppRecord, opts: BuildConfigHealScrip
     "# --- caddy-reload: reload Caddy to serve the updated artifacts ---",
     "# Full-path systemctl: hardened host requires exact-path NOPASSWD grant.",
     marker("caddy-reload", "start"),
+    "SAMOHOST_HEAL_RELOADED=1",
     "if sudo /usr/bin/systemctl reload caddy; then",
     `  sleep ${RESTART_SETTLE_SEC}`,
     `  ${marker("caddy-reload", "ok")}`,
@@ -692,6 +751,16 @@ export function buildConfigHealScript(app: AppRecord, opts: BuildConfigHealScrip
 
   // ---- Cleanup backups and emit heal:ok ------------------------------------
   push(
+    "# The form an older samohost's host-prep wrote, once replaced, is kept in",
+    "# the deploy user's home (heal has no sudo rule to write next to it).",
+    'if [[ "$SAMOHOST_MAIN_VHOST_UPGRADE" == "1" ]]; then',
+    `  _kept="\${HOME:-}/samohost-backups/00-main-${app.name}.caddy.bak.$(date -u +%Y%m%dT%H%M%SZ)"`,
+    '  if install -d -m 700 "${HOME:-}/samohost-backups" && install -m 600 "$SAMOHOST_MAIN_VHOST_BACKUP" "$_kept"; then',
+    '    echo "main vhost: the previous file is kept at $_kept"',
+    "  else",
+    '    echo "WARNING: could not keep a copy of the previous main vhost in ${HOME:-}/samohost-backups" >&2',
+    "  fi",
+    "fi",
     "# Cleanup backup temps",
     'rm -f "${SAMOHOST_MAIN_VHOST_BACKUP:-}" || true',
     ...(isStatic && staticPaths !== undefined

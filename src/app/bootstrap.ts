@@ -851,6 +851,7 @@ export function buildHostBootstrapScript(
             `${appUser} ALL=(root) NOPASSWD: /usr/bin/tee ${healStagedVhostFile}`,
             `${appUser} ALL=(root) NOPASSWD: /usr/bin/mv -- ${healStagedVhostFile} ${mainVhostFile}`,
             `${appUser} ALL=(root) NOPASSWD: /usr/bin/rm -f ${healStagedVhostFile}`,
+            `${appUser} ALL=(root) NOPASSWD: /usr/bin/rm -f ${mainVhostFile}`,
             `${appUser} ALL=(root) NOPASSWD: /usr/bin/tee ${releaseEnvFile}`,
             caddyValidateSudoRule(appUser),
             "SAMOHOST_SPLIT_SUDOERS",

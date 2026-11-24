@@ -45,6 +45,13 @@ export function caddyValidateSudoRule(deployUser: string): string {
 }
 
 /**
+ * Exit status 0 when the deploy user has the sudo rule
+ * {@link caddyValidateSudoRule}: `sudo -l` with the command checks the rule
+ * and runs nothing.
+ */
+export const CADDY_VALIDATE_RULE_PROBE = `sudo -n -l -u caddy ${CADDY_VALIDATE}`;
+
+/**
  * samohost_caddy_validate for scripts that run as the deploy user (deploy,
  * heal). With the sudo rule (bootstrap writes it), it validates as the caddy
  * user, which can open every vhost's log file. Without it (a server whose
@@ -54,7 +61,7 @@ export function caddyValidateSudoRule(deployUser: string): string {
  */
 export const CADDY_VALIDATE_FN_LINES: readonly string[] = [
   "samohost_caddy_validate() {",
-  `  if sudo -n -l -u caddy ${CADDY_VALIDATE} >/dev/null 2>&1; then`,
+  `  if ${CADDY_VALIDATE_RULE_PROBE} >/dev/null 2>&1; then`,
   `    sudo -n -u caddy ${CADDY_VALIDATE} >/dev/null`,
   "  else",
   "    caddy validate --config /etc/caddy/Caddyfile >/dev/null",
