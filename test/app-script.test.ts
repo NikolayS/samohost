@@ -528,6 +528,10 @@ describe("buildDeployScript — static path (kind='static')", () => {
       writeFileSync(join(binDir, "sudo"), [
         "#!/usr/bin/env bash",
         'if [[ "${1:-}" == "/usr/bin/systemctl" ]]; then exit 0; fi',
+        // sudo -n -l: no caddy validate rule; sudo -u caddy /usr/bin/caddy runs the caddy stub.
+        'if [[ "${1:-}" == -n && "${2:-}" == -l ]]; then exit 1; fi',
+        'while [[ "${1:-}" == -n || "${1:-}" == -u ]]; do if [[ "$1" == -u ]]; then shift 2; else shift; fi; done',
+        'if [[ "${1:-}" == /usr/bin/caddy ]]; then shift; exec caddy "$@"; fi',
         'exec "$@"',
         "",
       ].join("\n"));
@@ -779,6 +783,10 @@ describe("buildDeployScript — static path (kind='static')", () => {
       writeFileSync(join(binDir, "sudo"), [
         "#!/usr/bin/env bash",
         'if [[ "${1:-}" == "/usr/bin/systemctl" ]]; then exit 0; fi',
+        // sudo -n -l: no caddy validate rule; sudo -u caddy /usr/bin/caddy runs the caddy stub.
+        'if [[ "${1:-}" == -n && "${2:-}" == -l ]]; then exit 1; fi',
+        'while [[ "${1:-}" == -n || "${1:-}" == -u ]]; do if [[ "$1" == -u ]]; then shift 2; else shift; fi; done',
+        'if [[ "${1:-}" == /usr/bin/caddy ]]; then shift; exec caddy "$@"; fi',
         'exec "$@"',
         "",
       ].join("\n"));
