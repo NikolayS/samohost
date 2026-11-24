@@ -292,7 +292,8 @@ describe("heal: node app on a split-layout server", () => {
     try {
       const res = sb.run(heal());
       expect(res.status, res.stderr).toBe(0);
-      expect(sb.calls()).not.toContain("-u caddy");
+      // Only the sudo -n -l check names the caddy user; validation runs as the deploy user.
+      expect(sb.calls()).not.toContain("sudo -n -u caddy");
       expect(sb.calls()).toContain("caddy validate --config /etc/caddy/Caddyfile");
     } finally {
       sb.cleanup();
