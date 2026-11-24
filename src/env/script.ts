@@ -2401,6 +2401,21 @@ export function buildHostPrepScript(
     const stagedPath = `/etc/caddy/sites.d/.staged-00-main-${app.name}.caddy`;
     const bakedForce = firewallOpts?.forceMainVhost === true ? "true" : "false";
 
+    // Restore after a failed validation or reload: the backup goes back
+    // through a file in the same folder and mv -fT (never a partial file at
+    // the live path); the backup stays. With no backup (a first write) the
+    // live file is removed.
+    const restoreMainVhostLines = [
+      "    if [[ -n \"${backup}\" ]] && [[ -f \"${backup}\" ]]; then",
+      "      if ! { install -m 644 \"${backup}\" \"${live}.restore.$$\" && mv -fT \"${live}.restore.$$\" \"$live\"; }; then",
+      "        rm -f \"${live}.restore.$$\"",
+      "        echo \"samohost host-prep: could not restore $live; the previous file is ${backup}\" >&2",
+      "      fi",
+      "    else",
+      "      rm -f \"$live\"",
+      "    fi",
+    ];
+
     // Guard function definition — emitted early in the script (after set -euo
     // pipefail) so it is available when called later in the Caddy step.
     // All inner closing tokens use fi/done (not `}`), so the only `}` at
@@ -2453,21 +2468,13 @@ export function buildHostPrepScript(
       "  # file it creates as root is one Caddy cannot open.",
       `  if ! ${CADDY_VALIDATE_AS_CADDY_FROM_ROOT}; then`,
       "    echo \"samohost host-prep: caddy validate failed — restoring backup\" >&2",
-      "    if [[ -n \"${backup}\" ]] && [[ -f \"${backup}\" ]]; then",
-      "      cp \"${backup}\" \"$live\"",
-      "    else",
-      "      rm -f \"$live\"",
-      "    fi",
+      ...restoreMainVhostLines,
       "    return 1",
       "  fi",
       "  # A file Caddy did not load is not left on disk.",
       "  if ! systemctl reload caddy; then",
       "    echo \"samohost host-prep: caddy reload failed — restoring the previous main vhost\" >&2",
-      "    if [[ -n \"${backup}\" ]] && [[ -f \"${backup}\" ]]; then",
-      "      cp \"${backup}\" \"$live\"",
-      "    else",
-      "      rm -f \"$live\"",
-      "    fi",
+      ...restoreMainVhostLines,
       "    systemctl reload caddy || true",
       "    return 1",
       "  fi",

@@ -79,6 +79,12 @@ export function runGuard(opts: {
       `#!/usr/bin/env bash\nprintf 'systemctl %s\\n' "$*" >> '${log}'\n[[ "$1" == reload ]] && exit ${opts.reloadExit ?? 0}\nexit 0\n`,
       { mode: 0o755 },
     );
+    // GNU mv -T is not in macOS mv; the targets here are files, so mv -f is the same.
+    writeFileSync(
+      join(bin, "mv"),
+      `#!/usr/bin/env bash\nprintf 'mv %s\\n' "$*" >> '${log}'\na=(); for x in "$@"; do if [[ "$x" == -fT ]]; then a+=(-f); else a+=("$x"); fi; done\nexec /bin/mv "\${a[@]}"\n`,
+      { mode: 0o755 },
+    );
     const sites = join(dir, "sites.d");
     mkdirSync(sites);
     const staged = join(sites, ".staged-00-main-shop.caddy");
@@ -102,6 +108,7 @@ export function runGuard(opts: {
       calls: existsSync(log) ? readFileSync(log, "utf8") : "",
       stagedLeft: existsSync(staged),
       previousLeft: existsSync(previous),
+      sites: readdirSync(sites),
     };
   } finally {
     rmSync(dir, { recursive: true, force: true });
@@ -362,6 +369,30 @@ describe("host-prep — Caddy validation as the caddy user, restore on a failed 
     expect(r.code).toBe(1);
     expect(r.live).toBe(PREVIOUS);
     expect(r.stderr).toContain("reload failed");
+  });
+
+  test("a failed validation restores the previous file through a temporary file and mv -fT; only the backup stays next to it", () => {
+    const r = runGuard({ live: PREVIOUS, staged: NEW, previous: PREVIOUS, validateExit: 1 });
+    expect(r.code).toBe(1);
+    expect(r.live).toBe(PREVIOUS);
+    expect(r.sites.filter((f) => !f.startsWith("00-main-shop.caddy.bak."))).toEqual(["00-main-shop.caddy"]);
+    expect(r.backups).toEqual([PREVIOUS]);
+    expect(r.calls).toMatch(/^mv -fT .*\/sites\.d\/00-main-shop\.caddy\.restore\.\d+ .*\/sites\.d\/00-main-shop\.caddy$/m);
+  });
+
+  test("a failed reload restores the previous file through a temporary file and mv -fT; only the backup stays next to it", () => {
+    const r = runGuard({ live: PREVIOUS, staged: NEW, previous: PREVIOUS, reloadExit: 1 });
+    expect(r.code).toBe(1);
+    expect(r.live).toBe(PREVIOUS);
+    expect(r.sites.filter((f) => !f.startsWith("00-main-shop.caddy.bak."))).toEqual(["00-main-shop.caddy"]);
+    expect(r.backups).toEqual([PREVIOUS]);
+    expect(r.calls).toMatch(/^mv -fT .*\.restore\.\d+ .*\/sites\.d\/00-main-shop\.caddy$/m);
+  });
+
+  test("the guard does not cp the backup onto the live path", () => {
+    const fn = extractFn(buildHostPrepScript(cpApp(), "samo", { mainVhostTrustedProxy: CP }), "samohost_apply_main_vhost");
+    expect(fn).not.toMatch(/cp "\$\{backup\}" "\$live"/);
+    expect(fn).toContain('install -m 644 "${backup}"');
   });
 
   test("a failed reload after a first write removes the new file", () => {
