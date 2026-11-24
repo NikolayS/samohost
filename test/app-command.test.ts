@@ -736,6 +736,54 @@ describe("app commands", () => {
     expect(rec?.deployedSha).toBe("GOODSHA"); // NOT advanced on failure
   });
 
+  test("deploy lowercases an uppercase --sha and records it lowercase", async () => {
+    register();
+    const c = capture();
+    let script = "";
+    const code = await runAppDeploy(
+      { vm: "samo-we-field-record", app: "field-record", sha: SHA.toUpperCase(), skipCiGate: true },
+      { json: true }, vmStore, appStore,
+      deployDeps(HAPPY, {
+        remote: (_vm, s): Promise<SpawnResult> => {
+          script = s;
+          return Promise.resolve({ code: 0, stdout: HAPPY, stderr: "" });
+        },
+      }),
+      c.out, c.err,
+    );
+    expect(code, c.e).toBe(0);
+    expect(script).toContain(SHA);
+    expect(appStore.get("vm-1111", "field-record")?.deployedSha).toBe(SHA);
+  });
+
+  for (const [envFile, reason] of [
+    ["staging.env", "no directory"],
+    ["/opt/field-record/release.env", "the reserved name release.env"],
+    ["/opt/field-record/migrate.env", "the reserved name migrate.env"],
+  ] as const) {
+    test(`register refuses an envFile with ${reason}`, () => {
+      const c = capture();
+      const code = runAppRegister(
+        {
+          vm: "samo-we-field-record",
+          name: "field-record",
+          repo: "Tanya301/field-record-1",
+          branch: "main",
+          appDir: "/opt/field-record/app",
+          buildCmd: "npm run build",
+          serviceUnit: "field-record",
+          healthUrl: "http://localhost:3000/api/version",
+          envFile,
+          rlsNonSuperuser: false,
+        },
+        { json: false }, vmStore, appStore, c.out, c.err,
+      );
+      expect(code).toBe(1);
+      expect(c.e).toContain("envFile");
+      expect(appStore.get("vm-1111", "field-record")).toBeUndefined();
+    });
+  }
+
   for (const phase of ["install", "build"] as const) {
     test(`rollback after a failed ${phase}: exit 1, outcome rolled-back, no failedSha recorded`, async () => {
       register();

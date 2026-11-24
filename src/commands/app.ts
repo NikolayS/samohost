@@ -19,6 +19,7 @@ import { spawnSync } from "node:child_process";
 import { isIP } from "node:net";
 import { checkCiGreen, type CiStatus } from "../app/cigate.ts";
 import { parseDeployOutcome, rollbackRecordsFailedSha, type DeployOutcome } from "../app/parse.ts";
+import { migrateEnvFileOf, releaseEnvFileOf } from "../app/db-layout.ts";
 import { buildDeployScript } from "../app/script.ts";
 import { buildConfigHealScript } from "../app/heal-script.ts";
 import { validateStaticRoot } from "../app/static-root.ts";
@@ -229,6 +230,17 @@ export function runAppRegister(
     const appUserError = linuxAppUserError(input.appUser);
     if (appUserError !== undefined) {
       err(`error: invalid appUser: ${appUserError}`);
+      return 1;
+    }
+  }
+  // migrate.env and release.env sit next to a node app's env file: refuse a
+  // path with no directory or one of those names here, not first at deploy.
+  if (input.envFile !== undefined && input.kind !== "static") {
+    try {
+      migrateEnvFileOf(input.envFile);
+      releaseEnvFileOf(input.envFile);
+    } catch (e) {
+      err(`error: invalid envFile: ${e instanceof Error ? e.message : String(e)}`);
       return 1;
     }
   }
@@ -818,7 +830,8 @@ export async function runAppDeploy(
   // ---- resolve the target SHA --------------------------------------------
   let sha: string;
   if (input.sha !== undefined) {
-    sha = input.sha;
+    // Git prints lowercase hex; the deploy script accepts lowercase only.
+    sha = input.sha.toLowerCase();
   } else {
     const ref = input.ref ?? app.branch;
     try {
