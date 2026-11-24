@@ -7,7 +7,9 @@
  * samohost_pg_split ADDRESS sets two variables:
  *   samohost_pg_conn  the address without its password; passed to psql -d
  *   samohost_pg_pw    the password, decoded; empty when the address has none
- * and returns 1 when a key=value address has an unterminated quoted value.
+ * It returns 1 when a key=value address has an unterminated quoted value and
+ * 2 when it has a key with no `=`. The caller clears samohost_pg_pw and
+ * samohost_pct_out (both may hold the decoded password) on every path.
  *
  * Accepted forms, the same ones psql accepts as its database argument:
  *   - postgresql:// and postgres:// URIs. The password in the user part
@@ -82,7 +84,7 @@ export const PG_CONNINFO_BASH: readonly string[] = [
   '        start="$rest"',
   '        k="${rest%%[=[:space:]]*}"',
   '        rest="${rest:${#k}}"; rest="${rest#"${rest%%[![:space:]]*}"}"',
-  '        if [[ -z "$k" || "${rest:0:1}" != "=" ]]; then return 1; fi',
+  '        if [[ -z "$k" || "${rest:0:1}" != "=" ]]; then return 2; fi',
   '        rest="${rest:1}"; rest="${rest#"${rest%%[![:space:]]*}"}"',
   '        v=""',
   "        if [[ \"${rest:0:1}\" == \"'\" ]]; then",

@@ -12,7 +12,7 @@ function split(address: string): { status: number | null; conn: string; pw: stri
   const script = [
     "set -euo pipefail",
     ...PG_CONNINFO_BASH,
-    'if samohost_pg_split "$1"; then rc=0; else rc=1; fi',
+    'rc=0; samohost_pg_split "$1" || rc=$?',
     "printf 'CONN<%s>\\nPW<%s>\\n' \"$samohost_pg_conn\" \"$samohost_pg_pw\"",
     'exit "$rc"',
   ].join("\n");
@@ -111,6 +111,11 @@ describe("address forms", () => {
 
   test("a key=value address with an unterminated quoted value is refused", () => {
     expect(split("host=h password='abc").status).toBe(1);
+  });
+
+  test("a key=value address with a key and no = is refused with status 2", () => {
+    expect(split("host=h dbname").status).toBe(2);
+    expect(split("host=h password=pw dbname").status).toBe(2);
   });
 
   test("a plain database name is kept as it is", () => {
