@@ -1433,6 +1433,32 @@ describe("20. split-layout node app: rls-nonsuperuser probe and cp-http80 caddy-
     });
   }
 
+  test("a key=value address with a key and no = → its own message, not the closing-quote message", () => {
+    const path = envFile("APP_DATABASE_URL='host=127.0.0.1 password=pw dbname'\n");
+    const r = runProbe({ envFile: path, rlsUrlVar: "APP_DATABASE_URL" });
+    expect(r.sections.get("rls-nonsuperuser")).toBe("rls-probe: APP_DATABASE_URL has a key=value pair without =");
+    expect(r.psqlArgs).toBe("");
+  });
+
+  test("an unterminated quoted value keeps the closing-quote message", () => {
+    const path = envFile("APP_DATABASE_URL=\"host=127.0.0.1 password='pw\"\n");
+    const r = runProbe({ envFile: path, rlsUrlVar: "APP_DATABASE_URL" });
+    expect(r.sections.get("rls-nonsuperuser")).toBe("rls-probe: APP_DATABASE_URL has a quoted value without its closing quote");
+  });
+
+  test("the probe unsets the variables that hold the decoded password on every path", () => {
+    const checks = buildDoctorChecks(2223, {
+      appDir: "/opt/demo/app", envFile: "/opt/demo/staging.env", serviceUnit: "demo",
+      healthUrl: "http://127.0.0.1:4105/healthz", rlsUrlVar: "APP_DATABASE_URL",
+    });
+    const script = buildAuditScript(checks.filter((c) => c.id === "rls-nonsuperuser"));
+    const splitLine = script.indexOf('samohost_pg_split "$rls_url"');
+    expect(splitLine).toBeGreaterThan(0);
+    const after = script.slice(splitLine);
+    // Two refusal paths and the path after psql.
+    expect(after.split("unset samohost_pg_pw samohost_pct_out").length - 1).toBe(3);
+  });
+
   test("split layout: role owns the database → fail with a clear message", async () => {
     const path = envFile("APP_DATABASE_URL=postgresql://demo_app:pw@127.0.0.1:5432/demo\n", { migrate: true });
     const r = runProbe({ envFile: path, rlsUrlVar: "APP_DATABASE_URL", appUser: "demo", psqlOut: "owner" });
