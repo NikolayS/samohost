@@ -101,6 +101,7 @@ const SYNC_TEMPLATE_DEFAULT = [
 const SUDO_STUB_WITH_RLS_BYPASS = [
   "sudo() {",
   '  local sql="${!#}"',
+  '  if [[ "$sql" == *"jsonb_build_object"* ]]; then echo "[]"; return 0; fi',
   '  if [[ "$sql" == *"count(*)"* ]]; then',
   '    if [[ "$sql" == *"pg_policies"* ]]; then cat "$FIX/prod_policies"',
   '    elif [[ "$sql" == *"pg_auth_members"* ]]; then cat "$FIX/prod_auth_members"',
@@ -141,7 +142,8 @@ const PSQL_STUB_WITH_RLS_BYPASS = [
   '    if [[ -n "$CLONE_APPLY_FAIL_ON" && "$batch" == *"$CLONE_APPLY_FAIL_ON"* ]]; then return 1; fi',
   "    return 0",
   "  fi",
-  '  if [[ "$sql" == *"rolbypassrls"* ]]; then cat "$FIX/clone_bypass_count"',
+  '  if [[ "$sql" == *"jsonb_build_object"* ]]; then echo "[]"',
+  '  elif [[ "$sql" == *"rolbypassrls"* ]]; then cat "$FIX/clone_bypass_count"',
   '  elif [[ "$sql" == *"pg_auth_members"* ]]; then cat "$FIX/clone_auth_members"',
   '  elif [[ "$sql" == *"pg_policies"* ]]; then cat "$FIX/clone_policies"',
   '  elif [[ "$sql" == *"table_privileges"* ]]; then cat "$FIX/clone_grants"',

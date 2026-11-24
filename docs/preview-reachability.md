@@ -77,6 +77,16 @@ production Caddy roots, `config.js`, and release identity then live in that
 directory. Samohost resolves it after checkout and refuses missing paths or
 symlinks that escape the checkout.
 
+## Older DBLab snapshots
+
+A DBLab snapshot can predate newer production migrations. Globals replay and
+RLS parity checks cover tables present in the snapshot: policies, subjects,
+expressions, and enabled/forced RLS must match production exactly on those
+tables. New tables belong to the branch's migrations and application schema
+validation; a successful snapshot check is not proof of their protections.
+These checks do not sanitize clone data or disable inherited provider
+credentials. Those remain separate preview configuration requirements.
+
 ## DNS prerequisite
 
 `env create` ensures the per-preview A record **before** pushing the create

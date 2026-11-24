@@ -1336,6 +1336,7 @@ const AUTHID_DDL_LEGACY = [
 const SUDO_STUB = [
   "sudo() {",
   '  local sql="${!#}"',
+  '  if [[ "$sql" == *"jsonb_build_object"* ]]; then echo "[]"; return 0; fi',
   '  if [[ "$sql" == *"count(*)"* ]]; then',
   '    if [[ "$sql" == *"pg_policies"* ]]; then cat "$FIX/prod_policies"',
   '    elif [[ "$sql" == *"pg_auth_members"* ]]; then cat "$FIX/prod_auth_members"',
@@ -1386,7 +1387,8 @@ const PSQL_STUB = [
   '    if [[ -n "$CLONE_APPLY_FAIL_ON" && "$batch" == *"$CLONE_APPLY_FAIL_ON"* ]]; then return 1; fi',
   "    return 0",
   "  fi",
-  '  if [[ "$sql" == *"pg_auth_members"* ]]; then cat "$FIX/clone_auth_members"',
+  '  if [[ "$sql" == *"jsonb_build_object"* ]]; then echo "[]"',
+  '  elif [[ "$sql" == *"pg_auth_members"* ]]; then cat "$FIX/clone_auth_members"',
   '  elif [[ "$sql" == *"pg_policies"* ]]; then cat "$FIX/clone_policies"',
   // 3-pre branch: returns the clone table list (for _clone_tab_in in step 3 + parity gates).
   // "information_schema.tables" (with trailing 's') does NOT match "information_schema.table_privileges"
