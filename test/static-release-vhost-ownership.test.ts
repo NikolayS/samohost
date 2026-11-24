@@ -15,6 +15,7 @@ import { join } from "node:path";
 import { buildHostBootstrapScript } from "../src/app/bootstrap.ts";
 import { buildHostPrepScript } from "../src/env/script.ts";
 import type { AppRecord } from "../src/types.ts";
+import { CADDY_SUDO_STUB } from "./caddy-sudo-stub.ts";
 
 function staticApp(releaseChannel: boolean): AppRecord {
   return {
@@ -126,6 +127,7 @@ describe("static release-channel production vhost ownership", () => {
         "",
       ].join("\n"));
       writeFileSync(join(binDir, "caddy"), "#!/usr/bin/env bash\nexit 0\n");
+      writeFileSync(join(binDir, "sudo"), CADDY_SUDO_STUB, { mode: 0o755 });
       writeFileSync(join(binDir, "systemctl"), "#!/usr/bin/env bash\nexit 0\n");
       chmodSync(join(binDir, "caddy"), 0o755);
       chmodSync(join(binDir, "systemctl"), 0o755);
@@ -173,6 +175,7 @@ describe("static release-channel production vhost ownership", () => {
       const baseFile = join(caddyDir, "Caddyfile");
       writeFileSync(baseFile, legacyBase);
       writeFileSync(join(binDir, "caddy"), "#!/usr/bin/env bash\nexit 0\n");
+      writeFileSync(join(binDir, "sudo"), CADDY_SUDO_STUB, { mode: 0o755 });
       writeFileSync(join(binDir, "systemctl"), "#!/usr/bin/env bash\nexit 0\n");
       chmodSync(join(binDir, "caddy"), 0o755);
       chmodSync(join(binDir, "systemctl"), 0o755);
@@ -207,6 +210,7 @@ describe("static release-channel production vhost ownership", () => {
       mkdirSync(binDir, { recursive: true });
       writeFileSync(join(caddyDir, "Caddyfile"), "import sites.d/*.caddy\n");
       writeFileSync(join(binDir, "caddy"), "#!/usr/bin/env bash\nexit 0\n");
+      writeFileSync(join(binDir, "sudo"), CADDY_SUDO_STUB, { mode: 0o755 });
       writeFileSync(join(binDir, "systemctl"), "#!/usr/bin/env bash\nexit 0\n");
       chmodSync(join(binDir, "caddy"), 0o755);
       chmodSync(join(binDir, "systemctl"), 0o755);

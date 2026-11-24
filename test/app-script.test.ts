@@ -385,7 +385,7 @@ describe("buildDeployScript — static path (kind='static')", () => {
     expect(rollback).not.toContain("SAMOHOST_VERSION_BACKUP");
     expect(rollback).toContain("SAMOHOST_VHOST_BACKUP");
     expect(rollback).toContain('worktree remove --force "$SAMOHOST_CANDIDATE_DIR"');
-    expect(rollback).toContain("caddy validate");
+    expect(rollback).toContain("samohost_caddy_validate");
     expect(rollback).toContain("reload caddy");
   });
 

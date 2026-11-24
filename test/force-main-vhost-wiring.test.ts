@@ -49,6 +49,7 @@ import { AppStore } from "../src/state/apps.ts";
 import { EnvStore } from "../src/state/envs.ts";
 import { StateStore } from "../src/state/store.ts";
 import type { AppRecord, VmRecord } from "../src/types.ts";
+import { CADDY_SUDO_STUB } from "./caddy-sudo-stub.ts";
 
 // ---------------------------------------------------------------------------
 // Fixtures
@@ -241,6 +242,8 @@ function runGuardFromScript(opts: {
       ].join("\n"),
       { mode: 0o755 },
     );
+
+    writeFileSync(join(binDir, "sudo"), CADDY_SUDO_STUB, { mode: 0o755 });
 
     writeFileSync(
       join(binDir, "systemctl"),

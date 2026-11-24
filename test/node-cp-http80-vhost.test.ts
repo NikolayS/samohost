@@ -68,7 +68,10 @@ describe("host-prep and heal render one main vhost for node cp-http80 apps", () 
 
   test("host-prep no longer writes the bare-host form that makes Caddy request a certificate", () => {
     const hostPrep = buildHostPrepScript(cpApp(), "samo", { mainVhostTrustedProxy: CP });
-    expect(hostPrep).not.toContain("\nshop.example.com {\n\treverse_proxy localhost:3100\n}\n");
+    // The bare-host form appears only as the previous form the guard replaces.
+    const staged = heredoc(hostPrep, /^cat > \/etc\/caddy\/sites\.d\/\.staged-00-main-shop\.caddy <<'CADDY'$/, "CADDY");
+    expect(staged).not.toContain("shop.example.com {\n\treverse_proxy localhost:3100\n}");
+    expect(hostPrep).not.toContain("\nshop.example.com {\n\treverse_proxy localhost:3100\n}\nCADDY");
   });
 
   test("the trusted proxy does not add a firewall rule in host-prep", () => {

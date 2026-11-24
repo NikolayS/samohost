@@ -1,9 +1,18 @@
 /**
  * Fixtures and helpers for the bootstrap golden tests
- * (test/runtime-user-hardening.test.ts). The golden files under
- * test/fixtures/bootstrap-* were rendered from the code before the runtime
- * user change (commit 4477687) and must not change for static apps and for
- * node apps that keep the legacy env layout.
+ * (test/runtime-user-hardening.test.ts).
+ *
+ * - bootstrap-node-legacy-unit.txt was rendered from the code before the
+ *   runtime user change (commit 4477687): the unit of a node app that keeps
+ *   the legacy env layout must stay byte-identical to it.
+ * - bootstrap-node-legacy-sudoers.txt is that same rendering plus one last
+ *   line, the rule that lets the deploy user validate Caddy's config as the
+ *   caddy user (src/caddy/validate.ts).
+ * - bootstrap-static.sh and bootstrap-static-cp-http80.sh are the whole
+ *   static bootstrap script as this branch renders it. They were rendered
+ *   again by the commits that changed the static script on this branch (the
+ *   symbolic-link refusal in §0, the Caddy admin socket, Caddy validation as
+ *   the caddy user), so they are not the static script of upstream main.
  */
 
 import type { HostBootstrapOptions } from "../src/app/bootstrap.ts";

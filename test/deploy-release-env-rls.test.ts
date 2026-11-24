@@ -7,7 +7,9 @@
 import { describe, expect, test } from "bun:test";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { spawnSync } from "node:child_process";
 import { buildDeployScript } from "../src/app/script.ts";
+import { PG_CONNINFO_BASH } from "../src/app/pg-conninfo.ts";
 import { nodeApp } from "./bootstrap-db-harness.ts";
 import { makeDeploySandbox } from "./node-deploy-harness.ts";
 
@@ -110,5 +112,51 @@ describe("assert-rls probe", () => {
     expect(res.status).toBe(1);
     expect(res.stdout).toContain("<<<SAMOHOST_PHASE:assert-rls:fail>>>");
     expect(args.length).toBe(0);
+  });
+});
+
+describe("assert-rls probe — password variables and messages", () => {
+  // The rendered probe block, from its first line to the check of its result,
+  // run with a psql function that answers f.
+  function probeBlock(address: string) {
+    const lines = buildDeployScript(nodeApp(), { sha: TARGET }).split("\n");
+    const start = lines.indexOf("rls_result=CONNECTION_FAILED");
+    const end = lines.findIndex((l, i) => i > start && l.startsWith('if [[ "$rls_result" == "f" ]]'));
+    expect(start).toBeGreaterThan(0);
+    expect(end).toBeGreaterThan(start);
+    const body = [
+      "set -euo pipefail",
+      ...PG_CONNINFO_BASH,
+      "psql() { echo f; }",
+      'RLS_URL="$1"',
+      ...lines.slice(start, end),
+      `printf 'PW<%s> OUT<%s> RESULT<%s>\\n' "\${samohost_pg_pw-unset}" "\${samohost_pct_out-unset}" "$rls_result"`,
+    ].join("\n");
+    return spawnSync("bash", ["-c", body, "probe", address], { encoding: "utf8" });
+  }
+
+  for (const [label, address] of [
+    ["a URI with a percent-encoded password", "postgresql://shop_app:a%40b@127.0.0.1:5432/shop"],
+    ["a password pair before an unterminated quoted value", "password=s3cret host='h"],
+    ["a password pair before a key with no =", "password=s3cret host=h dbname"],
+  ] as const) {
+    test(`the decoded password is cleared after the probe: ${label}`, () => {
+      const out = probeBlock(address);
+      expect(out.status, out.stderr).toBe(0);
+      expect(out.stdout).toContain("PW<unset> OUT<unset>");
+    });
+  }
+
+  test("a key with no = gets its own message, not the closing-quote message", () => {
+    const out = probeBlock("host=h dbname");
+    expect(out.stderr).toContain("assert-rls: the database address has a key=value pair without =");
+    expect(out.stderr).not.toContain("closing quote");
+    expect(out.stdout).toContain("RESULT<CONNECTION_FAILED>");
+  });
+
+  test("an unterminated quoted value keeps the closing-quote message", () => {
+    const out = probeBlock("host='h");
+    expect(out.stderr).toContain("closing quote");
+    expect(out.stdout).toContain("RESULT<CONNECTION_FAILED>");
   });
 });

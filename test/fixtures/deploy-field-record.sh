@@ -332,7 +332,7 @@ samohost_pg_split() {
         start="$rest"
         k="${rest%%[=[:space:]]*}"
         rest="${rest:${#k}}"; rest="${rest#"${rest%%[![:space:]]*}"}"
-        if [[ -z "$k" || "${rest:0:1}" != "=" ]]; then return 1; fi
+        if [[ -z "$k" || "${rest:0:1}" != "=" ]]; then return 2; fi
         rest="${rest:1}"; rest="${rest#"${rest%%[![:space:]]*}"}"
         v=""
         if [[ "${rest:0:1}" == "'" ]]; then
@@ -361,12 +361,17 @@ samohost_pg_split() {
   esac
 }
 rls_result=CONNECTION_FAILED
-if samohost_pg_split "$RLS_URL"; then
+samohost_pg_rc=0
+samohost_pg_split "$RLS_URL" || samohost_pg_rc=$?
+if [[ "$samohost_pg_rc" == 0 ]]; then
   rls_result=$(if [[ -n "$samohost_pg_pw" ]]; then export PGPASSWORD="$samohost_pg_pw"; fi; psql -X -w -tA -d "$samohost_pg_conn" -c "SELECT rolsuper FROM pg_catalog.pg_roles WHERE rolname = current_user" 2>&1 || echo CONNECTION_FAILED)
-  samohost_pg_pw=""
+elif [[ "$samohost_pg_rc" == 2 ]]; then
+  echo "assert-rls: the database address has a key=value pair without =" >&2
 else
   echo "assert-rls: the database address has a quoted value without its closing quote" >&2
 fi
+# Both variables may hold the decoded password.
+unset samohost_pg_pw samohost_pct_out
 if [[ "$rls_result" == "f" ]]; then
   echo "<<<SAMOHOST_PHASE:assert-rls:ok>>>"
 else

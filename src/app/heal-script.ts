@@ -45,18 +45,13 @@
 import type { AppRecord } from "../types.ts";
 import { staticCacheHeaderLines } from "../static-cache.ts";
 import { staticReleaseStatePaths } from "./static-root.ts";
-import { renderVhost, planFromApp, mainVhostTrustedProxies } from "../caddy/render.ts";
+import { renderVhost, planFromApp, mainVhostTrustedProxies, previousNodeMainVhost } from "../caddy/render.ts";
+import { CADDY_VALIDATE, CADDY_VALIDATE_FN_LINES } from "../caddy/validate.ts";
 import { faviconVhostBodyLines } from "../caddy/favicon.ts";
 import { PHASE_PREFIX } from "./script.ts";
-import { buildStepScriptPath } from "./build-steps.ts";
 
-/**
- * Caddy's validation of the whole configuration. On a split-layout server
- * the deploy user runs it as the caddy user through an exact sudo rule
- * (src/app/bootstrap.ts §6): validation opens each vhost's log file in
- * /var/log/caddy, which only caddy can create.
- */
-export const CADDY_VALIDATE_COMMAND = "/usr/bin/caddy validate --config /etc/caddy/Caddyfile";
+/** Caddy's validation of the whole configuration (src/caddy/validate.ts). */
+export const CADDY_VALIDATE_COMMAND = CADDY_VALIDATE;
 
 /**
  * Build the static main-vhost address expression — matches the deploy path
@@ -218,6 +213,8 @@ export function buildConfigHealScript(app: AppRecord, opts: BuildConfigHealScrip
   const regeneratedMainVhost = isStatic
     ? undefined
     : renderVhost(planFromApp(app, { trustedProxies: mainVhostTrustedProxies(app, opts.controlPlaneIp) }));
+  // Node cp-http80 apps: host-prep of upstream main wrote this form.
+  const previousMainVhost = !isStatic && app.mainListen === "cp-http80" ? previousNodeMainVhost(app) : undefined;
 
   // ---- Script header --------------------------------------------------------
   push(
@@ -278,9 +275,7 @@ export function buildConfigHealScript(app: AppRecord, opts: BuildConfigHealScrip
           "  fi",
         ]
       : []),
-    isStatic
-      ? "  caddy validate --config /etc/caddy/Caddyfile >/dev/null || rb_ok=0"
-      : "  samohost_caddy_validate || rb_ok=0",
+    "  samohost_caddy_validate || rb_ok=0",
     '  if [[ "$rb_ok" == "1" ]]; then sudo /usr/bin/systemctl reload caddy || rb_ok=0; fi',
     `  sleep ${RESTART_SETTLE_SEC}`,
     "  local rb_code",
@@ -307,21 +302,11 @@ export function buildConfigHealScript(app: AppRecord, opts: BuildConfigHealScrip
   );
 
   // Defined after rollback(), which calls it at run time.
-  if (!isStatic) {
-    push(
-      "# Split layout (the step script exists): validate as the caddy user through",
-      "# the exact sudo rule; the deploy user cannot open the vhosts' log files.",
-      `SAMOHOST_STEP=${sq(buildStepScriptPath(app.name))}`,
-      "samohost_caddy_validate() {",
-      '  if [[ -x "$SAMOHOST_STEP" ]]; then',
-      `    sudo -n -u caddy ${CADDY_VALIDATE_COMMAND} >/dev/null`,
-      "  else",
-      "    caddy validate --config /etc/caddy/Caddyfile >/dev/null",
-      "  fi",
-      "}",
-      "",
-    );
-  }
+  push(
+    "# Validation as the caddy user when the sudo rule exists (src/caddy/validate.ts).",
+    ...CADDY_VALIDATE_FN_LINES,
+    "",
+  );
 
   // ---- Heal start -----------------------------------------------------------
   push(
@@ -437,6 +422,18 @@ export function buildConfigHealScript(app: AppRecord, opts: BuildConfigHealScrip
       "  # Provenance gate: only overwrite files with the samohost header on line 1.",
       "  # A hand-edited file → drift-foreign finding; NEVER overwritten.",
       `  _provenance=$(head -1 ${sq(mainVhostPath)} 2>/dev/null || true)`,
+      ...(previousMainVhost !== undefined
+        ? [
+            "  # The form host-prep of an older samohost wrote (no header): samohost's own",
+            "  # file, so it is regenerated like a file with the header.",
+            "  _prev_main_vhost=$(mktemp)",
+            `  cat > "$_prev_main_vhost" <<'SAMOHOST_PREVIOUS_MAIN_VHOST'`,
+            ...previousMainVhost.replace(/\n$/, "").split("\n"),
+            "SAMOHOST_PREVIOUS_MAIN_VHOST",
+            `  if cmp -s ${sq(mainVhostPath)} "$_prev_main_vhost"; then _provenance=${sq(SAMOHOST_PROVENANCE_HEADER)}; echo "main vhost: the form an older samohost's host-prep wrote; regenerating"; fi`,
+            '  rm -f "$_prev_main_vhost"',
+          ]
+        : []),
       `  if [[ "$_provenance" != ${sq(SAMOHOST_PROVENANCE_HEADER)} ]]; then`,
       ...(opts.adoptProvenance
         ? [
@@ -665,9 +662,7 @@ export function buildConfigHealScript(app: AppRecord, opts: BuildConfigHealScrip
   // ---- Validate the combined Caddy config ----------------------------------
   push(
     "# --- validate: check the combined Caddy config before reload ---",
-    isStatic
-      ? "caddy validate --config /etc/caddy/Caddyfile >/dev/null || rollback"
-      : "samohost_caddy_validate || rollback",
+    "samohost_caddy_validate || rollback",
     "",
   );
 

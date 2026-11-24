@@ -52,6 +52,7 @@ import { staticMainVhostLines } from "./heal-script.ts";
 import { databaseUrlVarsOf, migrateEnvFileOf, releaseEnvFileOf } from "./db-layout.ts";
 import { buildModelPaths, buildStepScriptPath } from "./build-steps.ts";
 import { PG_CONNINFO_BASH } from "./pg-conninfo.ts";
+import { CADDY_VALIDATE_FN_LINES } from "../caddy/validate.ts";
 
 /** Marker prefix the parser keys on. */
 export const PHASE_PREFIX = "<<<SAMOHOST_PHASE:";
@@ -352,6 +353,9 @@ export function buildDeployScript(app: AppRecord, target: DeployTarget): string 
   // re-probes health, emits the rollback marker, and exits 1.
   if (app.kind === "static") {
     push(
+      "# Validation as the caddy user when the sudo rule exists (src/caddy/validate.ts).",
+      ...CADDY_VALIDATE_FN_LINES,
+      "",
       "# rollback(): atomically restore the prior vhost and, on the first",
       "# release-channel activation, the legacy route in the base Caddyfile.",
       "# The previous checkout and public version.json were never modified, so",
@@ -381,7 +385,7 @@ export function buildDeployScript(app: AppRecord, target: DeployTarget): string 
       '    rb_active_tmp=$(mktemp "${SAMOHOST_RELEASES_DIR}/.active-state.restore.XXXXXX") || rb_route_ok=0',
       '    if [[ -n "$rb_active_tmp" ]] && cp "$SAMOHOST_ACTIVE_STATE_BACKUP" "$rb_active_tmp" && chmod 0644 "$rb_active_tmp"; then /usr/bin/mv -f "$rb_active_tmp" "$SAMOHOST_ACTIVE_STATE" || rb_route_ok=0; else rb_route_ok=0; fi',
       '  else rm -f "$SAMOHOST_ACTIVE_STATE" || rb_route_ok=0; fi',
-      "  caddy validate --config /etc/caddy/Caddyfile >/dev/null || rb_route_ok=0",
+      "  samohost_caddy_validate || rb_route_ok=0",
       // Static rollback: reload caddy, not restart a unit that doesn't exist.
       // full-path systemctl: see header note (3).
       '  if [[ "$rb_route_ok" == "1" ]]; then sudo /usr/bin/systemctl reload caddy || rb_ok=0; else rb_ok=0; fi',
@@ -707,7 +711,7 @@ export function buildDeployScript(app: AppRecord, target: DeployTarget): string 
           `if [[ "$SAMOHOST_BASE_CHANGED" == "1" ]]; then sudo /usr/bin/mv -- ${sq(staticStagedCaddyfile)} ${sq(staticCaddyfile)} || rollback; fi`,
         ]
         : []),
-      "caddy validate --config /etc/caddy/Caddyfile >/dev/null || rollback",
+      "samohost_caddy_validate || rollback",
       "",
     );
 
@@ -993,12 +997,17 @@ export function buildDeployScript(app: AppRecord, target: DeployTarget): string 
         "# The password goes to psql in PGPASSWORD, not as an argument (ps shows arguments).",
         ...PG_CONNINFO_BASH,
         "rls_result=CONNECTION_FAILED",
-        'if samohost_pg_split "$RLS_URL"; then',
+        "samohost_pg_rc=0",
+        'samohost_pg_split "$RLS_URL" || samohost_pg_rc=$?',
+        'if [[ "$samohost_pg_rc" == 0 ]]; then',
         '  rls_result=$(if [[ -n "$samohost_pg_pw" ]]; then export PGPASSWORD="$samohost_pg_pw"; fi; psql -X -w -tA -d "$samohost_pg_conn" -c "SELECT rolsuper FROM pg_catalog.pg_roles WHERE rolname = current_user" 2>&1 || echo CONNECTION_FAILED)',
-        '  samohost_pg_pw=""',
+        'elif [[ "$samohost_pg_rc" == 2 ]]; then',
+        '  echo "assert-rls: the database address has a key=value pair without =" >&2',
         "else",
         '  echo "assert-rls: the database address has a quoted value without its closing quote" >&2',
         "fi",
+        "# Both variables may hold the decoded password.",
+        "unset samohost_pg_pw samohost_pct_out",
         'if [[ "$rls_result" == "f" ]]; then',
         `  ${marker("assert-rls", "ok")}`,
         "else",

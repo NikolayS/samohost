@@ -262,7 +262,12 @@ In the old layout bootstrap creates no `<db>_app` role and keeps the
 reads the superuser password from `DATABASE_URL` in §3b, before it changes
 anything on the server; when that line is not
 `postgresql://postgres:<hex>@...` (or `postgres://`), bootstrap stops there
-with nothing changed.
+with nothing changed. A legacy app's env file must keep its `DATABASE_URL=`
+line: when the env file is missing or has no `DATABASE_URL=` line, there is
+no `migrate.env` and no marker, and `/etc/systemd/system/<serviceUnit>.service`
+has `User=<appUser>` (the unit a legacy bootstrap writes; the new layout
+writes `User=<app>-run`), bootstrap stops in §3b with nothing changed instead
+of converting the app.
 
 Two env files sit next to each other on the server:
 
@@ -294,7 +299,8 @@ its runtime env file and no `migrate.env`. Bootstrap and deploy detect that
 and keep it as it is. To move such an app to the new layout:
 
 1. As root on the server, remove the `DATABASE_URL=postgresql://postgres:...`
-   and `SEED_OWNER_*` lines from the runtime env file.
+   and `SEED_OWNER_*` lines from the runtime env file, and write the marker:
+   `install -d -m 755 /var/lib/samohost/db-layout && echo split > /var/lib/samohost/db-layout/<app>`.
 2. Run `app bootstrap` again. It now uses the new layout: it creates
    `<db>_owner`, makes it the owner of `<db>`, writes `migrate.env`, and prints
    a warning when objects in schema `public` are owned by another role.
@@ -321,6 +327,29 @@ connections from this server only (the SAMO app template listens on
 `HOST=0.0.0.0`. Bootstrap, heal and host-prep use the control-plane address
 recorded for the VM; `app bootstrap --control-plane-ip` with a different
 address is refused.
+
+Host-prep and heal replace, with a backup, a main vhost of such an app that
+an older samohost wrote: a file byte-equal to the earlier host-prep form
+`<host> {` / `reverse_proxy localhost:<port>` / `}`, or (host-prep) a file
+whose first line is samohost's provenance header. Host-prep still refuses any
+other differing file unless `--force-main-vhost` is given.
+
+### Caddy validation and log files
+
+`caddy validate` opens the log file of every vhost in `/var/log/caddy`; only
+the caddy user can open those files, and a file that validation creates as
+root is one Caddy cannot open. Host-prep and bootstrap (root) validate with
+`sudo -u caddy`, and give an existing `/var/log/caddy/<app>-prod.log` that
+another user owns to caddy (a symbolic link there is left as it is). When the
+reload after host-prep wrote the main vhost fails, host-prep puts the
+previous file back. Deploy and heal (the deploy user) validate through the
+sudo rule `<deploy user> ALL=(caddy) NOPASSWD: /usr/bin/caddy validate
+--config /etc/caddy/Caddyfile`, which bootstrap writes for static, legacy
+and new-layout apps. A deploy user without the rule (bootstrapped by an older
+samohost) validates as itself, as before, and that fails on a server where
+another app's vhost names a log file. On a server that gets a new-layout app
+or a cp-http80 node vhost with a log file, run bootstrap again once for its
+static and legacy apps.
 
 ### Rollback of a node deploy
 
@@ -359,8 +388,11 @@ Migrations that already ran are not undone, in either case. `node_modules`
 is not restored. The previous release must therefore work with the new
 schema: add columns as nullable or with a default, and drop a column only
 in a release after the code stopped using it. samohost records the commit as
-failed (`failedSha`) after a rollback and does not deploy it again until
-`app clear-failed`.
+failed (`failedSha`) after a rollback that follows a failed migrate, health
+check or `assert-rls`, and does not deploy it again until `app clear-failed`.
+A rollback after a failed install or build (for example an npm registry
+outage) does not record the commit: the outcome is `rolled-back`, the exit
+code 1, and the next trigger cycle deploys the same commit again.
 
 ### Runtime user and service hardening of a node app
 
