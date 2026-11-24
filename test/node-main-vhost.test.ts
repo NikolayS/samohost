@@ -60,7 +60,8 @@ function sandbox() {
     writeFileSync(join(bin, name), `#!/usr/bin/env bash\nprintf '%s %s\\n' ${JSON.stringify(name)} "$*" >> ${JSON.stringify(log)}\n${body}\n`);
     chmodSync(join(bin, name), 0o755);
   };
-  stub("sudo", ['while [[ "$1" == -n || "$1" == -u ]]; do if [[ "$1" == -u ]]; then shift 2; else shift; fi; done', 'c="$1"; shift', 'exec "${c#/usr/bin/}" "$@"'].join("\n"));
+  // sudo -l answers whether the caddy validate rule exists (T_CADDY_RULE=1).
+  stub("sudo", ['if [[ " $* " == *" -l "* ]]; then [[ "${T_CADDY_RULE:-0}" == 1 ]]; exit $?; fi', 'while [[ "$1" == -n || "$1" == -u ]]; do if [[ "$1" == -u ]]; then shift 2; else shift; fi; done', 'c="$1"; shift', 'exec "${c#/usr/bin/}" "$@"'].join("\n"));
   stub("caddy", 'if [[ "${T_CADDY_FAIL:-0}" == 1 ]]; then echo "caddy: invalid config" >&2; exit 1; fi');
   stub("systemctl", 'if [[ "${T_RELOAD_FAIL:-0}" == 1 ]]; then echo "reload failed" >&2; exit 1; fi');
   stub("curl", 'printf "%s" "${T_CURL_CODE:-200}"');
@@ -230,7 +231,7 @@ describe("heal: node app on a split-layout server", () => {
     const step = join(sb.dir, "step");
     writeFileSync(step, "#!/bin/sh\n");
     chmodSync(step, 0o755);
-    return sb.run(heal().replaceAll("/usr/local/lib/samohost/apps/shop/step", step), env);
+    return sb.run(heal().replaceAll("/usr/local/lib/samohost/apps/shop/step", step), { T_CADDY_RULE: "1", ...env });
   };
 
   test("validates through the exact caddy rule (the caddy user can open the vhost's log file)", () => {
@@ -286,7 +287,7 @@ describe("heal: node app on a split-layout server", () => {
     }
   });
 
-  test("a server without the step script (legacy layout) validates as the deploy user, as before", () => {
+  test("a deploy user without the caddy validate sudo rule validates as itself, as before", () => {
     const sb = sandbox();
     try {
       const res = sb.run(heal());
