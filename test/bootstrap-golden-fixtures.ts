@@ -9,8 +9,8 @@
  * - bootstrap-static.sh and bootstrap-static-cp-http80.sh are the whole
  *   static bootstrap script as this branch renders it. They were rendered
  *   again by the commits that changed the static script on this branch (the
- *   symbolic-link refusal in §0 and the Caddy admin socket), so they are not
- *   the static script of upstream main.
+ *   symbolic-link refusal in §0, the Caddy admin socket, Caddy validation as
+ *   the caddy user), so they are not the static script of upstream main.
  */
 
 import type { HostBootstrapOptions } from "../src/app/bootstrap.ts";

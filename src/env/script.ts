@@ -35,6 +35,7 @@ import {
   staticRootOf,
   staticTreeGuardFnLines,
 } from "../app/static-root.ts";
+import { CADDY_VALIDATE_AS_CADDY_FROM_ROOT, caddyLogOwnerRepairLines } from "../caddy/validate.ts";
 import { mainVhostTrustedProxies, planFromApp, planFromEnv, previousNodeMainVhost, renderVhost, VHOST_PROVENANCE_HEADER } from "../caddy/render.ts";
 
 /** Same marker prefix as deploy scripts — one parser convention everywhere. */
@@ -2448,7 +2449,9 @@ export function buildHostPrepScript(
       "    rm -f \"$previous\"",
       "  fi",
       "  mv \"$staged\" \"$live\"",
-      "  if ! caddy validate --config /etc/caddy/Caddyfile; then",
+      "  # As the caddy user: validation opens each vhost's log file, and a log",
+      "  # file it creates as root is one Caddy cannot open.",
+      `  if ! ${CADDY_VALIDATE_AS_CADDY_FROM_ROOT}; then`,
       "    echo \"samohost host-prep: caddy validate failed — restoring backup\" >&2",
       "    if [[ -n \"${backup}\" ]] && [[ -f \"${backup}\" ]]; then",
       "      cp \"${backup}\" \"$live\"",
@@ -2457,7 +2460,17 @@ export function buildHostPrepScript(
       "    fi",
       "    return 1",
       "  fi",
-      "  systemctl reload caddy",
+      "  # A file Caddy did not load is not left on disk.",
+      "  if ! systemctl reload caddy; then",
+      "    echo \"samohost host-prep: caddy reload failed — restoring the previous main vhost\" >&2",
+      "    if [[ -n \"${backup}\" ]] && [[ -f \"${backup}\" ]]; then",
+      "      cp \"${backup}\" \"$live\"",
+      "    else",
+      "      rm -f \"$live\"",
+      "    fi",
+      "    systemctl reload caddy || true",
+      "    return 1",
+      "  fi",
       "}",
       "",
     );
@@ -2523,6 +2536,7 @@ export function buildHostPrepScript(
             "SAMOHOST_PREVIOUS_MAIN_VHOST",
           ]
         : []),
+      ...caddyLogOwnerRepairLines(app.name),
       `samohost_apply_main_vhost \\`,
       `  ${stagedPath} \\`,
       `  ${livePath} \\`,

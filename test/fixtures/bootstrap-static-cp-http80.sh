@@ -203,7 +203,16 @@ SAMOHOST_CADDY_ADMIN_SWITCH=0
 if grep -Eq '^[[:space:]]*admin[[:space:]]+unix//var/lib/caddy/admin[.]sock([[:space:]]|$)' /etc/caddy/Caddyfile && ! grep -Eq '^[[:space:]]*admin[[:space:]]+unix//var/lib/caddy/admin[.]sock([[:space:]]|$)' "$SAMOHOST_CADDYFILE_PREV"; then
   SAMOHOST_CADDY_ADMIN_SWITCH=1
 fi
-caddy validate --config /etc/caddy/Caddyfile
+SAMOHOST_APP_CADDY_LOG='/var/log/caddy/my-static-site-prod.log'
+if [[ -L "$SAMOHOST_APP_CADDY_LOG" ]]; then
+  echo "WARNING: $SAMOHOST_APP_CADDY_LOG is a symbolic link; left as it is" >&2
+elif [[ -f "$SAMOHOST_APP_CADDY_LOG" ]] && id -u caddy >/dev/null 2>&1 && [[ "$(stat -c %U "$SAMOHOST_APP_CADDY_LOG")" != caddy ]]; then
+  chown caddy:caddy "$SAMOHOST_APP_CADDY_LOG"
+  echo "Caddy: $SAMOHOST_APP_CADDY_LOG given to caddy (Caddy opens it as caddy)"
+fi
+# As the caddy user: a log file created by a root-run validation is one
+# Caddy cannot open.
+sudo -u caddy /usr/bin/caddy validate --config /etc/caddy/Caddyfile
 /usr/bin/systemctl enable caddy
 if [[ "$SAMOHOST_CADDY_ADMIN_SWITCH" == 1 ]]; then
   # A failed restart must reach the restore below, not stop the script.
@@ -458,7 +467,7 @@ CADDY_SITE
   samohost_assert_static_tree_safe "$SAMOHOST_CHECKOUT_REAL" "$SAMOHOST_STATIC_DIR" "$SAMOHOST_STATIC_ROOT"
   echo "Caddy: canonical fresh static route ready; no health-proven detached deployment exists yet."
 fi
-caddy validate --config /etc/caddy/Caddyfile
+sudo -u caddy /usr/bin/caddy validate --config /etc/caddy/Caddyfile
 /usr/bin/systemctl reload caddy || /usr/bin/systemctl restart caddy
 samohost_cleanup_bootstrap_static_route
 trap - EXIT

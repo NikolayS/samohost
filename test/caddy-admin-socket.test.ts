@@ -18,6 +18,7 @@ import { buildHostPrepScript } from "../src/env/script.ts";
 import type { AppRecord } from "../src/types.ts";
 import { goldenCases } from "./bootstrap-golden-fixtures.ts";
 import { nodeApp, nodeOpts } from "./bootstrap-db-harness.ts";
+import { CADDY_SUDO_STUB } from "./caddy-sudo-stub.ts";
 
 const ADMIN = "  admin unix//var/lib/caddy/admin.sock";
 const SOCKET_FILE = "# Caddy global options (ACME TLS — default).\n{\n" + ADMIN + "\n}\n\nimport sites.d/*.caddy\n";
@@ -55,6 +56,8 @@ function run9(r: Run) {
   const counter = join(dir, "reload-count");
   const once = join(dir, "restarted-once");
   stub("caddy", "exit 0");
+  writeFileSync(join(bin, "sudo"), CADDY_SUDO_STUB);
+  chmodSync(join(bin, "sudo"), 0o755);
   stub(
     "systemctl",
     [

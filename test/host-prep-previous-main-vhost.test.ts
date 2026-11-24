@@ -15,7 +15,8 @@ import { join } from "node:path";
 import { buildHostPrepScript } from "../src/env/script.ts";
 import { buildConfigHealScript, SAMOHOST_PROVENANCE_HEADER } from "../src/app/heal-script.ts";
 import { planFromApp, previousNodeMainVhost, renderVhost } from "../src/caddy/render.ts";
-import { nodeApp } from "./bootstrap-db-harness.ts";
+import { nodeApp, nodeOpts } from "./bootstrap-db-harness.ts";
+import { buildHostBootstrapScript } from "../src/app/bootstrap.ts";
 
 const CP = "192.0.2.10";
 const cpApp = () => nodeApp({ mainHost: "shop.example.com", mainListen: "cp-http80", appUser: "shop" });
@@ -213,5 +214,96 @@ describe("heal — main vhost written by an older samohost's host-prep", () => {
     const r = runHeal(hand);
     expect(r.out).toContain("drift-foreign");
     expect(r.live).toBe(hand);
+  });
+});
+
+describe("host-prep — Caddy validation as the caddy user, restore on a failed reload", () => {
+  test("the guard validates as the caddy user, not as root", () => {
+    const r = runGuard({ live: PREVIOUS, staged: NEW, previous: PREVIOUS });
+    expect(r.code, r.stderr).toBe(0);
+    expect(r.calls).toContain("sudo -u caddy /usr/bin/caddy validate --config /etc/caddy/Caddyfile");
+    expect(r.calls.split("\n").filter((l) => l.startsWith("caddy validate")).length).toBe(1);
+  });
+
+  test("a failed reload after the write restores the previous file and exits 1", () => {
+    const r = runGuard({ live: PREVIOUS, staged: NEW, previous: PREVIOUS, reloadExit: 1 });
+    expect(r.code).toBe(1);
+    expect(r.live).toBe(PREVIOUS);
+    expect(r.stderr).toContain("reload failed");
+  });
+
+  test("a failed reload after a first write removes the new file", () => {
+    const r = runGuard({ live: null, staged: NEW, reloadExit: 1 });
+    expect(r.code).toBe(1);
+    expect(r.live).toBeNull();
+  });
+});
+
+describe("host-prep and bootstrap — the app's Caddy log file belongs to caddy", () => {
+  function runRepair(script: string, opts: { owner: string; link?: boolean }) {
+    const lines = script.split("\n");
+    const start = lines.findIndex((l) => l.startsWith("SAMOHOST_APP_CADDY_LOG="));
+    expect(start, "log repair block").toBeGreaterThanOrEqual(0);
+    const end = lines.findIndex((l, i) => i > start && l === "fi");
+    const dir = mkdtempSync(join(tmpdir(), "samohost-caddy-log-"));
+    try {
+      const bin = join(dir, "bin");
+      mkdirSync(bin);
+      const log = join(dir, "calls.log");
+      writeFileSync(join(bin, "id"), "#!/usr/bin/env bash\nexit 0\n", { mode: 0o755 });
+      writeFileSync(join(bin, "stat"), `#!/usr/bin/env bash\necho ${opts.owner}\n`, { mode: 0o755 });
+      writeFileSync(join(bin, "chown"), `#!/usr/bin/env bash\nprintf 'chown %s\\n' "$*" >> '${log}'\n`, { mode: 0o755 });
+      const logs = join(dir, "var-log-caddy");
+      mkdirSync(logs);
+      if (opts.link === true) {
+        writeFileSync(join(dir, "elsewhere"), "");
+        spawnSync("ln", ["-s", join(dir, "elsewhere"), join(logs, "shop-prod.log")]);
+      } else {
+        writeFileSync(join(logs, "shop-prod.log"), "");
+      }
+      const body = lines.slice(start, end + 1).join("\n").replaceAll("/var/log/caddy", logs);
+      const res = spawnSync("bash", ["-c", `set -euo pipefail\n${body}`], { encoding: "utf8", env: { PATH: `${bin}:/usr/bin:/bin` } });
+      return { code: res.status, out: res.stdout + res.stderr, calls: existsSync(log) ? readFileSync(log, "utf8") : "" };
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }
+
+  const hostPrep = () => buildHostPrepScript(cpApp(), "samo", { mainVhostTrustedProxy: CP });
+  const bootstrap = () => buildHostBootstrapScript(cpApp(), nodeOpts({ firewallOpts: { controlPlaneIp: CP } }));
+
+  for (const [name, render, validation] of [
+    ["host-prep", hostPrep, "samohost_apply_main_vhost \\\n"],
+    ["bootstrap", bootstrap, "\nsudo -u caddy /usr/bin/caddy validate --config /etc/caddy/Caddyfile\n"],
+  ] as const) {
+    test(`${name}: a root-owned /var/log/caddy/<app>-prod.log is given to caddy before validation`, () => {
+      const script = render();
+      const repair = script.indexOf("SAMOHOST_APP_CADDY_LOG=");
+      expect(repair).toBeGreaterThan(0);
+      expect(script.indexOf(validation, repair)).toBeGreaterThan(repair);
+      const r = runRepair(script, { owner: "root" });
+      expect(r.code, r.out).toBe(0);
+      expect(r.calls).toMatch(/^chown caddy:caddy .*\/shop-prod\.log$/m);
+    });
+
+    test(`${name}: a log file owned by caddy is left as it is; a symbolic link is not followed`, () => {
+      expect(runRepair(render(), { owner: "caddy" }).calls).toBe("");
+      const link = runRepair(render(), { owner: "root", link: true });
+      expect(link.code).toBe(0);
+      expect(link.calls).toBe("");
+      expect(link.out).toContain("symbolic link");
+    });
+  }
+
+  test("bootstrap validates the Caddyfile as the caddy user in §9", () => {
+    const script = bootstrap();
+    expect(script).toContain("sudo -u caddy /usr/bin/caddy validate --config /etc/caddy/Caddyfile");
+    expect(script).not.toMatch(/^caddy validate --config/m);
+    const staticScript = buildHostBootstrapScript(
+      nodeApp({ kind: "static", mainHost: "site.example.com", appUser: "shop", envFile: undefined, migrateCmd: undefined }),
+      { appUser: "shop" },
+    );
+    expect(staticScript).not.toMatch(/^\s*caddy validate --config/m);
+    expect(staticScript).toContain("sudo -u caddy /usr/bin/caddy validate --config /etc/caddy/Caddyfile");
   });
 });

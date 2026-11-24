@@ -94,6 +94,7 @@ import {
 } from "./linux-user.ts";
 import { staticMainVhostLines } from "./heal-script.ts";
 import { migrateEnvFileOf, releaseEnvFileOf, splitLayoutPathError } from "./db-layout.ts";
+import { CADDY_VALIDATE_AS_CADDY_FROM_ROOT, caddyLogOwnerRepairLines } from "../caddy/validate.ts";
 import { isIP } from "node:net";
 import { dirname } from "node:path";
 
@@ -1059,7 +1060,10 @@ export function buildHostBootstrapScript(
     `if grep -Eq '${caddyAdminRe}' /etc/caddy/Caddyfile && ! grep -Eq '${caddyAdminRe}' "$SAMOHOST_CADDYFILE_PREV"; then`,
     `  SAMOHOST_CADDY_ADMIN_SWITCH=1`,
     `fi`,
-    `caddy validate --config /etc/caddy/Caddyfile`,
+    ...caddyLogOwnerRepairLines(app.name),
+    `# As the caddy user: a log file created by a root-run validation is one`,
+    `# Caddy cannot open.`,
+    CADDY_VALIDATE_AS_CADDY_FROM_ROOT,
     `/usr/bin/systemctl enable caddy`,
     `if [[ "$SAMOHOST_CADDY_ADMIN_SWITCH" == 1 ]]; then`,
     `  # A failed restart must reach the restore below, not stop the script.`,
@@ -1227,7 +1231,7 @@ export function buildHostBootstrapScript(
       '  samohost_assert_static_tree_safe "$SAMOHOST_CHECKOUT_REAL" "$SAMOHOST_STATIC_DIR" "$SAMOHOST_STATIC_ROOT"',
       '  echo "Caddy: canonical fresh static route ready; no health-proven detached deployment exists yet."',
       'fi',
-      `caddy validate --config /etc/caddy/Caddyfile`,
+      CADDY_VALIDATE_AS_CADDY_FROM_ROOT,
       `/usr/bin/systemctl reload caddy || /usr/bin/systemctl restart caddy`,
       'samohost_cleanup_bootstrap_static_route',
       'trap - EXIT',
