@@ -45,7 +45,7 @@
 import type { AppRecord } from "../types.ts";
 import { staticCacheHeaderLines } from "../static-cache.ts";
 import { staticReleaseStatePaths } from "./static-root.ts";
-import { renderVhost, planFromApp, mainVhostTrustedProxies } from "../caddy/render.ts";
+import { renderVhost, planFromApp, mainVhostTrustedProxies, previousNodeMainVhost } from "../caddy/render.ts";
 import { faviconVhostBodyLines } from "../caddy/favicon.ts";
 import { PHASE_PREFIX } from "./script.ts";
 
@@ -209,6 +209,8 @@ export function buildConfigHealScript(app: AppRecord, opts: BuildConfigHealScrip
   const regeneratedMainVhost = isStatic
     ? undefined
     : renderVhost(planFromApp(app, { trustedProxies: mainVhostTrustedProxies(app, opts.controlPlaneIp) }));
+  // Node cp-http80 apps: host-prep of upstream main wrote this form.
+  const previousMainVhost = !isStatic && app.mainListen === "cp-http80" ? previousNodeMainVhost(app) : undefined;
 
   // ---- Script header --------------------------------------------------------
   push(
@@ -401,6 +403,18 @@ export function buildConfigHealScript(app: AppRecord, opts: BuildConfigHealScrip
       "  # Provenance gate: only overwrite files with the samohost header on line 1.",
       "  # A hand-edited file → drift-foreign finding; NEVER overwritten.",
       `  _provenance=$(head -1 ${sq(mainVhostPath)} 2>/dev/null || true)`,
+      ...(previousMainVhost !== undefined
+        ? [
+            "  # The form host-prep of an older samohost wrote (no header): samohost's own",
+            "  # file, so it is regenerated like a file with the header.",
+            "  _prev_main_vhost=$(mktemp)",
+            `  cat > "$_prev_main_vhost" <<'SAMOHOST_PREVIOUS_MAIN_VHOST'`,
+            ...previousMainVhost.replace(/\n$/, "").split("\n"),
+            "SAMOHOST_PREVIOUS_MAIN_VHOST",
+            `  if cmp -s ${sq(mainVhostPath)} "$_prev_main_vhost"; then _provenance=${sq(SAMOHOST_PROVENANCE_HEADER)}; echo "main vhost: the form an older samohost's host-prep wrote; regenerating"; fi`,
+            '  rm -f "$_prev_main_vhost"',
+          ]
+        : []),
       `  if [[ "$_provenance" != ${sq(SAMOHOST_PROVENANCE_HEADER)} ]]; then`,
       ...(opts.adoptProvenance
         ? [

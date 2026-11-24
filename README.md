@@ -312,6 +312,12 @@ connections from this server only (the SAMO app template listens on
 recorded for the VM; `app bootstrap --control-plane-ip` with a different
 address is refused.
 
+Host-prep and heal replace, with a backup, a main vhost of such an app that
+an older samohost wrote: a file byte-equal to the earlier host-prep form
+`<host> {` / `reverse_proxy localhost:<port>` / `}`, or (host-prep) a file
+whose first line is samohost's provenance header. Host-prep still refuses any
+other differing file unless `--force-main-vhost` is given.
+
 ### Rollback of a node deploy
 
 A node deploy runs fetch, checkout, install, build, migrate, restart and the

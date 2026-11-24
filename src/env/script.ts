@@ -35,7 +35,7 @@ import {
   staticRootOf,
   staticTreeGuardFnLines,
 } from "../app/static-root.ts";
-import { mainVhostTrustedProxies, planFromApp, planFromEnv, renderVhost } from "../caddy/render.ts";
+import { mainVhostTrustedProxies, planFromApp, planFromEnv, previousNodeMainVhost, renderVhost, VHOST_PROVENANCE_HEADER } from "../caddy/render.ts";
 
 /** Same marker prefix as deploy scripts — one parser convention everywhere. */
 export const ENV_PHASE_PREFIX = "<<<SAMOHOST_PHASE:";
@@ -2412,13 +2412,27 @@ export function buildHostPrepScript(
       "  local live=\"$2\"",
       // Regular string so ${3:-false} is emitted verbatim (bash default, not TS).
       "  local force=\"${3:-false}\"",
+      // Optional 4th argument (node cp-http80 apps): a file with the main
+      // vhost as an older samohost's host-prep wrote it.
+      "  local previous=\"${4:-}\"",
       "  local backup=\"\"",
+      "  local upgrade=false",
       "  if [[ -f \"$live\" ]]; then",
       "    if diff -q \"$staged\" \"$live\" >/dev/null 2>&1; then",
       "      rm -f \"$staged\"",
+      "      if [[ -n \"$previous\" ]]; then rm -f \"$previous\"; fi",
       "      return 0",
       "    fi",
-      "    if [[ \"$force\" != \"true\" ]]; then",
+      "    # A file an older samohost wrote (its previous form, or samohost's",
+      "    # provenance header on line 1) is replaced with a backup, like --force.",
+      "    if [[ -n \"$previous\" ]]; then",
+      `      if cmp -s "$previous" "$live" || [[ "$(head -n 1 "$live")" == ${sq(VHOST_PROVENANCE_HEADER)} ]]; then`,
+      "        upgrade=true",
+      "        echo \"samohost host-prep: $live was written by an older samohost; replacing it with the current render (backup kept)\"",
+      "      fi",
+      "      rm -f \"$previous\"",
+      "    fi",
+      "    if [[ \"$force\" != \"true\" && \"$upgrade\" != \"true\" ]]; then",
       "      echo \"samohost host-prep: refusing to overwrite hand-authored/drifted main vhost:\" >&2",
       "      echo \"  $live\" >&2",
       "      diff -u \"$live\" \"$staged\" >&2 || true",
@@ -2430,6 +2444,8 @@ export function buildHostPrepScript(
       // Regular strings so ${live} and ${...} expand as bash vars, not TS.
       "    backup=\"${live}.bak.$(date +%Y%m%dT%H%M%S)\"",
       "    cp \"$live\" \"$backup\"",
+      "  elif [[ -n \"$previous\" ]]; then",
+      "    rm -f \"$previous\"",
       "  fi",
       "  mv \"$staged\" \"$live\"",
       "  if ! caddy validate --config /etc/caddy/Caddyfile; then",
@@ -2472,6 +2488,8 @@ export function buildHostPrepScript(
           `}`,
         ];
 
+    // Node cp-http80 apps: host-prep of upstream main wrote the bare-host form.
+    const previousMainVhost = !isStatic && app.mainListen === "cp-http80" ? previousNodeMainVhost(app) : undefined;
     mainVhostLines.push(
       "",
       `#    Landmine guard: render the intended single-service vhost to a staged`,
@@ -2496,10 +2514,21 @@ export function buildHostPrepScript(
       ...(isStatic
         ? ['samohost_assert_static_tree_safe "$SAMOHOST_CHECKOUT_REAL" "$SAMOHOST_STATIC_DIR" "$SAMOHOST_STATIC_ROOT"']
         : []),
+      ...(previousMainVhost !== undefined
+        ? [
+            "# The main vhost as host-prep of an older samohost wrote it: replaced, not refused.",
+            'SAMOHOST_PREVIOUS_MAIN_VHOST="$(mktemp)"',
+            `cat > "$SAMOHOST_PREVIOUS_MAIN_VHOST" <<'SAMOHOST_PREVIOUS_MAIN_VHOST'`,
+            ...previousMainVhost.replace(/\n$/, "").split("\n"),
+            "SAMOHOST_PREVIOUS_MAIN_VHOST",
+          ]
+        : []),
       `samohost_apply_main_vhost \\`,
       `  ${stagedPath} \\`,
       `  ${livePath} \\`,
-      `  ${bakedForce}`,
+      ...(previousMainVhost !== undefined
+        ? [`  ${bakedForce} \\`, `  "$SAMOHOST_PREVIOUS_MAIN_VHOST"`]
+        : [`  ${bakedForce}`]),
     );
   }
 
