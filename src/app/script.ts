@@ -49,6 +49,9 @@ import {
   staticTreeGuardFnLines,
 } from "./static-root.ts";
 import { staticMainVhostLines } from "./heal-script.ts";
+import { databaseUrlVarsOf, migrateEnvFileOf, releaseEnvFileOf } from "./db-layout.ts";
+import { PG_CONNINFO_BASH } from "./pg-conninfo.ts";
+import { CADDY_VALIDATE_FN_LINES } from "../caddy/validate.ts";
 
 /** Marker prefix the parser keys on. */
 export const PHASE_PREFIX = "<<<SAMOHOST_PHASE:";
@@ -119,6 +122,18 @@ export function buildDeployScript(app: AppRecord, target: DeployTarget): string 
 
   const sha = target.sha;
   const releaseIdentity = target.tag ?? sha;
+  // Node apps: the tag goes into the build environment and the release env
+  // file (systemd EnvironmentFile syntax), so it must be a plain tag name.
+  const nodeReleaseTag = target.tag ?? "";
+  if (app.kind !== "static" && !/^[A-Za-z0-9._-]{0,128}$/.test(nodeReleaseTag)) {
+    throw new Error(`invalid release tag for a node deploy: ${JSON.stringify(nodeReleaseTag)}`);
+  }
+  if (app.kind !== "static" && !/^[0-9a-f]{7,64}$/.test(sha)) {
+    throw new Error(`invalid deploy sha: ${JSON.stringify(sha)}`);
+  }
+  const releaseEnvFile = app.kind !== "static" && app.envFile !== undefined
+    ? releaseEnvFileOf(app.envFile)
+    : undefined;
   const isStaticReleaseChannel =
     app.kind === "static" && app.releaseTagPattern !== undefined;
   const staticReleaseTagFormat = app.releaseTagFormat ?? "";
@@ -170,6 +185,14 @@ export function buildDeployScript(app: AppRecord, target: DeployTarget): string 
           `SAMOHOST_ACTIVE_ROUTE=${sq(staticReleaseState.activeRoute)}`,
         ]
       : []),
+    ...(app.kind !== "static"
+      ? [
+          "# Release identity for the build (dist/build-info.json, /version.json) and,",
+          "# through the release env file, for the running service.",
+          `export SAMO_RELEASE_TAG=${sq(nodeReleaseTag)}`,
+          `export SAMO_RELEASE_SHA=${sq(sha)}`,
+        ]
+      : []),
     "",
     ...(app.kind === "static" ? [...staticTreeGuardFnLines(), ""] : []),
     'cd "$SAMOHOST_APP_DIR"',
@@ -193,10 +216,29 @@ export function buildDeployScript(app: AppRecord, target: DeployTarget): string 
   // DATABASE_URL, ...). Issue #2 bug 1: without this, migrate died with
   // "DATABASE_URL environment variable is required". The file is never
   // written and its values are never echoed.
+  // Split env layout (src/app/db-layout.ts), detected on the server by the
+  // presence of the migrate env file: database addresses stay in this shell
+  // (export -n) so `npm ci`, install scripts and the build do not receive
+  // them; only the migrate subshell exports them, together with the migrate
+  // env file. Legacy apps (no migrate env file) keep the old behaviour.
+  const splitLayout = app.kind !== "static" && app.envFile !== undefined
+    ? { migrateEnvFile: migrateEnvFileOf(app.envFile), dbVars: databaseUrlVarsOf(app) }
+    : undefined;
   if (app.envFile !== undefined) {
     push(
       "# --- env: source the app env file (READ-ONLY; never written, never echoed) ---",
       `set -a; . ${sq(app.envFile)}; set +a`,
+      ...(splitLayout !== undefined
+        ? [
+            `SAMOHOST_MIGRATE_ENV_FILE=${sq(splitLayout.migrateEnvFile)}`,
+            'if [[ -f "$SAMOHOST_MIGRATE_ENV_FILE" ]]; then',
+            `  export -n ${splitLayout.dbVars.join(" ")}`,
+            "fi",
+            "# split layout: the service runs as a separate runtime user, which reads",
+            "# the checkout, node_modules and dist/ through their world-read bit.",
+            'if [[ -f "$SAMOHOST_MIGRATE_ENV_FILE" ]]; then umask 022; fi',
+          ]
+        : []),
       "",
     );
   }
@@ -260,9 +302,13 @@ export function buildDeployScript(app: AppRecord, target: DeployTarget): string 
       marker("checkpoint", "start"),
       "PRE_DEPLOY_SHA=$(git rev-parse HEAD)",
       'echo "pre-deploy sha: ${PRE_DEPLOY_SHA}"',
+      "# A previous release exists when dist/ is present before this deploy. Its copy",
+      "# dist.prev/ is made here, before install and build (a build may delete dist/).",
+      "SAMOHOST_HAS_PREVIOUS_RELEASE=0",
       'if [[ -d "${SAMOHOST_APP_DIR}/dist" ]]; then',
       '  rm -rf "${SAMOHOST_APP_DIR}/dist.prev"',
       '  cp -r "${SAMOHOST_APP_DIR}/dist" "${SAMOHOST_APP_DIR}/dist.prev"',
+      "  SAMOHOST_HAS_PREVIOUS_RELEASE=1",
       "fi",
       marker("checkpoint", "ok"),
       "",
@@ -275,6 +321,9 @@ export function buildDeployScript(app: AppRecord, target: DeployTarget): string 
   // re-probes health, emits the rollback marker, and exits 1.
   if (app.kind === "static") {
     push(
+      "# Validation as the caddy user when the sudo rule exists (src/caddy/validate.ts).",
+      ...CADDY_VALIDATE_FN_LINES,
+      "",
       "# rollback(): atomically restore the prior vhost and, on the first",
       "# release-channel activation, the legacy route in the base Caddyfile.",
       "# The previous checkout and public version.json were never modified, so",
@@ -304,7 +353,7 @@ export function buildDeployScript(app: AppRecord, target: DeployTarget): string 
       '    rb_active_tmp=$(mktemp "${SAMOHOST_RELEASES_DIR}/.active-state.restore.XXXXXX") || rb_route_ok=0',
       '    if [[ -n "$rb_active_tmp" ]] && cp "$SAMOHOST_ACTIVE_STATE_BACKUP" "$rb_active_tmp" && chmod 0644 "$rb_active_tmp"; then /usr/bin/mv -f "$rb_active_tmp" "$SAMOHOST_ACTIVE_STATE" || rb_route_ok=0; else rb_route_ok=0; fi',
       '  else rm -f "$SAMOHOST_ACTIVE_STATE" || rb_route_ok=0; fi',
-      "  caddy validate --config /etc/caddy/Caddyfile >/dev/null || rb_route_ok=0",
+      "  samohost_caddy_validate || rb_route_ok=0",
       // Static rollback: reload caddy, not restart a unit that doesn't exist.
       // full-path systemctl: see header note (3).
       '  if [[ "$rb_route_ok" == "1" ]]; then sudo /usr/bin/systemctl reload caddy || rb_ok=0; else rb_ok=0; fi',
@@ -343,15 +392,41 @@ export function buildDeployScript(app: AppRecord, target: DeployTarget): string 
     push(
       "# rollback(): restore the pre-deploy state coherently (git + dist), then",
       "# restart and re-health. Emits rollback:ok / rollback:fail and exits 1.",
+      "# rollback before-restart: used when install, build or migrate failed. The",
+      "# service was not restarted and still runs the previous release, so the",
+      "# files are restored and its health is checked without a restart.",
+      "# Database migrations that already ran are not undone.",
       "rollback() {",
+      '  local rb_mode="${1:-}"',
       "  git reset --hard \"${PRE_DEPLOY_SHA}\" || true",
+      ...(releaseEnvFile !== undefined
+        ? [
+            "  # Restore the previous release env file (or remove the one this deploy created).",
+            '  if [[ "${SAMOHOST_RELEASE_ENV_WRITTEN:-0}" == "1" ]]; then',
+            '    if [[ -f "$SAMOHOST_MIGRATE_ENV_FILE" ]]; then',
+            "      # split layout: root-owned directory; the exact sudo tee rule writes the file (empty on a first deploy).",
+            '      if [[ "${SAMOHOST_RELEASE_ENV_HAD_PREVIOUS:-0}" == "1" ]]; then',
+            "        printf '%s\\n' \"$SAMOHOST_RELEASE_ENV_PREVIOUS\" | sudo /usr/bin/tee \"$SAMOHOST_RELEASE_ENV_FILE\" >/dev/null || true",
+            "      else",
+            "        printf '' | sudo /usr/bin/tee \"$SAMOHOST_RELEASE_ENV_FILE\" >/dev/null || true",
+            "      fi",
+            '    elif [[ "${SAMOHOST_RELEASE_ENV_HAD_PREVIOUS:-0}" == "1" ]]; then',
+            "      printf '%s\\n' \"$SAMOHOST_RELEASE_ENV_PREVIOUS\" > \"$SAMOHOST_RELEASE_ENV_FILE\" || true",
+            "    else",
+            '      rm -f "$SAMOHOST_RELEASE_ENV_FILE" || true',
+            "    fi",
+            "  fi",
+          ]
+        : []),
       '  if [[ -d "${SAMOHOST_APP_DIR}/dist.prev" ]]; then',
       '    rm -rf "${SAMOHOST_APP_DIR}/dist"',
       '    cp -r "${SAMOHOST_APP_DIR}/dist.prev" "${SAMOHOST_APP_DIR}/dist"',
       "  fi",
       // full-path systemctl: see header note (3).
-      '  sudo /usr/bin/systemctl restart "${SAMOHOST_UNIT}" || true',
-      `  sleep ${RESTART_SETTLE_SEC}`,
+      '  if [[ "$rb_mode" != "before-restart" ]]; then',
+      '    sudo /usr/bin/systemctl restart "${SAMOHOST_UNIT}" || true',
+      `    sleep ${RESTART_SETTLE_SEC}`,
+      "  fi",
       "  local rb_code",
       '  rb_code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 "${SAMOHOST_HEALTH_URL}" || echo 000)',
       '  if [[ "$rb_code" == "200" ]]; then',
@@ -566,7 +641,7 @@ export function buildDeployScript(app: AppRecord, target: DeployTarget): string 
           `if [[ "$SAMOHOST_BASE_CHANGED" == "1" ]]; then sudo /usr/bin/mv -- ${sq(staticStagedCaddyfile)} ${sq(staticCaddyfile)} || rollback; fi`,
         ]
         : []),
-      "caddy validate --config /etc/caddy/Caddyfile >/dev/null || rollback",
+      "samohost_caddy_validate || rollback",
       "",
     );
 
@@ -649,6 +724,7 @@ export function buildDeployScript(app: AppRecord, target: DeployTarget): string 
       `  ${marker("install", "ok")}`,
       "else",
       `  ${marker("install", "fail")}`,
+      '  if [[ "$SAMOHOST_HAS_PREVIOUS_RELEASE" == "1" ]]; then rollback before-restart; fi',
       "  exit 1",
       "fi",
       "",
@@ -670,8 +746,20 @@ export function buildDeployScript(app: AppRecord, target: DeployTarget): string 
       `  ${marker("build", "ok")}`,
       "else",
       `  ${marker("build", "fail")}`,
+      '  if [[ "$SAMOHOST_HAS_PREVIOUS_RELEASE" == "1" ]]; then rollback before-restart; fi',
       "  exit 1",
       "fi",
+      ...(splitLayout !== undefined
+        ? [
+            "# split layout: the service's runtime user reads the release through the",
+            "# world-read bit; umask 022 covers new files, this covers files an earlier",
+            "# clone or deploy left owner-only. Skips .git; does not follow links.",
+            'if [[ -f "$SAMOHOST_MIGRATE_ENV_FILE" ]]; then',
+            '  find "$SAMOHOST_APP_DIR" -path "$SAMOHOST_APP_DIR/.git" -prune -o ! -type l -exec chmod go+rX {} + \\',
+            '    || echo "WARNING: could not make every file in $SAMOHOST_APP_DIR readable for the runtime user" >&2',
+            "fi",
+          ]
+        : []),
       "",
     );
 
@@ -680,11 +768,17 @@ export function buildDeployScript(app: AppRecord, target: DeployTarget): string 
       push(
         "# --- migrate: apply DB migrations before the new code boots ---",
         "# subshell + cd: always runs from the app dir, whatever buildCmd cd'd into (issue #122).",
+        ...(splitLayout !== undefined
+          ? ["# split layout: only this subshell exports the database addresses and loads the migrate env file."]
+          : []),
         marker("migrate", "start"),
-        `if (cd "$SAMOHOST_APP_DIR" && ${app.migrateCmd}); then`,
+        splitLayout !== undefined
+          ? `if (if [[ -f "$SAMOHOST_MIGRATE_ENV_FILE" ]]; then set -a; . "$SAMOHOST_MIGRATE_ENV_FILE"; set +a; export ${splitLayout.dbVars.join(" ")}; fi && cd "$SAMOHOST_APP_DIR" && ${app.migrateCmd}); then`
+          : `if (cd "$SAMOHOST_APP_DIR" && ${app.migrateCmd}); then`,
         `  ${marker("migrate", "ok")}`,
         "else",
         `  ${marker("migrate", "fail")}`,
+        '  if [[ "$SAMOHOST_HAS_PREVIOUS_RELEASE" == "1" ]]; then rollback before-restart; fi',
         "  exit 1",
         "fi",
         "",
@@ -693,6 +787,30 @@ export function buildDeployScript(app: AppRecord, target: DeployTarget): string 
 
     // ----- restart -----------------------------------------------------------
     // Full-path sudo systemctl, mandatory. See header note (3).
+    if (releaseEnvFile !== undefined) {
+      push(
+        "# --- release env: tag and sha for the running service (unit EnvironmentFile=-) ---",
+        "# No secret is written here. The previous content is kept in a variable for",
+        "# rollback. A failed write is a warning, not a failure: units written before",
+        "# this file existed do not load it, and the release runs without the values.",
+        `SAMOHOST_RELEASE_ENV_FILE=${sq(releaseEnvFile)}`,
+        "SAMOHOST_RELEASE_ENV_HAD_PREVIOUS=0",
+        'SAMOHOST_RELEASE_ENV_PREVIOUS=""',
+        'if [[ -f "$SAMOHOST_RELEASE_ENV_FILE" ]] && SAMOHOST_RELEASE_ENV_PREVIOUS="$(cat "$SAMOHOST_RELEASE_ENV_FILE")"; then SAMOHOST_RELEASE_ENV_HAD_PREVIOUS=1; fi',
+        "SAMOHOST_RELEASE_ENV_WRITTEN=0",
+        "# split layout: the env file's directory is root-owned; the exact sudo tee rule writes the file.",
+        'if [[ -f "$SAMOHOST_MIGRATE_ENV_FILE" ]]; then',
+        '  if printf \'SAMO_RELEASE_TAG=%s\\nSAMO_RELEASE_SHA=%s\\n\' "$SAMO_RELEASE_TAG" "$SAMO_RELEASE_SHA" | sudo /usr/bin/tee "$SAMOHOST_RELEASE_ENV_FILE" >/dev/null; then SAMOHOST_RELEASE_ENV_WRITTEN=1; fi',
+        'elif printf \'SAMO_RELEASE_TAG=%s\\nSAMO_RELEASE_SHA=%s\\n\' "$SAMO_RELEASE_TAG" "$SAMO_RELEASE_SHA" 2>/dev/null > "${SAMOHOST_RELEASE_ENV_FILE}.next" && chmod 0644 "${SAMOHOST_RELEASE_ENV_FILE}.next" && mv -f "${SAMOHOST_RELEASE_ENV_FILE}.next" "$SAMOHOST_RELEASE_ENV_FILE"; then',
+        "  SAMOHOST_RELEASE_ENV_WRITTEN=1",
+        "fi",
+        'if [[ "$SAMOHOST_RELEASE_ENV_WRITTEN" != "1" ]]; then',
+        '  rm -f "${SAMOHOST_RELEASE_ENV_FILE}.next" 2>/dev/null || true',
+        '  echo "WARNING: could not write the release env file $SAMOHOST_RELEASE_ENV_FILE; the service starts without SAMO_RELEASE_TAG and SAMO_RELEASE_SHA" >&2',
+        "fi",
+        "",
+      );
+    }
     push(
       "# --- restart: full-path sudo systemctl (NOPASSWD exact-path + use_pty) ---",
       marker("restart", "start"),
@@ -761,9 +879,25 @@ export function buildDeployScript(app: AppRecord, target: DeployTarget): string 
         "# --- assert-rls: app must connect as a non-superuser (RLS not bypassed) ---",
         marker("assert-rls", "start"),
         ...rlsLookup,
-        // psql reads the URL as its connection string; the secret stays in the
-        // variable and is never echoed. Probe returns 'f' for non-superuser.
-        'rls_result=$(psql "$RLS_URL" -tAc "SELECT rolsuper FROM pg_roles WHERE rolname = current_user" 2>&1 || echo CONNECTION_FAILED)',
+        // The password is taken out of the address and passed in PGPASSWORD, so
+        // that it is not a process argument (ps shows arguments to every user);
+        // the rest of the address goes to psql -d unchanged, so every form psql
+        // accepts as its database argument still works (src/app/pg-conninfo.ts).
+        // Probe returns 'f' for non-superuser.
+        "# The password goes to psql in PGPASSWORD, not as an argument (ps shows arguments).",
+        ...PG_CONNINFO_BASH,
+        "rls_result=CONNECTION_FAILED",
+        "samohost_pg_rc=0",
+        'samohost_pg_split "$RLS_URL" || samohost_pg_rc=$?',
+        'if [[ "$samohost_pg_rc" == 0 ]]; then',
+        '  rls_result=$(if [[ -n "$samohost_pg_pw" ]]; then export PGPASSWORD="$samohost_pg_pw"; fi; psql -X -w -tA -d "$samohost_pg_conn" -c "SELECT rolsuper FROM pg_catalog.pg_roles WHERE rolname = current_user" 2>&1 || echo CONNECTION_FAILED)',
+        'elif [[ "$samohost_pg_rc" == 2 ]]; then',
+        '  echo "assert-rls: the database address has a key=value pair without =" >&2',
+        "else",
+        '  echo "assert-rls: the database address has a quoted value without its closing quote" >&2',
+        "fi",
+        "# Both variables may hold the decoded password.",
+        "unset samohost_pg_pw samohost_pct_out",
         'if [[ "$rls_result" == "f" ]]; then',
         `  ${marker("assert-rls", "ok")}`,
         "else",
@@ -783,7 +917,9 @@ export function buildDeployScript(app: AppRecord, target: DeployTarget): string 
         "# --- seed: idempotent post-deploy seed (only after healthy deploy) ---",
         "# subshell + cd: always runs from the app dir, whatever earlier commands cd'd into (issue #122).",
         marker("seed", "start"),
-        `if (cd "$SAMOHOST_APP_DIR" && ${app.seedCmd}); then`,
+        splitLayout !== undefined
+          ? `if (if [[ -f "$SAMOHOST_MIGRATE_ENV_FILE" ]]; then set -a; . "$SAMOHOST_MIGRATE_ENV_FILE"; set +a; export ${splitLayout.dbVars.join(" ")}; fi && cd "$SAMOHOST_APP_DIR" && ${app.seedCmd}); then`
+          : `if (cd "$SAMOHOST_APP_DIR" && ${app.seedCmd}); then`,
         `  ${marker("seed", "ok")}`,
         "else",
         `  ${marker("seed", "fail")}`,

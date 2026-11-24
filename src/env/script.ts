@@ -29,12 +29,14 @@ import type { AppRecord, EnvDbBackend, EnvRecord } from "../types.ts";
 import { staticCacheHeaderLines } from "../static-cache.ts";
 import { servicesOf } from "../app/services.ts";
 import { assertOptionalLinuxAppUser } from "../app/linux-user.ts";
+import { migrateEnvFileOf } from "../app/db-layout.ts";
 import {
   staticReleaseStatePaths,
   staticRootOf,
   staticTreeGuardFnLines,
 } from "../app/static-root.ts";
-import { planFromEnv, renderVhost } from "../caddy/render.ts";
+import { CADDY_VALIDATE_AS_CADDY_FROM_ROOT, caddyLogOwnerRepairLines } from "../caddy/validate.ts";
+import { mainVhostTrustedProxies, planFromApp, planFromEnv, previousNodeMainVhost, renderVhost, VHOST_PROVENANCE_HEADER } from "../caddy/render.ts";
 
 /** Same marker prefix as deploy scripts — one parser convention everywhere. */
 export const ENV_PHASE_PREFIX = "<<<SAMOHOST_PHASE:";
@@ -2323,6 +2325,14 @@ export interface HostPrepFirewallOpts {
    * @default false
    */
   forceMainVhost?: boolean;
+
+  /**
+   * Control-plane address for a node app with `mainListen = "cp-http80"`.
+   * The main vhost is then rendered by renderVhost(planFromApp(...)), the same
+   * render `app heal` uses, with this address as reverse_proxy
+   * `trusted_proxies`. Does not add a firewall rule (bootstrap opens :80).
+   */
+  mainVhostTrustedProxy?: string;
 }
 
 /**
@@ -2391,6 +2401,21 @@ export function buildHostPrepScript(
     const stagedPath = `/etc/caddy/sites.d/.staged-00-main-${app.name}.caddy`;
     const bakedForce = firewallOpts?.forceMainVhost === true ? "true" : "false";
 
+    // Restore after a failed validation or reload: the backup goes back
+    // through a file in the same folder and mv -fT (never a partial file at
+    // the live path); the backup stays. With no backup (a first write) the
+    // live file is removed.
+    const restoreMainVhostLines = [
+      "    if [[ -n \"${backup}\" ]] && [[ -f \"${backup}\" ]]; then",
+      "      if ! { install -m 644 \"${backup}\" \"${live}.restore.$$\" && mv -fT \"${live}.restore.$$\" \"$live\"; }; then",
+      "        rm -f \"${live}.restore.$$\"",
+      "        echo \"samohost host-prep: could not restore $live; the previous file is ${backup}\" >&2",
+      "      fi",
+      "    else",
+      "      rm -f \"$live\"",
+      "    fi",
+    ];
+
     // Guard function definition — emitted early in the script (after set -euo
     // pipefail) so it is available when called later in the Caddy step.
     // All inner closing tokens use fi/done (not `}`), so the only `}` at
@@ -2403,13 +2428,27 @@ export function buildHostPrepScript(
       "  local live=\"$2\"",
       // Regular string so ${3:-false} is emitted verbatim (bash default, not TS).
       "  local force=\"${3:-false}\"",
+      // Optional 4th argument (node cp-http80 apps): a file with the main
+      // vhost as an older samohost's host-prep wrote it.
+      "  local previous=\"${4:-}\"",
       "  local backup=\"\"",
+      "  local upgrade=false",
       "  if [[ -f \"$live\" ]]; then",
       "    if diff -q \"$staged\" \"$live\" >/dev/null 2>&1; then",
       "      rm -f \"$staged\"",
+      "      if [[ -n \"$previous\" ]]; then rm -f \"$previous\"; fi",
       "      return 0",
       "    fi",
-      "    if [[ \"$force\" != \"true\" ]]; then",
+      "    # A file an older samohost wrote (its previous form, or samohost's",
+      "    # provenance header on line 1) is replaced with a backup, like --force.",
+      "    if [[ -n \"$previous\" ]]; then",
+      `      if cmp -s "$previous" "$live" || [[ "$(head -n 1 "$live")" == ${sq(VHOST_PROVENANCE_HEADER)} ]]; then`,
+      "        upgrade=true",
+      "        echo \"samohost host-prep: $live was written by an older samohost; replacing it with the current render (backup kept)\"",
+      "      fi",
+      "      rm -f \"$previous\"",
+      "    fi",
+      "    if [[ \"$force\" != \"true\" && \"$upgrade\" != \"true\" ]]; then",
       "      echo \"samohost host-prep: refusing to overwrite hand-authored/drifted main vhost:\" >&2",
       "      echo \"  $live\" >&2",
       "      diff -u \"$live\" \"$staged\" >&2 || true",
@@ -2421,18 +2460,24 @@ export function buildHostPrepScript(
       // Regular strings so ${live} and ${...} expand as bash vars, not TS.
       "    backup=\"${live}.bak.$(date +%Y%m%dT%H%M%S)\"",
       "    cp \"$live\" \"$backup\"",
+      "  elif [[ -n \"$previous\" ]]; then",
+      "    rm -f \"$previous\"",
       "  fi",
       "  mv \"$staged\" \"$live\"",
-      "  if ! caddy validate --config /etc/caddy/Caddyfile; then",
+      "  # As the caddy user: validation opens each vhost's log file, and a log",
+      "  # file it creates as root is one Caddy cannot open.",
+      `  if ! ${CADDY_VALIDATE_AS_CADDY_FROM_ROOT}; then`,
       "    echo \"samohost host-prep: caddy validate failed — restoring backup\" >&2",
-      "    if [[ -n \"${backup}\" ]] && [[ -f \"${backup}\" ]]; then",
-      "      cp \"${backup}\" \"$live\"",
-      "    else",
-      "      rm -f \"$live\"",
-      "    fi",
+      ...restoreMainVhostLines,
       "    return 1",
       "  fi",
-      "  systemctl reload caddy",
+      "  # A file Caddy did not load is not left on disk.",
+      "  if ! systemctl reload caddy; then",
+      "    echo \"samohost host-prep: caddy reload failed — restoring the previous main vhost\" >&2",
+      ...restoreMainVhostLines,
+      "    systemctl reload caddy || true",
+      "    return 1",
+      "  fi",
       "}",
       "",
     );
@@ -2450,12 +2495,21 @@ export function buildHostPrepScript(
           ...(app.mainListen === "cp-http80" ? [] : [`\ttls internal`]),
           `}`,
         ]
-      : [
+      : app.mainListen === "cp-http80"
+        // One render for node cp-http80 apps, shared with `app heal`
+        // (src/app/heal-script.ts): http://<host>:80, no certificate and no
+        // HTTPS redirect, visitor address kept from the control plane.
+        ? renderVhost(planFromApp(app, {
+            trustedProxies: mainVhostTrustedProxies(app, firewallOpts?.mainVhostTrustedProxy),
+          })).replace(/\n$/, "").split("\n")
+        : [
           `${mainHost} {`,
           `\treverse_proxy localhost:${port}`,
           `}`,
         ];
 
+    // Node cp-http80 apps: host-prep of upstream main wrote the bare-host form.
+    const previousMainVhost = !isStatic && app.mainListen === "cp-http80" ? previousNodeMainVhost(app) : undefined;
     mainVhostLines.push(
       "",
       `#    Landmine guard: render the intended single-service vhost to a staged`,
@@ -2480,10 +2534,22 @@ export function buildHostPrepScript(
       ...(isStatic
         ? ['samohost_assert_static_tree_safe "$SAMOHOST_CHECKOUT_REAL" "$SAMOHOST_STATIC_DIR" "$SAMOHOST_STATIC_ROOT"']
         : []),
+      ...(previousMainVhost !== undefined
+        ? [
+            "# The main vhost as host-prep of an older samohost wrote it: replaced, not refused.",
+            'SAMOHOST_PREVIOUS_MAIN_VHOST="$(mktemp)"',
+            `cat > "$SAMOHOST_PREVIOUS_MAIN_VHOST" <<'SAMOHOST_PREVIOUS_MAIN_VHOST'`,
+            ...previousMainVhost.replace(/\n$/, "").split("\n"),
+            "SAMOHOST_PREVIOUS_MAIN_VHOST",
+          ]
+        : []),
+      ...caddyLogOwnerRepairLines(app.name),
       `samohost_apply_main_vhost \\`,
       `  ${stagedPath} \\`,
       `  ${livePath} \\`,
-      `  ${bakedForce}`,
+      ...(previousMainVhost !== undefined
+        ? [`  ${bakedForce} \\`, `  "$SAMOHOST_PREVIOUS_MAIN_VHOST"`]
+        : [`  ${bakedForce}`]),
     );
   }
 
@@ -2681,12 +2747,41 @@ export function buildHostPrepScript(
     "visudo -cf /etc/sudoers.d/samohost-env-" + app.name,
   );
 
+  // Node apps: stop before any change on a server that shows the new layout
+  // of src/app/bootstrap.ts (separate database roles, runtime user
+  // <app>-run). Previews of those apps are not designed yet, and the rules
+  // below give the operator user wildcard sudo rights for previews.
+  const newLayoutCheckLines: string[] = [];
+  if (!isStatic) {
+    const envFile = app.envFile ?? `/opt/${app.name}/staging.env`;
+    let migrateEnvFile: string | undefined;
+    try {
+      migrateEnvFile = migrateEnvFileOf(envFile);
+    } catch {
+      migrateEnvFile = undefined;
+    }
+    const signs = [
+      `[[ "$(cat ${sq(`/var/lib/samohost/db-layout/${app.name}`)} 2>/dev/null)" == split ]]`,
+      ...(migrateEnvFile !== undefined ? [`[[ -e ${sq(migrateEnvFile)} ]]`] : []),
+      `id -u ${sq(`${app.name}-run`)} >/dev/null 2>&1`,
+    ];
+    newLayoutCheckLines.push(
+      "# 0. New-layout node apps: no previews yet.",
+      `if ${signs.join(" || ")}; then`,
+      `  echo ${sq(`ERROR: app '${app.name}' uses the new layout (separate database roles, runtime user ${app.name}-run). Host-prep sets up previews, which such apps do not support yet, so it stops here and changes nothing.`)} >&2`,
+      "  exit 1",
+      "fi",
+      "",
+    );
+  }
+
   return [
     "#!/usr/bin/env bash",
     `# samohost host-prep for app '${app.name}' — ONE-TIME, run by an operator with root.`,
     "# Review before applying. Nothing here is executed by samohost itself.",
     "set -euo pipefail",
     "",
+    ...newLayoutCheckLines,
     ...(isStatic && managesMainVhost ? [...staticTreeGuardFnLines(), ""] : []),
     // Guard function definition (only when mainHost is set); placed early so
     // it is in scope before the Caddy step that calls it.

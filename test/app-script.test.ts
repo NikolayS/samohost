@@ -83,7 +83,9 @@ describe("buildDeployScript hard-won behaviors", () => {
     const script = buildDeployScript(fieldRecord(), TARGET);
     // The script must never assign a literal secret value.
     expect(script).not.toContain("DATABASE_URL=");
-    expect(script).not.toContain("PGPASSWORD=");
+    // The assert-rls probe passes the password to psql in PGPASSWORD, from a
+    // variable parsed out of the env file at run time; never a literal value.
+    expect(script).not.toMatch(/PGPASSWORD=(?!"\$samohost_pg_pw")/);
     // Issue #2 (bug 1): the env file IS now sourced (read-only) so migrate/
     // seed/probes get the app environment — but it must never be WRITTEN:
     // no append-redirect, no in-place edit, no DEPLOYED_SHA bookkeeping in it.
@@ -383,7 +385,7 @@ describe("buildDeployScript — static path (kind='static')", () => {
     expect(rollback).not.toContain("SAMOHOST_VERSION_BACKUP");
     expect(rollback).toContain("SAMOHOST_VHOST_BACKUP");
     expect(rollback).toContain('worktree remove --force "$SAMOHOST_CANDIDATE_DIR"');
-    expect(rollback).toContain("caddy validate");
+    expect(rollback).toContain("samohost_caddy_validate");
     expect(rollback).toContain("reload caddy");
   });
 
@@ -526,6 +528,10 @@ describe("buildDeployScript — static path (kind='static')", () => {
       writeFileSync(join(binDir, "sudo"), [
         "#!/usr/bin/env bash",
         'if [[ "${1:-}" == "/usr/bin/systemctl" ]]; then exit 0; fi',
+        // sudo -n -l: no caddy validate rule; sudo -u caddy /usr/bin/caddy runs the caddy stub.
+        'if [[ "${1:-}" == -n && "${2:-}" == -l ]]; then exit 1; fi',
+        'while [[ "${1:-}" == -n || "${1:-}" == -u ]]; do if [[ "$1" == -u ]]; then shift 2; else shift; fi; done',
+        'if [[ "${1:-}" == /usr/bin/caddy ]]; then shift; exec caddy "$@"; fi',
         'exec "$@"',
         "",
       ].join("\n"));
@@ -777,6 +783,10 @@ describe("buildDeployScript — static path (kind='static')", () => {
       writeFileSync(join(binDir, "sudo"), [
         "#!/usr/bin/env bash",
         'if [[ "${1:-}" == "/usr/bin/systemctl" ]]; then exit 0; fi',
+        // sudo -n -l: no caddy validate rule; sudo -u caddy /usr/bin/caddy runs the caddy stub.
+        'if [[ "${1:-}" == -n && "${2:-}" == -l ]]; then exit 1; fi',
+        'while [[ "${1:-}" == -n || "${1:-}" == -u ]]; do if [[ "$1" == -u ]]; then shift 2; else shift; fi; done',
+        'if [[ "${1:-}" == /usr/bin/caddy ]]; then shift; exec caddy "$@"; fi',
         'exec "$@"',
         "",
       ].join("\n"));

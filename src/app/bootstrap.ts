@@ -48,10 +48,18 @@
  *     CRITICAL for non-static apps: dbName is REQUIRED and EXPLICIT — never
  *     derived from app.name. Static apps skip the DB and base-env sections.
  *
- *  e. Base env file seeding (600, appUser-owned): DATABASE_URL (superuser),
- *     APP_DATABASE_URL placeholder (app role + 'app_password' — rotated by
- *     deploy.sh on first deploy), NODE_ENV, PORT (from healthUrl), HOST,
- *     COOKIE_SECRET (on-host openssl rand), SEED_OWNER_LOGIN/PASSWORD.
+ *     Then the app's own login role (`<dbName>_app` by default): created
+ *     NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS with a
+ *     password generated on the host; CONNECT on the app's database is
+ *     revoked from PUBLIC and granted to that role.
+ *
+ *  e. Env files (600, appUser-owned; see src/app/db-layout.ts). Split layout:
+ *     the runtime env file has APP_DATABASE_URL (the app role), NODE_ENV,
+ *     PORT (from healthUrl), HOST, COOKIE_SECRET and TRUSTED_PROXIES; the
+ *     migrate env file has DATABASE_URL (the owner role) and
+ *     SEED_OWNER_LOGIN/PASSWORD. Legacy layout: one env file with the
+ *     superuser DATABASE_URL and all of the above. Both are written through
+ *     a temporary file in a root-owned directory and renamed into place.
  *     PG_BACKEND is intentionally NOT written here (lives in unit Environment=).
  *     Idempotent: reuses existing pw/secret/DEPLOYED_SHA values.
  *
@@ -82,8 +90,13 @@ import {
 import {
   assertLinuxAppUser,
   assertOptionalLinuxAppUser,
+  linuxAppUserError,
 } from "./linux-user.ts";
 import { staticMainVhostLines } from "./heal-script.ts";
+import { migrateEnvFileOf, releaseEnvFileOf, splitLayoutPathError } from "./db-layout.ts";
+import { CADDY_VALIDATE_AS_CADDY_FROM_ROOT, caddyLogOwnerRepairLines, caddyValidateSudoRule } from "../caddy/validate.ts";
+import { isIP } from "node:net";
+import { dirname } from "node:path";
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -158,9 +171,10 @@ export interface HostBootstrapOptions {
   tlsMode?: "acme" | "local";
 
   /**
-   * PR-A2 — The app (non-superuser, RLS) database role name written into the
-   * APP_DATABASE_URL placeholder. Default "app_user". The placeholder password
-   * is the literal 'app_password' — deploy.sh rotates it on first deploy.
+   * The app's own non-superuser login role (the user in APP_DATABASE_URL).
+   * Default `<dbName>_app`. The bootstrap creates it with a password
+   * generated on the server (openssl rand) and writes that password into the
+   * env file. A re-run keeps the password already in the env file.
    */
   appDbRole?: string;
 
@@ -257,9 +271,85 @@ export function buildHostBootstrapScript(
   const gitSafeConf = `${appBase}/git-safe.conf`;
   const repoUrl = `https://github.com/${app.repo}.git`;
   const appPort = bootstrapPort(app);
-  const appDbRole = opts.appDbRole ?? "app_user";
-  const seedOwnerLogin = opts.seedOwnerLogin ?? "owner";
+  // dbName and the role names are embedded in SQL and in the root-run shell
+  // script. Accept only lowercase PostgreSQL identifiers that need no quoting,
+  // short enough that "<dbName>_owner" still fits in 63 bytes.
+  if (dbName !== undefined && !/^[a-z_][a-z0-9_]{0,47}$/.test(dbName)) {
+    throw new Error(
+      `buildHostBootstrapScript: invalid dbName ${JSON.stringify(dbName)}: ` +
+        "expected ^[a-z_][a-z0-9_]{0,47}$ (a lowercase PostgreSQL identifier)",
+    );
+  }
   const rlsUrlVar = app.rlsUrlVar ?? "APP_DATABASE_URL";
+  if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(rlsUrlVar)) {
+    throw new Error(`buildHostBootstrapScript: invalid rlsUrlVar ${JSON.stringify(rlsUrlVar)}`);
+  }
+  const appDbRole = opts.appDbRole ?? `${dbName ?? app.name}_app`;
+  if (!isStatic && !/^[a-z_][a-z0-9_]{0,62}$/.test(appDbRole)) {
+    throw new Error(
+      `buildHostBootstrapScript: invalid appDbRole ${JSON.stringify(appDbRole)}: ` +
+        "expected ^[a-z_][a-z0-9_]{0,62}$",
+    );
+  }
+  if (
+    !isStatic &&
+    (!appDbRole.startsWith(`${dbName}_`) ||
+      appDbRole === `${dbName}_owner` ||
+      appDbRole === "postgres" ||
+      appDbRole.startsWith("pg_"))
+  ) {
+    throw new Error(
+      `buildHostBootstrapScript: invalid appDbRole ${JSON.stringify(appDbRole)}: ` +
+        `it must start with "${dbName}_" and must not be "${dbName}_owner", "postgres" or a pg_ name`,
+    );
+  }
+  // Session settings fed to psql before any statement that carries a
+  // password, so the statement text never reaches the PostgreSQL log (same
+  // lines as src/env/script.ts uses for preview roles).
+  const noLogSqlArgs =
+    `"SET log_statement TO 'none';" "SET log_min_duration_statement TO -1;" "SET log_min_error_statement TO 'panic';"`;
+  // psql as postgres inside the app's database: the database owner role can
+  // set the database's search_path, so pin it to pg_catalog.
+  const psqlInAppDb = (db: string): string =>
+    `sudo -u postgres env PGOPTIONS='-c search_path=pg_catalog' psql -p 5432 -d ${sq(db)}`;
+  // Split layout (src/app/db-layout.ts): the migration role owns the app's
+  // database; the migrate env file sits next to the runtime env file.
+  const ownerDbRole = `${dbName ?? app.name}_owner`;
+  const migrateEnvFile = isStatic ? "" : migrateEnvFileOf(envFile);
+  const releaseEnvFile = isStatic ? "" : releaseEnvFileOf(envFile);
+  // New env layout only: the service runs as a separate runtime user under a
+  // hardened unit, and the deploy user's sudo rules name exact files. The
+  // name must be a valid Linux user name, and the app name must be plain
+  // enough to sit in a sudo rule and a sudo regular expression unescaped.
+  const runtimeUser = `${app.name}-run`;
+  const runtimeUserUsable =
+    !isStatic && linuxAppUserError(runtimeUser) === undefined && /^[a-z0-9][a-z0-9_.-]*$/.test(app.name);
+  const uploadsDir = `${appBase}/uploads`;
+  const mainVhostFile = `/etc/caddy/sites.d/00-main-${app.name}.caddy`;
+  // Same name as the heal script's staging file (src/app/heal-script.ts).
+  const healStagedVhostFile = `/etc/caddy/sites.d/.samohost-heal-next-00-main-${app.name}.caddy`;
+  // No sudo rule for preview vhost files (/etc/caddy/sites.d/<app>-<label>.caddy):
+  // that name pattern overlaps between apps whose names share a prefix, and
+  // previews of new-layout apps are not designed yet (host-prep refuses them).
+  const seedOwnerLogin = opts.seedOwnerLogin ?? "owner";
+  // cp-http80: the control plane is the only proxy in front of this server's
+  // Caddy (the firewall opens :80 to it alone). The app trusts its
+  // X-Forwarded-For entries (TRUSTED_PROXIES), Caddy keeps them
+  // (trusted_proxies in the main vhost).
+  const trustedProxy = !isStatic && app.mainListen === "cp-http80"
+    ? opts.firewallOpts?.controlPlaneIp
+    : undefined;
+  if (trustedProxy !== undefined) {
+    const [address = "", prefix, extra] = trustedProxy.split("/");
+    const max = isIP(address) === 4 ? 32 : 128;
+    if (isIP(address) === 0 || extra !== undefined || (prefix !== undefined && !(/^\d{1,3}$/.test(prefix) && Number(prefix) >= 1 && Number(prefix) <= max))) {
+      throw new Error(`buildHostBootstrapScript: invalid controlPlaneIp ${JSON.stringify(trustedProxy)}`);
+    }
+  }
+  // The app's TCP peer is Caddy on loopback (Caddy dials localhost:<port>;
+  // the app listens on 127.0.0.1 in the split layout and on 0.0.0.0 in the
+  // legacy one, where Go tries 127.0.0.1), and Caddy's peer is the control plane.
+  const trustedProxiesEnvLines = trustedProxy !== undefined ? [`TRUSTED_PROXIES=127.0.0.1,${trustedProxy}`] : [];
   const staticReleaseState = staticReleaseStatePaths(app.appDir);
   const staticReleaseTagFormat = app.releaseTagFormat ?? "";
 
@@ -317,7 +407,11 @@ export function buildHostBootstrapScript(
     `# ---------------------------------------------------------------------------`,
     "",
     `TOKEN_FILE=${sq(tokenFile)}`,
+    `# Root writes and chmods the token file in a folder the deploy user may own:`,
+    `# refuse symbolic links at the folder and at the file.`,
+    `if [[ -L ${sq(appBase)} ]]; then echo ${sq(`ERROR: ${appBase} is a symbolic link; refusing to write the token file through it`)} >&2; exit 1; fi`,
     `mkdir -p ${sq(appBase)}`,
+    `if [[ -L "$TOKEN_FILE" ]]; then echo "ERROR: $TOKEN_FILE is a symbolic link; refusing to write or chmod it as root" >&2; exit 1; fi`,
     `if [[ ! -s "$TOKEN_FILE" ]]; then`,
     `  # No token file yet: try FD 3 (a dedicated channel — never the FD 0 the`,
     `  # script itself is being read from). If FD 3 is not open the read is a`,
@@ -465,6 +559,109 @@ export function buildHostBootstrapScript(
     "",
   );
 
+  // ---- section 3b: env layout (node apps) -----------------------------------
+  if (!isStatic) {
+    push(
+      `# ---------------------------------------------------------------------------`,
+      `# §3b. Env layout. Decides §4, §5, §5c, §6, §7, §9, §10, §11 and §12.`,
+      `# ---------------------------------------------------------------------------`,
+      "",
+      `ENV_FILE=${sq(envFile)}`,
+      `# Env layout: see src/app/db-layout.ts. An app bootstrapped before the`,
+      `# split layout has the superuser DATABASE_URL in its runtime env file and`,
+      `# no migrate env file: it keeps that legacy layout unchanged. A legacy app`,
+      `# whose env file lost that line is refused (below), not converted. Every`,
+      `# other app gets the split layout: no superuser address in any env file, a`,
+      `# migration role that owns only this database, and a migrate env file`,
+      `# that only the deploy's migrate step loads.`,
+      `MIGRATE_ENV_FILE=${sq(migrateEnvFile)}`,
+      `# Root reads and writes these files in the app user's directory: refuse`,
+      `# symbolic links, which could point root at any file.`,
+      `for _f in "$ENV_FILE" "$MIGRATE_ENV_FILE"; do`,
+      `  if [[ -L "$_f" ]]; then echo "ERROR: $_f is a symbolic link; refusing to read or write it as root" >&2; exit 1; fi`,
+      `done`,
+      `# Root-owned marker, written once an app has the split layout: deleting the`,
+      `# migrate env file or planting a superuser address does not bring back the`,
+      `# legacy path (which sets the superuser password from the env file).`,
+      `SAMOHOST_LAYOUT_MARKER=${sq(`/var/lib/samohost/db-layout/${app.name}`)}`,
+      `# The unit a legacy node bootstrap wrote runs the service as the deploy`,
+      `# user (User=${appUser}). The new layout writes User=${runtimeUser}; a static`,
+      `# setup and the steps before the first node bootstrap (app user, clone)`,
+      `# write no unit of this name.`,
+      `SAMOHOST_UNIT_FILE=${sq(`/etc/systemd/system/${unit}.service`)}`,
+      `if [[ -f "$SAMOHOST_LAYOUT_MARKER" ]] && [[ "$(cat "$SAMOHOST_LAYOUT_MARKER")" == split ]]; then`,
+      `  SAMOHOST_DB_LAYOUT=split`,
+      `# Any DATABASE_URL line in an existing env file, whatever its scheme or`,
+      `# user, keeps the legacy layout.`,
+      `elif [[ -f "$ENV_FILE" ]] && grep -q '^DATABASE_URL=' "$ENV_FILE" && [[ ! -e "$MIGRATE_ENV_FILE" ]]; then`,
+      `  SAMOHOST_DB_LAYOUT=legacy`,
+      `  echo "postgres: legacy env layout (DATABASE_URL in $ENV_FILE) kept unchanged"`,
+      // Only when the runtime user name is usable: otherwise the new layout's
+      // unit also runs as the deploy user, and a retry of an interrupted
+      // first run must not be refused.
+      ...(runtimeUserUsable
+        ? [
+            `# No marker, no migrate env file, no DATABASE_URL line, and the legacy unit:`,
+            `# the app runs in the legacy layout. Stop instead of converting it.`,
+            `elif [[ ! -e "$MIGRATE_ENV_FILE" && -f "$SAMOHOST_UNIT_FILE" ]] && grep -Eq ${sq(`^[[:space:]]*User[[:space:]]*=[[:space:]]*${appUser}[[:space:]]*$`)} "$SAMOHOST_UNIT_FILE"; then`,
+            `  echo "ERROR: $SAMOHOST_UNIT_FILE runs ${app.name} as ${appUser}: ${app.name} is in the legacy layout, and its env file $ENV_FILE is missing or has no DATABASE_URL= line; bootstrap changed nothing. A legacy app's env file must contain its DATABASE_URL= line. A move to the new layout is the manual procedure in the README (Database roles and env files of a node app)." >&2`,
+            `  exit 1`,
+          ]
+        : []),
+      `else`,
+      `  SAMOHOST_DB_LAYOUT=split`,
+      `fi`,
+      `# Legacy layout: §10 sets the postgres role's password from the env file's`,
+      `# DATABASE_URL. Check it here, before any change to the server, so that a`,
+      `# value samohost did not write stops the run with nothing changed.`,
+      `if [[ "$SAMOHOST_DB_LAYOUT" == legacy && -f "$ENV_FILE" ]]; then`,
+      `  PG_SUPER_PW="$(grep '^DATABASE_URL=' "$ENV_FILE" | sed -E 's#.*//postgres:([^@]*)@.*#\\1#')"`,
+      `  if [[ ! "$PG_SUPER_PW" =~ ^[0-9a-f]+$ ]]; then`,
+      `    echo "ERROR: DATABASE_URL in $ENV_FILE is not a postgres superuser address with a hex password as samohost writes it; bootstrap changed nothing. Correct that line, then run bootstrap again." >&2`,
+      `    exit 1`,
+      `  fi`,
+      `fi`,
+      "",
+    );
+    // Host-prep (src/env/script.ts) gives the operator user wildcard sudo
+    // rules for previews, which new-layout apps do not support yet. It refuses
+    // such servers; this covers host-prep that ran before the first bootstrap.
+    push(
+      `if [[ "$SAMOHOST_DB_LAYOUT" == split && -e ${sq(`/etc/sudoers.d/samohost-env-${app.name}`)} ]]; then`,
+      `  echo ${sq(`ERROR: /etc/sudoers.d/samohost-env-${app.name} (preview rules from host-prep) exists; the new layout does not support previews yet. Remove that file after checking that no preview of ${app.name} is in use, then run bootstrap again.`)} >&2`,
+      `  exit 1`,
+      `fi`,
+      "",
+    );
+    // The new layout limits the deploy user to the rules in ${sudoersFile}.
+    // Another sudoers.d file that names the user (rule, Defaults:<user>, alias
+    // member, %<user>) would give it more; stop and name the file.
+    push(
+      `if [[ "$SAMOHOST_DB_LAYOUT" == split ]]; then`,
+      `  for _f in /etc/sudoers.d/*; do`,
+      `    if [[ ! -f "$_f" || "$_f" == ${sq(sudoersFile)} ]]; then continue; fi`,
+      `    if grep -Eq ${sq(`^[^#]*(^|[[:space:],=():!%])${appUser}([[:space:],=():]|$)`)} "$_f"; then`,
+      `      echo "ERROR: $_f names the deploy user ${appUser}; a new-layout app needs a deploy user that no other sudo rule names. Use another deploy user for this app, or remove ${appUser} from that file." >&2`,
+      `      exit 1`,
+      `    fi`,
+      `  done`,
+      `fi`,
+      "",
+    );
+    // §5 makes appBase root-owned and the env files sit next to the env file:
+    // other paths are refused in the split layout (the legacy layout continues).
+    const pathError = splitLayoutPathError(appBase, envFile, appDir);
+    if (pathError !== undefined) {
+      push(
+        `if [[ "$SAMOHOST_DB_LAYOUT" == split ]]; then`,
+        `  echo ${sq(`ERROR: ${pathError}`)} >&2`,
+        `  exit 1`,
+        `fi`,
+        "",
+      );
+    }
+  }
+
   // ---- section 4: OS user + authorized_keys ---------------------------------
   push(
     `# ---------------------------------------------------------------------------`,
@@ -489,10 +686,29 @@ export function buildHostBootstrapScript(
     `  OPERATOR_KEYS="/root/.ssh/authorized_keys"`,
     `fi`,
     `if [[ -n "\${OPERATOR_KEYS}" ]]; then`,
+    ...(runtimeUserUsable
+      ? [
+          `if [[ "$SAMOHOST_DB_LAYOUT" == split ]]; then`,
+          `  # split layout: root does not write into the deploy user's home. Refuse`,
+          `  # links, keep an existing file, and write a missing one as the user.`,
+          `  for _p in ${sq(`/home/${appUser}/.ssh`)} ${sq(`/home/${appUser}/.ssh/authorized_keys`)}; do`,
+          `    if [[ -L "$_p" ]]; then echo "ERROR: $_p is a symbolic link" >&2; exit 1; fi`,
+          `  done`,
+          `  if [[ -e ${sq(`/home/${appUser}/.ssh/authorized_keys`)} ]]; then`,
+          `    echo "Kept the existing /home/${appUser}/.ssh/authorized_keys"`,
+          `  else`,
+          `    sudo -u ${sq(appUser)} install -d -m 700 ${sq(`/home/${appUser}/.ssh`)}`,
+          `    sudo -u ${sq(appUser)} sh -c 'umask 077 && cat > "$1"' sh ${sq(`/home/${appUser}/.ssh/authorized_keys`)} < "\${OPERATOR_KEYS}"`,
+          `    echo "Copied \${OPERATOR_KEYS} -> /home/${appUser}/.ssh/authorized_keys (as ${appUser})"`,
+          `  fi`,
+          `else`,
+        ]
+      : []),
     `  install -d -m 700 -o ${sq(appUser)} -g ${sq(appUser)} "/home/${appUser}/.ssh"`,
     `  install -m 600 -o ${sq(appUser)} -g ${sq(appUser)} "\${OPERATOR_KEYS}" \\`,
     `    "/home/${appUser}/.ssh/authorized_keys"`,
     `  echo "Copied \${OPERATOR_KEYS} -> /home/${appUser}/.ssh/authorized_keys"`,
+    ...(runtimeUserUsable ? [`fi`] : []),
     `else`,
     `  echo "WARNING: no operator authorized_keys found; skipping key copy." >&2`,
     `fi`,
@@ -500,17 +716,88 @@ export function buildHostBootstrapScript(
   );
 
   // ---- section 5: /opt/<app> layout -----------------------------------------
+  // Split layout: appBase is root-owned, so the deploy user cannot create,
+  // rename or replace entries next to the files root writes and systemd
+  // reads (env files, migrate.env, release.env, git-safe.conf, the token
+  // file). The deploy user owns only the checkout; uploads belongs to the
+  // runtime user (§5c).
+  const oldLayoutLines = [
+    `install -d -m 755 -o ${sq(appUser)} -g ${sq(appUser)} ${sq(appBase)}`,
+    `install -d -m 755 -o ${sq(appUser)} -g ${sq(appUser)} ${sq(`${appBase}/uploads`)}`,
+    `install -d -m 755 -o ${sq(appUser)} -g ${sq(appUser)} ${sq(appDir)}`,
+  ];
   push(
     `# ---------------------------------------------------------------------------`,
     `# §5. /opt/${app.name} directory layout (appBase, uploads, appDir).`,
     `# ---------------------------------------------------------------------------`,
     "",
-    `install -d -m 755 -o ${sq(appUser)} -g ${sq(appUser)} ${sq(appBase)}`,
-    `install -d -m 755 -o ${sq(appUser)} -g ${sq(appUser)} ${sq(`${appBase}/uploads`)}`,
-    `install -d -m 755 -o ${sq(appUser)} -g ${sq(appUser)} ${sq(appDir)}`,
+    ...(runtimeUserUsable
+      ? [
+          `if [[ "$SAMOHOST_DB_LAYOUT" == split ]]; then`,
+          `  # appBase root-owned; its parent is root-owned, so the name cannot be swapped.`,
+          `  if [[ -L ${sq(appBase)} ]]; then echo "ERROR: ${appBase} is a symbolic link" >&2; exit 1; fi`,
+          `  install -d -m 755 -o root -g root ${sq(appBase)}`,
+          `  chown -h root:root ${sq(appBase)}`,
+          `  chmod 755 ${sq(appBase)}`,
+          `  # From here only root can change entries in ${appBase}. Refuse links that`,
+          `  # an earlier deploy user may have left, before root follows any name.`,
+          `  for _p in ${sq(`${appBase}/uploads`)} ${sq(appDir)} ${sq(tokenFile)} ${sq(gitSafeConf)}; do`,
+          `    if [[ -L "$_p" ]]; then echo "ERROR: $_p is a symbolic link" >&2; exit 1; fi`,
+          `  done`,
+          `  if [[ -L ${sq(releaseEnvFile)} ]]; then rm -f ${sq(releaseEnvFile)}; fi`,
+          `  # uploads is created in §5c for the runtime user, never for the deploy user.`,
+          `  install -d -m 755 -o ${sq(appUser)} -g ${sq(appUser)} ${sq(appDir)}`,
+          `else`,
+          ...oldLayoutLines.map((l) => `  ${l}`),
+          `fi`,
+        ]
+      : oldLayoutLines),
     `echo "Layout: ${appBase}/ (uploads/, app checkout at ${appDir})"`,
     "",
   );
+
+  // ---- section 5c: runtime user (node apps) ---------------------------------
+  if (!isStatic) {
+    push(
+      `# ---------------------------------------------------------------------------`,
+      `# §5c. Runtime user ${sq(runtimeUser)} (split layout only). The service runs as`,
+      `#      this user: no sudo rules, no login shell, not in the deploy user's`,
+      `#      group. It reads the release (world-readable files in the checkout);`,
+      `#      it writes only ${uploadsDir}. systemd reads the env files for it.`,
+      `# ---------------------------------------------------------------------------`,
+      "",
+      `if [[ "$SAMOHOST_DB_LAYOUT" == split ]]; then`,
+      ...(runtimeUserUsable
+        ? [
+            `  if id ${sq(runtimeUser)} >/dev/null 2>&1; then`,
+            `    echo "User ${sq(runtimeUser)} already exists — skipping useradd."`,
+            `  else`,
+            `    useradd --system --user-group --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin ${sq(runtimeUser)}`,
+            `  fi`,
+            `  usermod --shell /usr/sbin/nologin ${sq(runtimeUser)}`,
+            `  # chmod follows symbolic links: refuse one at the uploads folder.`,
+            `  if [[ -L ${sq(uploadsDir)} ]]; then echo "ERROR: ${uploadsDir} is a symbolic link" >&2; exit 1; fi`,
+            `  gpasswd -d ${sq(runtimeUser)} ${sq(appUser)} >/dev/null 2>&1 || true`,
+            `  if [[ -d ${sq(uploadsDir)} ]]; then`,
+            `    # An older bootstrap gave this folder to the deploy user. Change the owner`,
+            `    # without following links, and skip files with more than one hard link:`,
+            `    # such a file may be another file of the server.`,
+            `    find ${sq(uploadsDir)} ! -type d -links +1 -exec printf 'WARNING: owner not changed (more than one hard link): %s\\n' {} + >&2`,
+            `    find ${sq(uploadsDir)} \\( -type d -o -links 1 \\) -exec chown -h ${sq(`${runtimeUser}:${runtimeUser}`)} {} +`,
+            `    chmod 750 ${sq(uploadsDir)}`,
+            `  else`,
+            `    install -d -m 750 -o ${sq(runtimeUser)} -g ${sq(runtimeUser)} ${sq(uploadsDir)}`,
+            `  fi`,
+            `  echo "Runtime user: ${runtimeUser} (writes only ${uploadsDir})"`,
+          ]
+        : [
+            `  echo "ERROR: the runtime user name ${runtimeUser} is not a valid Linux user name (^[a-z_][a-z0-9_-]{0,31}$); use a shorter app name" >&2`,
+            `  exit 1`,
+          ]),
+      `fi`,
+      "",
+    );
+  }
 
   // ---- section 6: deploy sudoers --------------------------------------------
   // Static apps get a reduced sudoers: no unit-specific grants (the main unit
@@ -538,6 +825,7 @@ export function buildHostBootstrapScript(
         ]
         : []),
       `${appUser} ALL=(root) NOPASSWD: /usr/bin/journalctl *`,
+      caddyValidateSudoRule(appUser),
       "SUDOERS",
       `chmod 440 ${sq(sudoersFile)}`,
       `visudo -cf ${sq(sudoersFile)}`,
@@ -553,6 +841,30 @@ export function buildHostBootstrapScript(
       `#     samohost is push-based (no timer); no timer/path-deploy grants here.`,
       `# ---------------------------------------------------------------------------`,
       "",
+      ...(runtimeUserUsable
+        ? [
+            `# split layout: exact file names for the main vhost, the heal staging file`,
+            `# and release.env. No wildcard, preview, journalctl, daemon-reload or psql`,
+            `# grant: the deploy and heal scripts do not use them (logs and doctor run`,
+            `# as the operator user; previews of these apps are not designed yet).`,
+            `if [[ "$SAMOHOST_DB_LAYOUT" == split ]]; then`,
+            `cat > ${sq(sudoersFile)} <<'SAMOHOST_SPLIT_SUDOERS'`,
+            `${appUser} ALL=(root) NOPASSWD: /usr/bin/systemctl enable ${unit}`,
+            `${appUser} ALL=(root) NOPASSWD: /usr/bin/systemctl start ${unit}`,
+            `${appUser} ALL=(root) NOPASSWD: /usr/bin/systemctl stop ${unit}`,
+            `${appUser} ALL=(root) NOPASSWD: /usr/bin/systemctl restart ${unit}`,
+            `${appUser} ALL=(root) NOPASSWD: /usr/bin/systemctl reload caddy`,
+            `${appUser} ALL=(root) NOPASSWD: /usr/bin/tee ${mainVhostFile}`,
+            `${appUser} ALL=(root) NOPASSWD: /usr/bin/tee ${healStagedVhostFile}`,
+            `${appUser} ALL=(root) NOPASSWD: /usr/bin/mv -- ${healStagedVhostFile} ${mainVhostFile}`,
+            `${appUser} ALL=(root) NOPASSWD: /usr/bin/rm -f ${healStagedVhostFile}`,
+            `${appUser} ALL=(root) NOPASSWD: /usr/bin/rm -f ${mainVhostFile}`,
+            `${appUser} ALL=(root) NOPASSWD: /usr/bin/tee ${releaseEnvFile}`,
+            caddyValidateSudoRule(appUser),
+            "SAMOHOST_SPLIT_SUDOERS",
+            "else",
+          ]
+        : []),
       `cat > ${sq(sudoersFile)} <<SUDOERS`,
       `${appUser} ALL=(root) NOPASSWD: /usr/bin/systemctl daemon-reload`,
       `${appUser} ALL=(root) NOPASSWD: /usr/bin/systemctl enable ${unit}`,
@@ -565,7 +877,9 @@ export function buildHostBootstrapScript(
       `${appUser} ALL=(root) NOPASSWD: /usr/bin/rm -f /etc/caddy/sites.d/*.caddy`,
       `${appUser} ALL=(postgres) NOPASSWD: /usr/bin/psql`,
       `${appUser} ALL=(root) NOPASSWD: /usr/bin/journalctl *`,
+      caddyValidateSudoRule(appUser),
       "SUDOERS",
+      ...(runtimeUserUsable ? ["fi"] : []),
       `chmod 440 ${sq(sudoersFile)}`,
       `visudo -cf ${sq(sudoersFile)}`,
       `echo "Sudoers: ${sudoersFile} written and validated."`,
@@ -585,6 +899,50 @@ export function buildHostBootstrapScript(
     `#     start is deferred to first deploy (daemon-reload + enable only).`,
     `# ---------------------------------------------------------------------------`,
     "",
+    ...(runtimeUserUsable
+      ? [
+          `# split layout: the service runs as ${runtimeUser} with systemd hardening.`,
+          `# systemd reads the EnvironmentFile= files before it drops to that user.`,
+          `# MemoryDenyWriteExecute is not set: Node's JIT needs writable code pages.`,
+          `if [[ "$SAMOHOST_DB_LAYOUT" == split ]]; then`,
+          `cat > /etc/systemd/system/${unit}.service <<'SAMOHOST_SPLIT_UNIT'`,
+          "[Unit]",
+          `Description=${app.name} main service`,
+          "After=network.target postgresql.service",
+          "",
+          "[Service]",
+          `User=${runtimeUser}`,
+          `Group=${runtimeUser}`,
+          `WorkingDirectory=${appDir}`,
+          `EnvironmentFile=${envFile}`,
+          `EnvironmentFile=-${releaseEnvFile}`,
+          `ExecStart=${execStart}`,
+          "Restart=always",
+          "NoNewPrivileges=yes",
+          "ProtectSystem=strict",
+          "ProtectHome=yes",
+          "PrivateTmp=yes",
+          "PrivateDevices=yes",
+          "ProtectKernelTunables=yes",
+          "ProtectKernelModules=yes",
+          "ProtectControlGroups=yes",
+          "ProtectProc=invisible",
+          "RestrictSUIDSGID=yes",
+          // AF_NETLINK: Node's os.networkInterfaces() throws without it.
+          "RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK",
+          "CapabilityBoundingSet=",
+          "LockPersonality=yes",
+          "MemoryMax=50%",
+          "TasksMax=256",
+          `ReadWritePaths=${uploadsDir}`,
+          `InaccessiblePaths=${[migrateEnvFile, tokenFile, gitSafeConf, `${appDir}/.git`, `${appDir}/.npmrc`].map((x) => `-${x}`).join(" ")}`,
+          "",
+          "[Install]",
+          "WantedBy=multi-user.target",
+          "SAMOHOST_SPLIT_UNIT",
+          "else",
+        ]
+      : []),
     `cat > /etc/systemd/system/${unit}.service <<'UNIT'`,
     "[Unit]",
     `Description=${app.name} main service`,
@@ -595,12 +953,14 @@ export function buildHostBootstrapScript(
     `Group=${appUser}`,
     `WorkingDirectory=${appDir}`,
     `EnvironmentFile=${envFile}`,
+    `EnvironmentFile=-${releaseEnvFile}`,
     `ExecStart=${execStart}`,
     "Restart=always",
     "",
     "[Install]",
     "WantedBy=multi-user.target",
     "UNIT",
+    ...(runtimeUserUsable ? ["fi"] : []),
     `/usr/bin/systemctl daemon-reload`,
     `# Enable unit so it starts on reboot; start is deferred to first deploy.`,
     `/usr/bin/systemctl enable ${unit}`,
@@ -632,6 +992,34 @@ export function buildHostBootstrapScript(
   const caddyfileHeader = tlsMode === "local"
     ? ["# Caddy global options (local TLS — no ACME).", "{", "  local_certs", "}"]
     : ["# Caddy global options (ACME TLS — default)."];
+  // Caddy's admin API on a unix socket in the caddy user's home, for servers
+  // where a new-layout bootstrap ran. Caddy creates the socket with mode 0200
+  // by default, and connecting needs write permission on it, so only the
+  // caddy user and root can use it. The default is TCP localhost:2019, which
+  // every local process, the app included, can use to load a new Caddy
+  // config. `systemctl reload caddy` runs `caddy reload` as caddy, which
+  // sends the config to the admin address the config names.
+  const caddyAdminSocket = "/var/lib/caddy/admin.sock";
+  const caddyAdminRe = `^[[:space:]]*admin[[:space:]]+unix/${caddyAdminSocket.replaceAll(".", "[.]")}([[:space:]]|$)`;
+  const caddyfileHeaderSocket = tlsMode === "local"
+    ? ["# Caddy global options (local TLS — no ACME).", "{", "  local_certs", `  admin unix/${caddyAdminSocket}`, "}"]
+    : ["# Caddy global options (ACME TLS — default).", "{", `  admin unix/${caddyAdminSocket}`, "}"];
+  // Write the canonical base file, with the admin socket line when chosen.
+  const writeBaseCaddyfile = (indent: string): string[] => [
+    `${indent}if [[ "$SAMOHOST_CADDY_ADMIN_SOCKET" == 1 ]]; then`,
+    `${indent}cat > /etc/caddy/Caddyfile <<'CADDYFILE'`,
+    ...caddyfileHeaderSocket,
+    "",
+    "import sites.d/*.caddy",
+    "CADDYFILE",
+    `${indent}else`,
+    `${indent}cat > /etc/caddy/Caddyfile <<'CADDYFILE'`,
+    ...caddyfileHeader,
+    "",
+    "import sites.d/*.caddy",
+    "CADDYFILE",
+    `${indent}fi`,
+  ];
 
   push(
     `# ---------------------------------------------------------------------------`,
@@ -640,6 +1028,15 @@ export function buildHostBootstrapScript(
     `# ---------------------------------------------------------------------------`,
     "",
     `mkdir -p /etc/caddy/sites.d`,
+    "",
+    `# Admin API: a server where a new-layout bootstrap ran keeps it on`,
+    `# ${caddyAdminSocket}, so no bootstrap of any app moves it back to TCP.`,
+    `SAMOHOST_CADDY_ADMIN_SOCKET=0`,
+    `if ${!isStatic ? `[[ "\${SAMOHOST_DB_LAYOUT:-}" == split ]] || ` : ""}grep -Eq '${caddyAdminRe}' /etc/caddy/Caddyfile 2>/dev/null || grep -qsx split /var/lib/samohost/db-layout/*; then`,
+    `  SAMOHOST_CADDY_ADMIN_SOCKET=1`,
+    `fi`,
+    `SAMOHOST_CADDYFILE_PREV="$(mktemp)"`,
+    `if [[ -f /etc/caddy/Caddyfile ]]; then cp /etc/caddy/Caddyfile "$SAMOHOST_CADDYFILE_PREV"; fi`,
     "",
   );
   if (isStaticReleaseChannel) {
@@ -650,11 +1047,7 @@ export function buildHostBootstrapScript(
       `if [[ "\${SAMOHOST_CADDY_INSTALLED_NOW:-0}" == "1" || ! -f /etc/caddy/Caddyfile ]]; then`,
       `  # A just-installed package Caddyfile is vendor sample content, not a`,
       `  # legacy production route. Start fresh hosts from the canonical base.`,
-      `  cat > /etc/caddy/Caddyfile <<'CADDYFILE'`,
-      ...caddyfileHeader,
-      "",
-      "import sites.d/*.caddy",
-      "CADDYFILE",
+      ...writeBaseCaddyfile("  "),
       `elif grep -Eq '^[[:space:]]*import[[:space:]]+(/etc/caddy/)?sites\\.d/\\*\\.caddy([[:space:]]*(#.*)?)?$' /etc/caddy/Caddyfile; then`,
       `  echo "Caddy: existing sites.d import preserved."`,
       `else`,
@@ -667,18 +1060,37 @@ export function buildHostBootstrapScript(
     push(
       `# Write a minimal-but-valid Caddyfile. Idempotent: overwrite with the`,
       `# deterministic content — no append-drift.`,
-      `cat > /etc/caddy/Caddyfile <<'CADDYFILE'`,
-      ...caddyfileHeader,
-      "",
-      "import sites.d/*.caddy",
-      "CADDYFILE",
+      ...writeBaseCaddyfile(""),
       "",
     );
   }
   push(
-    `caddy validate --config /etc/caddy/Caddyfile`,
+    `# The switch from TCP to the socket: the running Caddy does not listen on`,
+    `# the new address yet, so reload fails and Caddy is restarted.`,
+    `SAMOHOST_CADDY_ADMIN_SWITCH=0`,
+    `if grep -Eq '${caddyAdminRe}' /etc/caddy/Caddyfile && ! grep -Eq '${caddyAdminRe}' "$SAMOHOST_CADDYFILE_PREV"; then`,
+    `  SAMOHOST_CADDY_ADMIN_SWITCH=1`,
+    `fi`,
+    ...caddyLogOwnerRepairLines(app.name),
+    `# As the caddy user: a log file created by a root-run validation is one`,
+    `# Caddy cannot open.`,
+    CADDY_VALIDATE_AS_CADDY_FROM_ROOT,
     `/usr/bin/systemctl enable caddy`,
-    `/usr/bin/systemctl reload caddy || /usr/bin/systemctl restart caddy`,
+    `if [[ "$SAMOHOST_CADDY_ADMIN_SWITCH" == 1 ]]; then`,
+    `  # A failed restart must reach the restore below, not stop the script.`,
+    `  /usr/bin/systemctl reload caddy || /usr/bin/systemctl restart caddy || true`,
+    `  # One reload over the socket: deploy and heal reload Caddy this way.`,
+    `  if ! /usr/bin/systemctl is-active --quiet caddy || ! /usr/bin/systemctl reload caddy; then`,
+    `    echo "ERROR: caddy is not running or does not accept a reload over the admin socket ${caddyAdminSocket} after the admin socket change; restoring the previous Caddyfile. The admin socket needs Caddy 2.5.1 or later ('caddy version' shows the installed version)." >&2`,
+    `    if [[ -s "$SAMOHOST_CADDYFILE_PREV" ]]; then cp "$SAMOHOST_CADDYFILE_PREV" /etc/caddy/Caddyfile; fi`,
+    `    /usr/bin/systemctl restart caddy || true`,
+    `    rm -f "$SAMOHOST_CADDYFILE_PREV"`,
+    `    exit 1`,
+    `  fi`,
+    `else`,
+    `  /usr/bin/systemctl reload caddy || /usr/bin/systemctl restart caddy`,
+    `fi`,
+    `rm -f "$SAMOHOST_CADDYFILE_PREV"`,
     `echo "Caddy: Caddyfile ${isStaticReleaseChannel ? "ready" : "written"} (tls=${tlsMode}), validated, reloaded."`,
     "",
   );
@@ -830,7 +1242,7 @@ export function buildHostBootstrapScript(
       '  samohost_assert_static_tree_safe "$SAMOHOST_CHECKOUT_REAL" "$SAMOHOST_STATIC_DIR" "$SAMOHOST_STATIC_ROOT"',
       '  echo "Caddy: canonical fresh static route ready; no health-proven detached deployment exists yet."',
       'fi',
-      `caddy validate --config /etc/caddy/Caddyfile`,
+      CADDY_VALIDATE_AS_CADDY_FROM_ROOT,
       `/usr/bin/systemctl reload caddy || /usr/bin/systemctl restart caddy`,
       'samohost_cleanup_bootstrap_static_route',
       'trap - EXIT',
@@ -881,7 +1293,7 @@ export function buildHostBootstrapScript(
     `#      from app.name (which could produce a different string via transforms).`,
     `# ---------------------------------------------------------------------------`,
     "",
-    `ENV_FILE=${sq(envFile)}`,
+    `# ENV_FILE, MIGRATE_ENV_FILE and SAMOHOST_DB_LAYOUT are set in §3b.`,
     "",
     `# Enable and start postgresql. Try the meta-unit first; fall back to the`,
     `# versioned cluster unit if needed.`,
@@ -898,16 +1310,10 @@ export function buildHostBootstrapScript(
     `  || { echo "ERROR: PostgreSQL cluster did not come up on 127.0.0.1:5432" >&2; exit 1; }`,
     `echo "postgres: cluster ready on 127.0.0.1:5432"`,
     "",
-    `# Superuser password: generate ONCE; persist into the env file only.`,
-    `# If the env file already carries a DATABASE_URL, reuse that password`,
-    `# (idempotent — safe to re-run after the box is already configured).`,
-    `if [[ -f "$ENV_FILE" ]] && grep -q '^DATABASE_URL=' "$ENV_FILE"; then`,
-    `  PG_SUPER_PW="$(grep '^DATABASE_URL=' "$ENV_FILE" | sed -E 's#.*//postgres:([^@]*)@.*#\\1#')"`,
-    `  echo "postgres: reusing existing superuser password from $ENV_FILE"`,
-    `else`,
-    `  PG_SUPER_PW="$(openssl rand -hex 24)"`,
-    `  echo "postgres: generated new superuser password (value only in $ENV_FILE)"`,
-    `fi`,
+    `if [[ "$SAMOHOST_DB_LAYOUT" == legacy ]]; then`,
+    `# Superuser password: PG_SUPER_PW was read from the env file's DATABASE_URL`,
+    `# and checked in §3b, before any change to the server.`,
+    `echo "postgres: reusing existing superuser password from $ENV_FILE"`,
     `# Set/rotate the postgres role password to match (idempotent).`,
     `# The whole SQL — INCLUDING the quoted literal — is fed via STDIN so the`,
     `# cleartext password never lands in argv / the process table.`,
@@ -915,18 +1321,132 @@ export function buildHostBootstrapScript(
     // Dollar-quoting: \$pgpw\$...\$pgpw\$ — fed via STDIN so cleartext never lands in argv.
     // \$pgpw\$ in the generated bash script: backslash-escaped so bash treats $ as literal.
     // Use string concatenation + explicit escapes to prevent TS template-literal expansion.
-    "printf 'ALTER ROLE postgres PASSWORD %s;\\n'" +
-      " \"\\$pgpw\\$${PG_SUPER_PW}\\$pgpw\\$\" \\",
+    `printf '%s\\n' ${noLogSqlArgs} \\`,
+    "  \"ALTER ROLE postgres PASSWORD \\$pgpw\\$${PG_SUPER_PW}\\$pgpw\\$;\" \\",
     `  | sudo -u postgres psql -p 5432 -q >/dev/null`,
     `echo "postgres: superuser password set (value not logged)"`,
+    `fi`,
+    "",
+    `# Migration role ${ownerDbRole} (split layout): owns the app's database and`,
+    `# nothing else. Not a superuser, so a migration cannot reach other`,
+    `# databases' objects or run programs on the server (COPY ... TO PROGRAM).`,
+    `# Its password is kept in the migrate env file and reused on re-runs.`,
+    `if [[ "$SAMOHOST_DB_LAYOUT" == split ]]; then`,
+    `  OWNER_DB_ROLE=${sq(ownerDbRole)}`,
+    `  OWNER_DB_PW=""`,
+    `  if [[ -f "$MIGRATE_ENV_FILE" ]] && grep -q "^DATABASE_URL=postgresql://\${OWNER_DB_ROLE}:" "$MIGRATE_ENV_FILE"; then`,
+    `    OWNER_DB_PW="$(grep '^DATABASE_URL=' "$MIGRATE_ENV_FILE" | head -1 | sed -E 's#^[^=]*=postgresql://[^:]*:([^@]*)@.*#\\1#')"`,
+    `  fi`,
+    `  if [[ "$OWNER_DB_PW" =~ ^[0-9a-f]+$ ]]; then`,
+    `    echo "postgres: reusing the existing password of role $OWNER_DB_ROLE from $MIGRATE_ENV_FILE"`,
+    `  else`,
+    `    OWNER_DB_PW="$(openssl rand -hex 24)"`,
+    `    echo "postgres: generated a new password for role $OWNER_DB_ROLE (value only in $MIGRATE_ENV_FILE)"`,
+    `  fi`,
+    `  printf '%s\\n' ${noLogSqlArgs} \\`,
+    "    \"DO \\$samohost\\$ BEGIN IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = '${OWNER_DB_ROLE}') THEN EXECUTE format('CREATE ROLE %I', '${OWNER_DB_ROLE}'); END IF; END \\$samohost\\$;\" \\",
+    "    \"ALTER ROLE ${OWNER_DB_ROLE} WITH LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS PASSWORD \\$pgpw\\$${OWNER_DB_PW}\\$pgpw\\$;\" \\",
+    `    | sudo -u postgres psql -p 5432 -q -v ON_ERROR_STOP=1 >/dev/null`,
+    `  echo "postgres: role $OWNER_DB_ROLE ready (login, no superuser) [password not logged]"`,
+    `fi`,
     "",
     `# createdb ${dbName} (idempotent: guarded by pg_database check)`,
     `if ! sudo -u postgres psql -p 5432 -qAtc \\`,
     `    "SELECT 1 FROM pg_database WHERE datname='${dbName}'" | grep -q 1; then`,
+    `  if [[ "$SAMOHOST_DB_LAYOUT" == split ]]; then`,
+    `    sudo -u postgres createdb -p 5432 -O "$OWNER_DB_ROLE" ${sq(dbName)}`,
+    `  else`,
     `  sudo -u postgres createdb -p 5432 ${sq(dbName)}`,
+    `  fi`,
     `  echo "postgres: created database ${dbName}"`,
     `else`,
     `  echo "postgres: database ${dbName} already exists"`,
+    `fi`,
+    `if [[ "$SAMOHOST_DB_LAYOUT" == split ]]; then`,
+    `  printf '%s\\n' \\`,
+    `    "SELECT format('ALTER DATABASE %I OWNER TO %I', '${dbName}', '\${OWNER_DB_ROLE}') \\\\gexec" \\`,
+    `    "SELECT format('REVOKE CONNECT, TEMPORARY ON DATABASE %I FROM PUBLIC', '${dbName}') \\\\gexec" \\`,
+    `    "SELECT format('GRANT CONNECT, TEMPORARY ON DATABASE %I TO %I', '${dbName}', '\${OWNER_DB_ROLE}') \\\\gexec" \\`,
+    `    | sudo -u postgres psql -p 5432 -q -v ON_ERROR_STOP=1 >/dev/null`,
+    `  # Tables created earlier by another role (for example by the superuser in`,
+    `  # the legacy layout) stay owned by that role; migrations as $OWNER_DB_ROLE`,
+    `  # cannot alter them until an operator changes their owner.`,
+    `  SAMOHOST_FOREIGN_OWNED="$(${psqlInAppDb(dbName)} -qAtc "SELECT pg_catalog.count(*) FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid OPERATOR(pg_catalog.=) c.relnamespace WHERE n.nspname OPERATOR(pg_catalog.=) 'public' AND c.relowner OPERATOR(pg_catalog.<>) (SELECT oid FROM pg_catalog.pg_roles WHERE rolname OPERATOR(pg_catalog.=) '\${OWNER_DB_ROLE}')" 2>/dev/null || echo 0)"`,
+    `  if [[ "\${SAMOHOST_FOREIGN_OWNED:-0}" =~ ^[1-9] ]]; then`,
+    `    echo "WARNING: \${SAMOHOST_FOREIGN_OWNED} object(s) in schema public of ${dbName} are not owned by $OWNER_DB_ROLE; migrations cannot alter them" >&2`,
+    `  fi`,
+    `fi`,
+    "",
+    `# App role ${appDbRole}: the non-superuser login role the running app uses`,
+    `# (${rlsUrlVar}). Its password is generated here once and kept in the env`,
+    `# file; a re-run reuses that password, so a working password is never`,
+    `# rotated. A ${rlsUrlVar} that names a different role was set up by hand`,
+    `# or by an older tool: that line and that role are left unchanged.`,
+    `# The SQL, including the password, reaches psql on stdin only.`,
+    `APP_DB_ROLE=${sq(appDbRole)}`,
+    `APP_DB_LINE=""`,
+    `APP_DB_PW=""`,
+    `if [[ -f "$ENV_FILE" ]] && grep -q '^${rlsUrlVar}=' "$ENV_FILE" \\`,
+    `   && ! grep -q '^${rlsUrlVar}=postgresql://[^:@/]*:app_password@' "$ENV_FILE"; then`,
+    `  APP_DB_LINE="$(grep '^${rlsUrlVar}=' "$ENV_FILE" | head -1)"`,
+    `fi`,
+    `if [[ -n "$APP_DB_LINE" ]]; then`,
+    `  APP_DB_PW="$(printf '%s' "$APP_DB_LINE" | sed -E 's#^[^=]*=postgresql://[^:]*:([^@]*)@.*#\\1#')"`,
+    `fi`,
+    `if [[ "$SAMOHOST_DB_LAYOUT" == legacy ]]; then`,
+    `  # In the legacy layout the app role would get no table rights: no role is`,
+    `  # created and the ${rlsUrlVar} line (also the placeholder) is kept as it is.`,
+    ...(rlsUrlVar === "DATABASE_URL"
+      ? [`  APP_DB_LINE=""`]
+      : [`  APP_DB_LINE="$(grep '^${rlsUrlVar}=' "$ENV_FILE" | head -1 || true)"`]),
+    `  echo "postgres: legacy layout: ${rlsUrlVar} in $ENV_FILE kept as it is; no app role created"`,
+    `elif [[ -n "$APP_DB_LINE" && ( "$APP_DB_LINE" != "${rlsUrlVar}=postgresql://\${APP_DB_ROLE}:"* || ! "$APP_DB_PW" =~ ^[0-9a-f]+$ ) ]]; then`,
+    `  echo "postgres: ${rlsUrlVar} in $ENV_FILE was not written by samohost; leaving it and its role unchanged"`,
+    `else`,
+    `  if [[ -n "$APP_DB_LINE" ]]; then`,
+    `    echo "postgres: reusing the existing password of role $APP_DB_ROLE from $ENV_FILE"`,
+    `  else`,
+    `    APP_DB_PW="$(openssl rand -hex 24)"`,
+    `    echo "postgres: generated a new password for role $APP_DB_ROLE (value only in $ENV_FILE)"`,
+    `  fi`,
+    `  printf '%s\\n' ${noLogSqlArgs} \\`,
+    "    \"DO \\$samohost\\$ BEGIN IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = '${APP_DB_ROLE}') THEN EXECUTE format('CREATE ROLE %I', '${APP_DB_ROLE}'); END IF; END \\$samohost\\$;\" \\",
+    "    \"ALTER ROLE ${APP_DB_ROLE} WITH LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS PASSWORD \\$pgpw\\$${APP_DB_PW}\\$pgpw\\$;\" \\",
+    `    "SELECT format('REVOKE CONNECT, TEMPORARY ON DATABASE %I FROM PUBLIC', '${dbName}') \\\\gexec" \\`,
+    `    "SELECT format('GRANT CONNECT, TEMPORARY ON DATABASE %I TO %I', '${dbName}', '\${APP_DB_ROLE}') \\\\gexec" \\`,
+    `    | sudo -u postgres psql -p 5432 -q -v ON_ERROR_STOP=1 >/dev/null`,
+    `  APP_DB_LINE="${rlsUrlVar}=postgresql://\${APP_DB_ROLE}:\${APP_DB_PW}@127.0.0.1:5432/${dbName}"`,
+    `  echo "postgres: role $APP_DB_ROLE ready (login, no superuser, CONNECT on ${dbName} only) [password not logged]"`,
+    `fi`,
+    `unset APP_DB_PW`,
+    "",
+    `# Rights of the role in ${rlsUrlVar} (the samohost app role or a role set up`,
+    `# by hand): CONNECT on ${dbName} in both layouts, so the REVOKE from PUBLIC`,
+    `# above does not lock out a preserved role. Split layout only: the migration`,
+    `# role owns schema public (PostgreSQL 15+ gives CREATE on it only to its`,
+    `# owner), and the app role gets data rights on the tables and sequences`,
+    `# that the migration role creates now (default privileges) and that exist.`,
+    `APP_DB_GRANTEE="$(printf '%s' "$APP_DB_LINE" | sed -E 's#^[^=]*=postgresql://([^:@/?]*).*#\\1#')"`,
+    `if [[ ! "$APP_DB_GRANTEE" =~ ^[a-z_][a-z0-9_]{0,62}$ ]]; then`,
+    `  if [[ -n "$APP_DB_LINE" ]]; then echo "WARNING: the role in ${rlsUrlVar} is not a plain lowercase name; it gets no grants" >&2; fi`,
+    `  APP_DB_GRANTEE=""`,
+    `fi`,
+    `if [[ -n "$APP_DB_GRANTEE" ]]; then`,
+    `  printf '%s\\n' \\`,
+    `    "SELECT format('GRANT CONNECT, TEMPORARY ON DATABASE %I TO %I', '${dbName}', rolname) FROM pg_catalog.pg_roles WHERE rolname = '\${APP_DB_GRANTEE}' \\\\gexec" \\`,
+    `    | sudo -u postgres psql -p 5432 -q -v ON_ERROR_STOP=1 >/dev/null`,
+    `fi`,
+    `if [[ "$SAMOHOST_DB_LAYOUT" == split ]]; then`,
+    `  printf '%s\\n' \\`,
+    `    "SELECT format('ALTER SCHEMA public OWNER TO %I', '\${OWNER_DB_ROLE}') \\\\gexec" \\`,
+    `    "SELECT format('GRANT USAGE ON SCHEMA public TO %I', rolname) FROM pg_catalog.pg_roles WHERE rolname = '\${APP_DB_GRANTEE}' \\\\gexec" \\`,
+    `    "SELECT format('ALTER DEFAULT PRIVILEGES FOR ROLE %I IN SCHEMA public GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO %I', '\${OWNER_DB_ROLE}', rolname) FROM pg_catalog.pg_roles WHERE rolname = '\${APP_DB_GRANTEE}' \\\\gexec" \\`,
+    `    "SELECT format('ALTER DEFAULT PRIVILEGES FOR ROLE %I IN SCHEMA public GRANT USAGE, SELECT, UPDATE ON SEQUENCES TO %I', '\${OWNER_DB_ROLE}', rolname) FROM pg_catalog.pg_roles WHERE rolname = '\${APP_DB_GRANTEE}' \\\\gexec" \\`,
+    `    "SELECT format('GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO %I', rolname) FROM pg_catalog.pg_roles WHERE rolname = '\${APP_DB_GRANTEE}' \\\\gexec" \\`,
+    `    "SELECT format('GRANT USAGE, SELECT, UPDATE ON ALL SEQUENCES IN SCHEMA public TO %I', rolname) FROM pg_catalog.pg_roles WHERE rolname = '\${APP_DB_GRANTEE}' \\\\gexec" \\`,
+    `    "SELECT format('REVOKE INSERT, UPDATE, DELETE ON TABLE public.schema_migrations FROM %I', rolname) FROM pg_catalog.pg_roles WHERE rolname = '\${APP_DB_GRANTEE}' AND pg_catalog.to_regclass('public.schema_migrations') IS NOT NULL \\\\gexec" \\`,
+    `    | ${psqlInAppDb(dbName)} -q -v ON_ERROR_STOP=1 >/dev/null`,
+    `  echo "postgres: schema public of ${dbName} owned by $OWNER_DB_ROLE; data rights for \${APP_DB_GRANTEE:-no app role}"`,
     `fi`,
     "",
   );
@@ -935,9 +1455,10 @@ export function buildHostBootstrapScript(
   push(
     `# ---------------------------------------------------------------------------`,
     `# §11. Base env file seeding (PR-A2-e): ${envFile}`,
-    `#      600, ${appUser}-owned. DATABASE_URL = superuser (migrations/seed only).`,
-    `#      ${rlsUrlVar} = ${appDbRole}:app_password placeholder`,
-    `#        (deploy.sh rotates the password on the first deploy).`,
+    `#      600, ${appUser}-owned. Split layout: ${rlsUrlVar} (role ${appDbRole}) in the`,
+    `#      runtime env file; DATABASE_URL (role ${ownerDbRole}) and SEED_OWNER_* in`,
+    `#      ${migrateEnvFile}. Legacy layout: one file with the superuser DATABASE_URL.`,
+    `#      Written in a root-owned temporary directory, then renamed into place.`,
     `#      PG_BACKEND is intentionally NOT set here — it lives in the unit's`,
     `#      Environment= directive (stack-prep.sh invariant).`,
     `#      Idempotent: reuses existing secrets across re-runs.`,
@@ -949,6 +1470,9 @@ export function buildHostBootstrapScript(
     `else`,
     `  SEED_PW="$(openssl rand -hex 8)"`,
     `fi`,
+    `if [[ "$SAMOHOST_DB_LAYOUT" == split ]] && [[ -f "$MIGRATE_ENV_FILE" ]] && grep -q '^SEED_OWNER_PASSWORD=' "$MIGRATE_ENV_FILE"; then`,
+    `  SEED_PW="$(grep '^SEED_OWNER_PASSWORD=' "$MIGRATE_ENV_FILE" | head -1 | cut -d= -f2-)"`,
+    `fi`,
     "",
     `# Cookie secret: generate once; reuse if already present.`,
     `if [[ -f "$ENV_FILE" ]] && grep -q '^COOKIE_SECRET=' "$ENV_FILE"; then`,
@@ -957,14 +1481,7 @@ export function buildHostBootstrapScript(
     `  COOKIE_SECRET="$(openssl rand -hex 32)"`,
     `fi`,
     "",
-    `# Preserve an already-rotated ${rlsUrlVar} across re-runs.`,
-    `# The placeholder (${appDbRole}:app_password) is only valid before the first deploy.`,
-    `APP_DB_LINE="${rlsUrlVar}=postgresql://${appDbRole}:app_password@127.0.0.1:5432/${dbName}"`,
-    `if [[ -f "$ENV_FILE" ]] && grep -q '^${rlsUrlVar}=postgresql://${appDbRole}:' "$ENV_FILE" \\`,
-    `   && ! grep -q '^${rlsUrlVar}=postgresql://${appDbRole}:app_password@' "$ENV_FILE"; then`,
-    `  APP_DB_LINE="$(grep '^${rlsUrlVar}=' "$ENV_FILE" | head -1)"`,
-    `  echo "$ENV_FILE: preserving already-rotated ${rlsUrlVar}"`,
-    `fi`,
+    `# ${rlsUrlVar}: APP_DB_LINE was set in §10 (the app role and its password).`,
     "",
     `# Preserve deploy bookkeeping vars (DEPLOYED_SHA, DEPLOY_FAILED_SHA) if present.`,
     `PRESERVE=""`,
@@ -975,10 +1492,14 @@ export function buildHostBootstrapScript(
     `done`,
     "",
     `umask 077`,
-    `cat > "$ENV_FILE" <<ENVEOF`,
+    `# Root-owned temporary directory next to the app directory (same file`,
+    `# system), so the rename below replaces the target name without following it.`,
+    `SAMOHOST_WRITE_DIR="$(mktemp -d ${sq(`${dirname(dirname(envFile))}/.samohost-bootstrap.XXXXXX`)})"`,
+    `if [[ "$SAMOHOST_DB_LAYOUT" == legacy ]]; then`,
+    `cat > "$SAMOHOST_WRITE_DIR/env" <<ENVEOF`,
     `# ${app.name} env file — generated by samohost host-bootstrap. chmod 600, ${appUser}-owned.`,
     `# NEVER commit. DATABASE_URL is the superuser (migrations/seed only).`,
-    `# ${rlsUrlVar} placeholder is rotated by deploy.sh on the first deploy.`,
+    `# ${rlsUrlVar} is the app's own non-superuser role.`,
     `# PG_BACKEND is intentionally NOT set here — it is set in ${unit}.service Environment=.`,
     `DATABASE_URL=postgresql://postgres:\${PG_SUPER_PW}@127.0.0.1:5432/${dbName}`,
     `\${APP_DB_LINE}`,
@@ -986,13 +1507,50 @@ export function buildHostBootstrapScript(
     `PORT=${appPort}`,
     `HOST=0.0.0.0`,
     `COOKIE_SECRET=\${COOKIE_SECRET}`,
+    ...trustedProxiesEnvLines,
     `SEED_OWNER_LOGIN=${seedOwnerLogin}`,
     `SEED_OWNER_PASSWORD=\${SEED_PW}`,
     `ENVEOF`,
-    `[[ -n "\${PRESERVE}" ]] && printf '%s' "\${PRESERVE}" >> "$ENV_FILE"`,
-    `chown ${sq(appUser)}:${sq(appUser)} "$ENV_FILE"`,
-    `chmod 600 "$ENV_FILE"`,
+    `else`,
+    `cat > "$SAMOHOST_WRITE_DIR/env" <<ENVEOF`,
+    `# ${app.name} runtime env file — generated by samohost host-bootstrap. chmod 600, ${appUser}-owned.`,
+    `# Loaded by ${unit}.service. NEVER commit. No superuser or migration address:`,
+    `# ${rlsUrlVar} is the app's own non-superuser role. HOST is loopback: Caddy on`,
+    `# this server is the app's only client.`,
+    `\${APP_DB_LINE}`,
+    `NODE_ENV=production`,
+    `PORT=${appPort}`,
+    `HOST=127.0.0.1`,
+    `COOKIE_SECRET=\${COOKIE_SECRET}`,
+    ...trustedProxiesEnvLines,
+    `ENVEOF`,
+    `cat > "$SAMOHOST_WRITE_DIR/migrate" <<MIGRATEEOF`,
+    `# ${app.name} migrate env file — generated by samohost host-bootstrap. chmod 600, ${appUser}-owned.`,
+    `# Loaded only by the deploy's migrate step. NEVER commit.`,
+    `# DATABASE_URL is the migration role (owner of ${dbName} only, not a superuser).`,
+    `DATABASE_URL=postgresql://\${OWNER_DB_ROLE}:\${OWNER_DB_PW}@127.0.0.1:5432/${dbName}`,
+    `SEED_OWNER_LOGIN=${seedOwnerLogin}`,
+    `SEED_OWNER_PASSWORD=\${SEED_PW}`,
+    `MIGRATEEOF`,
+    `chown ${sq(appUser)}:${sq(appUser)} "$SAMOHOST_WRITE_DIR/migrate"`,
+    `chmod 600 "$SAMOHOST_WRITE_DIR/migrate"`,
+    `unset OWNER_DB_PW`,
+    `fi`,
+    `[[ -n "\${PRESERVE}" ]] && printf '%s' "\${PRESERVE}" >> "$SAMOHOST_WRITE_DIR/env"`,
+    `chown ${sq(appUser)}:${sq(appUser)} "$SAMOHOST_WRITE_DIR/env"`,
+    `chmod 600 "$SAMOHOST_WRITE_DIR/env"`,
+    `for _f in "$ENV_FILE" "$MIGRATE_ENV_FILE"; do`,
+    `  if [[ -L "$_f" ]]; then echo "ERROR: $_f is a symbolic link; refusing to replace it" >&2; rm -rf "$SAMOHOST_WRITE_DIR"; exit 1; fi`,
+    `done`,
+    `mv -fT "$SAMOHOST_WRITE_DIR/env" "$ENV_FILE"`,
     `echo "$ENV_FILE: written (600, ${appUser}). [secret values not logged]"`,
+    `if [[ "$SAMOHOST_DB_LAYOUT" == split ]]; then`,
+    `  mv -fT "$SAMOHOST_WRITE_DIR/migrate" "$MIGRATE_ENV_FILE"`,
+    `  echo "$MIGRATE_ENV_FILE: written (600, ${appUser}). [secret values not logged]"`,
+    `  mkdir -p /var/lib/samohost/db-layout`,
+    `  printf 'split\\n' > "$SAMOHOST_LAYOUT_MARKER"`,
+    `fi`,
+    `rmdir "$SAMOHOST_WRITE_DIR"`,
     "",
   );
   } // end if (!isStatic) for §10 + §11
@@ -1022,6 +1580,13 @@ export function buildHostBootstrapScript(
     `chown ${sq(appUser)}:${sq(appUser)} "$GIT_SAFE_CONF"`,
     `chmod 644 "$GIT_SAFE_CONF"`,
     "",
+    ...(runtimeUserUsable
+      ? [
+          `# split layout: the service runs as ${runtimeUser}, which reads the checkout`,
+          `# through the world-read bit. §11 left umask 077 for the env files.`,
+          `if [[ "$SAMOHOST_DB_LAYOUT" == split ]]; then umask 022; fi`,
+        ]
+      : []),
     `if [[ -d "$APP_DIR/.git" ]]; then`,
     `  echo "clone: $APP_DIR already a git checkout — leaving in place."`,
     `elif [[ -s "$TOKEN_FILE" ]]; then`,
@@ -1054,6 +1619,15 @@ export function buildHostBootstrapScript(
     `else`,
     `  echo "clone: SKIPPED (no token). Place a 600 token at $TOKEN_FILE and re-run."`,
     `fi`,
+    ...(runtimeUserUsable
+      ? [
+          `# split layout: open up files an earlier clone left owner-only. Runs as the`,
+          `# deploy user, who owns them; skips .git and does not follow links.`,
+          `if [[ "$SAMOHOST_DB_LAYOUT" == split && -d "$APP_DIR" && ! -L "$APP_DIR" ]]; then`,
+          `  sudo -u ${sq(appUser)} find "$APP_DIR" -path "$APP_DIR/.git" -prune -o ! -type l -exec chmod go+rX {} +`,
+          `fi`,
+        ]
+      : []),
     "",
   );
 

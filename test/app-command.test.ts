@@ -375,6 +375,22 @@ describe("app bootstrap uses the stored app kind for the database contract", () 
     expect(c.o).toContain("proto tcp from '91.99.233.145' to any port 80");
   });
 
+  test("cp-http80 bootstrap refuses a --control-plane-ip that differs from the one recorded for the VM", () => {
+    const existing = appStore.get("vm-1111", "site")!;
+    appStore.upsert({ ...existing, mainHost: "site.example.com", mainListen: "cp-http80" });
+    vmStore.upsert(vm({ controlPlaneIp: "192.0.2.10" } as Partial<VmRecord> & { controlPlaneIp: string }));
+    const c = capture();
+    const input = {
+      vm: "samo-we-field-record",
+      app: "site",
+      appUser: "site",
+      controlPlaneIp: "192.0.2.99",
+    } as Parameters<typeof runAppBootstrap>[0] & { controlPlaneIp: string };
+    expect(runAppBootstrap(input, vmStore, appStore, c.out, c.err)).toBe(1);
+    expect(c.o).toBe("");
+    expect(c.e).toContain("differs from the control-plane IP recorded for vm");
+  });
+
   test("persisted control-plane IP does not open :80 for a static TLS app", () => {
     vmStore.upsert(vm({
       controlPlaneIp: "91.99.233.145",
@@ -718,6 +734,113 @@ describe("app commands", () => {
     const rec = appStore.get("vm-1111", "field-record");
     expect(rec?.failedSha).toBe(SHA);
     expect(rec?.deployedSha).toBe("GOODSHA"); // NOT advanced on failure
+  });
+
+  test("deploy lowercases an uppercase --sha and records it lowercase", async () => {
+    register();
+    const c = capture();
+    let script = "";
+    const code = await runAppDeploy(
+      { vm: "samo-we-field-record", app: "field-record", sha: SHA.toUpperCase(), skipCiGate: true },
+      { json: true }, vmStore, appStore,
+      deployDeps(HAPPY, {
+        remote: (_vm, s): Promise<SpawnResult> => {
+          script = s;
+          return Promise.resolve({ code: 0, stdout: HAPPY, stderr: "" });
+        },
+      }),
+      c.out, c.err,
+    );
+    expect(code, c.e).toBe(0);
+    expect(script).toContain(SHA);
+    expect(appStore.get("vm-1111", "field-record")?.deployedSha).toBe(SHA);
+  });
+
+  for (const [envFile, reason] of [
+    ["staging.env", "no directory"],
+    ["/opt/field-record/release.env", "the reserved name release.env"],
+    ["/opt/field-record/migrate.env", "the reserved name migrate.env"],
+  ] as const) {
+    test(`register refuses an envFile with ${reason}`, () => {
+      const c = capture();
+      const code = runAppRegister(
+        {
+          vm: "samo-we-field-record",
+          name: "field-record",
+          repo: "Tanya301/field-record-1",
+          branch: "main",
+          appDir: "/opt/field-record/app",
+          buildCmd: "npm run build",
+          serviceUnit: "field-record",
+          healthUrl: "http://localhost:3000/api/version",
+          envFile,
+          rlsNonSuperuser: false,
+        },
+        { json: false }, vmStore, appStore, c.out, c.err,
+      );
+      expect(code).toBe(1);
+      expect(c.e).toContain("envFile");
+      expect(appStore.get("vm-1111", "field-record")).toBeUndefined();
+    });
+  }
+
+  for (const phase of ["install", "build"] as const) {
+    test(`rollback after a failed ${phase}: exit 1, outcome rolled-back, no failedSha recorded`, async () => {
+      register();
+      appStore.upsert({ ...appStore.get("vm-1111", "field-record")!, deployedSha: "GOODSHA" });
+      const c = capture();
+      const stream = [
+        "<<<SAMOHOST_PHASE:fetch:start>>>", "<<<SAMOHOST_PHASE:fetch:ok>>>",
+        ...(phase === "build" ? ["<<<SAMOHOST_PHASE:install:start>>>", "<<<SAMOHOST_PHASE:install:ok>>>"] : []),
+        `<<<SAMOHOST_PHASE:${phase}:start>>>`, `<<<SAMOHOST_PHASE:${phase}:fail>>>`,
+        "<<<SAMOHOST_PHASE:rollback:ok>>>",
+      ].join("\n");
+      const code = await runAppDeploy(
+        { vm: "samo-we-field-record", app: "field-record", sha: SHA, skipCiGate: false },
+        { json: true }, vmStore, appStore, deployDeps(stream), c.out, c.err,
+      );
+      expect(code).toBe(1);
+      expect(JSON.parse(c.o).outcome).toBe("rolled-back");
+      const rec = appStore.get("vm-1111", "field-record");
+      expect(rec?.failedSha).toBeUndefined();
+      expect(rec?.deployedSha).toBe("GOODSHA");
+    });
+  }
+
+  for (const phase of ["migrate", "health", "assert-rls"] as const) {
+    test(`rollback after a failed ${phase}: failedSha recorded`, async () => {
+      register();
+      const c = capture();
+      const stream = [
+        "<<<SAMOHOST_PHASE:install:start>>>", "<<<SAMOHOST_PHASE:install:ok>>>",
+        "<<<SAMOHOST_PHASE:build:start>>>", "<<<SAMOHOST_PHASE:build:ok>>>",
+        `<<<SAMOHOST_PHASE:${phase}:start>>>`, `<<<SAMOHOST_PHASE:${phase}:fail>>>`,
+        "<<<SAMOHOST_PHASE:rollback:ok>>>",
+      ].join("\n");
+      const code = await runAppDeploy(
+        { vm: "samo-we-field-record", app: "field-record", sha: SHA, skipCiGate: false },
+        { json: true }, vmStore, appStore, deployDeps(stream), c.out, c.err,
+      );
+      expect(code).toBe(1);
+      expect(JSON.parse(c.o).outcome).toBe("rolled-back");
+      expect(appStore.get("vm-1111", "field-record")?.failedSha).toBe(SHA);
+    });
+  }
+
+  test("failed rollback after a failed install: no failedSha recorded", async () => {
+    register();
+    const c = capture();
+    const stream = [
+      "<<<SAMOHOST_PHASE:install:start>>>", "<<<SAMOHOST_PHASE:install:fail>>>",
+      "<<<SAMOHOST_PHASE:rollback:fail>>>",
+    ].join("\n");
+    const code = await runAppDeploy(
+      { vm: "samo-we-field-record", app: "field-record", sha: SHA, skipCiGate: false },
+      { json: true }, vmStore, appStore, deployDeps(stream), c.out, c.err,
+    );
+    expect(code).toBe(1);
+    expect(JSON.parse(c.o).outcome).toBe("rollback-failed");
+    expect(appStore.get("vm-1111", "field-record")?.failedSha).toBeUndefined();
   });
 
   test("known-bad-SHA guard refuses a recorded failedSha", async () => {

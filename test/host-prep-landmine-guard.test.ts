@@ -39,6 +39,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { buildHostPrepScript } from "../src/env/script.ts";
 import type { AppRecord } from "../src/types.ts";
+import { CADDY_SUDO_STUB } from "./caddy-sudo-stub.ts";
 
 // ---------------------------------------------------------------------------
 // Fixtures
@@ -160,6 +161,8 @@ function runGuard(opts: {
       ].join("\n"),
       { mode: 0o755 },
     );
+
+    writeFileSync(join(binDir, "sudo"), CADDY_SUDO_STUB, { mode: 0o755 });
 
     // systemctl shim: logs reload calls.
     writeFileSync(

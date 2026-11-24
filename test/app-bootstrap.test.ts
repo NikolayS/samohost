@@ -567,7 +567,7 @@ function demoOptsA2(overrides: Partial<HostBootstrapOptions> = {}): HostBootstra
   return {
     appUser: "deployer",
     dbName: "demo_db",
-    appDbRole: "svc_user",
+    appDbRole: "demo_db_svc",
     seedOwnerLogin: "admin_owner",
     ...overrides,
   };
@@ -647,7 +647,8 @@ describe("buildHostBootstrapScript (A2) — DB superuser password handling", () 
     expect(script).toContain("ALTER ROLE postgres PASSWORD");
     // The psql invocation that carries the ALTER must use stdin piping, not -c with password
     // Pattern: something | ... psql  (the pipe feeds the SQL)
-    expect(script).toMatch(/printf[^\n]*\|\s*(sudo[^\n]*)?\s*.*psql|printf[^\n]*ALTER ROLE/);
+    // printf '%s\n' <no-log settings> \ / "ALTER ROLE postgres PASSWORD ..." \ / | sudo -u postgres psql
+    expect(script).toMatch(/printf '%s\\n'[^\n]*\\\n\s*"ALTER ROLE postgres PASSWORD[^\n]*\\\n\s*\|\s*sudo -u postgres psql/);
   });
 
   test("no PGPASSWORD= in a command line (password must not be in argv)", () => {
@@ -698,7 +699,9 @@ describe("buildHostBootstrapScript (A2) — base env file content", () => {
 
   test("env file is chowned to appUser", () => {
     const script = buildHostBootstrapScript(fieldRecord(), frOpts());
-    expect(script).toMatch(/chown.*agent.*staging\.env|chown.*agent.*ENV_FILE/);
+    // Written in a root-owned temporary directory, chowned there, then renamed.
+    expect(script).toContain(`chown 'agent':'agent' "$SAMOHOST_WRITE_DIR/env"`);
+    expect(script).toContain('mv -fT "$SAMOHOST_WRITE_DIR/env" "$ENV_FILE"');
   });
 
   test("env file contains DATABASE_URL=postgresql://postgres:", () => {
@@ -784,20 +787,22 @@ describe("buildHostBootstrapScript (A2) — base env file content", () => {
     expect(script).toContain("APP_DATABASE_URL=");
   });
 
-  test("custom appDbRole option used in RLS URL placeholder (default: app_user)", () => {
+  test("default app role is <dbName>_app, written with the generated password", () => {
     const script = buildHostBootstrapScript(fieldRecord(), frOpts());
-    // Default role is app_user
-    expect(script).toMatch(/APP_DATABASE_URL=postgresql:\/\/app_user:/);
+    expect(script).toContain("APP_DB_ROLE='field_record_app'");
+    expect(script).toContain(
+      'APP_DB_LINE="APP_DATABASE_URL=postgresql://${APP_DB_ROLE}:${APP_DB_PW}@127.0.0.1:5432/field_record"',
+    );
   });
 
-  test("custom appDbRole option (svc_user) appears in RLS URL placeholder", () => {
-    const script = buildHostBootstrapScript(demoApp(), demoOptsA2({ appDbRole: "svc_user" }));
-    expect(script).toMatch(/[A-Z_]*DATABASE_URL=postgresql:\/\/svc_user:/);
+  test("custom appDbRole option (demo_db_svc) is the role in the URL", () => {
+    const script = buildHostBootstrapScript(demoApp(), demoOptsA2({ appDbRole: "demo_db_svc" }));
+    expect(script).toContain("APP_DB_ROLE='demo_db_svc'");
   });
 
-  test("RLS URL placeholder uses literal 'app_password' (deploy.sh rotates on first deploy)", () => {
+  test("the literal 'app_password' placeholder is never written (only detected for replacement)", () => {
     const script = buildHostBootstrapScript(fieldRecord(), frOpts());
-    expect(script).toMatch(/APP_DATABASE_URL=postgresql:\/\/app_user:app_password@/);
+    expect(script).not.toMatch(/APP_DATABASE_URL=postgresql:\/\/app_user:app_password@127/);
   });
 
   test("env file preserves idempotency: reuse existing COOKIE_SECRET if present", () => {
@@ -1041,9 +1046,9 @@ describe("buildHostBootstrapScript (A2) — no hardcoding with demo-app fixture"
     expect(script).toContain("demo_db");
   });
 
-  test("demo-app script contains custom appDbRole 'svc_user'", () => {
-    const script = buildHostBootstrapScript(demoApp(), demoOptsA2({ appDbRole: "svc_user" }));
-    expect(script).toContain("svc_user");
+  test("demo-app script contains custom appDbRole 'demo_db_svc'", () => {
+    const script = buildHostBootstrapScript(demoApp(), demoOptsA2({ appDbRole: "demo_db_svc" }));
+    expect(script).toContain("demo_db_svc");
   });
 
   test("demo-app script contains custom seedOwnerLogin 'admin_owner'", () => {

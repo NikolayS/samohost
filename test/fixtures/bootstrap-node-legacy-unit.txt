@@ -1,0 +1,15 @@
+[Unit]
+Description=shop main service
+After=network.target postgresql.service
+
+[Service]
+User=shop
+Group=shop
+WorkingDirectory=/opt/shop/app
+EnvironmentFile=/opt/shop/staging.env
+EnvironmentFile=-/opt/shop/release.env
+ExecStart=/usr/bin/node dist/server.js
+Restart=always
+
+[Install]
+WantedBy=multi-user.target

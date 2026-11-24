@@ -198,6 +198,261 @@ serviceUnit = "field-record-1"                      # systemd unit restarted on 
 No secrets ever belong in the manifest — it lives in a (often public) client
 repo. Database URLs / tokens stay in the app's own `--env-file` on the host.
 
+The RLS probe (`--assert-rls` on deploy, `rls-nonsuperuser` in `doctor`)
+reads the address in the variable named by `rlsUrlVar` and accepts the forms
+psql accepts as its database argument:
+
+- `postgresql://` and `postgres://` URIs, with or without user and password,
+  host names, IPv6 literals such as `[::1]`, socket directories (`?host=/run/postgresql`
+  or a percent-encoded host such as `%2Frun%2Fpostgresql`), several hosts and
+  query parameters such as `sslmode=require`;
+- `key=value` strings such as `host=127.0.0.1 user=app password='p w' dbname=app`;
+- a plain database name.
+
+The probe removes the password (from `user:password@` or a `password=` query
+parameter of a URI, or the `password` pair of a `key=value` string) and passes
+it to psql in `PGPASSWORD`; the rest of the address is psql's `-d` argument as
+written. In a URI password each `%XX` of two hexadecimal digits is decoded;
+every other character stays as it is (`+`, a backslash, a `%` that is not
+followed by two hexadecimal digits, and `%00`). A `key=value` string with a
+quoted value that has no closing quote fails the probe; psql refuses it too.
+
+### Database roles and env files of a node app
+
+`app bootstrap --db-name <db>` creates two PostgreSQL roles for a node app,
+both without superuser, CREATEDB, CREATEROLE, REPLICATION or BYPASSRLS:
+
+- `<db>_app`: the role the running app uses (`APP_DATABASE_URL`).
+- `<db>_owner`: the owner of database `<db>` and nothing else, used by
+  `migrateCmd` and `seedCmd` (`DATABASE_URL` in the migrate env file).
+
+CONNECT on `<db>` is revoked from PUBLIC and granted to these two roles.
+Passwords are generated on the server and kept on re-runs.
+
+`<db>_owner` owns schema `public` of `<db>`, so migrations can create
+tables in it (PostgreSQL 15 and later give CREATE on `public` only to its
+owner). `<db>_app` gets USAGE on schema `public`, SELECT, INSERT, UPDATE and
+DELETE on tables, and USAGE, SELECT and UPDATE on sequences: as default
+privileges for objects that `<db>_owner` creates later, and as grants on the
+objects that exist when bootstrap runs. The default privileges also apply
+to `public.schema_migrations`: from the moment a migration creates it,
+`<db>_app` can change it until the migrate run (in the SAMO app template)
+or a bootstrap re-run revokes INSERT, UPDATE and DELETE on it. After its
+grants, bootstrap revokes these rights, so a re-run does not give them
+back. A re-run still
+grants the rights again on other tables from which a migration revoked
+them; the next migrate run revokes them again. If
+`APP_DATABASE_URL` names a role that samohost did not create, that role and
+the line are left unchanged, and the role gets CONNECT on `<db>` and the
+same rights.
+
+What the app sees:
+
+- new layout: the running app has `APP_DATABASE_URL` and no
+  `DATABASE_URL`. `DATABASE_URL` (the owner role) and `APP_DATABASE_URL`
+  are both set only for `migrateCmd` and `seedCmd`.
+- old layout (bootstrapped by an older samohost): the running app keeps
+  `DATABASE_URL` (the superuser) and `APP_DATABASE_URL`.
+
+A bootstrap re-run keeps the old layout for an app whose env file has any
+`DATABASE_URL` line (any scheme, any user), no `migrate.env` and no
+root-owned marker `/var/lib/samohost/db-layout/<app>` that says `split`.
+In the old layout bootstrap creates no `<db>_app` role and keeps the
+`APP_DATABASE_URL` line as it is, also the `app_password` placeholder. It
+reads the superuser password from `DATABASE_URL` in §3b, before it changes
+anything on the server; when that line is not
+`postgresql://postgres:<hex>@...` (or `postgres://`), bootstrap stops there
+with nothing changed. A legacy app's env file must keep its `DATABASE_URL=`
+line: when the env file is missing or has no `DATABASE_URL=` line, there is
+no `migrate.env` and no marker, and `/etc/systemd/system/<serviceUnit>.service`
+has `User=<appUser>` (the unit a legacy bootstrap writes; the new layout
+writes `User=<app>-run`), bootstrap stops in §3b with nothing changed instead
+of converting the app.
+
+Two env files sit next to each other on the server:
+
+- the runtime env file (`envFile`, loaded by the systemd unit): the app's
+  `APP_DATABASE_URL` and no other database address;
+- `migrate.env` in the same directory: the owner role's `DATABASE_URL` and
+  `SEED_OWNER_LOGIN` / `SEED_OWNER_PASSWORD`. Only the deploy's migrate and
+  seed steps load it. `npm ci` and the build run with no database address in
+  their environment.
+
+An app bootstrapped by an older samohost has the superuser `DATABASE_URL` in
+its runtime env file and no `migrate.env`. Bootstrap and deploy detect that
+and keep it as it is. To move such an app to the new layout:
+
+1. As root on the server, remove the `DATABASE_URL=postgresql://postgres:...`
+   and `SEED_OWNER_*` lines from the runtime env file, and write the marker:
+   `install -d -m 755 /var/lib/samohost/db-layout && echo split > /var/lib/samohost/db-layout/<app>`.
+2. Run `app bootstrap` again. It now uses the new layout: it creates
+   `<db>_owner`, makes it the owner of `<db>`, writes `migrate.env`, and prints
+   a warning when objects in schema `public` are owned by another role.
+3. As root, give those objects to `<db>_owner`
+   (`sudo -u postgres env PGOPTIONS='-c search_path=pg_catalog' psql -d <db>`,
+   then `ALTER TABLE public.<name> OWNER TO <db>_owner;` for each table, view
+   and unowned sequence), so migrations can alter them. Keep the
+   `search_path` setting: the owner of `<db>` can set the database's
+   `search_path`, and a superuser session that resolves names through
+   `public` could run functions that role wrote.
+4. Deploy. The next deploy finds `migrate.env` and uses the new layout.
+
+### Client addresses behind the control plane (cp-http80 node apps)
+
+The control plane proxies to this server's Caddy on port 80, and Caddy
+proxies to the app on `localhost:<port>`. Caddy's main vhost, including the
+favicon route, keeps the X-Forwarded-For entries of the control-plane
+address only (`trusted_proxies`). The runtime env file gets
+`TRUSTED_PROXIES=127.0.0.1,<control plane address>`: the app's TCP peer is
+Caddy on 127.0.0.1, then the control plane. In the new layout the env file
+gives the app `HOST=127.0.0.1`; an app that listens on `HOST` then accepts
+connections from this server only (the SAMO app template listens on
+127.0.0.1 unless `LISTEN_HOST` is set). The legacy layout keeps
+`HOST=0.0.0.0`. Bootstrap, heal and host-prep use the control-plane address
+recorded for the VM; `app bootstrap --control-plane-ip` with a different
+address is refused.
+
+Host-prep and heal replace, with a backup, a main vhost of such an app that
+an older samohost wrote: a file byte-equal to the earlier host-prep form
+`<host> {` / `reverse_proxy localhost:<port>` / `}`, or (host-prep) a file
+whose first line is samohost's provenance header. Host-prep still refuses any
+other differing file unless `--force-main-vhost` is given. Heal replaces the
+earlier form only when the deploy user has the caddy validate sudo rule (see
+below) and the current configuration validates as caddy, both checked before
+any write; heal keeps the backup in `~/samohost-backups/` of the deploy user.
+Without the rule, heal reports `drift-foreign` and changes nothing, as an
+older samohost did, until host-prep or a bootstrap re-run with this version
+replaces the file. When heal restores files after a failure, it compares the
+health check with the answer before its first write: an app that answered
+with a redirect before answers the same after a clean rollback.
+
+### Caddy validation and log files
+
+`caddy validate` opens the log file of every vhost in `/var/log/caddy`; only
+the caddy user can open those files, and a file that validation creates as
+root is one Caddy cannot open. Host-prep and bootstrap (root) validate with
+`sudo -u caddy`, and give an existing `/var/log/caddy/<app>-prod.log` that
+another user owns to caddy (a symbolic link there is left as it is). When the
+reload after host-prep wrote the main vhost fails, host-prep puts the
+previous file back. Deploy and heal (the deploy user) validate through the
+sudo rule `<deploy user> ALL=(caddy) NOPASSWD: /usr/bin/caddy validate
+--config /etc/caddy/Caddyfile`, which bootstrap writes for static, legacy
+and new-layout apps. A deploy user without the rule (bootstrapped by an older
+samohost) validates as itself, as before, and that fails on a server where
+another app's vhost names a log file. On a server that gets a new-layout app
+or a cp-http80 node vhost with a log file, run bootstrap again once for its
+static and legacy apps.
+
+### Rollback of a node deploy
+
+A node deploy runs fetch, checkout, install, build, migrate, restart and the
+health check. `dist/` is copied to `dist.prev/` before install and build.
+
+- If install, build or migrate fails and a previous release exists (`dist/`
+  was present before the deploy), the deploy resets the checkout to the
+  previous commit and restores `dist/` from `dist.prev/`. The service was not
+  restarted and keeps running the previous release; its health is checked.
+- If the health check fails after the restart, the deploy restores the same
+  files and `release.env`, restarts the service and checks health again.
+- On a first deploy (no `dist/` before it) a failure is reported without a
+  rollback.
+
+Migrations that already ran are not undone, in either case. `node_modules`
+is not restored. The previous release must therefore work with the new
+schema: add columns as nullable or with a default, and drop a column only
+in a release after the code stopped using it. samohost records the commit as
+failed (`failedSha`) after a rollback that follows a failed migrate, health
+check or `assert-rls`, and does not deploy it again until `app clear-failed`.
+A rollback after a failed install or build (for example an npm registry
+outage) does not record the commit: the outcome is `rolled-back`, the exit
+code 1, and the next trigger cycle deploys the same commit again.
+
+### Runtime user and service hardening of a node app
+
+This applies to node apps with the split env layout (a `migrate.env` next to
+the runtime env file; every new node app). Static apps and node apps that
+keep the legacy layout get the same sudo rules and unit as before.
+
+- The service runs as `<app>-run`: a system user with no login shell, no
+  sudo rules and its own group only. It reads the release through the
+  world-read bit of the checkout, `node_modules` and `dist/`. It can write
+  `/opt/<app>/uploads` and its private `/tmp` and `/var/tmp`
+  (`PrivateTmp`), nothing else. systemd reads `EnvironmentFile=` files before it
+  drops to this user, so the runtime env file stays mode 600.
+- The unit sets `NoNewPrivileges`, `ProtectSystem=strict`, `ProtectHome`,
+  `PrivateTmp`, `PrivateDevices`, the kernel and cgroup protections,
+  `ProtectProc=invisible`, `RestrictSUIDSGID`,
+  `RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK` (Node's
+  `os.networkInterfaces()` needs `AF_NETLINK`), an
+  empty `CapabilityBoundingSet`, `LockPersonality`, `MemoryMax=50%`,
+  `TasksMax=256`, `ReadWritePaths=/opt/<app>/uploads`, and
+  `InaccessiblePaths=` for `migrate.env`, `.gh-token`, `git-safe.conf`, the
+  checkout's `.git` and `.npmrc`. `MemoryDenyWriteExecute` is not set
+  because Node's JIT needs it off.
+- `/opt/<app>` is root-owned (755). The deploy user owns only the checkout
+  `/opt/<app>/app`, and the runtime user owns `/opt/<app>/uploads` (on a
+  fresh server bootstrap creates it for the runtime user directly). Nobody
+  but root can create, rename or replace entries next to the files that
+  root writes and systemd reads (the env file, `migrate.env`,
+  `release.env`, `git-safe.conf`, the token file), so a symbolic link
+  cannot point root or systemd at another file. Bootstrap refuses symbolic
+  links that an earlier deploy user left there.
+- The env file and the checkout must be entries directly in `/opt/<app>/`
+  (for example `/opt/<app>/staging.env` and `/opt/<app>/app`), not named
+  `uploads`, `migrate.env`, `release.env`, `git-safe.conf` or `.gh-token`.
+  Bootstrap stops with an error for other paths when it finds the new
+  layout. `migrate.env` and `release.env` are then always this app's files.
+- The deploy user must be unique to the app: bootstrap stops in the new
+  layout when a file in `/etc/sudoers.d` other than `<app>-agent` names
+  it (as the user of a rule, in `Defaults:<user>`, in a user alias, or
+  as `%<user>`). The message names the file.
+- Caddy's admin API listens on the unix socket `/var/lib/caddy/admin.sock`
+  instead of TCP `localhost:2019`. Caddy creates the socket with mode 0200,
+  so only the caddy user and root can use it. The first bootstrap that
+  writes the socket line restarts Caddy once, then runs one
+  `systemctl reload caddy` over the socket. If Caddy is not running or the
+  reload fails, bootstrap restores the previous Caddyfile, restarts Caddy
+  and stops. The socket needs Caddy 2.5.1 or later. Every later bootstrap
+  on the server, of any app, keeps the socket line when the Caddyfile has
+  it or a layout marker says `split`.
+- The deploy user keeps building and deploying. It writes `release.env`
+  through an exact `sudo /usr/bin/tee /opt/<app>/release.env` rule. Its
+  other sudo rules name exact files: `00-main-<app>.caddy` and the heal
+  staging file
+  `.samohost-heal-next-00-main-<app>.caddy`. It has no rule for preview
+  vhost files: their name `<app>-<label>.caddy` would also match previews of
+  another app whose name starts with `<app>-`. It has no `journalctl`,
+  `daemon-reload` or `psql` rule: `samohost logs`
+  and `samohost doctor` connect as the operator user, and the deploy and
+  heal scripts of these apps do not use the other two.
+- The deploy sets `umask 022` so the runtime user can read what it builds.
+
+Previews of these apps are not built yet. Host-prep stops before any change
+when the server has the layout marker `/var/lib/samohost/db-layout/<app>`
+with `split`, the app's `migrate.env`, or the user `<app>-run`. Bootstrap
+stops in the new layout when `/etc/sudoers.d/samohost-env-<app>` (host-prep
+rules) exists, which happens when host-prep ran before the first bootstrap.
+Previews of these apps will need a preview vhost file name that cannot
+match another app's files (for example `<app>--<label>.caddy` with labels
+that do not contain `--`), rules for writing and removing those files,
+rules for
+`systemctl enable --now`, `disable --now` and `reset-failed` of the preview
+instance `<app>@<label>`, and a way to create and drop the preview database
+that is not `psql` as `postgres`. The preview unit should use the same
+runtime user and hardening.
+
+To move an existing server that already has `migrate.env`:
+
+1. Run `samohost app bootstrap` again. It creates `<app>-run`, gives it
+   `/opt/<app>/uploads` (the owner of each entry is changed without
+   following links; files with more than one hard link are skipped with a
+   warning), rewrites the sudo rules and the unit, and runs
+   `systemctl daemon-reload`. The running service keeps its old user until
+   it restarts.
+2. Deploy, or restart the service. It then runs as `<app>-run`.
+3. If the app writes files anywhere other than `/opt/<app>/uploads`, those
+   writes now fail. Move that data under `uploads/` first.
+
 ## How it's tested
 
 - **Unit + golden/snapshot:** `bun test` (457 tests; rendered deploy/env scripts

@@ -18,7 +18,8 @@ import { readFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { isIP } from "node:net";
 import { checkCiGreen, type CiStatus } from "../app/cigate.ts";
-import { parseDeployOutcome, type DeployOutcome } from "../app/parse.ts";
+import { parseDeployOutcome, rollbackRecordsFailedSha, type DeployOutcome } from "../app/parse.ts";
+import { migrateEnvFileOf, releaseEnvFileOf } from "../app/db-layout.ts";
 import { buildDeployScript } from "../app/script.ts";
 import { buildConfigHealScript } from "../app/heal-script.ts";
 import { validateStaticRoot } from "../app/static-root.ts";
@@ -229,6 +230,17 @@ export function runAppRegister(
     const appUserError = linuxAppUserError(input.appUser);
     if (appUserError !== undefined) {
       err(`error: invalid appUser: ${appUserError}`);
+      return 1;
+    }
+  }
+  // migrate.env and release.env sit next to a node app's env file: refuse a
+  // path with no directory or one of those names here, not first at deploy.
+  if (input.envFile !== undefined && input.kind !== "static") {
+    try {
+      migrateEnvFileOf(input.envFile);
+      releaseEnvFileOf(input.envFile);
+    } catch (e) {
+      err(`error: invalid envFile: ${e instanceof Error ? e.message : String(e)}`);
       return 1;
     }
   }
@@ -672,6 +684,20 @@ export function runAppBootstrap(
     err("error: --control-plane-ip is only valid for cp-http80 apps");
     return 1;
   }
+  // Heal and host-prep use the address recorded for the VM; bootstrap must
+  // render the same one into TRUSTED_PROXIES and the firewall rule.
+  if (
+    app.mainListen === "cp-http80" &&
+    input.controlPlaneIp !== undefined &&
+    vm.controlPlaneIp !== undefined &&
+    input.controlPlaneIp !== vm.controlPlaneIp
+  ) {
+    err(
+      `error: --control-plane-ip ${input.controlPlaneIp} differs from the control-plane IP recorded for vm ` +
+        `${vm.name} (${vm.controlPlaneIp}); heal and host-prep use the recorded one`,
+    );
+    return 1;
+  }
   const controlPlaneIp = app.mainListen === "cp-http80"
     ? input.controlPlaneIp ?? vm.controlPlaneIp
     : input.controlPlaneIp;
@@ -804,7 +830,8 @@ export async function runAppDeploy(
   // ---- resolve the target SHA --------------------------------------------
   let sha: string;
   if (input.sha !== undefined) {
-    sha = input.sha;
+    // Git prints lowercase hex; the deploy script accepts lowercase only.
+    sha = input.sha.toLowerCase();
   } else {
     const ref = input.ref ?? app.branch;
     try {
@@ -922,7 +949,7 @@ export async function runAppDeploy(
   }
 
   const combined = result.stdout + "\n" + result.stderr;
-  const { outcome } = parseDeployOutcome(combined);
+  const { events, outcome } = parseDeployOutcome(combined);
 
   // ---- update bookkeeping -------------------------------------------------
   const stamped = deps.now().toISOString();
@@ -940,7 +967,9 @@ export async function runAppDeploy(
         // Non-fatal: best-effort; staleness check will treat missing as stale.
       }
     }
-  } else if (outcome === "rolled-back" || outcome === "rollback-failed") {
+  } else if ((outcome === "rolled-back" || outcome === "rollback-failed") && rollbackRecordsFailedSha(events)) {
+    // A rollback after a failed install or build does not record the commit:
+    // the next trigger cycle deploys it again (src/app/parse.ts).
     updated.failedSha = sha;
     // deployedSha is intentionally NOT advanced on failure.
     // generatorSha is intentionally NOT written on failure.
@@ -1427,7 +1456,7 @@ export async function runAppHeal(
     out(`dry-run: would heal ${apps.length} app(s) on vm ${vm.name} — pass --apply to write changes`);
     for (const app of apps) {
       try {
-        const script = buildConfigHealScript(app);
+        const script = buildConfigHealScript(app, vm.controlPlaneIp !== undefined ? { controlPlaneIp: vm.controlPlaneIp } : {});
         out(`[dry-run] heal script for ${app.name} (${script.split("\n").length} lines) — not executing`);
       } catch (e) {
         err(`error: cannot build heal script for ${app.name}: ${e instanceof Error ? e.message : String(e)}`);
@@ -1442,7 +1471,7 @@ export async function runAppHeal(
   for (const app of apps) {
     let script: string;
     try {
-      script = buildConfigHealScript(app);
+      script = buildConfigHealScript(app, vm.controlPlaneIp !== undefined ? { controlPlaneIp: vm.controlPlaneIp } : {});
     } catch (e) {
       err(`error: cannot build heal script for ${app.name}: ${e instanceof Error ? e.message : String(e)}`);
       anyFailure = true;
