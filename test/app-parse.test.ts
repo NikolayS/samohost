@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { readFileSync } from "node:fs";
 import {
   deployOutcome,
   parseDeployOutcome,
@@ -46,6 +47,17 @@ describe("parsePhaseStream", () => {
     const events = parsePhaseStream([m("backup", "start"), m("backup", "fail"), m("rollback", "ok")].join("\n"));
     expect(events.map((event) => `${event.phase}:${event.status}`)).toEqual(["backup:start", "backup:fail", "rollback:ok"]);
     expect(rollbackRecordsFailedSha(events)).toBe(true);
+  });
+
+  test("parses the backup precheck failure marker", () => {
+    expect(parsePhaseStream(m("backup-precheck", "fail"))).toEqual([
+      { phase: "backup-precheck", status: "fail" },
+    ]);
+  });
+
+  test("keeps backup-precheck in the parser allow-list", () => {
+    const source = readFileSync(new URL("../src/app/parse.ts", import.meta.url), "utf8");
+    expect(source).toMatch(/const VALID_PHASES[\s\S]*"backup-precheck"/);
   });
 });
 
@@ -157,7 +169,7 @@ describe("deployOutcome", () => {
   });
 
   test("a missing backup sudo rule uses the pre-checkout failure outcome and has no failed commit marker", () => {
-    const events = parsePhaseStream(m("lock", "fail"));
+    const events = parsePhaseStream(m("backup-precheck", "fail"));
     const outcome = deployOutcome(events);
     const recordsFailedCommit =
       (outcome === "rolled-back" || outcome === "rollback-failed") && rollbackRecordsFailedSha(events);

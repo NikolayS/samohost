@@ -48,7 +48,7 @@ fi
 # A server with the build model but without the backup sudo rule predates database backups.
 # Stop before fetch and checkout, so this commit is not recorded as failed.
 if [[ "$SAMOHOST_RELEASE_MODEL" == 1 ]] && ! sudo -n -l "$SAMOHOST_STEP" backup >/dev/null 2>&1; then
-  echo "<<<SAMOHOST_PHASE:lock:fail>>>"
+  echo "<<<SAMOHOST_PHASE:backup-precheck:fail>>>"
   echo 'ERROR: this server was set up before database backups existed; run `samohost app bootstrap` for this app again; this deploy changed nothing' >&2
   exit 1
 fi

@@ -165,6 +165,8 @@ describe("buildDeployScript hard-won behaviors", () => {
     expect(precheck).toBeLessThan(fetch);
     expect(precheck).toBeLessThan(checkout);
     expect(script).toContain("this deploy changed nothing");
+    expect(script).toContain("<<<SAMOHOST_PHASE:backup-precheck:fail>>>");
+    expect(script).not.toContain('sudo -n -l "$SAMOHOST_STEP" backup >/dev/null 2>&1; then\n  echo "<<<SAMOHOST_PHASE:lock:fail>>>"');
   });
 
   test("renders database backup code only for split node apps with migrations and a database", () => {
@@ -175,6 +177,7 @@ describe("buildDeployScript hard-won behaviors", () => {
       buildDeployScript(staticApp(), STATIC_TARGET),
       buildDeployScript(staticApp({ releaseTagPattern: "v*", releaseTagFormat: "date", releaseCiWorkflow: ".github/workflows/ci.yml" }), { ...STATIC_TARGET, tag: "v20261125.1" }),
       buildDeployScript(fieldRecord({ migrateCmd: undefined }), TARGET),
+      buildDeployScript(fieldRecord({ migrateCmd: "" }), TARGET),
       buildDeployScript(fieldRecord({ dbBackend: "none" }), TARGET),
       buildDeployScript(fieldRecord({ envFile: undefined }), TARGET),
     ];
@@ -187,6 +190,18 @@ describe("buildDeployScript hard-won behaviors", () => {
   test("a split server without the build model warns before it migrates without a backup", () => {
     const script = buildDeployScript(fieldRecord(), TARGET);
     expect(script).toContain("WARNING: no database backup was taken: this server does not use the build model");
+  });
+
+  test("a split app with migrations and no database backend warns that no backup was taken", () => {
+    const script = buildDeployScript(fieldRecord({ dbBackend: "none" }), TARGET);
+    expect(script).toContain("WARNING: no database backup was taken: this app declares no database backend");
+  });
+
+  test("an empty migrate command renders neither a backup nor a migration", () => {
+    const script = buildDeployScript(fieldRecord({ migrateCmd: "" }), TARGET);
+    expect(script).not.toContain("SAMOHOST_PHASE:backup");
+    expect(script).not.toContain("SAMOHOST_PHASE:migrate");
+    expect(script).not.toContain("no database backup was taken");
   });
 
   test("a failed backup takes the migrate rollback path and never reaches migrate", () => {

@@ -43,6 +43,7 @@ export type DeployOutcome =
 // ignored rather than mis-parsed).
 const VALID_PHASES = new Set<PhaseName>([
   "lock",
+  "backup-precheck",
   "fetch",
   "checkpoint",
   "checkout",

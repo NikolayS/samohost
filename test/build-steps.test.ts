@@ -85,7 +85,7 @@ function sandbox(params: Partial<BuildStepParams> = {}, edits: Array<[string, st
     .replaceAll("/run/samohost", join(dir, "run-samohost"))
     .replaceAll("/var/backups/samohost/shop", join(base, "backups"))
     .replaceAll("/usr/bin/systemctl", join(bin, "systemctl"))
-    .replace("/usr/sbin/runuser -u postgres -- /usr/bin/psql", join(bin, "psql"))
+    .replace("/usr/bin/timeout -k 5 60 /usr/sbin/runuser -u postgres -- /usr/bin/psql", join(bin, "psql"))
     .replace("/usr/bin/timeout -k 30 600 /usr/sbin/runuser -u postgres -- /usr/bin/pg_dump", join(bin, "pg_dump"))
     .replaceAll('install -d -m 700 -o root -g root "$BACKUP_ROOT"', 'mkdir -p "$BACKUP_ROOT"; chmod 700 "$BACKUP_ROOT"')
     .replaceAll('install -d -m 700 -o root -g root "$BACKUP_DIR"', 'mkdir -p "$BACKUP_DIR"; chmod 700 "$BACKUP_DIR"')
@@ -104,6 +104,16 @@ describe("step script: rendered", () => {
   const text = buildStepScript(PARAMS);
   test("lives at a root-owned path per app", () => {
     expect(buildStepScriptPath("shop")).toBe("/usr/local/lib/samohost/apps/shop/step");
+  });
+
+  test("database size lookup cannot wait for a password or run without a time limit", () => {
+    expect(text).toContain("/usr/bin/timeout -k 5 60 /usr/sbin/runuser -u postgres -- /usr/bin/psql -X -w -qAt");
+  });
+
+  test("omits database backup variables when the backup step is omitted", () => {
+    const withoutBackup = buildStepScript({ ...PARAMS, includeBackup: false });
+    expect(withoutBackup).not.toContain("\nDATABASE=");
+    expect(withoutBackup).not.toContain("\nBACKUP_DIR=");
   });
 
   test("backup publishes only a complete dump and keeps the newest five", () => {
@@ -151,7 +161,7 @@ describe("step script: rendered", () => {
       writeFileSync(join(s.dir, "db-bytes"), `${512 * 1024 * 1024}\n`);
       writeFileSync(join(s.dir, "free-kb"), `${3 * 1024 * 1024}\n`);
       expect(s.step("backup").status).toBe(0);
-      expect(s.calls()).toContain("psql -X -qAt --dbname=postgres");
+      expect(s.calls()).toContain("psql -X -w -qAt --dbname=postgres");
       expect(s.calls()).toContain("pg_dump --no-password --lock-wait-timeout=60000 -Fc --dbname=shop");
     } finally { s.cleanup(); }
   });
@@ -293,6 +303,19 @@ describe("step script: rendered", () => {
 });
 
 describe("step script: executed", () => {
+  test("a failed database size lookup stops without calling pg_dump", () => {
+    const s = sandbox();
+    try {
+      writeFileSync(join(s.base, "release.env"), "SAMO_RELEASE_SHA=abcdef0123456789\n");
+      writeFileSync(join(s.dir, "fail-psql"), "1");
+      const result = s.step("backup");
+      expect(result.status).not.toBe(0);
+      expect(result.stderr).toContain("backup did not run: could not read the size of database shop");
+      expect(s.calls()).not.toContain("pg_dump");
+    } finally {
+      s.cleanup();
+    }
+  });
   test("wrong arguments: usage and exit 2", () => {
     const s = sandbox();
     try {

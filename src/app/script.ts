@@ -60,6 +60,7 @@ export const PHASE_PREFIX = "<<<SAMOHOST_PHASE:";
 /** Phase names, in deploy order. `rollback` is emitted only on failure. */
 export type PhaseName =
   | "fetch"
+  | "backup-precheck"
   | "checkpoint"
   | "checkout"
   | "install"
@@ -229,7 +230,7 @@ export function buildDeployScript(app: AppRecord, target: DeployTarget): string 
   const splitLayout = app.kind !== "static" && app.envFile !== undefined
     ? { migrateEnvFile: migrateEnvFileOf(app.envFile), dbVars: databaseUrlVarsOf(app) }
     : undefined;
-  const databaseBackupEnabled = splitLayout !== undefined && app.migrateCmd !== undefined && app.dbBackend !== "none";
+  const databaseBackupEnabled = splitLayout !== undefined && Boolean(app.migrateCmd) && app.dbBackend !== "none";
   if (app.envFile !== undefined) {
     push(
       "# --- env: source the app env file (READ-ONLY; never written, never echoed) ---",
@@ -264,7 +265,7 @@ export function buildDeployScript(app: AppRecord, target: DeployTarget): string 
                   "# A server with the build model but without the backup sudo rule predates database backups.",
                   "# Stop before fetch and checkout, so this commit is not recorded as failed.",
                   'if [[ "$SAMOHOST_RELEASE_MODEL" == 1 ]] && ! sudo -n -l "$SAMOHOST_STEP" backup >/dev/null 2>&1; then',
-                  `  ${marker("lock", "fail")}`,
+                  `  ${marker("backup-precheck", "fail")}`,
                   `  echo ${sq("ERROR: this server was set up before database backups existed; run `samohost app bootstrap` for this app again; this deploy changed nothing")} >&2`,
                   "  exit 1",
                   "fi",
@@ -905,7 +906,9 @@ export function buildDeployScript(app: AppRecord, target: DeployTarget): string 
               "fi",
               "",
             ]
-          : []),
+          : splitLayout !== undefined && app.dbBackend === "none"
+            ? ['echo "WARNING: no database backup was taken: this app declares no database backend" >&2', ""]
+            : []),
         "# --- migrate: apply DB migrations before the new code boots ---",
         "# subshell + cd: always runs from the app dir, whatever buildCmd cd'd into (issue #122).",
         ...(splitLayout !== undefined

@@ -836,7 +836,7 @@ export function buildHostBootstrapScript(
   // step script (src/app/build-steps.ts); the service runs a root-owned copy
   // of the build in /opt/<app>/releases through the /opt/<app>/current link.
   const buildUser = `${app.name}-build`;
-  const databaseBackupEnabled = app.migrateCmd !== undefined && app.dbBackend !== "none";
+  const databaseBackupEnabled = Boolean(app.migrateCmd) && app.dbBackend !== "none";
   const buildModel = buildModelPaths(appBase);
   const stepScriptPath = buildStepScriptPath(app.name);
   if (!isStatic && runtimeUserUsable && linuxAppUserError(buildUser) !== undefined) {

@@ -450,6 +450,8 @@ when `appDbRole` overrides that default. Root opens the mode 0600 dump and
 passes it to `pg_restore` on standard input. Do not give the dump to the deploy,
 runtime, build, or app database user.
 
+A restore stops with an error and changes nothing in the new database because it runs in a single transaction when the dump holds an object that only a superuser can create, for example an extension that was created by `postgres`; the operator then creates that object first and runs the restore again.
+
 The deploy user can invoke the permitted backup step repeatedly and replace the
 five retained dumps. These dumps protect against a bad migration, not against a
 compromised deploy user.
