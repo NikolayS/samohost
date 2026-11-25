@@ -85,7 +85,7 @@ const SPLIT_SUDOERS = [
   "shop ALL=(root) NOPASSWD: /usr/bin/rm -f /etc/caddy/sites.d/00-main-shop.caddy",
   "shop ALL=(caddy) NOPASSWD: /usr/bin/caddy validate --config /etc/caddy/Caddyfile",
   "shop ALL=(root) NOPASSWD: /usr/bin/tee /opt/shop/release.env",
-  ...["install", "build", "migrate", "seed", "release", "rollback", "cleanup"].map(
+  ...["install", "build", "backup", "migrate", "seed", "release", "rollback", "cleanup"].map(
     (step) => `shop ALL=(root) NOPASSWD: /usr/local/lib/samohost/apps/shop/step ${step}`,
   ),
 ].join("\n") + "\n";
@@ -388,8 +388,8 @@ describe("new layout: deploy user's sudo rules", () => {
     expect(seen).toContain("/usr/bin/rm -f /etc/caddy/sites.d/00-main-shop.caddy");
   });
 
-  test("the deploy user has 19 rules: 12 exact commands and 7 step rules", () => {
-    expect(SPLIT_SUDOERS.trim().split("\n").length).toBe(19);
+  test("the deploy user has 20 rules: 12 exact commands and 8 step rules", () => {
+    expect(SPLIT_SUDOERS.trim().split("\n").length).toBe(20);
   });
 
   test("the sudo grant self-check still passes with the new rule count", () => {

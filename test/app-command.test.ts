@@ -824,7 +824,7 @@ describe("app commands", () => {
     });
   }
 
-  for (const phase of ["migrate", "health", "assert-rls"] as const) {
+  for (const phase of ["backup", "migrate", "health", "assert-rls"] as const) {
     test(`rollback after a failed ${phase}: failedSha recorded`, async () => {
       register();
       const c = capture();

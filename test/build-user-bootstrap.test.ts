@@ -133,7 +133,7 @@ describe("§5d build user and step script", () => {
       const app = nodeApp();
       const expected = buildStepScript({
         appName: "shop", buildUser: "shop-build", runUser: "shop-run", appBase: "/opt/shop", checkoutDir: app.appDir,
-        envFile: app.envFile!, migrateEnvFile: "/opt/shop/migrate.env", releaseEnvFile: "/opt/shop/release.env",
+        envFile: app.envFile!, migrateEnvFile: "/opt/shop/migrate.env", releaseEnvFile: "/opt/shop/release.env", database: "shop",
         tokenFile: "/opt/shop/.gh-token", gitSafeConf: "/opt/shop/git-safe.conf", buildCmd: app.buildCmd,
         ...(app.migrateCmd !== undefined ? { migrateCmd: app.migrateCmd } : {}),
       });

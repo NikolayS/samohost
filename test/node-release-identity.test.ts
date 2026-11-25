@@ -25,7 +25,7 @@ describe("node deploy — release identity (executed with stubs)", () => {
       writeFileSync(sb.envFile, "APP_DATABASE_URL=postgresql://shop_app:pw@127.0.0.1:5432/shop\n");
       const script = buildDeployScript(nodeApp({ appDir: sb.appDir, envFile: sb.envFile }), { sha: SHA, tag: TAG });
       const res = sb.run(script);
-      expect(res.stderr).toBe("");
+      expect(res.stderr).toBe("WARNING: no database backup was taken: this server does not use the build model\n");
       expect(res.status).toBe(0);
       const build = sb.npmCalls().find((c) => c.args === "run build")!;
       expect(build.env.SAMO_RELEASE_TAG).toBe(TAG);

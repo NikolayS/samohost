@@ -578,6 +578,26 @@ function demoOptsA2(overrides: Partial<HostBootstrapOptions> = {}): HostBootstra
 // ---------------------------------------------------------------------------
 
 describe("buildHostBootstrapScript (A2) — explicit dbName (critical invariant)", () => {
+  test("installs one exact database backup step grant for split-layout node apps", () => {
+    const script = buildHostBootstrapScript(fieldRecord(), frOpts({ dbName: "field_record" }));
+    expect(script).toContain("/usr/local/lib/samohost/apps/field-record/step backup");
+    expect(script).toContain("BACKUP_DIR='/var/backups/samohost/field-record'");
+    expect(script).toContain("DATABASE='field_record'");
+    expect(script).toContain("pg_dump --no-password --lock-wait-timeout=60000 -Fc");
+    expect(script).toContain("timeout -k 30 600");
+    expect(script).toContain("install -d -m 700 -o root -g root");
+    expect(script).toContain("chmod 600");
+    expect(script).toContain("mv -fT");
+    expect(script).toContain("--lock-wait-timeout=60000");
+  });
+  test("omits the backup case and sudo rule without a migration command or a real database", () => {
+    for (const app of [fieldRecord({ migrateCmd: undefined }), fieldRecord({ dbBackend: "none" })]) {
+      const script = buildHostBootstrapScript(app, frOpts({ dbName: "field_record" }));
+      expect(script).not.toContain("SAMOHOST_STEP_SCRIPT backup");
+      expect(script).not.toContain("/usr/local/lib/samohost/apps/field-record/step backup");
+      expect(script).not.toContain('  backup)');
+    }
+  });
   test("createdb uses the literal dbName value, not a derived variant", () => {
     // dbName='field_record', app.name='field-record' → transformed 'field_record_1'
     // must NOT appear; only the literal dbName must appear in createdb.

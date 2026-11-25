@@ -43,11 +43,13 @@ export type DeployOutcome =
 // ignored rather than mis-parsed).
 const VALID_PHASES = new Set<PhaseName>([
   "lock",
+  "backup-precheck",
   "fetch",
   "checkpoint",
   "checkout",
   "install",
   "build",
+  "backup",
   "migrate",
   "release",
   "stop",
@@ -132,7 +134,7 @@ const RETRYABLE_FAILED_PHASES = new Set<PhaseName>(["install", "build"]);
 /**
  * Whether a rolled-back deploy records its commit as failed (`failedSha`).
  * Yes, unless the phase that failed before the rollback was install or build.
- * A failed migrate, health check or assert-rls, and a rollback with no failed
+ * A failed backup, migrate, health check or assert-rls, and a rollback with no failed
  * phase marker (static deploy steps), record it.
  */
 export function rollbackRecordsFailedSha(events: PhaseEvent[]): boolean {

@@ -836,6 +836,7 @@ export function buildHostBootstrapScript(
   // step script (src/app/build-steps.ts); the service runs a root-owned copy
   // of the build in /opt/<app>/releases through the /opt/<app>/current link.
   const buildUser = `${app.name}-build`;
+  const databaseBackupEnabled = Boolean(app.migrateCmd) && app.dbBackend !== "none";
   const buildModel = buildModelPaths(appBase);
   const stepScriptPath = buildStepScriptPath(app.name);
   if (!isStatic && runtimeUserUsable && linuxAppUserError(buildUser) !== undefined) {
@@ -863,11 +864,13 @@ export function buildHostBootstrapScript(
       envFile,
       migrateEnvFile,
       releaseEnvFile,
+      database: dbName!,
       tokenFile,
       gitSafeConf,
       buildCmd: app.buildCmd,
       ...(app.migrateCmd !== undefined ? { migrateCmd: app.migrateCmd } : {}),
       ...(app.seedCmd !== undefined ? { seedCmd: app.seedCmd } : {}),
+      includeBackup: databaseBackupEnabled,
     });
     push(
       `# ---------------------------------------------------------------------------`,
@@ -983,7 +986,7 @@ export function buildHostBootstrapScript(
             `${appUser} ALL=(root) NOPASSWD: /usr/bin/rm -f ${mainVhostFile}`,
             `${appUser} ALL=(caddy) NOPASSWD: ${caddyValidateAsCaddy}`,
             `${appUser} ALL=(root) NOPASSWD: /usr/bin/tee ${releaseEnvFile}`,
-            ...BUILD_STEP_NAMES.map((step) => `${appUser} ALL=(root) NOPASSWD: ${stepScriptPath} ${step}`),
+            ...BUILD_STEP_NAMES.filter((step) => databaseBackupEnabled || step !== "backup").map((step) => `${appUser} ALL=(root) NOPASSWD: ${stepScriptPath} ${step}`),
             "SAMOHOST_SPLIT_SUDOERS",
             "else",
           ]

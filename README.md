@@ -396,11 +396,81 @@ Migrations that already ran are not undone, in either case. `node_modules`
 is not restored. The previous release must therefore work with the new
 schema: add columns as nullable or with a default, and drop a column only
 in a release after the code stopped using it. samohost records the commit as
-failed (`failedSha`) after a rollback that follows a failed migrate, health
-check or `assert-rls`, and does not deploy it again until `app clear-failed`.
+failed (`failedSha`) after a rollback that follows a failed backup, migrate,
+health check or `assert-rls`, and does not deploy it again until `app clear-failed`.
 A rollback after a failed install or build (for example an npm registry
 outage) does not record the commit: the outcome is `rolled-back`, the exit
 code 1, and the next trigger cycle deploys the same commit again.
+
+### Database backup before a migration
+
+For a split-layout node app with a database, deploy saves a custom-format
+PostgreSQL dump before it runs migrations. Root keeps the dumps in
+`/var/backups/samohost/<app>/`; the directory is mode 0700, each dump is mode
+0600, and only the newest five completed dumps are retained. A failed or timed
+out backup leaves no completed dump, does not prune older dumps, stops the
+deploy before migrations, and follows the same rollback and failed-commit path
+as a failed migration. Plain `pg_dump` runs while the old release serves and
+does not block its normal reads and writes.
+
+Servers set up before database backups existed must run `samohost app
+bootstrap` again for each split-layout node app that has migrations and a
+database. Until
+then, deploy stops before fetch and prints that the server predates database
+backups, bootstrap must be run again, and the deploy changed nothing. A
+split-layout server that does not use the build model still runs migrations
+without a dump and prints `WARNING: no database backup was taken: this server
+does not use the build model`. An app that declares no database backend prints
+`WARNING: no database backup was taken: this app declares no database backend`.
+
+A dump named `<UTC stamp>-<sha>.dump` holds the database as it was before the
+migration of commit `<sha>` ran. Restore it to go back to the data of the
+release that was live before `<sha>`: make sure that earlier release is the one
+serving. After a failed deploy of `<sha>`, it already is. If `<sha>` itself is
+the serving release, restoring this dump removes its migration while its code
+still runs. Deploy `<sha>` again afterwards, which applies the migration again.
+
+Restoring is a manual operator procedure. Stop every deploy of the app on the
+control machine first. Then run the following as root on the app server,
+replacing every placeholder with the app's actual values:
+
+```sh
+systemctl stop <unit>
+runuser -u postgres -- psql -X -v ON_ERROR_STOP=1 --dbname=postgres -c "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = '<db>' AND pid <> pg_backend_pid()"
+runuser -u postgres -- psql -X -v ON_ERROR_STOP=1 --dbname=postgres -c 'ALTER DATABASE "<db>" RENAME TO "<db>_before_restore"'
+runuser -u postgres -- createdb -O <db>_owner <db>
+runuser -u postgres -- psql -X -v ON_ERROR_STOP=1 --dbname=postgres -c 'REVOKE CONNECT, TEMPORARY ON DATABASE "<db>" FROM PUBLIC'
+runuser -u postgres -- psql -X -v ON_ERROR_STOP=1 --dbname=postgres -c 'GRANT CONNECT, TEMPORARY ON DATABASE "<db>" TO "<db>_owner", "<db>_app"'
+runuser -u postgres -- psql -X -v ON_ERROR_STOP=1 --dbname=<db> -c 'ALTER SCHEMA public OWNER TO "<db>_owner"'
+runuser -u postgres -- pg_restore --exit-on-error --single-transaction --no-owner --role=<db>_owner --dbname=<db> < /var/backups/samohost/<app>/<file>.dump
+systemctl start <unit>
+```
+
+Check the restored app and database before running `runuser -u postgres --
+dropdb <db>_before_restore`. Bootstrap normally names the migration role
+`<db>_owner` and the runtime role `<db>_app`; use the configured runtime role
+when `appDbRole` overrides that default. Root opens the mode 0600 dump and
+passes it to `pg_restore` on standard input. Do not give the dump to the deploy,
+runtime, build, or app database user.
+
+The dump may hold an object that only a superuser can create, for example an
+extension created by `postgres`. In that case, `pg_restore` stops with an
+error. Because the restore runs in a single transaction, the new database is
+still empty. The service is stopped, `<db>` is a new empty database, and the
+old data is in `<db>_before_restore`.
+
+To continue, create the object in `<db>` as `postgres` and run the
+`pg_restore` command again. To go back instead, run:
+
+```sh
+runuser -u postgres -- dropdb <db>
+runuser -u postgres -- psql -X -v ON_ERROR_STOP=1 --dbname=postgres -c 'ALTER DATABASE "<db>_before_restore" RENAME TO "<db>"'
+systemctl start <unit>
+```
+
+The deploy user can invoke the permitted backup step repeatedly and replace the
+five retained dumps. These dumps protect against a bad migration, not against a
+compromised deploy user.
 
 ### Runtime user and service hardening of a node app
 

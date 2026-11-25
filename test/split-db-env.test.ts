@@ -156,7 +156,7 @@ describe("deploy — split env layout (executed with stubs)", () => {
     const { sb, script } = setup(true);
     try {
       const res = sb.run(script);
-      expect(res.stderr).toBe("");
+      expect(res.stderr).toBe("WARNING: no database backup was taken: this server does not use the build model\n");
       expect(res.status).toBe(0);
       const calls = sb.npmCalls();
       const install = calls.find((c) => c.args.startsWith("ci"))!;
