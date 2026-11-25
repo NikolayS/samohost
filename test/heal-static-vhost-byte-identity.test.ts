@@ -175,7 +175,7 @@ describe("staticMainVhostLines: shared helper emits the canonical static vhost t
     expect(norm[5]).toContain("max-age=31536000, immutable");
     expect(norm[6]).toContain("@samohost_documents path");
     expect(norm[7]).toContain('Cache-Control "no-cache"');
-    expect(norm[8]).toBe("\ttry_files {path} {path}/ =404");
+    expect(norm[8]).toBe("\ttry_files {path} {path}/index.html =404");
     expect(norm[9]).toBe("\tfile_server");
     expect(norm[10]).toBe("\tencode gzip");
     // no tls internal when addTls=false

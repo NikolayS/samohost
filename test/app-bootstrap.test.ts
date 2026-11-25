@@ -1334,7 +1334,7 @@ describe("buildHostBootstrapScript — static path (kind='static')", () => {
     const block = script.slice(start, end);
     expect(block).toContain('root * "${SAMOHOST_STATIC_DIR}"');
     expect(script).toContain("samohost_assert_static_tree_safe");
-    expect(block).toContain("try_files {path} {path}/ =404");
+    expect(block).toContain("try_files {path} {path}/index.html =404");
     expect(block).toContain("file_server");
     expect(block).not.toContain("tls internal");
   });

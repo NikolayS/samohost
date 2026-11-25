@@ -31,6 +31,8 @@ import { servicesOf } from "../app/services.ts";
 import { assertOptionalLinuxAppUser } from "../app/linux-user.ts";
 import { migrateEnvFileOf } from "../app/db-layout.ts";
 import {
+  PREVIOUS_STATIC_ROUTE_SED,
+  STATIC_TRY_FILES,
   staticReleaseStatePaths,
   staticRootOf,
   staticTreeGuardFnLines,
@@ -1103,7 +1105,7 @@ function buildStaticEnvCreateScript(
       "Caddy file_server vhost snippet + reload (sites.d include applied in host-prep)",
       [
         'if samohost_assert_static_tree_safe "$SAMOHOST_CHECKOUT_REAL" "$SAMOHOST_STATIC_DIR" "$SAMOHOST_STATIC_ROOT" \\',
-        `   && printf '%s {\\n\\ttls internal\\n\\troot * %s\\n${cacheHeadersPrintf}\\n\\ttry_files {path} {path}/ =404\\n\\tfile_server\\n\\tencode gzip\\n}\\n' \\`,
+        `   && printf '%s {\\n\\ttls internal\\n\\troot * %s\\n${cacheHeadersPrintf}\\n\\t${STATIC_TRY_FILES}\\n\\tfile_server\\n\\tencode gzip\\n}\\n' \\`,
         `     "$SAMOHOST_VHOST" "${servedDir}" \\`,
         '   | sudo /usr/bin/tee "$SAMOHOST_CADDY_SNIPPET" >/dev/null \\',
         "   && sudo /usr/bin/systemctl reload caddy; ",
@@ -2448,6 +2450,16 @@ export function buildHostPrepScript(
       "      fi",
       "      rm -f \"$previous\"",
       "    fi",
+      ...(isStatic
+        ? [
+            "    # The static route an older samohost wrote (try_files {path} {path}/ =404)",
+            "    # is upgraded in place, with the same backup as --force.",
+            `    if [[ "$upgrade" != "true" ]] && ${PREVIOUS_STATIC_ROUTE_SED} "$live" | cmp -s "$staged" -; then`,
+            "      upgrade=true",
+            "      echo \"samohost host-prep: $live has the static route of an older samohost; replacing it with the current render (backup kept)\"",
+            "    fi",
+          ]
+        : []),
       "    if [[ \"$force\" != \"true\" && \"$upgrade\" != \"true\" ]]; then",
       "      echo \"samohost host-prep: refusing to overwrite hand-authored/drifted main vhost:\" >&2",
       "      echo \"  $live\" >&2",
@@ -2489,7 +2501,7 @@ export function buildHostPrepScript(
       ? [
           `${mainSiteAddress} {`,
           `\troot * "\${SAMOHOST_STATIC_DIR}"`,
-          `\ttry_files {path} {path}/ =404`,
+          `\t${STATIC_TRY_FILES}`,
           `\tfile_server`,
           `\tencode gzip`,
           ...(app.mainListen === "cp-http80" ? [] : [`\ttls internal`]),
@@ -2969,8 +2981,9 @@ export function buildCustomDomainVhostScript(
                 "    raise SystemExit('active static release identity does not match state')",
                 "PY",
                 'EXPECTED_ROUTE=$(mktemp)',
-                'printf \'root * "%s"\\ntry_files {path} {path}/ =404\\nfile_server\\nencode gzip\\n\' "$SAMOHOST_STATIC_DIR" > "$EXPECTED_ROUTE"',
-                'cmp -s "$EXPECTED_ROUTE" "$SAMOHOST_ACTIVE_ROUTE" || { echo "active static route does not match structured release state" >&2; exit 1; }',
+                `printf 'root * "%s"\\n${STATIC_TRY_FILES}\\nfile_server\\nencode gzip\\n' "$SAMOHOST_STATIC_DIR" > "$EXPECTED_ROUTE"`,
+                // A route with the try_files line of an earlier samohost is accepted.
+                `cmp -s "$EXPECTED_ROUTE" "$SAMOHOST_ACTIVE_ROUTE" || ${PREVIOUS_STATIC_ROUTE_SED} "$SAMOHOST_ACTIVE_ROUTE" | cmp -s "$EXPECTED_ROUTE" - || { echo "active static route does not match structured release state" >&2; exit 1; }`,
                 'SAMOHOST_ACTIVE_FINGERPRINT=$(sha256sum "$SAMOHOST_ACTIVE_STATE" "$SAMOHOST_ACTIVE_ROUTE" | sha256sum | awk \'{print $1}\')',
           "samohost_assert_custom_domain_source() {",
           '  samohost_assert_static_tree_safe "$SAMOHOST_CHECKOUT_REAL" "$SAMOHOST_STATIC_DIR" "$SAMOHOST_STATIC_ROOT" || return 1',

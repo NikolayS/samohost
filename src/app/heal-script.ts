@@ -44,7 +44,7 @@
 
 import type { AppRecord } from "../types.ts";
 import { staticCacheHeaderLines } from "../static-cache.ts";
-import { staticReleaseStatePaths } from "./static-root.ts";
+import { STATIC_TRY_FILES, staticReleaseStatePaths } from "./static-root.ts";
 import { renderVhost, planFromApp, mainVhostTrustedProxies, previousNodeMainVhost } from "../caddy/render.ts";
 import { CADDY_VALIDATE, CADDY_VALIDATE_FN_LINES, CADDY_VALIDATE_RULE_PROBE } from "../caddy/validate.ts";
 import { faviconVhostBodyLines } from "../caddy/favicon.ts";
@@ -132,7 +132,7 @@ export function staticMainVhostLines(
     `\t# samohost-worktree "${releaseDirVar}"`,
     `\troot * "${staticDirVar}"`,
     ...staticCacheHeaderLines(),
-    `\ttry_files {path} {path}/ =404`,
+    `\t${STATIC_TRY_FILES}`,
     `\tfile_server`,
     `\tencode gzip`,
     ...(addTls ? [`\ttls internal`] : []),
@@ -420,7 +420,7 @@ export function buildConfigHealScript(app: AppRecord, opts: BuildConfigHealScrip
   //   <provenance header>
   //   <address> {
   //     root * "$SAMOHOST_STATIC_DIR"
-  //     try_files {path} {path}/ =404
+  //     try_files {path} {path}/index.html =404
   //     file_server
   //     encode gzip
   //     [tls internal]  (if not cp-http80)
@@ -648,7 +648,7 @@ export function buildConfigHealScript(app: AppRecord, opts: BuildConfigHealScrip
     push(
       "# --- static active-route: regenerate snippet using SAMOHOST_STATIC_DIR ---",
       "# The active-route file is a raw Caddy snippet (NOT a site block).",
-      "# Format: root * \"<dir>\"\\ntry_files {path} {path}/ =404\\nfile_server\\nencode gzip\\n",
+      `# Format: root * "<dir>"\\n${STATIC_TRY_FILES}\\nfile_server\\nencode gzip\\n`,
       'if [[ "$SAMOHOST_STATIC_DIR_RESOLVED" == "1" ]]; then',
       "  # Backup the live active-route snippet",
       '  SAMOHOST_ACTIVE_ROUTE_BACKUP="$(mktemp)"',
@@ -659,7 +659,7 @@ export function buildConfigHealScript(app: AppRecord, opts: BuildConfigHealScrip
       "  fi",
       "  # Generate the regenerated active-route snippet to a temp file",
       '  SAMOHOST_ACTIVE_ROUTE_STAGED="$(mktemp "${SAMOHOST_RELEASES_DIR}/.active-route.heal.XXXXXX")"',
-      '  if printf \'root * "%s"\\ntry_files {path} {path}/ =404\\nfile_server\\nencode gzip\\n\' "$SAMOHOST_STATIC_DIR" > "$SAMOHOST_ACTIVE_ROUTE_STAGED" && chmod 0644 "$SAMOHOST_ACTIVE_ROUTE_STAGED"; then',
+      `  if printf 'root * "%s"\\n${STATIC_TRY_FILES}\\nfile_server\\nencode gzip\\n' "$SAMOHOST_STATIC_DIR" > "$SAMOHOST_ACTIVE_ROUTE_STAGED" && chmod 0644 "$SAMOHOST_ACTIVE_ROUTE_STAGED"; then`,
       "    # cmp: if identical → no drift",
       `    if [[ -f ${sq(staticPaths.activeRoute)} ]] && cmp -s ${sq(staticPaths.activeRoute)} "$SAMOHOST_ACTIVE_ROUTE_STAGED"; then`,
       '      rm -f "$SAMOHOST_ACTIVE_ROUTE_STAGED"',

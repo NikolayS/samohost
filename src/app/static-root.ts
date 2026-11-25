@@ -41,6 +41,25 @@ export function staticRootOf(app: Pick<AppSpec, "kind" | "staticRoot">): string 
   return validateStaticRoot(app.staticRoot, app.kind);
 }
 
+/**
+ * The try_files line of every static route samohost writes. `{path}/` alone
+ * answered 404 for a bare `/` on Caddy 2.11.9; naming the index file serves
+ * `/` and sub-folders and keeps real 404s.
+ */
+export const STATIC_TRY_FILES = "try_files {path} {path}/index.html =404";
+
+/** The try_files line that earlier samohost versions wrote. */
+export const PREVIOUS_STATIC_TRY_FILES = "try_files {path} {path}/ =404";
+
+/**
+ * A sed command (for generated bash) that turns a static route an earlier
+ * samohost wrote into the current one; nothing else in the file changes.
+ * `<file> | cmp -s <expected> -` after it tells samohost's own earlier output
+ * from a hand-edited file.
+ */
+export const PREVIOUS_STATIC_ROUTE_SED =
+  `sed 's|${PREVIOUS_STATIC_TRY_FILES}|${STATIC_TRY_FILES}|'`;
+
 /** Stable, app-owned metadata paths shared by tagged deploys and domain add. */
 export function staticReleaseStatePaths(appDir: string): {
   releasesDir: string;
