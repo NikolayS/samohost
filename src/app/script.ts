@@ -59,8 +59,8 @@ export const PHASE_PREFIX = "<<<SAMOHOST_PHASE:";
 
 /** Phase names, in deploy order. `rollback` is emitted only on failure. */
 export type PhaseName =
-  | "fetch"
   | "backup-precheck"
+  | "fetch"
   | "checkpoint"
   | "checkout"
   | "install"

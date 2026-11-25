@@ -420,12 +420,15 @@ then, deploy stops before fetch and prints that the server predates database
 backups, bootstrap must be run again, and the deploy changed nothing. A
 split-layout server that does not use the build model still runs migrations
 without a dump and prints `WARNING: no database backup was taken: this server
-does not use the build model`.
+does not use the build model`. An app that declares no database backend prints
+`WARNING: no database backup was taken: this app declares no database backend`.
 
-Restore only the dump that matches the release to which `current` points. The
-dump name contains the first seven characters of the commit that was being
-deployed when the dump was taken, and its contents are the database state
-before that commit's migration.
+A dump named `<UTC stamp>-<sha>.dump` holds the database as it was before the
+migration of commit `<sha>` ran. Restore it to go back to the data of the
+release that was live before `<sha>`: make sure that earlier release is the one
+serving. After a failed deploy of `<sha>`, it already is. If `<sha>` itself is
+the serving release, restoring this dump removes its migration while its code
+still runs. Deploy `<sha>` again afterwards, which applies the migration again.
 
 Restoring is a manual operator procedure. Stop every deploy of the app on the
 control machine first. Then run the following as root on the app server,
@@ -450,7 +453,20 @@ when `appDbRole` overrides that default. Root opens the mode 0600 dump and
 passes it to `pg_restore` on standard input. Do not give the dump to the deploy,
 runtime, build, or app database user.
 
-A restore stops with an error and changes nothing in the new database because it runs in a single transaction when the dump holds an object that only a superuser can create, for example an extension that was created by `postgres`; the operator then creates that object first and runs the restore again.
+The dump may hold an object that only a superuser can create, for example an
+extension created by `postgres`. In that case, `pg_restore` stops with an
+error. Because the restore runs in a single transaction, the new database is
+still empty. The service is stopped, `<db>` is a new empty database, and the
+old data is in `<db>_before_restore`.
+
+To continue, create the object in `<db>` as `postgres` and run the
+`pg_restore` command again. To go back instead, run:
+
+```sh
+runuser -u postgres -- dropdb <db>
+runuser -u postgres -- psql -X -v ON_ERROR_STOP=1 --dbname=postgres -c 'ALTER DATABASE "<db>_before_restore" RENAME TO "<db>"'
+systemctl start <unit>
+```
 
 The deploy user can invoke the permitted backup step repeatedly and replace the
 five retained dumps. These dumps protect against a bad migration, not against a
