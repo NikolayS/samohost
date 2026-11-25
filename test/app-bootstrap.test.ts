@@ -578,6 +578,18 @@ function demoOptsA2(overrides: Partial<HostBootstrapOptions> = {}): HostBootstra
 // ---------------------------------------------------------------------------
 
 describe("buildHostBootstrapScript (A2) — explicit dbName (critical invariant)", () => {
+  test("installs one exact database backup step grant for split-layout node apps", () => {
+    const script = buildHostBootstrapScript(fieldRecord(), frOpts({ dbName: "field_record" }));
+    expect(script).toContain("/usr/local/lib/samohost/apps/field-record/step backup");
+    expect(script).toContain("BACKUP_DIR='/var/backups/samohost/field-record'");
+    expect(script).toContain("DATABASE='field_record'");
+    expect(script).toContain("pg_dump -Fc");
+    expect(script).toContain("timeout 600");
+    expect(script).toContain("install -d -m 700 -o root -g root");
+    expect(script).toContain("chmod 600");
+    expect(script).toContain("mv -fT");
+    expect(script).toContain("tail -n +6");
+  });
   test("createdb uses the literal dbName value, not a derived variant", () => {
     // dbName='field_record', app.name='field-record' → transformed 'field_record_1'
     // must NOT appear; only the literal dbName must appear in createdb.

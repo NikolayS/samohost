@@ -215,6 +215,19 @@ if [[ -f "$SAMOHOST_MIGRATE_ENV_FILE" && "$SAMOHOST_RELEASE_MODEL" != 1 ]]; then
     || echo "WARNING: could not make every file in $SAMOHOST_APP_DIR readable for the runtime user" >&2
 fi
 
+# --- backup: save the database before migrations change it ---
+if [[ "${SAMOHOST_RELEASE_MODEL:-0}" == 1 ]]; then
+echo "<<<SAMOHOST_PHASE:backup:start>>>"
+if sudo -n "$SAMOHOST_STEP" backup </dev/null; then
+  echo "<<<SAMOHOST_PHASE:backup:ok>>>"
+else
+  echo "<<<SAMOHOST_PHASE:backup:fail>>>"
+  echo "ERROR: the database backup failed and migrations did not run. If this server predates database backups, run samohost app bootstrap to install the per-app backup helper and sudo rule." >&2
+  if [[ "$SAMOHOST_HAS_PREVIOUS_RELEASE" == "1" ]]; then rollback before-restart; fi
+  exit 1
+fi
+fi
+
 # --- migrate: apply DB migrations before the new code boots ---
 # subshell + cd: always runs from the app dir, whatever buildCmd cd'd into (issue #122).
 # split layout: only this subshell exports the database addresses and loads the migrate env file.

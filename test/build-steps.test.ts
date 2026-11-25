@@ -21,6 +21,7 @@ const PARAMS: BuildStepParams = {
   envFile: "/opt/shop/staging.env",
   migrateEnvFile: "/opt/shop/migrate.env",
   releaseEnvFile: "/opt/shop/release.env",
+  database: "shop",
   tokenFile: "/opt/shop/.gh-token",
   gitSafeConf: "/opt/shop/git-safe.conf",
   buildCmd: "npm run build",
@@ -66,6 +67,7 @@ function sandbox(params: Partial<BuildStepParams> = {}, edits: Array<[string, st
   stub(bin, "flock", `if [[ -e ${JSON.stringify(join(dir, "locked"))} ]]; then exit 1; fi`, log);
   // systemctl is-active <unit>: the content of <dir>/state-<unit>, else inactive.
   stub(bin, "systemctl", `f=${JSON.stringify(dir)}/state-$2; if [[ -f "$f" ]]; then cat "$f"; [[ "$(cat "$f")" == active ]] && exit 0; exit 3; fi; echo inactive; exit 3`, log);
+  stub(bin, "pg_dump", `if [[ -e ${JSON.stringify(join(dir, "fail-pg-dump"))} ]]; then exit 1; fi; printf 'dump-data'`, log);
   // GNU cp options on macOS: drop --preserve=timestamps and --, copy with -RP.
   stub(bin, "cp", 'a=(); for x in "$@"; do case "$x" in -R|-P|--preserve=timestamps|--) ;; *) a+=("$x");; esac; done\nprintf "releases at copy: %s\\n" "$(ls "$(dirname "${a[1]}")" | grep -v "\\.src$" | grep -v "\\.tmp$" | tr "\\n" " ")" >> ' + JSON.stringify(log) + '\n/bin/cp -RP "${a[@]}"', log);
   // GNU tar's --no-overwrite-dir is not in macOS tar; drop it there.
@@ -77,7 +79,10 @@ function sandbox(params: Partial<BuildStepParams> = {}, edits: Array<[string, st
     .replace("export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin", `export PATH=${bin}:/usr/bin:/bin`)
     .replace("/proc/sys/fs/protected_hardlinks", join(dir, "protected_hardlinks"))
     .replaceAll("/run/samohost", join(dir, "run-samohost"))
+    .replaceAll("/var/backups/samohost/shop", join(base, "backups"))
     .replaceAll("/usr/bin/systemctl", join(bin, "systemctl"))
+    .replace("/usr/bin/timeout 600 /usr/sbin/runuser -u postgres -- /usr/bin/pg_dump", join(bin, "pg_dump"))
+    .replace('install -d -m 700 -o root -g root "$BACKUP_DIR"', 'mkdir -p "$BACKUP_DIR"; chmod 700 "$BACKUP_DIR"')
     .replace("MIN_FREE_KB=2097152", "MIN_FREE_KB=0");
   let edited = text;
   for (const [a, b] of edits) edited = edited.replace(a, b);
@@ -93,6 +98,44 @@ describe("step script: rendered", () => {
   const text = buildStepScript(PARAMS);
   test("lives at a root-owned path per app", () => {
     expect(buildStepScriptPath("shop")).toBe("/usr/local/lib/samohost/apps/shop/step");
+  });
+
+  test("backup publishes only a complete dump and keeps the newest five", () => {
+    const s = sandbox();
+    try {
+      writeFileSync(join(s.base, "release.env"), "SAMO_RELEASE_SHA=abcdef0123456789\n");
+      const backups = join(s.base, "backups");
+      mkdirSync(backups);
+      for (let n = 1; n <= 7; n++) writeFileSync(join(backups, `2026010${n}T000000Z-1111111.dump`), "old");
+      writeFileSync(join(backups, ".backup.abandoned.tmp"), "partial");
+      const result = s.step("backup");
+      expect(result.stderr).toBe("");
+      expect(result.status).toBe(0);
+      const files = readdirSync(backups);
+      expect(files.filter((name) => name.endsWith(".dump")).length).toBe(5);
+      expect(files.some((name) => name.endsWith("-abcdef0.dump"))).toBe(true);
+      expect(files.some((name) => name.endsWith(".tmp"))).toBe(false);
+    } finally {
+      s.cleanup();
+    }
+  });
+
+  test("a failed pg_dump leaves no final or temporary file and does not prune", () => {
+    const s = sandbox();
+    try {
+      writeFileSync(join(s.base, "release.env"), "SAMO_RELEASE_SHA=abcdef0123456789\n");
+      writeFileSync(join(s.dir, "fail-pg-dump"), "1");
+      const backups = join(s.base, "backups");
+      mkdirSync(backups);
+      for (let n = 1; n <= 7; n++) writeFileSync(join(backups, `2026010${n}T000000Z-1111111.dump`), "old");
+      const result = s.step("backup");
+      expect(result.status).toBe(1);
+      const files = readdirSync(backups);
+      expect(files.filter((name) => name.endsWith(".dump")).length).toBe(7);
+      expect(files.some((name) => name.endsWith(".tmp"))).toBe(false);
+    } finally {
+      s.cleanup();
+    }
   });
 
   test("build steps run as the build user in a hardened transient service with limits", () => {

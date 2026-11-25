@@ -141,6 +141,45 @@ describe("buildDeployScript hard-won behaviors", () => {
     expect(script).not.toContain("SAMOHOST_PHASE:migrate");
     expect(script).not.toContain("SAMOHOST_PHASE:seed");
     expect(script).not.toContain("SAMOHOST_PHASE:assert-rls");
+    expect(script).not.toContain("SAMOHOST_PHASE:backup");
+  });
+
+  test("backs up the database immediately before migrations", () => {
+    const script = buildDeployScript(fieldRecord(), TARGET);
+    const backup = script.indexOf("<<<SAMOHOST_PHASE:backup:start>>>");
+    const migrate = script.indexOf("<<<SAMOHOST_PHASE:migrate:start>>>");
+    expect(backup).toBeGreaterThan(-1);
+    expect(backup).toBeLessThan(migrate);
+    expect(script).toContain('sudo -n "$SAMOHOST_STEP" backup');
+    expect(script).toContain("the database backup failed and migrations did not run");
+    expect(script).toContain("run samohost app bootstrap");
+  });
+
+  test("a failed backup takes the migrate rollback path and never reaches migrate", () => {
+    const dir = mkdtempSync(join(tmpdir(), "samohost-backup-failure-"));
+    const step = join(dir, "step");
+    const log = join(dir, "step.log");
+    writeFileSync(step, `#!/usr/bin/env bash\necho "$1" >> ${JSON.stringify(log)}\n[[ "$1" != backup ]]\n`);
+    chmodSync(step, 0o755);
+    const script = buildDeployScript(fieldRecord(), TARGET);
+    const start = script.indexOf("# --- backup:");
+    const end = script.indexOf("# --- release", start);
+    const phases = script.slice(start, end);
+    const harness = [
+      "set -euo pipefail",
+      'sudo() { if [[ "${1:-}" == -n ]]; then shift; fi; "$@"; }',
+      `SAMOHOST_STEP=${JSON.stringify(step)}`,
+      "SAMOHOST_RELEASE_MODEL=1",
+      "SAMOHOST_HAS_PREVIOUS_RELEASE=1",
+      'rollback() { echo "ROLLBACK:$1"; exit 1; }',
+      phases,
+    ].join("\n");
+    const run = spawnSync("bash", ["-c", harness], { encoding: "utf8" });
+    expect(run.status).toBe(1);
+    expect(run.stdout).toContain("ROLLBACK:before-restart");
+    expect(run.stderr).toContain("backup failed and migrations did not run");
+    expect(readFileSync(log, "utf8")).toBe("backup\n");
+    rmSync(dir, { recursive: true, force: true });
   });
 
   test("assert-rls phase appears only when rlsNonSuperuser is set", () => {
@@ -1063,7 +1102,10 @@ describe("issue #122: per-phase cwd — build's cd must not leak into migrate", 
 
     // Execute exactly the build+migrate phase code the remote shell would run
     // (fetch/checkout/install need a VM; the cwd contract doesn't).
-    const phases = slicePhases(script, "# --- build ---", "# --- restart");
+    // This test isolates the cwd contract. Database backup execution is covered
+    // separately and requires the server-installed privileged helper.
+    const phases = slicePhases(script, "# --- build ---", "# --- backup") +
+      slicePhases(script, "# --- migrate", "# --- restart");
     const harness = [
       "#!/usr/bin/env bash",
       "set -euo pipefail",

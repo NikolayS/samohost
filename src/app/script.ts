@@ -64,6 +64,7 @@ export type PhaseName =
   | "checkout"
   | "install"
   | "build"
+  | "backup"
   | "migrate"
   | "release"
   | "lock"
@@ -874,6 +875,19 @@ export function buildDeployScript(app: AppRecord, target: DeployTarget): string 
     // ----- migrate (optional) ------------------------------------------------
     if (app.migrateCmd) {
       push(
+        "# --- backup: save the database before migrations change it ---",
+        'if [[ "${SAMOHOST_RELEASE_MODEL:-0}" == 1 ]]; then',
+        marker("backup", "start"),
+        'if sudo -n "$SAMOHOST_STEP" backup </dev/null; then',
+        `  ${marker("backup", "ok")}`,
+        "else",
+        `  ${marker("backup", "fail")}`,
+        '  echo "ERROR: the database backup failed and migrations did not run. If this server predates database backups, run samohost app bootstrap to install the per-app backup helper and sudo rule." >&2',
+        '  if [[ "$SAMOHOST_HAS_PREVIOUS_RELEASE" == "1" ]]; then rollback before-restart; fi',
+        "  exit 1",
+        "fi",
+        "fi",
+        "",
         "# --- migrate: apply DB migrations before the new code boots ---",
         "# subshell + cd: always runs from the app dir, whatever buildCmd cd'd into (issue #122).",
         ...(splitLayout !== undefined

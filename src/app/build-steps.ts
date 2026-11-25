@@ -25,7 +25,7 @@
  * (read by systemd as root) and cannot write anywhere but their private /tmp.
  */
 
-export const BUILD_STEP_NAMES = ["install", "build", "migrate", "seed", "release", "rollback", "cleanup"] as const;
+export const BUILD_STEP_NAMES = ["install", "build", "backup", "migrate", "seed", "release", "rollback", "cleanup"] as const;
 
 export interface BuildStepParams {
   appName: string;
@@ -36,6 +36,7 @@ export interface BuildStepParams {
   envFile: string;
   migrateEnvFile: string;
   releaseEnvFile: string;
+  database: string;
   tokenFile: string;
   gitSafeConf: string;
   buildCmd: string;
@@ -112,6 +113,8 @@ export function buildStepScript(p: BuildStepParams): string {
     `PREVIOUS=${sq(m.previousLink)}`,
     `MIGRATE_ENV=${sq(p.migrateEnvFile)}`,
     `RELEASE_ENV=${sq(p.releaseEnvFile)}`,
+    `DATABASE=${sq(p.database)}`,
+    `BACKUP_DIR=${sq(`/var/backups/samohost/${p.appName}`)}`,
     `HIDDEN=${sq(hidden)}`,
     `HIDDEN_COPY=${sq(hiddenCopy)}`,
     `COPY_CMD=${sq(copyCmd)}`,
@@ -126,7 +129,7 @@ export function buildStepScript(p: BuildStepParams): string {
     "MIN_FREE_KB=2097152",
     "",
     `if [[ $# -ne 1 ]]; then echo "usage: $0 ${BUILD_STEP_NAMES.join("|")}" >&2; exit 2; fi`,
-    'case "$1" in install|build|migrate|seed|release|rollback|cleanup) ;; *)',
+    'case "$1" in install|build|backup|migrate|seed|release|rollback|cleanup) ;; *)',
     `  echo "usage: $0 ${BUILD_STEP_NAMES.join("|")}" >&2; exit 2 ;;`,
     "esac",
     "",
@@ -236,6 +239,25 @@ export function buildStepScript(p: BuildStepParams): string {
     "    ;;",
     "  build)",
     '    samohost_build_unit build 1800 "$BUILD_DIR $CACHE_DIR" "" "$CACHE_DIR" "$BUILD_CMD"',
+    "    ;;",
+    "  backup)",
+    "    # Root owns the directory and opens the output file. pg_dump itself runs",
+    "    # as the postgres OS user over peer authentication and cannot list backups.",
+    '    install -d -m 700 -o root -g root "$BACKUP_DIR"',
+    '    find "$BACKUP_DIR" -maxdepth 1 -type f -name ".backup.*.tmp" -delete',
+    '    sha="$(sed -n "s/^SAMO_RELEASE_SHA=//p" "$RELEASE_ENV" | tail -n 1)"',
+    '    if [[ ! "$sha" =~ ^[0-9a-f]{7,64}$ ]]; then echo "ERROR: release.env has no valid SAMO_RELEASE_SHA; database backup did not run" >&2; exit 1; fi',
+    '    stamp="$(date -u +%Y%m%dT%H%M%SZ)"',
+    '    final="$BACKUP_DIR/$stamp-${sha:0:7}.dump"',
+    '    tmp="$(mktemp "$BACKUP_DIR/.backup.XXXXXX.tmp")"',
+    '    trap \'rm -f -- "$tmp"\' EXIT',
+    '    chmod 600 "$tmp"',
+    '    if ! /usr/bin/timeout 600 /usr/sbin/runuser -u postgres -- /usr/bin/pg_dump -Fc --dbname="$DATABASE" > "$tmp"; then',
+    '      echo "ERROR: pg_dump failed or exceeded the 10 minute timeout; database backup was not saved" >&2; exit 1',
+    "    fi",
+    '    mv -fT -- "$tmp" "$final"',
+    "    trap - EXIT",
+    '    find "$BACKUP_DIR" -maxdepth 1 -type f -name "*.dump" -print | sort -r | tail -n +6 | while IFS= read -r old; do rm -f -- "$old"; done',
     "    ;;",
     "  migrate|seed)",
     '    if [[ "$1" == migrate ]]; then cmd="$MIGRATE_CMD"; else cmd="$SEED_CMD"; fi',

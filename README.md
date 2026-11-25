@@ -402,6 +402,25 @@ A rollback after a failed install or build (for example an npm registry
 outage) does not record the commit: the outcome is `rolled-back`, the exit
 code 1, and the next trigger cycle deploys the same commit again.
 
+### Database backup before a migration
+
+For a split-layout node app with a database, deploy saves a custom-format
+PostgreSQL dump before it runs migrations. Root keeps the dumps in
+`/var/backups/samohost/<app>/`; the directory is mode 0700, each dump is mode
+0600, and only the newest five completed dumps are retained. A failed or timed
+out backup leaves no completed dump, does not prune older dumps, stops the
+deploy before migrations, and follows the same rollback and failed-commit path
+as a failed migration. Plain `pg_dump` runs while the old release serves and
+does not block its normal reads and writes.
+
+Restoring a dump is a manual operator procedure. Stop the app service, then as
+the PostgreSQL OS user run `pg_restore --clean --if-exists
+--role=<database>_owner --dbname=<database>
+/var/backups/samohost/<app>/<file>.dump`, and start the app service again. Check
+the restored app before returning it to users. The restore runs with the
+app database owner role; do not give the dump to the deploy user, runtime user,
+build user, or an app database role.
+
 ### Runtime user and service hardening of a node app
 
 This applies to node apps with the split env layout (a `migrate.env` next to

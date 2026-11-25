@@ -863,6 +863,7 @@ export function buildHostBootstrapScript(
       envFile,
       migrateEnvFile,
       releaseEnvFile,
+      database: dbName!,
       tokenFile,
       gitSafeConf,
       buildCmd: app.buildCmd,
