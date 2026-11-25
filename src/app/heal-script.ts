@@ -44,7 +44,12 @@
 
 import type { AppRecord } from "../types.ts";
 import { staticCacheHeaderLines } from "../static-cache.ts";
-import { STATIC_TRY_FILES, staticReleaseStatePaths } from "./static-root.ts";
+import {
+  PREVIOUS_STATIC_ROUTE_SED,
+  PREVIOUS_STATIC_TRY_FILES,
+  STATIC_TRY_FILES,
+  staticReleaseStatePaths,
+} from "./static-root.ts";
 import { renderVhost, planFromApp, mainVhostTrustedProxies, previousNodeMainVhost } from "../caddy/render.ts";
 import { CADDY_VALIDATE, CADDY_VALIDATE_FN_LINES, CADDY_VALIDATE_RULE_PROBE } from "../caddy/validate.ts";
 import { faviconVhostBodyLines } from "../caddy/favicon.ts";
@@ -405,6 +410,25 @@ export function buildConfigHealScript(app: AppRecord, opts: BuildConfigHealScrip
       "  fi",
       "fi",
       "",
+      `# The static route an older samohost wrote (${PREVIOUS_STATIC_TRY_FILES}) is`,
+      "# samohost's own file. It is replaced only when the Caddy configuration",
+      "# validates for the deploy user now, checked before any write (the same",
+      "# validation heal runs after its writes). Otherwise it is left as it is:",
+      "# one line, outcome drift-foreign, exit 0.",
+      "SAMOHOST_PREVIOUS_ROUTE_OK=0",
+      "SAMOHOST_PREVIOUS_ROUTE_REPORTED=0",
+      "SAMOHOST_ACTIVE_ROUTE_UPGRADE=0",
+      `if [[ "$SAMOHOST_STATIC_DIR_RESOLVED" == "1" ]] && grep -qsF -- ${sq(PREVIOUS_STATIC_TRY_FILES)} ${sq(mainVhostPath)} ${sq(staticPaths.activeRoute)}; then`,
+      "  if samohost_caddy_validate 2>/dev/null; then SAMOHOST_PREVIOUS_ROUTE_OK=1; fi",
+      "fi",
+      "samohost_heal_previous_route_left() {",
+      '  if [[ "$SAMOHOST_PREVIOUS_ROUTE_REPORTED" == "0" ]]; then',
+      `    echo "drift-foreign: the static route an older samohost wrote (${PREVIOUS_STATIC_TRY_FILES}) is left as it is: the Caddy configuration does not validate for the deploy user; a bootstrap re-run with this samohost version, then heal or the next deploy, upgrades it"`,
+      "    SAMOHOST_PREVIOUS_ROUTE_REPORTED=1",
+      "  fi",
+      "  SAMOHOST_HEAL_DRIFT_FOREIGN=1",
+      "}",
+      "",
     );
   }
 
@@ -611,7 +635,14 @@ export function buildConfigHealScript(app: AppRecord, opts: BuildConfigHealScrip
       `      if cmp -s ${sq(mainVhostPath)} "$_new_main_vhost"; then`,
       `        rm -f "$_new_main_vhost"`,
       '        echo "main vhost: no drift"',
+      `      elif ${PREVIOUS_STATIC_ROUTE_SED} ${sq(mainVhostPath)} | cmp -s "$_new_main_vhost" - && [[ "$SAMOHOST_PREVIOUS_ROUTE_OK" != "1" ]]; then`,
+      `        rm -f "$_new_main_vhost"`,
+      "        samohost_heal_previous_route_left",
       "      else",
+      `        if ${PREVIOUS_STATIC_ROUTE_SED} ${sq(mainVhostPath)} | cmp -s "$_new_main_vhost" -; then`,
+      "          SAMOHOST_MAIN_VHOST_UPGRADE=1",
+      `          echo "main vhost: the static route an older samohost wrote; regenerating"`,
+      "        fi",
       "        # Stage: tee to staged path, then atomic mv",
       "        samohost_heal_before_change",
       `        if sudo /usr/bin/tee ${sq(stagedMainVhost)} >/dev/null < "$_new_main_vhost"; then`,
@@ -664,7 +695,14 @@ export function buildConfigHealScript(app: AppRecord, opts: BuildConfigHealScrip
       `    if [[ -f ${sq(staticPaths.activeRoute)} ]] && cmp -s ${sq(staticPaths.activeRoute)} "$SAMOHOST_ACTIVE_ROUTE_STAGED"; then`,
       '      rm -f "$SAMOHOST_ACTIVE_ROUTE_STAGED"',
       '      echo "active-route: no drift"',
+      `    elif [[ -f ${sq(staticPaths.activeRoute)} ]] && ${PREVIOUS_STATIC_ROUTE_SED} ${sq(staticPaths.activeRoute)} | cmp -s "$SAMOHOST_ACTIVE_ROUTE_STAGED" - && [[ "$SAMOHOST_PREVIOUS_ROUTE_OK" != "1" ]]; then`,
+      '      rm -f "$SAMOHOST_ACTIVE_ROUTE_STAGED"',
+      "      samohost_heal_previous_route_left",
       "    else",
+      `      if [[ -f ${sq(staticPaths.activeRoute)} ]] && ${PREVIOUS_STATIC_ROUTE_SED} ${sq(staticPaths.activeRoute)} | cmp -s "$SAMOHOST_ACTIVE_ROUTE_STAGED" -; then`,
+      "        SAMOHOST_ACTIVE_ROUTE_UPGRADE=1",
+      `        echo "active-route: the static route an older samohost wrote; regenerating"`,
+      "      fi",
       "      # Atomic mv into place (the rollback removes a snippet heal created)",
       "      samohost_heal_before_change",
       `      if [[ ! -e ${sq(staticPaths.activeRoute)} ]]; then SAMOHOST_ACTIVE_ROUTE_CREATED=1; fi`,
@@ -754,8 +792,9 @@ export function buildConfigHealScript(app: AppRecord, opts: BuildConfigHealScrip
 
   // ---- Cleanup backups and emit heal:ok ------------------------------------
   push(
-    "# The form an older samohost's host-prep wrote, once replaced, is kept in",
-    "# the deploy user's home (heal has no sudo rule to write next to it).",
+    "# The form an older samohost wrote (host-prep's main vhost, or a static",
+    "# route), once replaced, is kept in the deploy user's home (heal has no",
+    "# sudo rule to write next to the main vhost).",
     'if [[ "$SAMOHOST_MAIN_VHOST_UPGRADE" == "1" ]]; then',
     `  _kept="\${HOME:-}/samohost-backups/00-main-${app.name}.caddy.bak.$(date -u +%Y%m%dT%H%M%SZ)"`,
     '  if install -d -m 700 "${HOME:-}/samohost-backups" && install -m 600 "$SAMOHOST_MAIN_VHOST_BACKUP" "$_kept"; then',
@@ -764,6 +803,18 @@ export function buildConfigHealScript(app: AppRecord, opts: BuildConfigHealScrip
     '    echo "WARNING: could not keep a copy of the previous main vhost in ${HOME:-}/samohost-backups" >&2',
     "  fi",
     "fi",
+    ...(isStatic && staticPaths !== undefined
+      ? [
+          'if [[ "$SAMOHOST_ACTIVE_ROUTE_UPGRADE" == "1" ]]; then',
+          `  _kept="\${HOME:-}/samohost-backups/${app.name}-active-static.caddy.bak.$(date -u +%Y%m%dT%H%M%SZ)"`,
+          '  if install -d -m 700 "${HOME:-}/samohost-backups" && install -m 600 "$SAMOHOST_ACTIVE_ROUTE_BACKUP" "$_kept"; then',
+          '    echo "active-route: the previous file is kept at $_kept"',
+          "  else",
+          '    echo "WARNING: could not keep a copy of the previous active-route snippet in ${HOME:-}/samohost-backups" >&2',
+          "  fi",
+          "fi",
+        ]
+      : []),
     "# Cleanup backup temps",
     'rm -f "${SAMOHOST_MAIN_VHOST_BACKUP:-}" || true',
     ...(isStatic && staticPaths !== undefined

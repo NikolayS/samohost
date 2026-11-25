@@ -13,7 +13,7 @@ import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, 
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { buildHostPrepScript, buildEnvCreateScript, buildCustomDomainVhostScript } from "../src/env/script.ts";
-import { buildConfigHealScript, staticMainVhostLines } from "../src/app/heal-script.ts";
+import { buildConfigHealScript, staticMainVhostLines, staticVhostAddress } from "../src/app/heal-script.ts";
 import { buildHostBootstrapScript } from "../src/app/bootstrap.ts";
 import { buildDeployScript } from "../src/app/script.ts";
 import { faviconVhostBodyLines } from "../src/caddy/favicon.ts";
@@ -21,6 +21,7 @@ import {
   PREVIOUS_STATIC_ROUTE_SED,
   PREVIOUS_STATIC_TRY_FILES,
   STATIC_TRY_FILES,
+  staticReleaseStatePaths,
 } from "../src/app/static-root.ts";
 import type { AppRecord } from "../src/types.ts";
 import { nodeApp } from "./bootstrap-db-harness.ts";
@@ -263,5 +264,170 @@ describe("custom domain — active route of an earlier samohost", () => {
     const hand = runLine(line, { EXPECTED_ROUTE: ROUTE_NEW, SAMOHOST_ACTIVE_ROUTE: ROUTE_HAND });
     expect(hand.code).toBe(1);
     expect(hand.out).toContain("active static route does not match structured release state");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// heal: the whole script in a sandbox
+// ---------------------------------------------------------------------------
+
+/** The outcome `app heal` reports for this output (src/commands/app.ts). */
+function outcomeOf(out: string): string {
+  if (out.includes("<<<SAMOHOST_PHASE:no-drift:ok>>>")) return "no-drift";
+  if (out.includes("<<<SAMOHOST_PHASE:rollback:fail>>>")) return "rollback-failed";
+  if (out.includes("<<<SAMOHOST_PHASE:rollback:ok>>>")) return "rolled-back";
+  if (out.includes("<<<SAMOHOST_PHASE:heal:ok>>>")) return out.includes("drift-foreign:") ? "drift-foreign" : "healed";
+  return "incomplete";
+}
+
+/**
+ * Runs the static heal script with /etc/caddy, /opt/site, $HOME and $TMPDIR in
+ * a sandbox. `validates` is whether the Caddy configuration validates for the
+ * deploy user (no caddy sudo rule here: heal validates as the deploy user).
+ * `codes` are the HTTP codes curl answers, one per call; the last one repeats.
+ */
+function runHeal(form: "old" | "new", opts: { validates?: boolean; codes?: string[]; route?: "old" | "new" } = {}) {
+  const dir = mkdtempSync(join(tmpdir(), "samohost-static-route-heal-"));
+  try {
+    const bin = join(dir, "bin");
+    const home = join(dir, "home");
+    const tmp = join(dir, "tmp");
+    for (const d of [bin, home, tmp]) mkdirSync(d);
+    const log = join(dir, "calls.log");
+    const etc = join(dir, "etc-caddy");
+    const opt = join(dir, "opt-site");
+    const paths = staticReleaseStatePaths("/opt/site/app");
+    const sandboxed = (p: string) => p.replace("/opt/site", opt);
+    const releaseDir = join(opt, "releases", "r1");
+    mkdirSync(releaseDir, { recursive: true });
+    mkdirSync(join(etc, "sites.d"), { recursive: true });
+    writeFileSync(join(etc, "Caddyfile"), "{\n}\nimport sites.d/*.caddy\n");
+    writeFileSync(sandboxed(paths.activeState), JSON.stringify({ schema: 1, releaseDir, staticRoot: "" }) + "\n");
+    const mainNew = staticMainVhostLines(staticVhostAddress("site.example.com", "cp-http80"), releaseDir, releaseDir, false, "site").join("\n") + "\n";
+    const routeNew = `root * "${releaseDir}"\n${NEW_LINE}\nfile_server\nencode gzip\n`;
+    const mainLive = form === "old" ? mainNew.replace(NEW_LINE, OLD_LINE) : mainNew;
+    const routeLive = (opts.route ?? form) === "old" ? routeNew.replace(NEW_LINE, OLD_LINE) : routeNew;
+    const mainPath = join(etc, "sites.d", "00-main-site.caddy");
+    const routePath = sandboxed(paths.activeRoute);
+    writeFileSync(mainPath, mainLive);
+    writeFileSync(routePath, routeLive);
+    const stub = (name: string, body: string) => writeFileSync(join(bin, name), `#!/usr/bin/env bash\n${body}\n`, { mode: 0o755 });
+    stub("caddy", `printf 'caddy %s\\n' "$*" >> '${log}'\n[[ "$1" == validate ]] && exit ${opts.validates === false ? 1 : 0}\nexit 0`);
+    stub("systemctl", `printf 'systemctl %s\\n' "$*" >> '${log}'`);
+    const codes = opts.codes ?? ["200"];
+    const counter = join(dir, "curl.count");
+    stub(
+      "curl",
+      [
+        `n=$(cat '${counter}' 2>/dev/null || echo 0); echo $((n + 1)) > '${counter}'`,
+        `codes=(${codes.join(" ")}); i=$n; if (( i >= \${#codes[@]} )); then i=$(( \${#codes[@]} - 1 )); fi`,
+        'printf "%s" "${codes[$i]}"',
+      ].join("\n"),
+    );
+    stub("sleep", "exit 0");
+    stub(
+      "sudo",
+      [
+        `printf 'sudo %s\\n' "$*" >> '${log}'`,
+        // No caddy validate sudo rule for this deploy user.
+        'if [[ " $* " == *" -l "* ]]; then exit 1; fi',
+        "while [[ $# -gt 0 ]]; do case \"$1\" in -n) shift ;; -u) shift 2 ;; *) break ;; esac; done",
+        'c="$1"; shift; case "$c" in /usr/bin/*) c="${c#/usr/bin/}" ;; esac',
+        'exec "$c" "$@"',
+      ].join("\n"),
+    );
+    // macOS has no /usr/bin/mv; the sandbox runs mv from PATH.
+    const script = buildConfigHealScript(siteApp())
+      .replaceAll("/etc/caddy", etc)
+      .replaceAll("/opt/site", opt)
+      .replaceAll("/usr/bin/mv", "mv");
+    const res = spawnSync("bash", ["-c", script], {
+      encoding: "utf8",
+      env: { ...process.env, PATH: `${bin}:${process.env["PATH"] ?? ""}`, HOME: home, TMPDIR: tmp },
+    });
+    const backupDir = join(home, "samohost-backups");
+    return {
+      code: res.status,
+      out: res.stdout + res.stderr,
+      main: readFileSync(mainPath, "utf8"),
+      route: readFileSync(routePath, "utf8"),
+      mainOld: mainNew.replace(NEW_LINE, OLD_LINE),
+      routeOld: routeNew.replace(NEW_LINE, OLD_LINE),
+      mainNew,
+      routeNew,
+      sites: readdirSync(join(etc, "sites.d")),
+      releases: readdirSync(join(opt, "releases")),
+      tmpLeft: readdirSync(tmp),
+      kept: existsSync(backupDir) ? readdirSync(backupDir).sort().map((f) => ({ name: f, text: readFileSync(join(backupDir, f), "utf8") })) : [],
+      calls: existsSync(log) ? readFileSync(log, "utf8") : "",
+    };
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+describe("heal — static app whose files have the route of an earlier samohost", () => {
+  test("the current route in both files: no-drift, nothing validated or written", () => {
+    const r = runHeal("new");
+    expect(r.code, r.out).toBe(0);
+    expect(outcomeOf(r.out)).toBe("no-drift");
+    expect(r.main).toBe(r.mainNew);
+    expect(r.route).toBe(r.routeNew);
+    expect(r.calls).not.toContain("caddy validate");
+    expect(r.calls).not.toContain("systemctl reload");
+    expect(r.kept).toEqual([]);
+  });
+
+  test("the earlier route, configuration validates: both files upgraded, backups kept, / answers 200 after", () => {
+    // Before the change / answers 404 (the earlier route), after the reload 200.
+    const r = runHeal("old", { codes: ["404", "200"] });
+    expect(r.code, r.out).toBe(0);
+    expect(outcomeOf(r.out)).toBe("healed");
+    expect(r.main).toBe(r.mainNew);
+    expect(r.route).toBe(r.routeNew);
+    expect(r.out).toContain("main vhost: the static route an older samohost wrote; regenerating");
+    expect(r.out).toContain("active-route: the static route an older samohost wrote; regenerating");
+    expect(r.kept.map((k) => k.name)).toEqual([
+      expect.stringMatching(/^00-main-site\.caddy\.bak\.\d{8}T\d{6}Z$/),
+      expect.stringMatching(/^site-active-static\.caddy\.bak\.\d{8}T\d{6}Z$/),
+    ]);
+    expect(r.kept.map((k) => k.text)).toEqual([r.mainOld, r.routeOld]);
+    // Validated before any write and after the writes.
+    expect(r.calls.split("\n").filter((l) => l.startsWith("caddy validate --config ")).length).toBe(2);
+    expect(r.calls).toContain("systemctl reload caddy");
+    expect(r.sites).toEqual(["00-main-site.caddy"]);
+    expect(r.tmpLeft).toEqual([]);
+  });
+
+  test("the earlier route, configuration does not validate: drift-foreign, exit 0, files unchanged, one line", () => {
+    const r = runHeal("old", { validates: false, codes: ["404"] });
+    expect(r.code, r.out).toBe(0);
+    expect(outcomeOf(r.out)).toBe("drift-foreign");
+    expect(r.out).not.toContain("rollback");
+    expect(r.main).toBe(r.mainOld);
+    expect(r.route).toBe(r.routeOld);
+    expect(r.out.split("\n").filter((l) => l.includes("older samohost")).length).toBe(1);
+    expect(r.calls).not.toContain("tee");
+    expect(r.calls).not.toContain("systemctl reload");
+    expect(r.kept).toEqual([]);
+    expect(r.sites).toEqual(["00-main-site.caddy"]);
+    expect(r.releases.sort()).toEqual([".samohost-active-static.caddy", ".samohost-active-static.json", "r1"]);
+    expect(r.tmpLeft).toEqual([]);
+  });
+
+  test("only the active route has the earlier line: it alone is upgraded", () => {
+    const r = runHeal("new", { route: "old", codes: ["200"] });
+    expect(r.code, r.out).toBe(0);
+    expect(outcomeOf(r.out)).toBe("healed");
+    expect(r.main).toBe(r.mainNew);
+    expect(r.route).toBe(r.routeNew);
+    expect(r.kept.map((k) => k.text)).toEqual([r.routeOld]);
+  });
+
+  test("a second heal after the upgrade is no-drift", () => {
+    const first = runHeal("old", { codes: ["404", "200"] });
+    expect(outcomeOf(first.out)).toBe("healed");
+    const again = runHeal("new");
+    expect(outcomeOf(again.out)).toBe("no-drift");
   });
 });
