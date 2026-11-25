@@ -414,7 +414,9 @@ type CustomDomainFixture =
   | "clean"
   | "root-symlink"
   | "nested-file-symlink"
-  | "reload-failure";
+  | "reload-failure"
+  | "previous-route"
+  | "hand-edited-route";
 
 function runCustomDomainSandbox(
   fixture: CustomDomainFixture,
@@ -477,9 +479,13 @@ function runCustomDomainSandbox(
     staticRoot: "dist",
     releaseTagFormat: identity?.releaseTagFormat ?? null,
   }) + "\n");
+  // "previous-route": the try_files line an earlier samohost wrote.
+  const tryFiles = fixture === "previous-route" || fixture === "hand-edited-route"
+    ? "try_files {path} {path}/ =404"
+    : "try_files {path} {path}/index.html =404";
   writeFileSync(
     activePaths.activeRoute,
-    `root * "${staticDir}"\ntry_files {path} {path}/ =404\nfile_server\nencode gzip\n`,
+    `root * "${staticDir}"\n${tryFiles}\nfile_server\nencode gzip\n${fixture === "hand-edited-route" ? "header X-Hand 1\n" : ""}`,
   );
   mkdirSync(join(caddyDir, "sites.d"), { recursive: true });
   if (fixture === "reload-failure") {
@@ -536,6 +542,27 @@ describe("staticRoot custom-domain sandbox", () => {
         `root * "${join(result.dir, "site", "releases", "active-candidate", "dist")}"`,
       );
       expect(vhost).not.toContain(result.appDir);
+    } finally {
+      rmSync(result.dir, { recursive: true, force: true });
+    }
+  });
+
+  test("accepts an active route with the try_files line of an earlier samohost", () => {
+    const result = runCustomDomainSandbox("previous-route");
+    try {
+      expect(result.status, result.stderr).toBe(0);
+      expect(readFileSync(result.snippet, "utf8")).toContain(`import "${result.activeRoute}"`);
+    } finally {
+      rmSync(result.dir, { recursive: true, force: true });
+    }
+  });
+
+  test("still rejects an active route that differs in more than the try_files line", () => {
+    const result = runCustomDomainSandbox("hand-edited-route");
+    try {
+      expect(result.status).toBe(1);
+      expect(result.stderr).toContain("active static route does not match structured release state");
+      expect(existsSync(result.snippet)).toBe(false);
     } finally {
       rmSync(result.dir, { recursive: true, force: true });
     }

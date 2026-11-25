@@ -774,7 +774,7 @@ describe("buildDeployScript — static path (kind='static')", () => {
       writeFileSync(siteFile, [
         "http://my-static-site.example.com {",
         `\troot * "${join(appDir, "dist")}"`,
-        "\ttry_files {path} {path}/ =404",
+        "\ttry_files {path} {path}/index.html =404",
         "\tfile_server",
         "\tencode gzip",
         "}",

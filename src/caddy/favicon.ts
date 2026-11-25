@@ -36,6 +36,7 @@
  */
 
 import { staticCacheHeaderLines } from "../static-cache.ts";
+import { STATIC_TRY_FILES } from "../app/static-root.ts";
 
 // ---------------------------------------------------------------------------
 // Name guard — defensive charset validation
@@ -219,7 +220,7 @@ export function faviconVhostBodyLines(
     `\t\t\t}`,
     `\t\t}`,
     ...staticCacheHeaderLines("\t\t"),
-    `\t\ttry_files {path} {path}/ =404`,
+    `\t\t${STATIC_TRY_FILES}`,
     `\t\tfile_server`,
     `\t\tencode gzip`,
     `\t}`,

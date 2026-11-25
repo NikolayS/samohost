@@ -116,7 +116,7 @@ describe("BUG-1: heal renders correct static vhost (file_server, not reverse_pro
   test("heal-1d: main vhost block contains try_files with =404 (matches deploy format)", () => {
     const script = buildConfigHealScript(staticApp());
     // Must match the deploy path's try_files directive exactly
-    expect(script).toContain("try_files {path} {path}/ =404");
+    expect(script).toContain("try_files {path} {path}/index.html =404");
   });
 
   test("heal-1e: main vhost block contains encode gzip", () => {

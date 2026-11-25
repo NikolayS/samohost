@@ -83,6 +83,8 @@
 import type { AppRecord } from "../types.ts";
 import { buildFirewallLines, isValidMainHost, type HostPrepFirewallOpts } from "../env/script.ts";
 import {
+  PREVIOUS_STATIC_ROUTE_SED,
+  STATIC_TRY_FILES,
   staticReleaseStatePaths,
   staticRootOf,
   staticTreeGuardFnLines,
@@ -1329,8 +1331,10 @@ export function buildHostBootstrapScript(
       "    raise SystemExit('active static deployment identity does not match state')",
       'PY',
       '  SAMOHOST_BOOTSTRAP_EXPECTED_ROUTE=$(mktemp)',
-      '  printf \'root * "%s"\\ntry_files {path} {path}/ =404\\nfile_server\\nencode gzip\\n\' "$SAMOHOST_STATIC_DIR" > "$SAMOHOST_BOOTSTRAP_EXPECTED_ROUTE"',
-      '  cmp -s "$SAMOHOST_BOOTSTRAP_EXPECTED_ROUTE" "$SAMOHOST_ACTIVE_ROUTE" || { echo "active static route does not match structured deployment state" >&2; exit 1; }',
+      `  printf 'root * "%s"\\n${STATIC_TRY_FILES}\\nfile_server\\nencode gzip\\n' "$SAMOHOST_STATIC_DIR" > "$SAMOHOST_BOOTSTRAP_EXPECTED_ROUTE"`,
+      // A route with the try_files line of an earlier samohost is accepted:
+      // the next deploy, or heal, writes the current line.
+      `  cmp -s "$SAMOHOST_BOOTSTRAP_EXPECTED_ROUTE" "$SAMOHOST_ACTIVE_ROUTE" || ${PREVIOUS_STATIC_ROUTE_SED} "$SAMOHOST_ACTIVE_ROUTE" | cmp -s "$SAMOHOST_BOOTSTRAP_EXPECTED_ROUTE" - || { echo "active static route does not match structured deployment state" >&2; exit 1; }`,
       '  SAMOHOST_BOOTSTRAP_EXPECTED_MAIN=$(mktemp)',
       '  cat > "$SAMOHOST_BOOTSTRAP_EXPECTED_MAIN" <<CADDY_SITE',
       // staticMainVhostLines() is the shared three-way contract (deploy == heal == bootstrap).
@@ -1344,7 +1348,7 @@ export function buildHostBootstrapScript(
       ),
       'CADDY_SITE',
       '  [[ -f "$SAMOHOST_MAIN_VHOST" && ! -L "$SAMOHOST_MAIN_VHOST" ]] || { echo "active static main vhost is missing or unsafe; refusing bootstrap route change" >&2; exit 1; }',
-      '  cmp -s "$SAMOHOST_BOOTSTRAP_EXPECTED_MAIN" "$SAMOHOST_MAIN_VHOST" || { echo "active static main vhost diverges from structured deployment state; refusing bootstrap route change" >&2; exit 1; }',
+      `  cmp -s "$SAMOHOST_BOOTSTRAP_EXPECTED_MAIN" "$SAMOHOST_MAIN_VHOST" || ${PREVIOUS_STATIC_ROUTE_SED} "$SAMOHOST_MAIN_VHOST" | cmp -s "$SAMOHOST_BOOTSTRAP_EXPECTED_MAIN" - || { echo "active static main vhost diverges from structured deployment state; refusing bootstrap route change" >&2; exit 1; }`,
       '  SAMOHOST_BOOTSTRAP_FINGERPRINT=$(sha256sum "$SAMOHOST_ACTIVE_STATE" "$SAMOHOST_ACTIVE_ROUTE" "$SAMOHOST_MAIN_VHOST" | sha256sum | awk \'{print $1}\')',
       '  samohost_assert_static_tree_safe "$SAMOHOST_CHECKOUT_REAL" "$SAMOHOST_STATIC_DIR" "$SAMOHOST_STATIC_ROOT"',
       '  [[ "$(sha256sum "$SAMOHOST_ACTIVE_STATE" "$SAMOHOST_ACTIVE_ROUTE" "$SAMOHOST_MAIN_VHOST" | sha256sum | awk \'{print $1}\')" == "$SAMOHOST_BOOTSTRAP_FINGERPRINT" ]] || { echo "active static deployment changed during bootstrap; retry" >&2; exit 1; }',
@@ -1364,7 +1368,7 @@ export function buildHostBootstrapScript(
       '  cat > "$SAMOHOST_BOOTSTRAP_EXPECTED_MAIN" <<CADDY_SITE',
       `${siteAddress} {`,
       `\troot * "\${SAMOHOST_STATIC_DIR}"`,
-      `\ttry_files {path} {path}/ =404`,
+      `\t${STATIC_TRY_FILES}`,
       `\tfile_server`,
       `\tencode gzip`,
       ...(app.mainListen === "cp-http80" ? [] : [`\ttls internal`]),
@@ -1372,7 +1376,7 @@ export function buildHostBootstrapScript(
       'CADDY_SITE',
       '  chmod 0644 "$SAMOHOST_BOOTSTRAP_EXPECTED_MAIN"',
       '  if [[ -e "$SAMOHOST_MAIN_VHOST" ]]; then',
-      '    [[ -f "$SAMOHOST_MAIN_VHOST" && ! -L "$SAMOHOST_MAIN_VHOST" ]] && cmp -s "$SAMOHOST_BOOTSTRAP_EXPECTED_MAIN" "$SAMOHOST_MAIN_VHOST" || { echo "main static vhost exists without authorized active state and is not the canonical fresh route; refusing bootstrap route change" >&2; exit 1; }',
+      `    [[ -f "$SAMOHOST_MAIN_VHOST" && ! -L "$SAMOHOST_MAIN_VHOST" ]] && { cmp -s "$SAMOHOST_BOOTSTRAP_EXPECTED_MAIN" "$SAMOHOST_MAIN_VHOST" || ${PREVIOUS_STATIC_ROUTE_SED} "$SAMOHOST_MAIN_VHOST" | cmp -s "$SAMOHOST_BOOTSTRAP_EXPECTED_MAIN" -; } || { echo "main static vhost exists without authorized active state and is not the canonical fresh route; refusing bootstrap route change" >&2; exit 1; }`,
       '  else',
       '    /usr/bin/mv -f "$SAMOHOST_BOOTSTRAP_EXPECTED_MAIN" "$SAMOHOST_MAIN_VHOST"',
       '    SAMOHOST_BOOTSTRAP_EXPECTED_MAIN=""',
