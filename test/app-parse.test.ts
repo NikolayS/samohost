@@ -3,6 +3,7 @@ import {
   deployOutcome,
   parseDeployOutcome,
   parsePhaseStream,
+  rollbackRecordsFailedSha,
 } from "../src/app/parse.ts";
 
 function m(phase: string, status: string): string {
@@ -39,6 +40,12 @@ describe("parsePhaseStream", () => {
   test("handles markers embedded mid-line", () => {
     const raw = `prefix ${m("restart", "ok")} suffix`;
     expect(parsePhaseStream(raw)).toEqual([{ phase: "restart", status: "ok" }]);
+  });
+
+  test("parses the backup phase and records a rolled-back backup failure", () => {
+    const events = parsePhaseStream([m("backup", "start"), m("backup", "fail"), m("rollback", "ok")].join("\n"));
+    expect(events.map((event) => `${event.phase}:${event.status}`)).toEqual(["backup:start", "backup:fail", "rollback:ok"]);
+    expect(rollbackRecordsFailedSha(events)).toBe(true);
   });
 });
 
@@ -147,6 +154,16 @@ describe("deployOutcome", () => {
     const events = parsePhaseStream(m("lock", "fail"));
     expect(events.map((e) => `${e.phase}:${e.status}`)).toEqual(["lock:fail"]);
     expect(deployOutcome(events)).toBe("incomplete");
+  });
+
+  test("a missing backup sudo rule uses the pre-checkout failure outcome and has no failed commit marker", () => {
+    const events = parsePhaseStream(m("lock", "fail"));
+    const outcome = deployOutcome(events);
+    const recordsFailedCommit =
+      (outcome === "rolled-back" || outcome === "rollback-failed") && rollbackRecordsFailedSha(events);
+    expect(outcome).toBe("incomplete");
+    expect(recordsFailedCommit).toBe(false);
+    expect(events.some((event) => event.phase === "rollback")).toBe(false);
   });
 
   test("build model: health fail, then stop:ok (no previous release) → 'stopped'", () => {

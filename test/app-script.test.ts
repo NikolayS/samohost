@@ -152,7 +152,41 @@ describe("buildDeployScript hard-won behaviors", () => {
     expect(backup).toBeLessThan(migrate);
     expect(script).toContain('sudo -n "$SAMOHOST_STEP" backup');
     expect(script).toContain("the database backup failed and migrations did not run");
-    expect(script).toContain("run samohost app bootstrap");
+    expect(script).toContain("run `samohost app bootstrap` for this app again");
+  });
+
+  test("checks the backup sudo rule after the deploy lock and before fetch or checkout", () => {
+    const script = buildDeployScript(fieldRecord(), TARGET);
+    const lock = script.indexOf('flock -n 8');
+    const precheck = script.indexOf('sudo -n -l "$SAMOHOST_STEP" backup');
+    const fetch = script.indexOf("# --- fetch:");
+    const checkout = script.indexOf("# --- checkout:");
+    expect(precheck).toBeGreaterThan(lock);
+    expect(precheck).toBeLessThan(fetch);
+    expect(precheck).toBeLessThan(checkout);
+    expect(script).toContain("this deploy changed nothing");
+  });
+
+  test("renders database backup code only for split node apps with migrations and a database", () => {
+    const eligible = buildDeployScript(fieldRecord(), TARGET);
+    expect(eligible).toContain("SAMOHOST_PHASE:backup:start");
+    expect(eligible).toContain('sudo -n -l "$SAMOHOST_STEP" backup');
+    const ineligible = [
+      buildDeployScript(staticApp(), STATIC_TARGET),
+      buildDeployScript(staticApp({ releaseTagPattern: "v*", releaseTagFormat: "date", releaseCiWorkflow: ".github/workflows/ci.yml" }), { ...STATIC_TARGET, tag: "v20261125.1" }),
+      buildDeployScript(fieldRecord({ migrateCmd: undefined }), TARGET),
+      buildDeployScript(fieldRecord({ dbBackend: "none" }), TARGET),
+      buildDeployScript(fieldRecord({ envFile: undefined }), TARGET),
+    ];
+    for (const script of ineligible) {
+      expect(script).not.toContain("SAMOHOST_PHASE:backup");
+      expect(script).not.toContain('sudo -n -l "$SAMOHOST_STEP" backup');
+    }
+  });
+
+  test("a split server without the build model warns before it migrates without a backup", () => {
+    const script = buildDeployScript(fieldRecord(), TARGET);
+    expect(script).toContain("WARNING: no database backup was taken: this server does not use the build model");
   });
 
   test("a failed backup takes the migrate rollback path and never reaches migrate", () => {
@@ -1103,8 +1137,8 @@ describe("issue #122: per-phase cwd — build's cd must not leak into migrate", 
     // Execute exactly the build+migrate phase code the remote shell would run
     // (fetch/checkout/install need a VM; the cwd contract doesn't).
     // This test isolates the cwd contract. Database backup execution is covered
-    // separately and requires the server-installed privileged helper.
-    const phases = slicePhases(script, "# --- build ---", "# --- backup") +
+    // separately for split-layout apps. This legacy-layout app has no backup helper.
+    const phases = slicePhases(script, "# --- build ---", "# --- migrate") +
       slicePhases(script, "# --- migrate", "# --- restart");
     const harness = [
       "#!/usr/bin/env bash",

@@ -45,6 +45,13 @@ if [[ "$SAMOHOST_RELEASE_MODEL" == 1 ]]; then
     exit 1
   fi
 fi
+# A server with the build model but without the backup sudo rule predates database backups.
+# Stop before fetch and checkout, so this commit is not recorded as failed.
+if [[ "$SAMOHOST_RELEASE_MODEL" == 1 ]] && ! sudo -n -l "$SAMOHOST_STEP" backup >/dev/null 2>&1; then
+  echo "<<<SAMOHOST_PHASE:lock:fail>>>"
+  echo 'ERROR: this server was set up before database backups existed; run `samohost app bootstrap` for this app again; this deploy changed nothing' >&2
+  exit 1
+fi
 # No process of the build user outlives the deploy, whatever its outcome.
 # Every step gets stdin from /dev/null: this script reaches bash on stdin,
 # and code in a step must not read or consume the rest of it.
@@ -222,10 +229,12 @@ if sudo -n "$SAMOHOST_STEP" backup </dev/null; then
   echo "<<<SAMOHOST_PHASE:backup:ok>>>"
 else
   echo "<<<SAMOHOST_PHASE:backup:fail>>>"
-  echo "ERROR: the database backup failed and migrations did not run. If this server predates database backups, run samohost app bootstrap to install the per-app backup helper and sudo rule." >&2
+  echo "ERROR: the database backup failed and migrations did not run" >&2
   if [[ "$SAMOHOST_HAS_PREVIOUS_RELEASE" == "1" ]]; then rollback before-restart; fi
   exit 1
 fi
+else
+  echo "WARNING: no database backup was taken: this server does not use the build model" >&2
 fi
 
 # --- migrate: apply DB migrations before the new code boots ---

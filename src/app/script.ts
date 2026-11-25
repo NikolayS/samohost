@@ -229,6 +229,7 @@ export function buildDeployScript(app: AppRecord, target: DeployTarget): string 
   const splitLayout = app.kind !== "static" && app.envFile !== undefined
     ? { migrateEnvFile: migrateEnvFileOf(app.envFile), dbVars: databaseUrlVarsOf(app) }
     : undefined;
+  const databaseBackupEnabled = splitLayout !== undefined && app.migrateCmd !== undefined && app.dbBackend !== "none";
   if (app.envFile !== undefined) {
     push(
       "# --- env: source the app env file (READ-ONLY; never written, never echoed) ---",
@@ -258,6 +259,17 @@ export function buildDeployScript(app: AppRecord, target: DeployTarget): string 
             "    exit 1",
             "  fi",
             "fi",
+            ...(databaseBackupEnabled
+              ? [
+                  "# A server with the build model but without the backup sudo rule predates database backups.",
+                  "# Stop before fetch and checkout, so this commit is not recorded as failed.",
+                  'if [[ "$SAMOHOST_RELEASE_MODEL" == 1 ]] && ! sudo -n -l "$SAMOHOST_STEP" backup >/dev/null 2>&1; then',
+                  `  ${marker("lock", "fail")}`,
+                  `  echo ${sq("ERROR: this server was set up before database backups existed; run `samohost app bootstrap` for this app again; this deploy changed nothing")} >&2`,
+                  "  exit 1",
+                  "fi",
+                ]
+              : []),
             "# No process of the build user outlives the deploy, whatever its outcome.",
             "# Every step gets stdin from /dev/null: this script reaches bash on stdin,",
             "# and code in a step must not read or consume the rest of it.",
@@ -875,19 +887,25 @@ export function buildDeployScript(app: AppRecord, target: DeployTarget): string 
     // ----- migrate (optional) ------------------------------------------------
     if (app.migrateCmd) {
       push(
-        "# --- backup: save the database before migrations change it ---",
-        'if [[ "${SAMOHOST_RELEASE_MODEL:-0}" == 1 ]]; then',
-        marker("backup", "start"),
-        'if sudo -n "$SAMOHOST_STEP" backup </dev/null; then',
-        `  ${marker("backup", "ok")}`,
-        "else",
-        `  ${marker("backup", "fail")}`,
-        '  echo "ERROR: the database backup failed and migrations did not run. If this server predates database backups, run samohost app bootstrap to install the per-app backup helper and sudo rule." >&2',
-        '  if [[ "$SAMOHOST_HAS_PREVIOUS_RELEASE" == "1" ]]; then rollback before-restart; fi',
-        "  exit 1",
-        "fi",
-        "fi",
-        "",
+        ...(databaseBackupEnabled
+          ? [
+              "# --- backup: save the database before migrations change it ---",
+              'if [[ "${SAMOHOST_RELEASE_MODEL:-0}" == 1 ]]; then',
+              marker("backup", "start"),
+              'if sudo -n "$SAMOHOST_STEP" backup </dev/null; then',
+              `  ${marker("backup", "ok")}`,
+              "else",
+              `  ${marker("backup", "fail")}`,
+              '  echo "ERROR: the database backup failed and migrations did not run" >&2',
+              '  if [[ "$SAMOHOST_HAS_PREVIOUS_RELEASE" == "1" ]]; then rollback before-restart; fi',
+              "  exit 1",
+              "fi",
+              "else",
+              '  echo "WARNING: no database backup was taken: this server does not use the build model" >&2',
+              "fi",
+              "",
+            ]
+          : []),
         "# --- migrate: apply DB migrations before the new code boots ---",
         "# subshell + cd: always runs from the app dir, whatever buildCmd cd'd into (issue #122).",
         ...(splitLayout !== undefined

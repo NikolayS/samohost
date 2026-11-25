@@ -42,6 +42,7 @@ export interface BuildStepParams {
   buildCmd: string;
   migrateCmd?: string;
   seedCmd?: string;
+  includeBackup?: boolean;
 }
 
 function sq(s: string): string {
@@ -66,6 +67,8 @@ export function buildModelPaths(appBase: string) {
 
 /** Text of the step script (bash). */
 export function buildStepScript(p: BuildStepParams): string {
+  const includeBackup = p.includeBackup !== false;
+  const stepNames = BUILD_STEP_NAMES.filter((name) => includeBackup || name !== "backup");
   const m = buildModelPaths(p.appBase);
   const hidden = [p.envFile, p.migrateEnvFile, p.tokenFile, p.gitSafeConf, `${p.checkoutDir}/.git`, m.releasesDir]
     .map((x) => `-${x}`)
@@ -128,9 +131,9 @@ export function buildStepScript(p: BuildStepParams): string {
     "MAX_BUILD_KB=2097152",
     "MIN_FREE_KB=2097152",
     "",
-    `if [[ $# -ne 1 ]]; then echo "usage: $0 ${BUILD_STEP_NAMES.join("|")}" >&2; exit 2; fi`,
-    'case "$1" in install|build|backup|migrate|seed|release|rollback|cleanup) ;; *)',
-    `  echo "usage: $0 ${BUILD_STEP_NAMES.join("|")}" >&2; exit 2 ;;`,
+    `if [[ $# -ne 1 ]]; then echo "usage: $0 ${stepNames.join("|")}" >&2; exit 2; fi`,
+    `case "$1" in ${stepNames.join("|")}) ;; *)`,
+    `  echo "usage: $0 ${stepNames.join("|")}" >&2; exit 2 ;;`,
     "esac",
     "",
     "# One lock per app for the whole run of every step: no two steps of this app",
@@ -240,25 +243,39 @@ export function buildStepScript(p: BuildStepParams): string {
     "  build)",
     '    samohost_build_unit build 1800 "$BUILD_DIR $CACHE_DIR" "" "$CACHE_DIR" "$BUILD_CMD"',
     "    ;;",
-    "  backup)",
+    ...(includeBackup ? ["  backup)",
     "    # Root owns the directory and opens the output file. pg_dump itself runs",
     "    # as the postgres OS user over peer authentication and cannot list backups.",
+    '    BACKUP_ROOT="$(dirname -- "$BACKUP_DIR")"',
+    '    if [[ -L "$BACKUP_ROOT" || ( -e "$BACKUP_ROOT" && ( ! -d "$BACKUP_ROOT" || ! -O "$BACKUP_ROOT" ) ) ]]; then echo "ERROR: backup did not run: $BACKUP_ROOT is not a folder owned by root or is a symbolic link" >&2; exit 1; fi',
+    '    install -d -m 700 -o root -g root "$BACKUP_ROOT"',
+    '    if [[ -L "$BACKUP_DIR" || ( -e "$BACKUP_DIR" && ( ! -d "$BACKUP_DIR" || ! -O "$BACKUP_DIR" ) ) ]]; then echo "ERROR: backup did not run: $BACKUP_DIR is not a folder owned by root or is a symbolic link" >&2; exit 1; fi',
     '    install -d -m 700 -o root -g root "$BACKUP_DIR"',
     '    find "$BACKUP_DIR" -maxdepth 1 -type f -name ".backup.*.tmp" -delete',
-    '    sha="$(sed -n "s/^SAMO_RELEASE_SHA=//p" "$RELEASE_ENV" | tail -n 1)"',
-    '    if [[ ! "$sha" =~ ^[0-9a-f]{7,64}$ ]]; then echo "ERROR: release.env has no valid SAMO_RELEASE_SHA; database backup did not run" >&2; exit 1; fi',
+    '    if [[ ! -r "$RELEASE_ENV" ]]; then echo "ERROR: backup did not run: release.env is missing or unreadable at $RELEASE_ENV" >&2; exit 1; fi',
+    '    sha="$(sed -n "s/^SAMO_RELEASE_SHA=//p" "$RELEASE_ENV" 2>/dev/null | tail -n 1)"',
+    '    if [[ ! "$sha" =~ ^[0-9a-f]{7,64}$ ]]; then echo "ERROR: backup did not run: release.env has no valid SAMO_RELEASE_SHA" >&2; exit 1; fi',
+    '    if ! db_bytes="$(/usr/sbin/runuser -u postgres -- /usr/bin/psql -X -qAt --dbname=postgres -c "SELECT pg_database_size(\'$DATABASE\');" 2>/dev/null)"; then echo "ERROR: backup did not run: could not read the size of database $DATABASE" >&2; exit 1; fi',
+    '    if ! free_kb="$(df -Pk "$BACKUP_DIR" | awk \'NR == 2 { print $4 }\')"; then echo "ERROR: backup did not run: could not read free space for $BACKUP_DIR" >&2; exit 1; fi',
+    '    if [[ ! "$db_bytes" =~ ^[0-9]+$ || ! "$free_kb" =~ ^[0-9]+$ ]]; then echo "ERROR: backup did not run: could not determine database size and backup disk free space" >&2; exit 1; fi',
+    '    db_kb=$(( (db_bytes + 1023) / 1024 ))',
+    '    if (( free_kb - db_kb < MIN_FREE_KB )); then printf "ERROR: backup did not run: database size is %d MB and backup disk free space is %d MB; the dump could leave less than %d MB free\n" "$(( (db_kb + 1023) / 1024 ))" "$(( free_kb / 1024 ))" "$(( MIN_FREE_KB / 1024 ))" >&2; exit 1; fi',
     '    stamp="$(date -u +%Y%m%dT%H%M%SZ)"',
     '    final="$BACKUP_DIR/$stamp-${sha:0:7}.dump"',
     '    tmp="$(mktemp "$BACKUP_DIR/.backup.XXXXXX.tmp")"',
     '    trap \'rm -f -- "$tmp"\' EXIT',
     '    chmod 600 "$tmp"',
-    '    if ! /usr/bin/timeout 600 /usr/sbin/runuser -u postgres -- /usr/bin/pg_dump -Fc --dbname="$DATABASE" > "$tmp"; then',
+    '    if ! /usr/bin/timeout -k 30 600 /usr/sbin/runuser -u postgres -- /usr/bin/pg_dump --no-password --lock-wait-timeout=60000 -Fc --dbname="$DATABASE" > "$tmp"; then',
     '      echo "ERROR: pg_dump failed or exceeded the 10 minute timeout; database backup was not saved" >&2; exit 1',
     "    fi",
     '    mv -fT -- "$tmp" "$final"',
     "    trap - EXIT",
-    '    find "$BACKUP_DIR" -maxdepth 1 -type f -name "*.dump" -print | sort -r | tail -n +6 | while IFS= read -r old; do rm -f -- "$old"; done',
-    "    ;;",
+    '    dumps=()',
+    '    while IFS= read -r -d "" old; do name="${old##*/}"; if [[ "$name" =~ ^[0-9]{8}T[0-9]{6}Z-[0-9a-f]{7}\\.dump$ ]]; then dumps+=("$old"); fi; done < <(find "$BACKUP_DIR" -maxdepth 1 -type f -print0)',
+    '    for ((i=0; i<${#dumps[@]}; i++)); do for ((j=i+1; j<${#dumps[@]}; j++)); do if [[ "${dumps[j]##*/}" > "${dumps[i]##*/}" ]]; then old="${dumps[i]}"; dumps[i]="${dumps[j]}"; dumps[j]="$old"; fi; done; done',
+    '    kept=1',
+    '    for old in "${dumps[@]}"; do if [[ "$old" == "$final" ]]; then continue; fi; if [[ "$kept" -lt 5 ]]; then kept=$((kept + 1)); continue; fi; if ! rm -f -- "$old"; then echo "WARNING: could not remove old database backup $old" >&2; fi; done',
+    "    ;;",] : []),
     "  migrate|seed)",
     '    if [[ "$1" == migrate ]]; then cmd="$MIGRATE_CMD"; else cmd="$SEED_CMD"; fi',
     '    if [[ -z "$cmd" ]]; then echo "ERROR: no $1 command was set when bootstrap wrote this script; run bootstrap again" >&2; exit 1; fi',
@@ -325,7 +342,7 @@ export function buildStepScript(p: BuildStepParams): string {
     '    pkill -KILL -u "$BUILD_USER" 2>/dev/null || true',
     "    ;;",
     "  *)",
-    `    echo "usage: $0 ${BUILD_STEP_NAMES.join("|")}" >&2; exit 2`,
+    `    echo "usage: $0 ${stepNames.join("|")}" >&2; exit 2`,
     "    ;;",
     "esac",
     "",

@@ -7,7 +7,7 @@
 
 import { describe, expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
-import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, readlinkSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, readlinkSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { buildStepScript, buildStepScriptPath, type BuildStepParams } from "../src/app/build-steps.ts";
@@ -68,6 +68,10 @@ function sandbox(params: Partial<BuildStepParams> = {}, edits: Array<[string, st
   // systemctl is-active <unit>: the content of <dir>/state-<unit>, else inactive.
   stub(bin, "systemctl", `f=${JSON.stringify(dir)}/state-$2; if [[ -f "$f" ]]; then cat "$f"; [[ "$(cat "$f")" == active ]] && exit 0; exit 3; fi; echo inactive; exit 3`, log);
   stub(bin, "pg_dump", `if [[ -e ${JSON.stringify(join(dir, "fail-pg-dump"))} ]]; then exit 1; fi; printf 'dump-data'`, log);
+  stub(bin, "psql", `if [[ -e ${JSON.stringify(join(dir, "fail-psql"))} ]]; then exit 1; fi; cat ${JSON.stringify(join(dir, "db-bytes"))}`, log);
+  writeFileSync(join(dir, "db-bytes"), "1024\n");
+  stub(bin, "df", `printf 'Filesystem 1024-blocks Used Available Capacity Mounted on\\n/dev/test 999999999 1 '; cat ${JSON.stringify(join(dir, "free-kb"))}; printf ' 1%% /\\n'`, log);
+  writeFileSync(join(dir, "free-kb"), "999999999\n");
   // GNU cp options on macOS: drop --preserve=timestamps and --, copy with -RP.
   stub(bin, "cp", 'a=(); for x in "$@"; do case "$x" in -R|-P|--preserve=timestamps|--) ;; *) a+=("$x");; esac; done\nprintf "releases at copy: %s\\n" "$(ls "$(dirname "${a[1]}")" | grep -v "\\.src$" | grep -v "\\.tmp$" | tr "\\n" " ")" >> ' + JSON.stringify(log) + '\n/bin/cp -RP "${a[@]}"', log);
   // GNU tar's --no-overwrite-dir is not in macOS tar; drop it there.
@@ -81,8 +85,10 @@ function sandbox(params: Partial<BuildStepParams> = {}, edits: Array<[string, st
     .replaceAll("/run/samohost", join(dir, "run-samohost"))
     .replaceAll("/var/backups/samohost/shop", join(base, "backups"))
     .replaceAll("/usr/bin/systemctl", join(bin, "systemctl"))
-    .replace("/usr/bin/timeout 600 /usr/sbin/runuser -u postgres -- /usr/bin/pg_dump", join(bin, "pg_dump"))
-    .replace('install -d -m 700 -o root -g root "$BACKUP_DIR"', 'mkdir -p "$BACKUP_DIR"; chmod 700 "$BACKUP_DIR"')
+    .replace("/usr/sbin/runuser -u postgres -- /usr/bin/psql", join(bin, "psql"))
+    .replace("/usr/bin/timeout -k 30 600 /usr/sbin/runuser -u postgres -- /usr/bin/pg_dump", join(bin, "pg_dump"))
+    .replaceAll('install -d -m 700 -o root -g root "$BACKUP_ROOT"', 'mkdir -p "$BACKUP_ROOT"; chmod 700 "$BACKUP_ROOT"')
+    .replaceAll('install -d -m 700 -o root -g root "$BACKUP_DIR"', 'mkdir -p "$BACKUP_DIR"; chmod 700 "$BACKUP_DIR"')
     .replace("MIN_FREE_KB=2097152", "MIN_FREE_KB=0");
   let edited = text;
   for (const [a, b] of edits) edited = edited.replace(a, b);
@@ -136,6 +142,114 @@ describe("step script: rendered", () => {
     } finally {
       s.cleanup();
     }
+  });
+
+  test("backup checks database size and free space before creating a file", () => {
+    const s = sandbox({}, [["MIN_FREE_KB=0", "MIN_FREE_KB=2097152"]]);
+    try {
+      writeFileSync(join(s.base, "release.env"), "SAMO_RELEASE_SHA=abcdef0123456789\n");
+      writeFileSync(join(s.dir, "db-bytes"), `${512 * 1024 * 1024}\n`);
+      writeFileSync(join(s.dir, "free-kb"), `${3 * 1024 * 1024}\n`);
+      expect(s.step("backup").status).toBe(0);
+      expect(s.calls()).toContain("psql -X -qAt --dbname=postgres");
+      expect(s.calls()).toContain("pg_dump --no-password --lock-wait-timeout=60000 -Fc --dbname=shop");
+    } finally { s.cleanup(); }
+  });
+
+  test("backup refuses insufficient space without calling pg_dump or leaving a temporary file", () => {
+    const s = sandbox({}, [["MIN_FREE_KB=0", "MIN_FREE_KB=2097152"]]);
+    try {
+      writeFileSync(join(s.base, "release.env"), "SAMO_RELEASE_SHA=abcdef0123456789\n");
+      writeFileSync(join(s.dir, "db-bytes"), `${1536 * 1024 * 1024}\n`);
+      writeFileSync(join(s.dir, "free-kb"), `${3 * 1024 * 1024}\n`);
+      const result = s.step("backup");
+      expect(result.status).toBe(1);
+      expect(result.stderr).toContain("database size is 1536 MB");
+      expect(result.stderr).toContain("backup disk free space is 3072 MB");
+      expect(s.calls()).not.toContain("pg_dump");
+      expect(readdirSync(join(s.base, "backups")).some((name) => name.includes(".tmp"))).toBe(false);
+    } finally { s.cleanup(); }
+  });
+
+  test("pruning protects the new dump from five future names", () => {
+    const s = sandbox();
+    try {
+      writeFileSync(join(s.base, "release.env"), "SAMO_RELEASE_SHA=abcdef0123456789\n");
+      const backups = join(s.base, "backups"); mkdirSync(backups);
+      const future = Array.from({ length: 5 }, (_, i) => `2099010${i + 1}T000000Z-1111111.dump`);
+      for (const name of future) writeFileSync(join(backups, name), "old");
+      expect(s.step("backup").status).toBe(0);
+      const names = readdirSync(backups).sort();
+      expect(names.some((name) => name.endsWith("-abcdef0.dump"))).toBe(true);
+      expect(names.filter((name) => future.includes(name))).toEqual(future.slice(1).sort());
+    } finally { s.cleanup(); }
+  });
+
+  test("pruning ignores manual files and retains the new dump plus four matching old dumps", () => {
+    const s = sandbox();
+    try {
+      writeFileSync(join(s.base, "release.env"), "SAMO_RELEASE_SHA=abcdef0123456789\n");
+      const backups = join(s.base, "backups"); mkdirSync(backups);
+      writeFileSync(join(backups, "pre-restore-manual.dump"), "manual");
+      for (let n = 1; n <= 6; n++) writeFileSync(join(backups, `2026010${n}T000000Z-1111111.dump`), "old");
+      expect(s.step("backup").status).toBe(0);
+      const names = readdirSync(backups).sort();
+      expect(names).toContain("pre-restore-manual.dump");
+      expect(names.filter((name) => /^[0-9]{8}T[0-9]{6}Z-[0-9a-f]{7}\.dump$/.test(name)).map((name) => name.includes("-abcdef0") ? "new" : name)).toEqual([
+        "20260103T000000Z-1111111.dump", "20260104T000000Z-1111111.dump", "20260105T000000Z-1111111.dump", "20260106T000000Z-1111111.dump", "new",
+      ]);
+    } finally { s.cleanup(); }
+  });
+
+  test("a pruning removal failure is a warning and keeps the new backup", () => {
+    const s = sandbox({}, [['if ! rm -f -- "$old"; then', 'if [[ "$old" == *20260101* ]] || ! rm -f -- "$old"; then']]);
+    try {
+      writeFileSync(join(s.base, "release.env"), "SAMO_RELEASE_SHA=abcdef0123456789\n");
+      const backups = join(s.base, "backups"); mkdirSync(backups);
+      for (let n = 1; n <= 6; n++) writeFileSync(join(backups, `2026010${n}T000000Z-1111111.dump`), "old");
+      const result = s.step("backup");
+      expect(result.status).toBe(0);
+      expect(result.stderr).toContain("WARNING: could not remove old database backup");
+      expect(readdirSync(backups).some((name) => name.endsWith("-abcdef0.dump"))).toBe(true);
+      expect(existsSync(join(backups, "20260101T000000Z-1111111.dump"))).toBe(true);
+    } finally { s.cleanup(); }
+  });
+
+  test("backup creates the final dump as mode 0600 and dumps the app database", () => {
+    const s = sandbox();
+    try {
+      writeFileSync(join(s.base, "release.env"), "SAMO_RELEASE_SHA=abcdef0123456789\n");
+      expect(s.step("backup").status).toBe(0);
+      const file = readdirSync(join(s.base, "backups")).find((name) => name.endsWith(".dump"))!;
+      expect(statSync(join(s.base, "backups", file)).mode & 0o777).toBe(0o600);
+      expect(s.calls()).toContain("--dbname=shop");
+      expect(buildStepScript(PARAMS).indexOf("umask 077")).toBeLessThan(buildStepScript(PARAMS).indexOf('tmp="$(mktemp'));
+    } finally { s.cleanup(); }
+  });
+
+  test("backup refuses a symbolic-link app folder before writing", () => {
+    const s = sandbox();
+    try {
+      writeFileSync(join(s.base, "release.env"), "SAMO_RELEASE_SHA=abcdef0123456789\n");
+      const target = join(s.dir, "elsewhere"); mkdirSync(target);
+      symlinkSync(target, join(s.base, "backups"));
+      const result = s.step("backup");
+      expect(result.status).toBe(1);
+      expect(result.stderr).toContain("is not a folder owned by root or is a symbolic link");
+      expect(readdirSync(target)).toEqual([]);
+      expect(s.calls()).not.toContain("pg_dump");
+    } finally { s.cleanup(); }
+  });
+
+  test("backup reports a missing release.env without a sed diagnostic", () => {
+    const s = sandbox();
+    try {
+      const result = s.step("backup");
+      expect(result.status).toBe(1);
+      expect(result.stderr).toContain("backup did not run: release.env is missing or unreadable");
+      expect(result.stderr).not.toContain("sed:");
+      expect(s.calls()).not.toContain("pg_dump");
+    } finally { s.cleanup(); }
   });
 
   test("build steps run as the build user in a hardened transient service with limits", () => {
