@@ -518,6 +518,49 @@ describe("3. dark-DB probe integration into auditVm and fleet-doctor", () => {
     expect(darkDbResult!.status).toBe("pass");
   });
 
+  test("3c2. first app static (none), second app has dbBackend=template, vmApps passed → dark-db passes", async () => {
+    const vm = makeVm();
+    const first = makeApp(vm.id, { kind: "static", dbBackend: "none" });
+    const second = makeApp(vm.id, { kind: "node", dbBackend: "template", databaseUrlEnv: "DATABASE_URL" });
+    const runner = makePassRunner({
+      "dark-db": "DATABASES:\nmyapp_prod\nROLES:\nmyapp_rw",
+    });
+    const results = await auditVm(vm, first, runner, [first, second]);
+    expect(results.find((r) => r.id === "dark-db")!.status).toBe("pass");
+  });
+
+  test("3c3. first app static, no other app declares a backend, vmApps passed → dark-db fails", async () => {
+    const vm = makeVm();
+    const first = makeApp(vm.id, { kind: "static", dbBackend: "none" });
+    const second = makeApp(vm.id, { kind: "node", dbBackend: "none" });
+    const runner = makePassRunner({
+      "dark-db": "DATABASES:\nmyapp_prod\nROLES:\nmyapp_rw",
+    });
+    const results = await auditVm(vm, first, runner, [first, second]);
+    expect(results.find((r) => r.id === "dark-db")!.status).toBe("fail");
+  });
+
+  test("3c4. first app static, vmApps not passed → dark-db fails as before", async () => {
+    const vm = makeVm();
+    const first = makeApp(vm.id, { kind: "static", dbBackend: "none" });
+    const runner = makePassRunner({
+      "dark-db": "DATABASES:\nmyapp_prod\nROLES:\nmyapp_rw",
+    });
+    const results = await auditVm(vm, first, runner);
+    expect(results.find((r) => r.id === "dark-db")!.status).toBe("fail");
+  });
+
+  test("3c5. first app declares a backend, vmApps passed → dark-db passes", async () => {
+    const vm = makeVm();
+    const first = makeApp(vm.id, { kind: "node", dbBackend: "template", databaseUrlEnv: "DATABASE_URL" });
+    const second = makeApp(vm.id, { kind: "static", dbBackend: "none" });
+    const runner = makePassRunner({
+      "dark-db": "DATABASES:\nmyapp_prod\nROLES:\nmyapp_rw",
+    });
+    const results = await auditVm(vm, first, runner, [first, second]);
+    expect(results.find((r) => r.id === "dark-db")!.status).toBe("pass");
+  });
+
   test("3d. auditVm: dark-db probe error → unknown (fail-safe, does not crash sweep)", async () => {
     const vm = makeVm();
     const app = makeApp(vm.id, { kind: "node" });

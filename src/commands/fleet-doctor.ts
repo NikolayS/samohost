@@ -214,7 +214,7 @@ export async function runFleetDoctor(
   for (const record of vms) {
     const app = allApps.find((a) => a.vmId === record.id);
     try {
-      const checks = await auditVm(record, app, runner);
+      const checks = await auditVm(record, app, runner, allApps.filter((a) => a.vmId === record.id));
 
       // ---------------------------------------------------------------------------
       // LOCAL-ONLY checks — injected per-VM after the SSH probe, no extra
