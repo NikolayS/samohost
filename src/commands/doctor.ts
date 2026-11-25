@@ -430,6 +430,8 @@ function evaluateDoctorCheck(
   serveKind?: "node" | "static",
   /** AppRecord passed through for app-aware parsers (dark-db). Optional for back-compat. */
   app?: AppRecord,
+  /** App whose DB declaration counts for dark-db (defaults to `app`). */
+  darkDbApp?: AppRecord,
 ): DoctorResult {
   if (skip) {
     return {
@@ -548,8 +550,13 @@ function evaluateDoctorCheck(
   }
 
   // dark-db: custom parser — FAIL when undeclared app DBs/roles exist on VM.
+  // The databases belong to the server, not to one app. auditVm passes
+  // darkDbApp, which is an app of this server that declares a real database
+  // backend when there is one, so a static first app does not make the
+  // databases of a second app look undeclared.
   if (check.id === "dark-db") {
-    const parsed = parseDarkDbOutput(observed, app?.dbBackend, app?.databaseUrlEnv);
+    const dbApp = darkDbApp ?? app;
+    const parsed = parseDarkDbOutput(observed, dbApp?.dbBackend, dbApp?.databaseUrlEnv);
     return {
       id: check.id,
       description: parsed.description ?? check.description,
@@ -673,7 +680,15 @@ export async function auditVm(
   record: import("../types.ts").VmRecord,
   app: AppRecord | undefined,
   remote: RemoteRunner,
+  /** All apps registered for this server. Used only by the dark-db check. */
+  vmApps?: readonly AppRecord[],
 ): Promise<DoctorResult[]> {
+  const hasRealBackend = (a: AppRecord | undefined): boolean =>
+    a?.dbBackend !== undefined && a.dbBackend !== "none" && (a.dbBackend as string) !== "";
+  // dark-db: the first app decides unless it declares no backend and another
+  // app of the server does.
+  const darkDbApp = hasRealBackend(app) ? app : (vmApps?.find(hasRealBackend) ?? app);
+
   // Build app params if an app is registered.
   const appParams = app ? appParamsOf(app) : undefined;
 
@@ -747,7 +762,7 @@ export async function auditVm(
       observed = ssListenersOutput;
     }
 
-    return evaluateDoctorCheck(check, observed, sshResult.stderr, record.sshPort, skip, serveKind, app);
+    return evaluateDoctorCheck(check, observed, sshResult.stderr, record.sshPort, skip, serveKind, app, darkDbApp);
   });
 
   return results;
@@ -780,7 +795,7 @@ export async function runDoctor(
   // Delegate probe + evaluation to auditVm.
   let results: DoctorResult[];
   try {
-    results = await auditVm(record, app, remote);
+    results = await auditVm(record, app, remote, apps);
   } catch (e) {
     err(`error: doctor probe failed: ${e instanceof Error ? e.message : String(e)}`);
     return 1;
